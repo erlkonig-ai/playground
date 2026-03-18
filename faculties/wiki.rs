@@ -776,7 +776,7 @@ fn resolve_to_show(space: &TribleSet, id: Id, follow_latest: bool) -> Result<Id>
 fn cmd_resolve(pile: &Path, branch: Option<&str>, prefix: String) -> Result<()> {
     with_wiki(pile, branch, |_repo, ws| {
         let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-        let id = resolve_fragment_prefix(&space, &prefix)?;
+        let id = resolve_prefix(&space, &prefix)?;
         println!("{}", fmt_id(id));
         Ok(())
     })
