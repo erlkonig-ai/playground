@@ -421,6 +421,32 @@ fn resolve_prefix(space: &TribleSet, input: &str) -> Result<Id> {
     }
 }
 
+/// Resolve a hex prefix to a fragment ID only (not version IDs).
+/// Used for wiki: link resolution where the target is always a fragment.
+fn resolve_fragment_prefix(space: &TribleSet, input: &str) -> Result<Id> {
+    let needle = input.trim().to_lowercase();
+    let mut matches = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for (frag,) in find!(
+        (frag: Id),
+        pattern!(space, [{ _?vid @ metadata::tag: &KIND_VERSION_ID, wiki::fragment: ?frag }])
+    ) {
+        if seen.insert(frag) {
+            let hex = format!("{frag:x}");
+            if hex.starts_with(&needle) {
+                matches.push(frag);
+            }
+        }
+    }
+    matches.sort();
+    matches.dedup();
+    match matches.len() {
+        0 => bail!("no fragment matches '{input}'"),
+        1 => Ok(matches[0]),
+        n => bail!("ambiguous fragment prefix '{input}' ({n} matches)"),
+    }
+}
+
 /// Parse a full 64-character hex ID. Returns an error for any other input.
 fn parse_full_id(input: &str) -> Result<Id> {
     let trimmed = input.trim();
@@ -520,7 +546,7 @@ fn extract_references(content: &str, space: &TribleSet) -> (Vec<Id>, Vec<(String
         let faculty = &caps[1];
         let hex = &caps[2];
         if faculty == "wiki" {
-            if let Ok(id) = resolve_prefix(space, hex) {
+            if let Ok(id) = resolve_fragment_prefix(space, hex) {
                 internal.push(id);
             }
         } else {
@@ -750,7 +776,7 @@ fn resolve_to_show(space: &TribleSet, id: Id, follow_latest: bool) -> Result<Id>
 fn cmd_resolve(pile: &Path, branch: Option<&str>, prefix: String) -> Result<()> {
     with_wiki(pile, branch, |_repo, ws| {
         let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-        let id = resolve_prefix(&space, &prefix)?;
+        let id = resolve_fragment_prefix(&space, &prefix)?;
         println!("{}", fmt_id(id));
         Ok(())
     })
