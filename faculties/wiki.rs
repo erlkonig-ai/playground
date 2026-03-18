@@ -185,12 +185,24 @@ enum Command {
         #[arg(long)]
         all: bool,
     },
-    /// Expand truncated wiki:/files: hex prefixes in a file to full-length IDs.
-    /// Reads the file, expands all unambiguous prefixes, prints result to stdout.
-    /// Ambiguous prefixes are left unchanged and reported on stderr.
+    /// Export all fragments to a directory (one file per fragment, named by fragment ID)
+    ExportAll {
+        /// Output directory
+        dir: PathBuf,
+    },
+    /// Import fragment content from a directory. For each <fragment-id>.typ file,
+    /// creates a new version if content differs from the latest. Tags are preserved.
+    ImportAll {
+        /// Input directory containing <fragment-id>.typ files
+        dir: PathBuf,
+    },
+    /// Resolve a list of scheme:prefix lines to full-length IDs.
+    /// Input: one `wiki:<hex>` or `files:<hex>` per line (from @path or @-).
+    /// Output: `old\tnew` mapping for each resolved prefix, one per line.
+    /// Ambiguous or unresolvable prefixes are reported on stderr.
     FixTruncated {
-        /// File to fix. Use @path for a file or @- for stdin.
-        content: String,
+        /// File with scheme:prefix lines. Use @path or @- for stdin.
+        input: String,
     },
 }
 
@@ -775,46 +787,192 @@ fn resolve_to_show(space: &TribleSet, id: Id, follow_latest: bool) -> Result<Id>
 
 // ── commands ───────────────────────────────────────────────────────────────
 
-fn cmd_fix_truncated(pile: &Path, branch: Option<&str>, raw_content: String) -> Result<()> {
-    let content = load_value_or_file(&raw_content, "content")?;
+fn cmd_fix_truncated(pile: &Path, branch: Option<&str>, raw_input: String) -> Result<()> {
+    let input = load_value_or_file(&raw_input, "input")?;
 
     with_wiki(pile, branch, |_repo, ws| {
         let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
 
-        use regex::Regex;
-        let re = Regex::new(r"(wiki|files):([0-9a-fA-F]+)").unwrap();
-        let mut ambiguous = Vec::new();
-        let mut expanded = 0u32;
+        let mut resolved = 0u32;
+        let mut ambiguous = 0u32;
+        let mut already_full = 0u32;
 
-        let result = re.replace_all(&content, |caps: &regex::Captures| {
-            let scheme = &caps[1];
-            let hex = &caps[2];
-            let full_len = if scheme == "wiki" { 32 } else { 64 };
+        for line in input.lines() {
+            let line = line.trim();
+            if line.is_empty() { continue; }
+            let Some((scheme, hex)) = line.split_once(':') else {
+                eprintln!("SKIP: {line} (no scheme:prefix format)");
+                continue;
+            };
+            let full_len = if scheme == "wiki" { 32 } else if scheme == "files" { 64 } else {
+                eprintln!("SKIP: {line} (unknown scheme '{scheme}')");
+                continue;
+            };
             if hex.len() >= full_len {
-                return caps[0].to_string(); // already full length
+                already_full += 1;
+                continue; // already full length, nothing to do
             }
             match resolve_prefix(&space, hex) {
                 Ok(id) => {
-                    expanded += 1;
-                    format!("{}:{}", scheme, fmt_id(id))
+                    println!("{}\t{}:{}", line, scheme, fmt_id(id));
+                    resolved += 1;
                 }
                 Err(e) => {
-                    ambiguous.push(format!("{}:{} — {}", scheme, hex, e));
-                    caps[0].to_string() // leave unchanged
+                    eprintln!("AMBIGUOUS: {} — {}", line, e);
+                    ambiguous += 1;
                 }
             }
-        });
+        }
+        eprintln!("{} resolved, {} ambiguous, {} already full", resolved, ambiguous, already_full);
+        Ok(())
+    })
+}
 
-        print!("{}", result);
-
-        if !ambiguous.is_empty() {
-            ambiguous.sort();
-            ambiguous.dedup();
-            for a in &ambiguous {
-                eprintln!("AMBIGUOUS: {}", a);
+fn cmd_export_all(pile: &Path, branch: Option<&str>, dir: PathBuf) -> Result<()> {
+    fs::create_dir_all(&dir).context("create output directory")?;
+    with_wiki(pile, branch, |_repo, ws| {
+        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let mut count = 0u32;
+        // Collect latest version per fragment
+        let mut latest: HashMap<Id, (Id, i128)> = HashMap::new();
+        for (vid, frag, ts) in find!(
+            (vid: Id, frag: Id, ts: Value<valueschemas::NsTAIInterval>),
+            pattern!(&space, [{
+                ?vid @
+                metadata::tag: &KIND_VERSION_ID,
+                wiki::fragment: ?frag,
+                wiki::created_at: ?ts,
+            }])
+        ) {
+            let key = interval_key(ts);
+            let entry = latest.entry(frag).or_insert((vid, key));
+            if key > entry.1 {
+                *entry = (vid, key);
             }
         }
-        eprintln!("{} expanded, {} ambiguous", expanded, ambiguous.len());
+        for (frag_id, (vid, _)) in &latest {
+            // Skip archived
+            let tags = tags_of(&space, *vid);
+            if tags.contains(&TAG_ARCHIVED_ID) {
+                continue;
+            }
+            let Some(ch) = content_handle_of(&space, *vid) else { continue };
+            let content: View<str> = ws.get(ch)
+                .map_err(|e| anyhow::anyhow!("read content: {e:?}"))?;
+            let path = dir.join(format!("{:x}.typ", frag_id));
+            fs::write(&path, content.as_ref())
+                .with_context(|| format!("write {}", path.display()))?;
+            count += 1;
+        }
+        eprintln!("Exported {} fragments to {}", count, dir.display());
+        Ok(())
+    })
+}
+
+fn cmd_import_all(pile: &Path, branch: Option<&str>, dir: PathBuf) -> Result<()> {
+    with_wiki(pile, branch, |repo, ws| {
+        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        ensure_tag_vocabulary(repo, ws)?;
+
+        // Collect latest version per fragment (for content comparison + tag inheritance)
+        let mut latest: HashMap<Id, Id> = HashMap::new();
+        for (vid, frag, ts) in find!(
+            (vid: Id, frag: Id, ts: Value<valueschemas::NsTAIInterval>),
+            pattern!(&space, [{
+                ?vid @
+                metadata::tag: &KIND_VERSION_ID,
+                wiki::fragment: ?frag,
+                wiki::created_at: ?ts,
+            }])
+        ) {
+            let key = interval_key(ts);
+            let entry = latest.entry(frag).or_insert(vid);
+            let existing_key = find!(
+                existing_ts: Value<valueschemas::NsTAIInterval>,
+                pattern!(&space, [{ *entry @ wiki::created_at: ?existing_ts }])
+            ).next().map(|t| interval_key(t)).unwrap_or(i128::MIN);
+            if key > existing_key {
+                *entry = vid;
+            }
+        }
+
+        let mut change = TribleSet::new();
+        let mut updated = 0u32;
+        let mut skipped = 0u32;
+
+        let entries: Vec<_> = fs::read_dir(&dir)
+            .with_context(|| format!("read dir {}", dir.display()))?
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "typ"))
+            .collect();
+
+        for entry in &entries {
+            let stem = entry.path().file_stem()
+                .and_then(|s| s.to_str())
+                .map(str::to_string);
+            let Some(hex) = stem else { continue };
+            let Some(frag_id) = Id::from_hex(hex.trim()) else {
+                eprintln!("skip {}: invalid fragment id", entry.path().display());
+                continue;
+            };
+            let Some(&prev_vid) = latest.get(&frag_id) else {
+                eprintln!("skip {}: unknown fragment", entry.path().display());
+                skipped += 1;
+                continue;
+            };
+
+            let new_content = fs::read_to_string(entry.path())
+                .with_context(|| format!("read {}", entry.path().display()))?;
+
+            // Compare with existing content
+            let existing_content = content_handle_of(&space, prev_vid)
+                .and_then(|ch| ws.get::<View<str>, _>(ch).ok())
+                .map(|v| v.as_ref().to_string())
+                .unwrap_or_default();
+
+            if new_content == existing_content {
+                continue; // no change
+            }
+
+            // Inherit tags and title from previous version
+            let tag_ids = tags_of(&space, prev_vid);
+            let title = read_title(&space, ws, prev_vid).unwrap_or_default();
+
+            // Build new version
+            let content_handle = ws.put(new_content);
+            let (internal_links, _external) = extract_references(
+                &ws.get::<View<str>, _>(content_handle)
+                    .map_err(|e| anyhow::anyhow!("read content: {e:?}"))?.as_ref(),
+                &space,
+            );
+            let link_targets: Vec<Id> = internal_links
+                .into_iter()
+                .filter(|&id| id != frag_id)
+                .collect();
+
+            let mut all_tags = tag_ids;
+            all_tags.push(KIND_VERSION_ID);
+            all_tags.sort();
+            all_tags.dedup();
+
+            let title_handle = ws.put(title);
+            let version = entity! { _ @
+                wiki::fragment: &frag_id,
+                wiki::title: title_handle,
+                wiki::content: content_handle,
+                wiki::created_at: now_tai(),
+                metadata::tag*: all_tags.iter(),
+                wiki::links_to*: link_targets.iter(),
+            };
+            change += version;
+            updated += 1;
+        }
+
+        if updated > 0 {
+            ws.commit(change, "wiki import-all");
+            repo.push(ws).map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
+        }
+        eprintln!("Imported: {} updated, {} skipped, {} total files", updated, skipped, entries.len());
         Ok(())
     })
 }
@@ -1668,6 +1826,8 @@ fn main() -> Result<()> {
         Command::Search { query, context, all } => {
             cmd_search(&cli.pile, branch, query, context, all)
         }
-        Command::FixTruncated { content } => cmd_fix_truncated(&cli.pile, branch, content),
+        Command::ExportAll { dir } => cmd_export_all(&cli.pile, branch, dir),
+        Command::ImportAll { dir } => cmd_import_all(&cli.pile, branch, dir),
+        Command::FixTruncated { input } => cmd_fix_truncated(&cli.pile, branch, input),
     }
 }

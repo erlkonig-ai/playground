@@ -760,6 +760,7 @@ fn cmd_resolve(
         bail!("prefix too short (need at least 4 hex chars)");
     }
     let mut matches = Vec::new();
+    // Scan files (by entity id and content hash)
     for (eid, h) in find!(
         (eid: Id, h: FileHandle),
         pattern!(&space, [{ ?eid @ metadata::tag: &KIND_FILE, file::content: ?h }])
@@ -771,6 +772,26 @@ fn cmd_resolve(
         let eid_hex = format!("{eid:x}");
         if eid_hex.starts_with(&needle) && !matches.iter().any(|m| m == &eid_hex) {
             matches.push(eid_hex);
+        }
+    }
+    // Scan directories (by entity id)
+    for eid in find!(
+        eid: Id,
+        pattern!(&space, [{ ?eid @ metadata::tag: &KIND_DIRECTORY }])
+    ) {
+        let hex = format!("{eid:x}");
+        if hex.starts_with(&needle) && !matches.contains(&hex) {
+            matches.push(hex);
+        }
+    }
+    // Scan imports (by entity id)
+    for eid in find!(
+        eid: Id,
+        pattern!(&space, [{ ?eid @ metadata::tag: &KIND_IMPORT }])
+    ) {
+        let hex = format!("{eid:x}");
+        if hex.starts_with(&needle) && !matches.contains(&hex) {
+            matches.push(hex);
         }
     }
     matches.sort();
