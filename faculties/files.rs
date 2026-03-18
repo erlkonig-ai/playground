@@ -152,6 +152,11 @@ enum Command {
         #[arg(long, short)]
         depth: Option<usize>,
     },
+    /// Resolve a hash prefix to the full 64-char hex hash
+    Resolve {
+        /// Hash prefix (any length)
+        prefix: String,
+    },
     /// Compare two imports, directories, or files
     Diff {
         /// Left (older) id prefix
@@ -743,6 +748,43 @@ fn cmd_list(
     Ok(())
 }
 
+fn cmd_resolve(
+    ws: &mut Workspace<Pile<valueschemas::Blake3>>,
+    prefix: &str,
+) -> Result<()> {
+    let space = ws
+        .checkout(..)
+        .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+    let needle = prefix.trim().to_lowercase();
+    if needle.len() < 4 {
+        bail!("prefix too short (need at least 4 hex chars)");
+    }
+    let mut matches = Vec::new();
+    for (eid, h) in find!(
+        (eid: Id, h: FileHandle),
+        pattern!(&space, [{ ?eid @ metadata::tag: &KIND_FILE, file::content: ?h }])
+    ) {
+        let hash_hex = handle_hex(h).to_lowercase();
+        if hash_hex.starts_with(&needle) {
+            matches.push(hash_hex);
+        }
+        let eid_hex = format!("{eid:x}");
+        if eid_hex.starts_with(&needle) && !matches.iter().any(|m| m == &eid_hex) {
+            matches.push(eid_hex);
+        }
+    }
+    matches.sort();
+    matches.dedup();
+    match matches.len() {
+        0 => bail!("no file matches prefix '{prefix}'"),
+        1 => {
+            println!("{}", matches[0]);
+            Ok(())
+        }
+        n => bail!("ambiguous prefix '{prefix}' ({n} matches)"),
+    }
+}
+
 fn cmd_show(
     ws: &mut Workspace<Pile<valueschemas::Blake3>>,
     id: &str,
@@ -1316,6 +1358,9 @@ fn main() -> Result<()> {
         }
         Command::Tree { id, depth } => {
             with_files(pile, branch, |_repo, ws| cmd_tree(ws, &id, depth))
+        }
+        Command::Resolve { prefix } => {
+            with_files(pile, branch, |_repo, ws| cmd_resolve(ws, &prefix))
         }
         Command::Diff { left, right } => {
             with_files(pile, branch, |_repo, ws| cmd_diff(ws, &left, &right))
