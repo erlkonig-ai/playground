@@ -185,10 +185,12 @@ enum Command {
         #[arg(long)]
         all: bool,
     },
-    /// Resolve a hex prefix to a full 64-character entity id
-    Resolve {
-        /// Hex prefix (any length)
-        prefix: String,
+    /// Expand truncated wiki:/files: hex prefixes in a file to full-length IDs.
+    /// Reads the file, expands all unambiguous prefixes, prints result to stdout.
+    /// Ambiguous prefixes are left unchanged and reported on stderr.
+    FixTruncated {
+        /// File to fix. Use @path for a file or @- for stdin.
+        content: String,
     },
 }
 
@@ -773,11 +775,46 @@ fn resolve_to_show(space: &TribleSet, id: Id, follow_latest: bool) -> Result<Id>
 
 // ── commands ───────────────────────────────────────────────────────────────
 
-fn cmd_resolve(pile: &Path, branch: Option<&str>, prefix: String) -> Result<()> {
+fn cmd_fix_truncated(pile: &Path, branch: Option<&str>, raw_content: String) -> Result<()> {
+    let content = load_value_or_file(&raw_content, "content")?;
+
     with_wiki(pile, branch, |_repo, ws| {
         let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-        let id = resolve_prefix(&space, &prefix)?;
-        println!("{}", fmt_id(id));
+
+        use regex::Regex;
+        let re = Regex::new(r"(wiki|files):([0-9a-fA-F]+)").unwrap();
+        let mut ambiguous = Vec::new();
+        let mut expanded = 0u32;
+
+        let result = re.replace_all(&content, |caps: &regex::Captures| {
+            let scheme = &caps[1];
+            let hex = &caps[2];
+            let full_len = if scheme == "wiki" { 32 } else { 64 };
+            if hex.len() >= full_len {
+                return caps[0].to_string(); // already full length
+            }
+            match resolve_prefix(&space, hex) {
+                Ok(id) => {
+                    expanded += 1;
+                    format!("{}:{}", scheme, fmt_id(id))
+                }
+                Err(e) => {
+                    ambiguous.push(format!("{}:{} — {}", scheme, hex, e));
+                    caps[0].to_string() // leave unchanged
+                }
+            }
+        });
+
+        print!("{}", result);
+
+        if !ambiguous.is_empty() {
+            ambiguous.sort();
+            ambiguous.dedup();
+            for a in &ambiguous {
+                eprintln!("AMBIGUOUS: {}", a);
+            }
+        }
+        eprintln!("{} expanded, {} ambiguous", expanded, ambiguous.len());
         Ok(())
     })
 }
@@ -1631,6 +1668,6 @@ fn main() -> Result<()> {
         Command::Search { query, context, all } => {
             cmd_search(&cli.pile, branch, query, context, all)
         }
-        Command::Resolve { prefix } => cmd_resolve(&cli.pile, branch, prefix),
+        Command::FixTruncated { content } => cmd_fix_truncated(&cli.pile, branch, content),
     }
 }
