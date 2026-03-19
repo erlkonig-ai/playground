@@ -50,7 +50,8 @@ mod file {
         "BFE2C88ECD13D56F80967C343FC072EE" as mime: valueschemas::ShortString;
         // import: timestamp
         "EA8B5429A86AF26D2B87F169AFEE3919" as imported_at: valueschemas::NsTAIInterval;
-        // any entity: user tag
+        // TODO: migrate to metadata::tag (GenId) — should use canonical tag
+        // entities with metadata::name, not inline ShortString. See wiki.rs TagIndex.
         "CDA941A27F86A7551779CF9524DE1D0F" as tag: valueschemas::ShortString;
         // directory: children (multi-valued, files or subdirectories)
         "0AC1D962B6E8170FDD73AE3743E16578" as children: valueschemas::GenId;

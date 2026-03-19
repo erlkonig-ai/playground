@@ -54,6 +54,9 @@ mod board {
     attributes! {
         "EE18CEC15C18438A2FAB670E2E46E00C" as title: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
         "F9B56611861316B31A6C510B081C30B3" as created_at: valueschemas::ShortString;
+        // TODO: migrate to metadata::tag (GenId) — tags should be entities with
+        // their own ID + metadata::name, not inline strings. See wiki.rs TagIndex
+        // for the correct pattern. This ShortString tag is a legacy design mistake.
         "5FF4941DCC3F6C35E9B3FD57216F69ED" as tag: valueschemas::ShortString;
         "9D2B6EBDA67E9BB6BE6215959D182041" as parent: valueschemas::GenId;
 
