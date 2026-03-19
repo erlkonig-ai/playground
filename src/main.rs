@@ -1935,12 +1935,28 @@ fn build_memory_cover_messages(
         used = used.saturating_add(candidate.extra_cost);
     }
 
-    // Compute the latest end_at across all selected cover chunks.
-    let cover_end_key = cover
-        .iter()
-        .filter_map(|id| index.chunks.get(id))
-        .map(|chunk| interval_key(chunk.end_at))
-        .max();
+    // Find the end of continuous coverage: walk the sorted cover and stop
+    // at the first gap. Only the contiguous prefix counts as "summarized" —
+    // isolated future memories shouldn't advance the boundary and drop
+    // unsummarized events between the continuous cover and the outlier.
+    let cover_end_key = {
+        let mut contiguous_end: Option<i128> = None;
+        for chunk_id in &cover {
+            let Some(chunk) = index.chunks.get(chunk_id) else {
+                continue;
+            };
+            let chunk_start = interval_key(chunk.start_at);
+            let chunk_end = interval_key(chunk.end_at);
+            if let Some(prev_end) = contiguous_end {
+                if chunk_start > prev_end {
+                    // Gap detected — stop here; previous end is the boundary.
+                    break;
+                }
+            }
+            contiguous_end = Some(contiguous_end.map_or(chunk_end, |e| e.max(chunk_end)));
+        }
+        contiguous_end
+    };
 
     let mut messages = Vec::new();
     for chunk_id in cover {
