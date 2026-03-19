@@ -57,6 +57,9 @@ pub struct ModelConfig {
     pub max_output_tokens: u64,
     pub context_safety_margin_tokens: u64,
     pub chars_per_token: u64,
+    pub max_inline_images: u64,
+    pub max_inline_image_bytes: u64,
+    pub vision: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -86,6 +89,9 @@ impl Default for ModelConfig {
             max_output_tokens: default_max_output_tokens(),
             context_safety_margin_tokens: default_context_safety_margin_tokens(),
             chars_per_token: default_chars_per_token(),
+            max_inline_images: 4,
+            max_inline_image_bytes: 5 * 1024 * 1024,
+            vision: true,
         }
     }
 }
@@ -327,6 +333,21 @@ fn load_latest_config(
     {
         config.model.chars_per_token = chars;
     }
+    if let Some(v) = load_u256_attr(catalog, config_id, playground_config::model_max_inline_images)
+        .and_then(|v| v.try_from_value::<u64>().ok())
+    {
+        config.model.max_inline_images = v;
+    }
+    if let Some(v) = load_u256_attr(catalog, config_id, playground_config::model_max_inline_image_bytes)
+        .and_then(|v| v.try_from_value::<u64>().ok())
+    {
+        config.model.max_inline_image_bytes = v;
+    }
+    if let Some(v) = load_u256_attr(catalog, config_id, playground_config::model_vision)
+        .and_then(|v| v.try_from_value::<u64>().ok())
+    {
+        config.model.vision = v != 0;
+    }
     if let Some(profile_id) = config.model_profile_id {
         if let Some((model_cfg, name)) = load_latest_model_profile(ws, catalog, profile_id)? {
             config.model = model_cfg;
@@ -421,6 +442,21 @@ fn load_latest_model_profile(
     {
         model.chars_per_token = chars;
     }
+    if let Some(v) = load_u256_attr(catalog, entry_id, playground_config::model_max_inline_images)
+        .and_then(|v| v.try_from_value::<u64>().ok())
+    {
+        model.max_inline_images = v;
+    }
+    if let Some(v) = load_u256_attr(catalog, entry_id, playground_config::model_max_inline_image_bytes)
+        .and_then(|v| v.try_from_value::<u64>().ok())
+    {
+        model.max_inline_image_bytes = v;
+    }
+    if let Some(v) = load_u256_attr(catalog, entry_id, playground_config::model_vision)
+        .and_then(|v| v.try_from_value::<u64>().ok())
+    {
+        model.vision = v != 0;
+    }
     let name = load_string_attr(ws, catalog, entry_id, metadata::name)?
         .unwrap_or_else(|| format!("profile-{profile_id:x}"));
     Ok(Some((model, name)))
@@ -479,6 +515,9 @@ fn store_config(ws: &mut Workspace<Pile>, config: &Config) -> Result<()> {
     let model_context_safety_margin_tokens: Value<U256BE> =
         config.model.context_safety_margin_tokens.to_value();
     let model_chars_per_token: Value<U256BE> = config.model.chars_per_token.to_value();
+    let model_max_inline_images: Value<U256BE> = config.model.max_inline_images.to_value();
+    let model_max_inline_image_bytes: Value<U256BE> = config.model.max_inline_image_bytes.to_value();
+    let model_vision: Value<U256BE> = if config.model.vision { 1u64 } else { 0u64 }.to_value();
 
     change += entity! { &profile_entry_id @
         metadata::tag: playground_config::kind_model_profile,
@@ -492,6 +531,9 @@ fn store_config(ws: &mut Workspace<Pile>, config: &Config) -> Result<()> {
         playground_config::model_max_output_tokens: model_max_output_tokens,
         playground_config::model_context_safety_margin_tokens: model_context_safety_margin_tokens,
         playground_config::model_chars_per_token: model_chars_per_token,
+        playground_config::model_max_inline_images: model_max_inline_images,
+        playground_config::model_max_inline_image_bytes: model_max_inline_image_bytes,
+        playground_config::model_vision: model_vision,
     };
 
     if let Some(key) = config.model.api_key.as_ref() {

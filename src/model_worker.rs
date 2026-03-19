@@ -121,8 +121,6 @@ const SEND_RETRY_BASE_MS: u64 = 1_000;
 const SEND_RETRY_MAX_MS: u64 = 30_000;
 const MODEL_CONNECT_TIMEOUT_SECS: u64 = 20;
 const MODEL_REQUEST_TIMEOUT_SECS: u64 = 240;
-const MAX_INLINE_IMAGES_PER_PROMPT: usize = 4;
-const MAX_INLINE_IMAGE_BYTES: usize = 5 * 1024 * 1024;
 
 fn chat_completions_url(api_base_url: &str) -> String {
     let base = api_base_url.trim().trim_end_matches('/');
@@ -514,11 +512,12 @@ fn next_pending_model_request(catalog: &TribleSet, worker_id: Id) -> Option<Mode
 }
 
 fn build_openai_messages(
+    config: &Config,
     ws: &mut Workspace<Pile>,
     model: &str,
     messages: &[ChatMessage],
 ) -> Vec<JsonValue> {
-    let supports_images = model_supports_images(model);
+    let supports_images = config.model.vision;
     let mut out = Vec::new();
 
     for message in messages {
@@ -538,7 +537,7 @@ fn build_openai_messages(
                 }
             });
             if has_blob {
-                let content = build_openai_input_content(ws, model, message.content.as_str());
+                let content = build_openai_input_content(&config, ws, model, message.content.as_str());
                 out.push(serde_json::json!({ "role": role, "content": content }));
                 continue;
             }
@@ -556,7 +555,7 @@ fn build_openai_payload(
     model: &str,
     messages: &[ChatMessage],
 ) -> JsonValue {
-    let messages = build_openai_messages(ws, model, messages);
+    let messages = build_openai_messages(&config, ws, model, messages);
     let max_tokens = config.model.max_output_tokens.max(1);
     serde_json::json!({
         "model": model,
@@ -567,11 +566,12 @@ fn build_openai_payload(
 }
 
 fn build_openai_input_content(
+    config: &Config,
     ws: &mut Workspace<Pile>,
-    model: &str,
+    _model: &str,
     prompt: &str,
 ) -> Vec<JsonValue> {
-    let supports_images = model_supports_images(model);
+    let supports_images = config.model.vision;
     let mut content = Vec::new();
     let mut images_added = 0usize;
 
@@ -593,14 +593,14 @@ fn build_openai_input_content(
                     }));
                     continue;
                 }
-                if images_added >= MAX_INLINE_IMAGES_PER_PROMPT {
+                if images_added >= config.model.max_inline_images as usize {
                     content.push(serde_json::json!({
                         "type": "text",
                         "text": format_blob_fallback(blob_ref.raw.as_str(), "image limit reached"),
                     }));
                     continue;
                 }
-                match resolve_blob_image(
+                match resolve_blob_image(&config,
                     ws,
                     &blob_ref.digest_hex,
                     None,
@@ -635,6 +635,7 @@ fn build_openai_input_content(
 
 /// Resolves a blob image to its (mime_type, base64_data) components.
 fn resolve_blob_image(
+    config: &Config,
     ws: &mut Workspace<Pile>,
     digest_hex: &str,
     mime_hint: Option<&str>,
@@ -652,11 +653,11 @@ fn resolve_blob_image(
             MIN_IMAGE_BYTES
         ));
     }
-    if bytes.len() > MAX_INLINE_IMAGE_BYTES {
+    if bytes.len() > config.model.max_inline_image_bytes as usize {
         return Err(format!(
             "image too large ({} bytes > {} bytes)",
             bytes.len(),
-            MAX_INLINE_IMAGE_BYTES
+            config.model.max_inline_image_bytes as usize
         ));
     }
     let mime = match mime_hint.filter(|mime| is_supported_image_mime(mime)) {
@@ -698,18 +699,6 @@ fn sniff_image_mime(bytes: &[u8]) -> Option<&'static str> {
     None
 }
 
-fn model_supports_images(model: &str) -> bool {
-    let model = model.to_ascii_lowercase();
-    if model.contains("mistral") || model.contains("claude") {
-        return true;
-    }
-    !(model.contains("codex")
-        || model.contains("gpt-oss")
-        || model.contains("llama")
-        || model.contains("qwen")
-        || model.contains("deepseek"))
-}
-
 fn format_blob_fallback(raw_marker: &str, reason: &str) -> String {
     format!("[blob omitted: {reason}] {raw_marker}")
 }
@@ -724,7 +713,7 @@ fn build_anthropic_payload(
     model: &str,
     messages: &[ChatMessage],
 ) -> JsonValue {
-    let supports_images = model_supports_images(model);
+    let supports_images = config.model.vision;
 
     // Extract system messages into a top-level "system" content array with cache_control.
     let system_parts: Vec<&str> = messages
@@ -750,7 +739,7 @@ fn build_anthropic_payload(
                 .iter()
                 .any(|c| if let PromptChunk::Blob(_) = c { true } else { false });
             if has_blob {
-                let content = build_anthropic_input_content(ws, model, message.content.as_str());
+                let content = build_anthropic_input_content(&config, ws, model, message.content.as_str());
                 api_messages.push(serde_json::json!({ "role": role, "content": content }));
                 continue;
             }
@@ -858,11 +847,12 @@ fn apply_message_cache_control(msg: &mut JsonValue) {
 }
 
 fn build_anthropic_input_content(
+    config: &Config,
     ws: &mut Workspace<Pile>,
-    model: &str,
+    _model: &str,
     prompt: &str,
 ) -> Vec<JsonValue> {
-    let supports_images = model_supports_images(model);
+    let supports_images = config.model.vision;
     let mut content = Vec::new();
     let mut images_added = 0usize;
 
@@ -884,14 +874,14 @@ fn build_anthropic_input_content(
                     }));
                     continue;
                 }
-                if images_added >= MAX_INLINE_IMAGES_PER_PROMPT {
+                if images_added >= config.model.max_inline_images as usize {
                     content.push(serde_json::json!({
                         "type": "text",
                         "text": format_blob_fallback(blob_ref.raw.as_str(), "image limit reached"),
                     }));
                     continue;
                 }
-                match resolve_blob_image(
+                match resolve_blob_image(&config,
                     ws,
                     &blob_ref.digest_hex,
                     None,
@@ -1475,11 +1465,13 @@ mod tests {
     #[test]
     fn blob_marker_becomes_image_part_for_vision_models() {
         with_test_workspace(|ws| {
+            let mut config = test_config();
+            config.model.vision = true;
             let digest_hex = put_test_png(ws);
             let prompt = format!(
                 "inspect this image ![sample](files:{digest_hex})"
             );
-            let content = build_openai_input_content(ws, "gpt-4.1", prompt.as_str());
+            let content = build_openai_input_content(&config, ws, "gpt-4.1", prompt.as_str());
             assert!(
                 content
                     .iter()
@@ -1492,9 +1484,11 @@ mod tests {
     #[test]
     fn blob_marker_falls_back_to_text_for_non_vision_models() {
         with_test_workspace(|ws| {
+            let mut config = test_config();
+            config.model.vision = false;
             let digest_hex = put_test_png(ws);
             let prompt = format!("![sample](files:{digest_hex})");
-            let content = build_openai_input_content(ws, "gpt-oss-120b", prompt.as_str());
+            let content = build_openai_input_content(&config, ws, "gpt-oss-120b", prompt.as_str());
             assert_eq!(content.len(), 1);
             assert_eq!(
                 content[0].get("type").and_then(JsonValue::as_str),
@@ -1604,8 +1598,10 @@ mod tests {
             let prompt = format!(
                 "inspect ![img](files:{digest_hex})"
             );
+            let mut config = test_config();
+            config.model.vision = true;
             let content =
-                super::build_anthropic_input_content(ws, "claude-sonnet-4-6", prompt.as_str());
+                super::build_anthropic_input_content(&config, ws, "claude-sonnet-4-6", prompt.as_str());
             let image_part = content
                 .iter()
                 .find(|p| p.get("type").and_then(JsonValue::as_str) == Some("image"))

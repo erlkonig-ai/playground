@@ -28,6 +28,9 @@ pub mod playground_config {
         "4200F6746B36F2784DEBA1555595D6AC" as pub model_max_output_tokens: U256BE;
         "1FF004BB48F7A4F8F72541F4D4FA75FF" as pub model_context_safety_margin_tokens: U256BE;
         "095FAECDB8FF205DF591DF594E593B01" as pub model_chars_per_token: U256BE;
+        "7F3D8D944C0DCDFEFDE7A1E4CB4F9780" as pub model_max_inline_images: U256BE;
+        "3DFAC4072FB6BB7051A470F457F3AAD2" as pub model_max_inline_image_bytes: U256BE;
+        "18AA5BED17D29C24832DDAF2E81905AA" as pub model_vision: U256BE;
         "120F9C6BBB103FAFFB31A66E2ABC15E6" as pub exec_default_cwd: Handle<Blake3, LongString>;
         "D18A351B6E03A460E4F400D97D285F96" as pub exec_sandbox_profile: GenId;
     }
