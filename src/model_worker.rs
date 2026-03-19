@@ -7,8 +7,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use base64::Engine as _;
-use reqwest::StatusCode;
-use reqwest::blocking::Client;
+use ureq;
 use serde_json::Value as JsonValue;
 use triblespace::core::blob::Bytes;
 use triblespace::core::blob::schemas::UnknownBlob;
@@ -73,22 +72,6 @@ impl ModelBackend {
         }
     }
 
-    fn apply_auth(
-        &self,
-        request: reqwest::blocking::RequestBuilder,
-        api_key: Option<&str>,
-    ) -> reqwest::blocking::RequestBuilder {
-        let Some(key) = api_key else {
-            return request;
-        };
-        match self {
-            Self::OpenAI { .. } => request.bearer_auth(key),
-            Self::Anthropic { .. } => request
-                .header("x-api-key", key)
-                .header("anthropic-version", "2023-06-01"),
-        }
-    }
-
     fn build_payload(
         &self,
         config: &Config,
@@ -104,7 +87,7 @@ impl ModelBackend {
 
     fn parse_response(
         &self,
-        response: reqwest::blocking::Response,
+        response: ureq::http::Response<ureq::Body>,
         stream: bool,
     ) -> Result<ModelResult> {
         match self {
@@ -127,7 +110,7 @@ impl ModelBackend {
 }
 
 struct ModelHttpClient {
-    client: Client,
+    agent: ureq::Agent,
     backend: ModelBackend,
     api_key: Option<String>,
     stream: bool,
@@ -154,14 +137,15 @@ fn chat_completions_url(api_base_url: &str) -> String {
 
 impl ModelHttpClient {
     fn new(config: &Config) -> Result<Self> {
-        let client = Client::builder()
-            .connect_timeout(Duration::from_secs(MODEL_CONNECT_TIMEOUT_SECS))
-            .timeout(Duration::from_secs(MODEL_REQUEST_TIMEOUT_SECS))
-            .build()
-            .context("build http client")?;
+        let agent_config = ureq::Agent::config_builder()
+            .timeout_connect(Some(Duration::from_secs(MODEL_CONNECT_TIMEOUT_SECS)))
+            .timeout_global(Some(Duration::from_secs(MODEL_REQUEST_TIMEOUT_SECS)))
+            .http_status_as_error(false)
+            .build();
+        let agent = ureq::Agent::new_with_config(agent_config);
         let backend = ModelBackend::from_config(config);
         Ok(Self {
-            client,
+            agent,
             backend,
             api_key: config.model.api_key.clone(),
             stream: config.model.stream,
@@ -201,11 +185,16 @@ impl ModelHttpClient {
         &self,
         payload: &JsonValue,
     ) -> std::result::Result<ModelResult, SendFailure> {
-        let response = self.send_request(payload).map_err(|err| SendFailure {
-            retryable: is_retryable_request_error(&err),
-            error: err,
+        let response = self.send_request(payload).map_err(|err| {
+            let retryable = is_retryable_request_error(&err);
+            SendFailure {
+                retryable,
+                error: anyhow::Error::new(err).context("send http request"),
+            }
         })?;
-        if response.status().is_success() {
+
+        let status = response.status().as_u16();
+        if (200..300).contains(&status) {
             return self
                 .backend
                 .parse_response(response, self.stream)
@@ -215,10 +204,10 @@ impl ModelHttpClient {
                 });
         }
 
-        let status = response.status();
         let endpoint = self.backend.endpoint_url();
         let body = response
-            .text()
+            .into_body()
+            .read_to_string()
             .unwrap_or_else(|_| "<failed to read error body>".to_string());
 
         let error = anyhow::anyhow!(
@@ -237,13 +226,22 @@ impl ModelHttpClient {
         })
     }
 
-    fn send_request(&self, payload: &JsonValue) -> Result<reqwest::blocking::Response> {
+    fn send_request(&self, payload: &JsonValue) -> std::result::Result<ureq::http::Response<ureq::Body>, ureq::Error> {
         let endpoint = self.backend.endpoint_url();
-        let request = self.client.post(endpoint);
-        let request = self
-            .backend
-            .apply_auth(request, self.api_key.as_deref());
-        request.json(payload).send().context("send http request")
+        let mut request = self.agent.post(endpoint);
+        if let Some(ref key) = self.api_key {
+            match &self.backend {
+                ModelBackend::OpenAI { .. } => {
+                    request = request.header("Authorization", &format!("Bearer {key}"));
+                }
+                ModelBackend::Anthropic { .. } => {
+                    request = request
+                        .header("x-api-key", key)
+                        .header("anthropic-version", "2023-06-01");
+                }
+            }
+        }
+        request.send_json(payload)
     }
 }
 
@@ -253,17 +251,15 @@ struct SendFailure {
     error: anyhow::Error,
 }
 
-fn is_retryable_http_status(status: StatusCode) -> bool {
-    status == StatusCode::REQUEST_TIMEOUT
-        || status == StatusCode::TOO_MANY_REQUESTS
-        || status.as_u16() == 529 // Anthropic "overloaded"
-        || status.is_server_error()
+fn is_retryable_http_status(status: u16) -> bool {
+    status == 408 // REQUEST_TIMEOUT
+        || status == 429 // TOO_MANY_REQUESTS
+        || status == 529 // Anthropic "overloaded"
+        || (500..600).contains(&status)
 }
 
-fn is_retryable_request_error(err: &anyhow::Error) -> bool {
-    err.chain()
-        .filter_map(|cause| cause.downcast_ref::<reqwest::Error>())
-        .any(|req_err| req_err.is_timeout() || req_err.is_connect() || req_err.is_request())
+fn is_retryable_request_error(err: &ureq::Error) -> bool {
+    matches!(err, ureq::Error::Timeout(_) | ureq::Error::ConnectionFailed)
 }
 
 pub(crate) fn run_model_loop(
@@ -931,8 +927,8 @@ fn build_anthropic_input_content(
     content
 }
 
-fn parse_anthropic_response(response: reqwest::blocking::Response) -> Result<ModelResult> {
-    let body = response.text().context("read response body")?;
+fn parse_anthropic_response(response: ureq::http::Response<ureq::Body>) -> Result<ModelResult> {
+    let body = response.into_body().read_to_string().context("read response body")?;
     let parsed: JsonValue = serde_json::from_str(&body).context("parse response JSON")?;
 
     let response_id = parsed.get("id").and_then(JsonValue::as_str).map(str::to_string);
@@ -973,7 +969,7 @@ fn parse_anthropic_response(response: reqwest::blocking::Response) -> Result<Mod
     })
 }
 
-fn parse_anthropic_stream(response: reqwest::blocking::Response) -> Result<ModelResult> {
+fn parse_anthropic_stream(response: ureq::http::Response<ureq::Body>) -> Result<ModelResult> {
     let mut output_text = String::new();
     let mut raw_events = Vec::new();
     let mut response_id = None;
@@ -983,7 +979,7 @@ fn parse_anthropic_stream(response: reqwest::blocking::Response) -> Result<Model
     let mut cache_creation_input_tokens = None;
     let mut cache_read_input_tokens = None;
 
-    let reader = BufReader::new(response);
+    let reader = BufReader::new(response.into_body().into_reader());
     let mut current_event_type = String::new();
 
     for line in reader.lines() {
@@ -1067,8 +1063,8 @@ fn parse_anthropic_stream(response: reqwest::blocking::Response) -> Result<Model
 // OpenAI Chat Completions API
 // ---------------------------------------------------------------------------
 
-fn parse_openai_response(response: reqwest::blocking::Response) -> Result<ModelResult> {
-    let body = response.text().context("read response body")?;
+fn parse_openai_response(response: ureq::http::Response<ureq::Body>) -> Result<ModelResult> {
+    let body = response.into_body().read_to_string().context("read response body")?;
     let parsed: JsonValue = serde_json::from_str(&body).context("parse response JSON")?;
     let output_text = extract_output_text(&parsed);
     let reasoning_text = extract_reasoning_text(&parsed);
@@ -1086,7 +1082,7 @@ fn parse_openai_response(response: reqwest::blocking::Response) -> Result<ModelR
     })
 }
 
-fn parse_openai_stream(response: reqwest::blocking::Response) -> Result<ModelResult> {
+fn parse_openai_stream(response: ureq::http::Response<ureq::Body>) -> Result<ModelResult> {
     let mut output_text = String::new();
     let mut raw_events = Vec::new();
     let mut response_id = None;
@@ -1094,7 +1090,7 @@ fn parse_openai_stream(response: reqwest::blocking::Response) -> Result<ModelRes
     let mut input_tokens = None;
     let mut output_tokens = None;
 
-    let reader = BufReader::new(response);
+    let reader = BufReader::new(response.into_body().into_reader());
     for line in reader.lines() {
         let line = line.context("read stream")?;
         let Some(data) = line.strip_prefix("data: ") else {

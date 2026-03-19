@@ -152,10 +152,11 @@ enum Command {
         #[arg(long, short)]
         depth: Option<usize>,
     },
-    /// Resolve a hash prefix to the full 64-char hex hash
+    /// Resolve hash/id prefixes. Single prefix or @path/@- for batch (one per line).
+    /// Batch mode outputs `old\tnew` mapping; ambiguous prefixes go to stderr.
     Resolve {
-        /// Hash prefix (any length)
-        prefix: String,
+        /// Hash prefix, or @path/@- for batch input (one prefix per line)
+        input: String,
     },
     /// Compare two imports, directories, or files
     Diff {
@@ -748,61 +749,106 @@ fn cmd_list(
     Ok(())
 }
 
-fn cmd_resolve(
-    ws: &mut Workspace<Pile<valueschemas::Blake3>>,
-    prefix: &str,
-) -> Result<()> {
-    let space = ws
-        .checkout(..)
-        .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-    let needle = prefix.trim().to_lowercase();
-    if needle.len() < 4 {
-        bail!("prefix too short (need at least 4 hex chars)");
-    }
+fn resolve_one_prefix(space: &TribleSet, needle: &str) -> Result<String, String> {
     let mut matches = Vec::new();
-    // Scan files (by entity id and content hash)
     for (eid, h) in find!(
         (eid: Id, h: FileHandle),
-        pattern!(&space, [{ ?eid @ metadata::tag: &KIND_FILE, file::content: ?h }])
+        pattern!(space, [{ ?eid @ metadata::tag: &KIND_FILE, file::content: ?h }])
     ) {
         let hash_hex = handle_hex(h).to_lowercase();
-        if hash_hex.starts_with(&needle) {
+        if hash_hex.starts_with(needle) {
             matches.push(hash_hex);
         }
         let eid_hex = format!("{eid:x}");
-        if eid_hex.starts_with(&needle) && !matches.iter().any(|m| m == &eid_hex) {
+        if eid_hex.starts_with(needle) && !matches.iter().any(|m| m == &eid_hex) {
             matches.push(eid_hex);
         }
     }
-    // Scan directories (by entity id)
     for eid in find!(
         eid: Id,
-        pattern!(&space, [{ ?eid @ metadata::tag: &KIND_DIRECTORY }])
+        pattern!(space, [{ ?eid @ metadata::tag: &KIND_DIRECTORY }])
     ) {
         let hex = format!("{eid:x}");
-        if hex.starts_with(&needle) && !matches.contains(&hex) {
+        if hex.starts_with(needle) && !matches.contains(&hex) {
             matches.push(hex);
         }
     }
-    // Scan imports (by entity id)
     for eid in find!(
         eid: Id,
-        pattern!(&space, [{ ?eid @ metadata::tag: &KIND_IMPORT }])
+        pattern!(space, [{ ?eid @ metadata::tag: &KIND_IMPORT }])
     ) {
         let hex = format!("{eid:x}");
-        if hex.starts_with(&needle) && !matches.contains(&hex) {
+        if hex.starts_with(needle) && !matches.contains(&hex) {
             matches.push(hex);
         }
     }
     matches.sort();
     matches.dedup();
     match matches.len() {
-        0 => bail!("no file matches prefix '{prefix}'"),
-        1 => {
-            println!("{}", matches[0]);
+        0 => Err(format!("no match")),
+        1 => Ok(matches.into_iter().next().unwrap()),
+        n => Err(format!("ambiguous ({n} matches)")),
+    }
+}
+
+fn cmd_resolve(
+    ws: &mut Workspace<Pile<valueschemas::Blake3>>,
+    input: &str,
+) -> Result<()> {
+    let space = ws
+        .checkout(..)
+        .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+
+    // Batch mode: @path or @-
+    if let Some(path) = input.strip_prefix('@') {
+        let content = if path == "-" {
+            let mut buf = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)
+                .context("read stdin")?;
+            buf
+        } else {
+            fs::read_to_string(path)
+                .with_context(|| format!("read {path}"))?
+        };
+        let mut resolved = 0u32;
+        let mut ambiguous = 0u32;
+        let mut already_full = 0u32;
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() { continue; }
+            let prefix = line.strip_prefix("files:").unwrap_or(line);
+            if prefix.len() >= 64 {
+                already_full += 1;
+                continue;
+            }
+            let needle = prefix.to_lowercase();
+            if needle.len() < 4 { continue; }
+            match resolve_one_prefix(&space, &needle) {
+                Ok(full) => {
+                    println!("{}\tfiles:{}", line, full);
+                    resolved += 1;
+                }
+                Err(e) => {
+                    eprintln!("AMBIGUOUS: {} — {}", line, e);
+                    ambiguous += 1;
+                }
+            }
+        }
+        eprintln!("{} resolved, {} ambiguous, {} already full", resolved, ambiguous, already_full);
+        return Ok(());
+    }
+
+    // Single prefix mode
+    let needle = input.trim().to_lowercase();
+    if needle.len() < 4 {
+        bail!("prefix too short (need at least 4 hex chars)");
+    }
+    match resolve_one_prefix(&space, &needle) {
+        Ok(full) => {
+            println!("{}", full);
             Ok(())
         }
-        n => bail!("ambiguous prefix '{prefix}' ({n} matches)"),
+        Err(e) => bail!("files resolve '{}': {}", input.trim(), e),
     }
 }
 
@@ -1380,8 +1426,8 @@ fn main() -> Result<()> {
         Command::Tree { id, depth } => {
             with_files(pile, branch, |_repo, ws| cmd_tree(ws, &id, depth))
         }
-        Command::Resolve { prefix } => {
-            with_files(pile, branch, |_repo, ws| cmd_resolve(ws, &prefix))
+        Command::Resolve { input } => {
+            with_files(pile, branch, |_repo, ws| cmd_resolve(ws, &input))
         }
         Command::Diff { left, right } => {
             with_files(pile, branch, |_repo, ws| cmd_diff(ws, &left, &right))
