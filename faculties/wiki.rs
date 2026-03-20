@@ -658,6 +658,34 @@ fn ensure_tag_vocabulary(
 }
 
 /// Create a new version entity, commit, and push.
+/// Validate typst content by attempting compilation. Returns Ok(()) if valid
+/// or if typst is not on PATH (graceful degradation). Returns Err if typst
+/// compilation fails.
+fn validate_typst(content: &str) -> Result<()> {
+    let tmp_dir = std::env::temp_dir().join("wiki-validate");
+    let _ = fs::create_dir_all(&tmp_dir);
+    let tmp_file = tmp_dir.join("check.typ");
+    fs::write(&tmp_file, content).context("write temp typst file")?;
+    let tmp_out = tmp_dir.join("check.pdf");
+    let output = std::process::Command::new("typst")
+        .args(["compile", &tmp_file.to_string_lossy(), &tmp_out.to_string_lossy()])
+        .output();
+    let _ = fs::remove_file(&tmp_file);
+    let _ = fs::remove_file(&tmp_out);
+    let _ = fs::remove_dir(&tmp_dir);
+    match output {
+        Ok(o) if o.status.success() => Ok(()),
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            bail!("typst compilation failed:\n{}", stderr.trim())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Ok(()) // typst not installed — skip validation
+        }
+        Err(e) => bail!("failed to run typst: {e}"),
+    }
+}
+
 fn commit_version(
     repo: &mut Repository<Pile<valueschemas::Blake3>>,
     ws: &mut Workspace<Pile<valueschemas::Blake3>>,
@@ -908,8 +936,14 @@ fn cmd_check(pile: &Path, branch: Option<&str>, try_compile: bool) -> Result<()>
             for caps in re.captures_iter(content_str) {
                 let scheme = &caps[1];
                 let hex = &caps[2];
-                let full_len = if scheme == "wiki" { 32 } else { 64 };
-                if hex.len() < full_len {
+                // wiki: links must be 32 chars (entity ID)
+                // files: links can be 32 chars (entity ID) or 64 chars (hash)
+                let is_truncated = match scheme {
+                    "wiki" => hex.len() < 32,
+                    "files" => hex.len() != 32 && hex.len() != 64,
+                    _ => false,
+                };
+                if is_truncated {
                     eprintln!("TRUNCATED    {}  {}:{}  in {}", frag_hex, scheme, hex, title);
                     issues += 1;
                 }
@@ -932,9 +966,10 @@ fn cmd_check(pile: &Path, branch: Option<&str>, try_compile: bool) -> Result<()>
             // Check: typst compilation
             if try_compile && has_typst {
                 let tmp_file = tmp_dir.join(format!("{}.typ", frag_hex));
+                let tmp_out = tmp_dir.join(format!("{}.pdf", frag_hex));
                 let _ = fs::write(&tmp_file, content_str);
                 let output = std::process::Command::new("typst")
-                    .args(["compile", &tmp_file.to_string_lossy(), "/dev/null"])
+                    .args(["compile", &tmp_file.to_string_lossy(), &tmp_out.to_string_lossy()])
                     .output();
                 match output {
                     Ok(o) if o.status.success() => { compile_ok += 1; }
@@ -1014,6 +1049,7 @@ fn cmd_import_all(pile: &Path, branch: Option<&str>, dir: PathBuf) -> Result<()>
     with_wiki(pile, branch, |repo, ws| {
         let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
         ensure_tag_vocabulary(repo, ws)?;
+        let tag_index = TagIndex::load(ws)?;
 
         // Collect latest version per fragment (for content comparison + tag inheritance)
         let mut latest: HashMap<Id, Id> = HashMap::new();
@@ -1079,6 +1115,18 @@ fn cmd_import_all(pile: &Path, branch: Option<&str>, dir: PathBuf) -> Result<()>
             let tag_ids = tags_of(&space, prev_vid);
             let title = read_title(&space, ws, prev_vid).unwrap_or_default();
 
+            // Validate typst if tagged
+            let is_typst = tag_ids.iter().any(|id| {
+                tag_index.by_id.get(id).is_some_and(|name| name == "typst")
+            });
+            if is_typst {
+                if let Err(e) = validate_typst(&new_content) {
+                    eprintln!("TYPST_ERROR {}: {}", entry.path().display(), e);
+                    skipped += 1;
+                    continue;
+                }
+            }
+
             // Build new version
             let content_handle = ws.put(new_content);
             let (internal_links, _external) = extract_references(
@@ -1135,6 +1183,11 @@ fn cmd_create(
         let mut tag_index = TagIndex::load(ws)?;
         let tag_ids = tag_index.resolve_or_mint(&tags, &mut change, ws)?;
 
+        // Validate typst if tagged
+        if tags.iter().any(|t| t.eq_ignore_ascii_case("typst")) {
+            validate_typst(&content)?;
+        }
+
         let fragment_id = genid().id;
         let content_handle = ws.put(content);
         let vid = commit_version(
@@ -1180,8 +1233,17 @@ fn cmd_edit(
         let title = new_title.unwrap_or_else(|| {
             read_title(&space, ws, prev_vid).unwrap_or_default()
         });
-        let content_handle = match content {
-            Some(text) => ws.put(text),
+        // Validate typst if tagged (either explicitly or inherited)
+        let is_typst = tag_ids.iter().any(|id| {
+            tag_index.by_id.get(id).is_some_and(|name| name == "typst")
+        });
+        let content_handle = match &content {
+            Some(text) => {
+                if is_typst {
+                    validate_typst(text)?;
+                }
+                ws.put(text.clone())
+            }
             None => content_handle_of(&space, prev_vid)
                 .ok_or_else(|| anyhow::anyhow!("no content on previous version"))?,
         };
