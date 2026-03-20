@@ -987,6 +987,7 @@ fn cmd_check(pile: &Path, branch: Option<&str>, try_compile: bool) -> Result<()>
                     }
                 }
                 let _ = fs::remove_file(&tmp_file);
+                let _ = fs::remove_file(&tmp_out);
             }
         }
 
