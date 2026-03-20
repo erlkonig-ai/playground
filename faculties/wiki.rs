@@ -196,6 +196,13 @@ enum Command {
         /// Input directory containing <fragment-id>.typ files
         dir: PathBuf,
     },
+    /// Check all fragments for common issues: invalid typst, broken links,
+    /// truncated IDs, missing format tags.
+    Check {
+        /// Also try compiling typst fragments (requires `typst` on PATH)
+        #[arg(long)]
+        compile: bool,
+    },
     /// Resolve a list of scheme:prefix lines to full-length IDs.
     /// Input: one `wiki:<hex>` or `files:<hex>` per line (from @path or @-).
     /// Output: `old\tnew` mapping for each resolved prefix, one per line.
@@ -824,6 +831,140 @@ fn cmd_fix_truncated(pile: &Path, branch: Option<&str>, raw_input: String) -> Re
             }
         }
         eprintln!("{} resolved, {} ambiguous, {} already full", resolved, ambiguous, already_full);
+        Ok(())
+    })
+}
+
+fn cmd_check(pile: &Path, branch: Option<&str>, try_compile: bool) -> Result<()> {
+    with_wiki(pile, branch, |_repo, ws| {
+        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+
+        // Collect latest version per fragment
+        let mut latest: HashMap<Id, (Id, i128)> = HashMap::new();
+        for (vid, frag, ts) in find!(
+            (vid: Id, frag: Id, ts: Value<valueschemas::NsTAIInterval>),
+            pattern!(&space, [{
+                ?vid @
+                metadata::tag: &KIND_VERSION_ID,
+                wiki::fragment: ?frag,
+                wiki::created_at: ?ts,
+            }])
+        ) {
+            let key = interval_key(ts);
+            let entry = latest.entry(frag).or_insert((vid, key));
+            if key > entry.1 {
+                *entry = (vid, key);
+            }
+        }
+
+        // Collect all known fragment IDs for link checking
+        let all_frag_ids: std::collections::HashSet<Id> = latest.keys().copied().collect();
+        let all_version_ids: std::collections::HashSet<Id> = latest.values().map(|(vid, _)| *vid).collect();
+
+        let tag_index = TagIndex::load(ws)?;
+        let typst_tag_id = tag_index.by_name.get("typst").copied();
+        let markdown_tag_id = tag_index.by_name.get("markdown").copied();
+
+        let mut issues = 0u32;
+        let mut checked = 0u32;
+        let mut compile_ok = 0u32;
+        let mut compile_fail = 0u32;
+
+        let tmp_dir = std::env::temp_dir().join("wiki-check");
+        if try_compile {
+            let _ = fs::create_dir_all(&tmp_dir);
+        }
+
+        for (frag_id, (vid, _)) in &latest {
+            let tags = tags_of(&space, *vid);
+            if tags.contains(&TAG_ARCHIVED_ID) {
+                continue;
+            }
+            checked += 1;
+            let title = read_title(&space, ws, *vid).unwrap_or_else(|| "?".into());
+            let frag_hex = fmt_id(*frag_id);
+
+            // Check: format tag present
+            let has_typst = typst_tag_id.is_some_and(|id| tags.contains(&id));
+            let has_markdown = markdown_tag_id.is_some_and(|id| tags.contains(&id));
+            if !has_typst && !has_markdown {
+                eprintln!("MISSING_TAG  {}  {}", frag_hex, title);
+                issues += 1;
+            }
+
+            // Read content
+            let Some(ch) = content_handle_of(&space, *vid) else {
+                eprintln!("NO_CONTENT   {}  {}", frag_hex, title);
+                issues += 1;
+                continue;
+            };
+            let content: View<str> = ws.get(ch)
+                .map_err(|e| anyhow::anyhow!("read content: {e:?}"))?;
+            let content_str = content.as_ref();
+
+            // Check: truncated links
+            use regex::Regex;
+            let re = Regex::new(r"(wiki|files):([0-9a-fA-F]+)").unwrap();
+            for caps in re.captures_iter(content_str) {
+                let scheme = &caps[1];
+                let hex = &caps[2];
+                let full_len = if scheme == "wiki" { 32 } else { 64 };
+                if hex.len() < full_len {
+                    eprintln!("TRUNCATED    {}  {}:{}  in {}", frag_hex, scheme, hex, title);
+                    issues += 1;
+                }
+            }
+
+            // Check: broken wiki links
+            for caps in re.captures_iter(content_str) {
+                let scheme = &caps[1];
+                let hex = &caps[2];
+                if scheme == "wiki" && hex.len() == 32 {
+                    if let Some(id) = Id::from_hex(hex) {
+                        if !all_frag_ids.contains(&id) && !all_version_ids.contains(&id) {
+                            eprintln!("BROKEN_LINK  {}  wiki:{}  in {}", frag_hex, hex, title);
+                            issues += 1;
+                        }
+                    }
+                }
+            }
+
+            // Check: typst compilation
+            if try_compile && has_typst {
+                let tmp_file = tmp_dir.join(format!("{}.typ", frag_hex));
+                let _ = fs::write(&tmp_file, content_str);
+                let output = std::process::Command::new("typst")
+                    .args(["compile", &tmp_file.to_string_lossy(), "/dev/null"])
+                    .output();
+                match output {
+                    Ok(o) if o.status.success() => { compile_ok += 1; }
+                    Ok(o) => {
+                        let stderr = String::from_utf8_lossy(&o.stderr);
+                        let first_line = stderr.lines().next().unwrap_or("unknown error");
+                        eprintln!("TYPST_ERROR  {}  {}  {}", frag_hex, title, first_line);
+                        compile_fail += 1;
+                        issues += 1;
+                    }
+                    Err(e) => {
+                        eprintln!("TYPST_ERROR  {}  {}  {}", frag_hex, title, e);
+                        compile_fail += 1;
+                        issues += 1;
+                    }
+                }
+                let _ = fs::remove_file(&tmp_file);
+            }
+        }
+
+        let _ = fs::remove_dir(&tmp_dir);
+
+        println!();
+        println!("Checked {} fragments, {} issues found", checked, issues);
+        if try_compile {
+            println!("Typst: {} ok, {} failed", compile_ok, compile_fail);
+        }
+        if issues == 0 {
+            println!("All clear!");
+        }
         Ok(())
     })
 }
@@ -1826,6 +1967,7 @@ fn main() -> Result<()> {
         Command::Search { query, context, all } => {
             cmd_search(&cli.pile, branch, query, context, all)
         }
+        Command::Check { compile } => cmd_check(&cli.pile, branch, compile),
         Command::ExportAll { dir } => cmd_export_all(&cli.pile, branch, dir),
         Command::ImportAll { dir } => cmd_import_all(&cli.pile, branch, dir),
         Command::FixTruncated { input } => cmd_fix_truncated(&cli.pile, branch, input),
