@@ -158,6 +158,29 @@ mod archive_schema {
     }
 }
 
+// ── Files branch schema (shared with files.rs faculty) ───────────────────
+const FILES_BRANCH_NAME: &str = "files";
+
+mod file_schema {
+    use triblespace::macros::id_hex;
+    use triblespace::prelude::*;
+
+    #[allow(non_upper_case_globals)]
+    pub const KIND_FILE: Id = id_hex!("1F9C9DCA69504452F318BA11E81D47D1");
+
+    pub mod file {
+        use triblespace::prelude::*;
+        attributes! {
+            "C1E3A12230595280F22ABEB8733D082C" as pub content: valueschemas::Handle<valueschemas::Blake3, blobschemas::FileBytes>;
+            "AA6AB6F5E68F3A9D95681251C2B9DAFA" as pub name: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
+            "BFE2C88ECD13D56F80967C343FC072EE" as pub mime: valueschemas::ShortString;
+        }
+    }
+}
+
+use file_schema::file;
+use file_schema::KIND_FILE;
+
 mod teams_schema {
     use triblespace::core::metadata;
     use triblespace::macros::id_hex;
@@ -810,19 +833,27 @@ fn pull_once_with_cache(
         let (messages, new_cursor) = fetch_delta_messages(&token, &start_url)?;
         let index = CatalogIndex::build(&catalog);
     let incoming = parse_messages(messages)?;
-    let mut change = build_ingest_change(&mut ws, &catalog, &index, incoming, &token, config)?;
+    let (mut change, files_change) = build_ingest_change(&mut ws, &catalog, &index, incoming, &token, config)?;
         if let Some(cursor_change) =
             build_cursor_change(&mut ws, &catalog, cursor_state.as_ref(), new_cursor)?
         {
             change += cursor_change;
         }
 
-        if change.is_empty() {
-            return Ok(());
+        if !change.is_empty() {
+            ws.commit(change, "teams ingest");
+            map_err_debug(repo.push(&mut ws), "push workspace")?;
         }
 
-        ws.commit(change, "teams ingest");
-        map_err_debug(repo.push(&mut ws), "push workspace")?;
+        // Commit file entities to the files branch.
+        if !files_change.is_empty() {
+            let files_branch_id = repo.ensure_branch(FILES_BRANCH_NAME, None)
+                .map_err(|e| anyhow::anyhow!("ensure files branch: {e:?}"))?;
+            let mut files_ws = map_err_debug(repo.pull(files_branch_id), "pull files workspace")?;
+            files_ws.commit(files_change, "teams attachment files");
+            map_err_debug(repo.push(&mut files_ws), "push files workspace")?;
+        }
+
         Ok(())
     })
 }
@@ -3156,13 +3187,14 @@ fn build_ingest_change(
     incoming: Vec<IncomingMessage>,
     token: &str,
     config: &TeamsBridgeConfig,
-) -> Result<TribleSet> {
+) -> Result<(TribleSet, TribleSet)> {
     let mut by_chat: HashMap<Id, Vec<IncomingMessage>> = HashMap::new();
     for message in incoming {
         by_chat.entry(message.chat_id).or_default().push(message);
     }
 
     let mut change = TribleSet::new();
+    let mut files_change = TribleSet::new();
     let mut added_attachments = HashSet::new();
     for (chat_id, mut messages) in by_chat {
         messages.sort_by(|left, right| {
@@ -3206,6 +3238,7 @@ fn build_ingest_change(
             ensure_attachments(
                 ws,
                 &mut change,
+                &mut files_change,
                 index,
                 &message,
                 token,
@@ -3266,7 +3299,7 @@ fn build_ingest_change(
         }
     }
 
-    Ok(change.difference(catalog))
+    Ok((change.difference(catalog), files_change))
 }
 
 fn ensure_author(
@@ -3307,6 +3340,7 @@ fn ensure_author(
 fn ensure_attachments(
     ws: &mut Workspace<Pile<Blake3>>,
     change: &mut TribleSet,
+    files_change: &mut TribleSet,
     index: &CatalogIndex,
     message: &IncomingMessage,
     token: &str,
@@ -3362,26 +3396,24 @@ fn ensure_attachments(
             }
         };
 
-        let size = bytes.len() as u64;
-        let data_handle = ws.put(Bytes::from_source(bytes));
-        let source_id_handle = ws.put(source_id.to_owned());
-        let source_pointer = source.source_url.as_ref().map(|url| ws.put(url.to_owned()));
-        let attachment_name = source
+        // Store as a file entity on the files branch.
+        let content_handle: Value<valueschemas::Handle<valueschemas::Blake3, blobschemas::FileBytes>> =
+            ws.put::<blobschemas::FileBytes, _>(bytes);
+        let name_str = source
             .name
-            .as_ref()
-            .map(|value| value.trim())
-            .filter(|value| !value.is_empty())
-            .map(|name| ws.put(name.to_owned()));
-        let attachment_mime = shortstring_value(content_type.as_deref());
+            .as_deref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("attachment");
+        let name_handle: Value<valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>> =
+            ws.put(name_str.to_owned());
+        let mime = content_type.as_deref().unwrap_or("application/octet-stream");
 
-        *change += entity! { ExclusiveId::force_ref(&attachment_id) @
-            metadata::tag: archive::kind_attachment,
-            archive::attachment_source_id: source_id_handle,
-            archive::attachment_data: data_handle,
-            archive::attachment_size_bytes: size.to_value(),
-            archive::attachment_source_pointer?: source_pointer,
-            archive::attachment_name?: attachment_name,
-            archive::attachment_mime?: attachment_mime,
+        *files_change += entity! { ExclusiveId::force_ref(&attachment_id) @
+            metadata::tag: &KIND_FILE,
+            file::content: content_handle,
+            file::name: name_handle,
+            file::mime: mime
         };
     }
 }
