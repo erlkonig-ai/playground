@@ -915,13 +915,10 @@ fn cmd_check(pile: &Path, branch: Option<&str>, try_compile: bool) -> Result<()>
             let title = read_title(&space, ws, *vid).unwrap_or_else(|| "?".into());
             let frag_hex = fmt_id(*frag_id);
 
-            // Check: format tag present
+            // Determine format (typst is default, markdown only if explicitly tagged)
             let has_typst = typst_tag_id.is_some_and(|id| tags.contains(&id));
             let has_markdown = markdown_tag_id.is_some_and(|id| tags.contains(&id));
-            if !has_typst && !has_markdown {
-                eprintln!("MISSING_TAG  {}  {}", frag_hex, title);
-                issues += 1;
-            }
+            let is_typst = has_typst || !has_markdown; // default to typst
 
             // Read content
             let Some(ch) = content_handle_of(&space, *vid) else {
@@ -967,7 +964,7 @@ fn cmd_check(pile: &Path, branch: Option<&str>, try_compile: bool) -> Result<()>
             }
 
             // Check: typst compilation
-            if try_compile && has_typst {
+            if try_compile && is_typst {
                 let tmp_file = tmp_dir.join(format!("{}.typ", frag_hex));
                 let tmp_out = tmp_dir.join(format!("{}.pdf", frag_hex));
                 let _ = fs::write(&tmp_file, content_str);
