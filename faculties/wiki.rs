@@ -993,12 +993,44 @@ fn cmd_check(pile: &Path, branch: Option<&str>, try_compile: bool) -> Result<()>
 
         let _ = fs::remove_dir(&tmp_dir);
 
+        // Check: orphaned fragments (no incoming or outgoing wiki edges)
+        let mut has_outgoing: std::collections::HashSet<Id> = std::collections::HashSet::new();
+        let mut has_incoming: std::collections::HashSet<Id> = std::collections::HashSet::new();
+        for (frag_id, (vid, _)) in &latest {
+            let tags = tags_of(&space, *vid);
+            if tags.contains(&TAG_ARCHIVED_ID) { continue; }
+            let outgoing = links_of(&space, *vid);
+            if !outgoing.is_empty() {
+                has_outgoing.insert(*frag_id);
+            }
+            for target in &outgoing {
+                has_incoming.insert(*target);
+                // Also mark the fragment that owns this version
+                if let Some(target_frag) = version_fragment(&space, *target) {
+                    has_incoming.insert(target_frag);
+                }
+            }
+        }
+        let mut orphans = 0u32;
+        for (frag_id, (vid, _)) in &latest {
+            let tags = tags_of(&space, *vid);
+            if tags.contains(&TAG_ARCHIVED_ID) { continue; }
+            if !has_outgoing.contains(frag_id) && !has_incoming.contains(frag_id) {
+                let title = read_title(&space, ws, *vid).unwrap_or_else(|| "?".into());
+                eprintln!("ORPHAN       {}  {}", fmt_id(*frag_id), title);
+                orphans += 1;
+            }
+        }
+
         println!();
         println!("Checked {} fragments, {} issues found", checked, issues);
+        if orphans > 0 {
+            println!("Orphans: {} (no incoming or outgoing wiki links)", orphans);
+        }
         if try_compile {
             println!("Typst: {} ok, {} failed", compile_ok, compile_fail);
         }
-        if issues == 0 {
+        if issues == 0 && orphans == 0 {
             println!("All clear!");
         }
         Ok(())
