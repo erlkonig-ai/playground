@@ -885,9 +885,12 @@ fn cmd_check(pile: &Path, branch: Option<&str>, try_compile: bool) -> Result<()>
             }
         }
 
-        // Collect all known fragment IDs for link checking
+        // Collect ALL known IDs for link checking (fragments + every version, not just latest)
         let all_frag_ids: std::collections::HashSet<Id> = latest.keys().copied().collect();
-        let all_version_ids: std::collections::HashSet<Id> = latest.values().map(|(vid, _)| *vid).collect();
+        let all_version_ids: std::collections::HashSet<Id> = find!(
+            vid: Id,
+            pattern!(&space, [{ ?vid @ metadata::tag: &KIND_VERSION_ID }])
+        ).collect();
 
         let tag_index = TagIndex::load(ws)?;
         let typst_tag_id = tag_index.by_name.get("typst").copied();
