@@ -230,6 +230,7 @@ struct DashboardState {
     teams_selected_chat: Option<Id>,
     context_selected_chunk: Option<Id>,
     turn_memory_selected_request: Option<Id>,
+    context_float_request_id: Option<Id>,
     context_selection_stack: Vec<Id>,
     context_show_children: bool,
     context_show_origins: bool,
@@ -864,7 +865,72 @@ _Live view of the agent pile, exec queue, and message activity._"
                 ui.label("No activity yet.");
                 return;
             }
-            render_activity_timeline(ui, snapshot.now_key, &snapshot.timeline_rows);
+            if let Some(request_id) = render_activity_timeline(ui, snapshot.now_key, &snapshot.timeline_rows) {
+                state.context_float_request_id = Some(request_id);
+                // Also select it in the turn memory view for consistency.
+                state.turn_memory_selected_request = Some(request_id);
+            }
+
+            // Render context float if one is open.
+            if let Some(request_id) = state.context_float_request_id {
+                if let Some(row) = snapshot.turn_memory_rows.iter().find(|r| r.request_id == request_id) {
+                    ui.push_id(request_id, |ui| {
+                        let float_id = ui.id().with("context_float");
+                        let pos = ui.ctx().input(|i| i.pointer.hover_pos().unwrap_or(egui::pos2(200.0, 100.0)));
+                        egui::Area::new(float_id)
+                            .default_pos(pos)
+                            .movable(true)
+                            .constrain(true)
+                            .show(ui.ctx(), |ui| {
+                                egui::Frame::NONE
+                                    .fill(ui.style().visuals.panel_fill)
+                                    .stroke(ui.style().visuals.window_stroke)
+                                    .shadow(egui::Shadow::NONE)
+                                    .inner_margin(egui::Margin::same(12))
+                                    .corner_radius(egui::CornerRadius::same(8))
+                                    .show(ui, |ui| {
+                                        ui.set_max_width(600.0);
+                                        ui.horizontal(|ui| {
+                                            ui.heading("Context");
+                                            ui.small(format!("turn {}", id_prefix(request_id)));
+                                            if ui.small_button("x").clicked() {
+                                                state.context_float_request_id = None;
+                                            }
+                                        });
+                                        ui.separator();
+                                        if row.context_messages.is_empty() {
+                                            if let Some(err) = row.context_error.as_deref() {
+                                                ui.colored_label(egui::Color32::LIGHT_RED, err);
+                                            } else {
+                                                ui.small("No context messages.");
+                                            }
+                                        } else {
+                                            egui::ScrollArea::vertical()
+                                                .id_salt("context_float_scroll")
+                                                .max_height(500.0)
+                                                .show(ui, |ui| {
+                                                    for (idx, message) in row.context_messages.iter().enumerate() {
+                                                        let (label, fill) = turn_memory_role_style(message.role);
+                                                        let chars = message.content.chars().count();
+                                                        ui.horizontal_wrapped(|ui| {
+                                                            render_timeline_source_chip(ui, label, fill);
+                                                            ui.small(format!("msg {idx} · {chars}c"));
+                                                        });
+                                                        egui::Frame::NONE
+                                                            .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(190)))
+                                                            .inner_margin(egui::Margin::symmetric(8, 6))
+                                                            .show(ui, |ui| {
+                                                                render_blob_aware_text(ui, message.content.as_str(), None, None);
+                                                            });
+                                                        ui.add_space(4.0);
+                                                    }
+                                                });
+                                        }
+                                    });
+                            });
+                    });
+                }
+            }
         });
     });
 
@@ -4575,7 +4641,8 @@ fn mask_secret(secret: &str) -> String {
     format!("{prefix}…{suffix}")
 }
 
-fn render_activity_timeline(ui: &mut egui::Ui, now_key: i128, rows: &[TimelineRow]) {
+fn render_activity_timeline(ui: &mut egui::Ui, now_key: i128, rows: &[TimelineRow]) -> Option<Id> {
+    let mut context_clicked = None;
     let max_height = if diagnostics_is_headless() {
         1800.0
     } else {
@@ -4593,10 +4660,13 @@ fn render_activity_timeline(ui: &mut egui::Ui, now_key: i128, rows: &[TimelineRo
         .max_height(max_height)
         .show(ui, |ui| {
             for row in rows {
-                render_timeline_row(ui, now_key, row);
+                if let Some(id) = render_timeline_row(ui, now_key, row) {
+                    context_clicked = Some(id);
+                }
                 ui.add_space(8.0);
             }
         });
+    context_clicked
 }
 
 fn render_turn_memory_view(
@@ -5024,7 +5094,8 @@ fn render_context_selected_details(
     }
 }
 
-fn render_timeline_row(ui: &mut egui::Ui, now_key: i128, row: &TimelineRow) {
+fn render_timeline_row(ui: &mut egui::Ui, now_key: i128, row: &TimelineRow) -> Option<Id> {
+    let mut context_clicked = None;
     let (source_label, source_color) = timeline_source_style(row.source);
     ui.horizontal_wrapped(|ui| {
         ui.small(format_age(now_key, row.at));
@@ -5044,6 +5115,9 @@ fn render_timeline_row(ui: &mut egui::Ui, now_key: i128, row: &TimelineRow) {
         } => {
             ui.horizontal_wrapped(|ui| {
                 ui.label(format!("{}: {}", exec_status_text(*status), command));
+                if ui.small_button("ctx").on_hover_text("Show model context for this turn").clicked() {
+                    context_clicked = Some(*request_id);
+                }
             });
             let mut details = Vec::new();
             details.push(format!("req {}", id_prefix(*request_id)));
@@ -5193,6 +5267,7 @@ fn render_timeline_row(ui: &mut egui::Ui, now_key: i128, row: &TimelineRow) {
             render_timeline_goal_event(ui, goal, Some(format!("note: {note}")));
         }
     }
+    context_clicked
 }
 
 fn timeline_source_style(source: TimelineSource) -> (&'static str, egui::Color32) {
