@@ -1,30 +1,30 @@
 use hifitime::Epoch;
 use triblespace::prelude::valueschemas::NsTAIInterval;
-use triblespace::prelude::{ToValue, Value};
+use triblespace::prelude::{TryToValue, Value};
 
 pub(crate) fn now_epoch() -> Epoch {
     Epoch::now().unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0))
 }
 
 pub(crate) fn epoch_interval(epoch: Epoch) -> Value<NsTAIInterval> {
-    (epoch, epoch).to_value()
+    (epoch, epoch).try_to_value().unwrap()
 }
 
 pub(crate) fn interval_key(interval: Value<NsTAIInterval>) -> i128 {
-    let (lower_ns, _): (i128, i128) = interval.from_value();
+    let (lower_ns, _): (i128, i128) = interval.try_from_value().unwrap();
     lower_ns
 }
 
 /// Width of a time range in nanoseconds (end - start). Zero for point intervals.
 pub(crate) fn interval_width(start: Value<NsTAIInterval>, end: Value<NsTAIInterval>) -> i128 {
-    let (_, upper_ns): (i128, i128) = end.from_value();
-    let (lower_ns, _): (i128, i128) = start.from_value();
+    let (_, upper_ns): (i128, i128) = end.try_from_value().unwrap();
+    let (lower_ns, _): (i128, i128) = start.try_from_value().unwrap();
     upper_ns.saturating_sub(lower_ns).max(0)
 }
 
 /// Format the lower bound of an interval as a TAI timestamp.
 pub(crate) fn format_tai_interval_timestamp(interval: Value<NsTAIInterval>) -> String {
-    let (lower, _): (Epoch, Epoch) = interval.from_value();
+    let (lower, _): (Epoch, Epoch) = interval.try_from_value().unwrap();
     format_tai_timestamp(lower)
 }
 
@@ -34,8 +34,8 @@ pub(crate) fn format_tai_timestamp(epoch: Epoch) -> String {
 }
 
 pub(crate) fn format_time_range(interval_start: Value<NsTAIInterval>, interval_end: Value<NsTAIInterval>) -> String {
-    let (start, _): (Epoch, Epoch) = interval_start.from_value();
-    let (_, end): (Epoch, Epoch) = interval_end.from_value();
+    let (start, _): (Epoch, Epoch) = interval_start.try_from_value().unwrap();
+    let (_, end): (Epoch, Epoch) = interval_end.try_from_value().unwrap();
     let (y1, m1, d1, h1, mi1, s1, _) = start.to_gregorian_tai();
     let (y2, m2, d2, h2, mi2, s2, _) = end.to_gregorian_tai();
     format!(

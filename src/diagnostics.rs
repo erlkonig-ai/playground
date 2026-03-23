@@ -1,7 +1,7 @@
 use ed25519_dalek::{SecretKey, SigningKey};
 use eframe::egui;
 use hifitime::Epoch;
-use rand_core::{OsRng, TryRngCore};
+use rand::rngs::OsRng;
 use serde_json::Value as JsonValue;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -21,12 +21,13 @@ use triblespace::core::value::schemas::time::NsTAIInterval;
 use triblespace::macros::{entity, find, id_hex, pattern, pattern_changes};
 use triblespace::prelude::valueschemas::{GenId, U256BE};
 use triblespace::prelude::{
-    Attribute, BlobStore, BlobStoreGet, BranchStore, ToBlob, ToValue, TryFromValue, View,
+    Attribute, BlobStore, BlobStoreGet, BranchStore, ToBlob, ToValue, TryFromValue, TryToValue,
+    View,
 };
 
 use GORBIE::NotebookConfig;
 use GORBIE::NotebookCtx;
-use GORBIE::cards::{DEFAULT_CARD_PADDING, with_padding};
+use GORBIE::cards::DEFAULT_CARD_PADDING;
 use GORBIE::md;
 use GORBIE::themes::colorhash;
 use GORBIE::widgets::{Button, TextField};
@@ -267,6 +268,7 @@ impl Default for DashboardState {
             teams_selected_chat: None,
             context_selected_chunk: None,
             turn_memory_selected_request: None,
+            context_float_request_id: None,
             context_selection_stack: Vec::new(),
             context_show_children: false,
             context_show_origins: false,
@@ -594,7 +596,7 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
         "playground-diagnostics",
         DashboardState::default(),
         move |ui, state| {
-            with_padding(ui, padding, |ui| {
+            ui.with_padding(padding, |ui| {
                 md!(
                     ui,
                     "# Playground Diagnostics\n\
@@ -691,7 +693,7 @@ _Live view of the agent pile, exec queue, and message activity._"
 
     nb.view(move |ui| {
         let mut state = dashboard.read_mut(ui);
-        with_padding(ui, padding, |ui| {
+        ui.with_padding(padding, |ui| {
             ui.heading("Overview");
             let (pile_path, branches) = {
                 let Some(snapshot) = snapshot_or_message(ui, &state.snapshot) else {
@@ -755,7 +757,7 @@ _Live view of the agent pile, exec queue, and message activity._"
 
     nb.view(move |ui| {
         let mut state = dashboard.read_mut(ui);
-        with_padding(ui, padding, |ui| {
+        ui.with_padding(padding, |ui| {
             ui.heading("Agent config");
             let snapshot = {
                 let Some(snapshot) = snapshot_or_message(ui, &state.snapshot) else {
@@ -804,7 +806,7 @@ _Live view of the agent pile, exec queue, and message activity._"
 
     nb.view(move |ui| {
         let mut state = dashboard.read_mut(ui);
-        with_padding(ui, padding, |ui| {
+        ui.with_padding(padding, |ui| {
             ui.heading("Activity timeline");
             let mut timeline_limit_changed = false;
             ui.horizontal_wrapped(|ui| {
@@ -874,60 +876,38 @@ _Live view of the agent pile, exec queue, and message activity._"
             // Render context float if one is open.
             if let Some(request_id) = state.context_float_request_id {
                 if let Some(row) = snapshot.turn_memory_rows.iter().find(|r| r.request_id == request_id) {
+                    let row = row.clone();
                     ui.push_id(request_id, |ui| {
-                        let float_id = ui.id().with("context_float");
-                        let pos = ui.ctx().input(|i| i.pointer.hover_pos().unwrap_or(egui::pos2(200.0, 100.0)));
-                        egui::Area::new(float_id)
-                            .default_pos(pos)
-                            .movable(true)
-                            .constrain(true)
-                            .show(ui.ctx(), |ui| {
-                                egui::Frame::NONE
-                                    .fill(ui.style().visuals.panel_fill)
-                                    .stroke(ui.style().visuals.window_stroke)
-                                    .shadow(egui::Shadow::NONE)
-                                    .inner_margin(egui::Margin::same(12))
-                                    .corner_radius(egui::CornerRadius::same(8))
-                                    .show(ui, |ui| {
-                                        ui.set_max_width(600.0);
-                                        ui.horizontal(|ui| {
-                                            ui.heading("Context");
-                                            ui.small(format!("turn {}", id_prefix(request_id)));
-                                            if ui.small_button("x").clicked() {
-                                                state.context_float_request_id = None;
-                                            }
-                                        });
-                                        ui.separator();
-                                        if row.context_messages.is_empty() {
-                                            if let Some(err) = row.context_error.as_deref() {
-                                                ui.colored_label(egui::Color32::LIGHT_RED, err);
-                                            } else {
-                                                ui.small("No context messages.");
-                                            }
-                                        } else {
-                                            egui::ScrollArea::vertical()
-                                                .id_salt("context_float_scroll")
-                                                .max_height(500.0)
-                                                .show(ui, |ui| {
-                                                    for (idx, message) in row.context_messages.iter().enumerate() {
-                                                        let (label, fill) = turn_memory_role_style(message.role);
-                                                        let chars = message.content.chars().count();
-                                                        ui.horizontal_wrapped(|ui| {
-                                                            render_timeline_source_chip(ui, label, fill);
-                                                            ui.small(format!("msg {idx} · {chars}c"));
-                                                        });
-                                                        egui::Frame::NONE
-                                                            .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(190)))
-                                                            .inner_margin(egui::Margin::symmetric(8, 6))
-                                                            .show(ui, |ui| {
-                                                                render_blob_aware_text(ui, message.content.as_str(), None, None);
-                                                            });
-                                                        ui.add_space(4.0);
-                                                    }
-                                                });
-                                        }
+                        let resp = ui.float(|ui| {
+                            ui.heading(&format!("Context · turn {}", id_prefix(request_id)));
+                            if row.context_messages.is_empty() {
+                                if let Some(err) = row.context_error.as_deref() {
+                                    ui.colored_label(egui::Color32::LIGHT_RED, err);
+                                } else {
+                                    ui.label("No context messages.");
+                                }
+                            } else {
+                                ui.label(&format!("{} messages", row.context_messages.len()));
+                                for (idx, message) in row.context_messages.iter().enumerate() {
+                                    let (label, fill) = turn_memory_role_style(message.role);
+                                    let chars = message.content.chars().count();
+                                    ui.horizontal_wrapped(|ui| {
+                                        render_timeline_source_chip(ui, label, fill);
+                                        ui.small(format!("msg {idx} · {chars}c"));
                                     });
-                            });
+                                    egui::Frame::NONE
+                                        .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(190)))
+                                        .inner_margin(egui::Margin::symmetric(8, 6))
+                                        .show(ui, |ui| {
+                                            render_blob_aware_text(ui, message.content.as_str(), None, None);
+                                        });
+                                    ui.add_space(4.0);
+                                }
+                            }
+                        });
+                        if resp.closed {
+                            state.context_float_request_id = None;
+                        }
                     });
                 }
             }
@@ -936,7 +916,7 @@ _Live view of the agent pile, exec queue, and message activity._"
 
     nb.view(move |ui| {
         let mut state = dashboard.read_mut(ui);
-        with_padding(ui, padding, |ui| {
+        ui.with_padding(padding, |ui| {
             ui.heading("Turn context view");
             let snapshot = {
                 let Some(snapshot) = snapshot_or_message(ui, &state.snapshot) else {
@@ -950,7 +930,7 @@ _Live view of the agent pile, exec queue, and message activity._"
 
     nb.view(move |ui| {
         let mut state = dashboard.read_mut(ui);
-        with_padding(ui, padding, |ui| {
+        ui.with_padding(padding, |ui| {
             ui.heading("Context compaction");
             let snapshot = {
                 let Some(snapshot) = snapshot_or_message(ui, &state.snapshot) else {
@@ -974,7 +954,7 @@ _Live view of the agent pile, exec queue, and message activity._"
 
     nb.view(move |ui| {
         let mut state = dashboard.read_mut(ui);
-        with_padding(ui, padding, |ui| {
+        ui.with_padding(padding, |ui| {
             ui.heading("Local message composer");
             let snapshot = {
                 let Some(snapshot) = snapshot_or_message(ui, &state.snapshot) else {
@@ -991,7 +971,7 @@ _Live view of the agent pile, exec queue, and message activity._"
 
     nb.view(move |ui| {
         let state = dashboard.read(ui);
-        with_padding(ui, padding, |ui| {
+        ui.with_padding(padding, |ui| {
             ui.heading("Relations");
             let Some(snapshot) = snapshot_or_message(ui, &state.snapshot) else {
                 return;
@@ -1006,7 +986,7 @@ _Live view of the agent pile, exec queue, and message activity._"
 
     nb.view(move |ui| {
         let mut state = dashboard.read_mut(ui);
-        with_padding(ui, padding, |ui| {
+        ui.with_padding(padding, |ui| {
             ui.heading("Teams conversations");
             let snapshot = {
                 let Some(snapshot) = snapshot_or_message(ui, &state.snapshot) else {
@@ -4166,7 +4146,7 @@ fn send_local_message(
     let mut change = ensure_local_metadata(&mut ws)?;
 
     let now = now_epoch();
-    let now_interval: Value<NsTAIInterval> = (now, now).to_value();
+    let now_interval: Value<NsTAIInterval> = (now, now).try_to_value().unwrap();
     let message_id = triblespace::prelude::ufoid();
     let body_handle = ws.put(body.to_string());
     change += entity! { &message_id @
@@ -4636,6 +4616,7 @@ fn mask_secret(secret: &str) -> String {
         .rev()
         .take(4)
         .collect::<Vec<_>>()
+        .into_iter()
         .rev()
         .collect();
     format!("{prefix}…{suffix}")
@@ -5948,7 +5929,7 @@ fn epoch_key(epoch: Epoch) -> i128 {
 }
 
 fn interval_key(interval: Value<NsTAIInterval>) -> i128 {
-    let (lower_ns, _): (i128, i128) = interval.from_value();
+    let (lower_ns, _): (i128, i128) = interval.try_from_value().unwrap();
     lower_ns
 }
 
@@ -5998,8 +5979,5 @@ fn repo_root() -> PathBuf {
 }
 
 fn random_signing_key() -> SigningKey {
-    let mut rng = OsRng;
-    let mut secret = SecretKey::default();
-    let _ = rng.try_fill_bytes(&mut secret);
-    SigningKey::from_bytes(&secret)
+    SigningKey::generate(&mut OsRng)
 }
