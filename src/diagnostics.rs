@@ -103,7 +103,6 @@ mod reason_events {
 
 type CommitHandle = Value<Handle<Blake3, SimpleArchive>>;
 const ACTIVITY_TIMELINE_HEIGHT: f32 = 980.0;
-const TURN_MEMORY_HEIGHT: f32 = 980.0;
 const TURN_MEMORY_MAX_ROWS: usize = 160;
 const TIMELINE_DEFAULT_LIMIT: usize = 300;
 const TIMELINE_LIMIT_PRESETS: [usize; 4] = [100, 300, 1000, 3000];
@@ -230,7 +229,6 @@ struct DashboardState {
     compass_expanded_goal: Option<Id>,
     teams_selected_chat: Option<Id>,
     context_selected_chunk: Option<Id>,
-    turn_memory_selected_request: Option<Id>,
     context_float_request_id: Option<Id>,
     context_selection_stack: Vec<Id>,
     context_show_children: bool,
@@ -267,7 +265,6 @@ impl Default for DashboardState {
             compass_expanded_goal: None,
             teams_selected_chat: None,
             context_selected_chunk: None,
-            turn_memory_selected_request: None,
             context_float_request_id: None,
             context_selection_stack: Vec::new(),
             context_show_children: false,
@@ -691,119 +688,7 @@ _Live view of the agent pile, exec queue, and message activity._"
         },
     );
 
-    nb.view(move |ui| {
-        let mut state = dashboard.read_mut(ui);
-        ui.with_padding(padding, |ui| {
-            ui.heading("Overview");
-            let (pile_path, branches) = {
-                let Some(snapshot) = snapshot_or_message(ui, &state.snapshot) else {
-                    return;
-                };
-                (snapshot.pile_path.clone(), snapshot.branches.clone())
-            };
-
-            ui.horizontal(|ui| {
-                ui.label(format!("Pile: {}", pile_path.display()));
-            });
-
-            if branches.is_empty() {
-                return;
-            }
-
-            let mut primary: Vec<BranchEntry> = Vec::new();
-            let mut extra: Vec<BranchEntry> = Vec::new();
-            for branch in branches {
-                let label = branch.name.as_deref().unwrap_or("<unnamed>");
-                if label.contains("--orphan-") || label.starts_with('<') {
-                    extra.push(branch);
-                } else {
-                    primary.push(branch);
-                }
-            }
-
-            ui.label(format!(
-                "Branches: {} primary, {} extra",
-                primary.len(),
-                extra.len()
-            ));
-
-            ui.label("Primary:");
-            for branch in &primary {
-                let label = branch.name.as_deref().unwrap_or("<unnamed>");
-                ui.label(format!("- {label} ({})", id_prefix(branch.id)));
-            }
-
-            if !extra.is_empty() {
-                let button_label = if state.show_extra_branches {
-                    "Hide extra branches"
-                } else {
-                    "Show extra branches"
-                };
-                if ui.add(Button::new(button_label)).clicked() {
-                    state.show_extra_branches = !state.show_extra_branches;
-                }
-
-                if state.show_extra_branches {
-                    ui.add_space(8.0);
-                    ui.label("Extra:");
-                    for branch in &extra {
-                        let label = branch.name.as_deref().unwrap_or("<unnamed>");
-                        ui.label(format!("- {label} ({})", id_prefix(branch.id)));
-                    }
-                }
-            }
-        });
-    });
-
-    nb.view(move |ui| {
-        let mut state = dashboard.read_mut(ui);
-        ui.with_padding(padding, |ui| {
-            ui.heading("Agent config");
-            let snapshot = {
-                let Some(snapshot) = snapshot_or_message(ui, &state.snapshot) else {
-                    return;
-                };
-                snapshot.clone()
-            };
-            if let Some(err) = &snapshot.agent_config_error {
-                ui.colored_label(egui::Color32::RED, err);
-            } else {
-                render_agent_config(
-                    ui,
-                    &mut state,
-                    snapshot.now_key,
-                    snapshot.agent_config.as_ref(),
-                );
-            }
-        });
-    });
-
-    nb.view(move |ui| {
-        let mut state = dashboard.read_mut(ui);
-        ui.heading("Compass");
-        let snapshot = {
-            let Some(snapshot) = snapshot_or_message(ui, &state.snapshot) else {
-                return;
-            };
-            snapshot.clone()
-        };
-        if let Some(err) = &snapshot.compass_error {
-            ui.colored_label(egui::Color32::RED, err);
-            return;
-        }
-
-        if snapshot.compass_rows.is_empty() {
-            ui.label("No goals yet.");
-            return;
-        }
-        render_compass_swimlanes(
-            ui,
-            &mut state.compass_expanded_goal,
-            &snapshot.compass_rows,
-            &snapshot.compass_notes,
-        );
-    });
-
+    // ── Card 2: Main view (Activity timeline + context float) ──────
     nb.view(move |ui| {
         let mut state = dashboard.read_mut(ui);
         ui.with_padding(padding, |ui| {
@@ -869,8 +754,6 @@ _Live view of the agent pile, exec queue, and message activity._"
             }
             if let Some(request_id) = render_activity_timeline(ui, snapshot.now_key, &snapshot.timeline_rows) {
                 state.context_float_request_id = Some(request_id);
-                // Also select it in the turn memory view for consistency.
-                state.turn_memory_selected_request = Some(request_id);
             }
 
             // Render context float if one is open.
@@ -914,97 +797,186 @@ _Live view of the agent pile, exec queue, and message activity._"
         });
     });
 
+    // ── Card 3: Agent (Overview + Agent Config + Context Compaction) ─
     nb.view(move |ui| {
         let mut state = dashboard.read_mut(ui);
         ui.with_padding(padding, |ui| {
-            ui.heading("Turn context view");
-            let snapshot = {
-                let Some(snapshot) = snapshot_or_message(ui, &state.snapshot) else {
-                    return;
-                };
-                snapshot.clone()
-            };
-            render_turn_memory_view(ui, &mut state, snapshot.now_key, &snapshot.turn_memory_rows);
-        });
-    });
+            ui.heading("Agent");
 
-    nb.view(move |ui| {
-        let mut state = dashboard.read_mut(ui);
-        ui.with_padding(padding, |ui| {
-            ui.heading("Context compaction");
-            let snapshot = {
-                let Some(snapshot) = snapshot_or_message(ui, &state.snapshot) else {
-                    return;
+            ui.collapsing("Overview", |ui| {
+                let (pile_path, branches) = {
+                    let Some(snapshot) = snapshot_or_message(ui, &state.snapshot) else {
+                        return;
+                    };
+                    (snapshot.pile_path.clone(), snapshot.branches.clone())
                 };
-                snapshot.clone()
-            };
-            if snapshot.context_chunks.is_empty() {
-                ui.label("No context chunks yet.");
-                return;
-            }
-            render_context_compaction(
-                ui,
-                &mut state,
-                snapshot.now_key,
-                &snapshot.context_chunks,
-                snapshot.context_selected.as_ref(),
-            );
-        });
-    });
 
-    nb.view(move |ui| {
-        let mut state = dashboard.read_mut(ui);
-        ui.with_padding(padding, |ui| {
-            ui.heading("Local message composer");
-            let snapshot = {
-                let Some(snapshot) = snapshot_or_message(ui, &state.snapshot) else {
+                ui.horizontal(|ui| {
+                    ui.label(format!("Pile: {}", pile_path.display()));
+                });
+
+                if branches.is_empty() {
                     return;
+                }
+
+                let mut primary: Vec<BranchEntry> = Vec::new();
+                let mut extra: Vec<BranchEntry> = Vec::new();
+                for branch in branches {
+                    let label = branch.name.as_deref().unwrap_or("<unnamed>");
+                    if label.contains("--orphan-") || label.starts_with('<') {
+                        extra.push(branch);
+                    } else {
+                        primary.push(branch);
+                    }
+                }
+
+                ui.label(format!(
+                    "Branches: {} primary, {} extra",
+                    primary.len(),
+                    extra.len()
+                ));
+
+                ui.label("Primary:");
+                for branch in &primary {
+                    let label = branch.name.as_deref().unwrap_or("<unnamed>");
+                    ui.label(format!("- {label} ({})", id_prefix(branch.id)));
+                }
+
+                if !extra.is_empty() {
+                    let button_label = if state.show_extra_branches {
+                        "Hide extra branches"
+                    } else {
+                        "Show extra branches"
+                    };
+                    if ui.add(Button::new(button_label)).clicked() {
+                        state.show_extra_branches = !state.show_extra_branches;
+                    }
+
+                    if state.show_extra_branches {
+                        ui.add_space(8.0);
+                        ui.label("Extra:");
+                        for branch in &extra {
+                            let label = branch.name.as_deref().unwrap_or("<unnamed>");
+                            ui.label(format!("- {label} ({})", id_prefix(branch.id)));
+                        }
+                    }
+                }
+            });
+
+            ui.collapsing("Agent Config", |ui| {
+                let snapshot = {
+                    let Some(snapshot) = snapshot_or_message(ui, &state.snapshot) else {
+                        return;
+                    };
+                    snapshot.clone()
                 };
-                snapshot.clone()
-            };
-            if let Some(err) = &snapshot.local_message_error {
-                ui.colored_label(egui::Color32::RED, err);
-            }
-            render_local_composer(ui, &mut state, &snapshot.branches, &snapshot);
-        });
-    });
+                if let Some(err) = &snapshot.agent_config_error {
+                    ui.colored_label(egui::Color32::RED, err);
+                } else {
+                    render_agent_config(
+                        ui,
+                        &mut state,
+                        snapshot.now_key,
+                        snapshot.agent_config.as_ref(),
+                    );
+                }
+            });
 
-    nb.view(move |ui| {
-        let state = dashboard.read(ui);
-        ui.with_padding(padding, |ui| {
-            ui.heading("Relations");
-            let Some(snapshot) = snapshot_or_message(ui, &state.snapshot) else {
-                return;
-            };
-            if let Some(err) = &snapshot.relations_error {
-                ui.colored_label(egui::Color32::RED, err);
-            } else {
-                render_relations(ui, &snapshot.relations_people);
-            }
-        });
-    });
-
-    nb.view(move |ui| {
-        let mut state = dashboard.read_mut(ui);
-        ui.with_padding(padding, |ui| {
-            ui.heading("Teams conversations");
-            let snapshot = {
-                let Some(snapshot) = snapshot_or_message(ui, &state.snapshot) else {
+            ui.collapsing("Context Compaction", |ui| {
+                let snapshot = {
+                    let Some(snapshot) = snapshot_or_message(ui, &state.snapshot) else {
+                        return;
+                    };
+                    snapshot.clone()
+                };
+                if snapshot.context_chunks.is_empty() {
+                    ui.label("No context chunks yet.");
                     return;
-                };
-                snapshot.clone()
-            };
-            if let Some(err) = &snapshot.teams_error {
-                ui.colored_label(egui::Color32::RED, err);
-            } else {
-                render_teams_conversations(
+                }
+                render_context_compaction(
                     ui,
                     &mut state,
                     snapshot.now_key,
-                    &snapshot.teams_chats,
-                    &snapshot.teams_messages,
+                    &snapshot.context_chunks,
+                    snapshot.context_selected.as_ref(),
                 );
-            }
+            });
+        });
+    });
+
+    // ── Card 4: Social & Planning (Compass + Messages + Relations + Teams) ─
+    nb.view(move |ui| {
+        let mut state = dashboard.read_mut(ui);
+        ui.with_padding(padding, |ui| {
+            ui.heading("Social & Planning");
+
+            ui.collapsing("Compass", |ui| {
+                let snapshot = {
+                    let Some(snapshot) = snapshot_or_message(ui, &state.snapshot) else {
+                        return;
+                    };
+                    snapshot.clone()
+                };
+                if let Some(err) = &snapshot.compass_error {
+                    ui.colored_label(egui::Color32::RED, err);
+                    return;
+                }
+
+                if snapshot.compass_rows.is_empty() {
+                    ui.label("No goals yet.");
+                    return;
+                }
+                render_compass_swimlanes(
+                    ui,
+                    &mut state.compass_expanded_goal,
+                    &snapshot.compass_rows,
+                    &snapshot.compass_notes,
+                );
+            });
+
+            ui.collapsing("Messages", |ui| {
+                let snapshot = {
+                    let Some(snapshot) = snapshot_or_message(ui, &state.snapshot) else {
+                        return;
+                    };
+                    snapshot.clone()
+                };
+                if let Some(err) = &snapshot.local_message_error {
+                    ui.colored_label(egui::Color32::RED, err);
+                }
+                render_local_composer(ui, &mut state, &snapshot.branches, &snapshot);
+            });
+
+            ui.collapsing("Relations", |ui| {
+                let Some(snapshot) = snapshot_or_message(ui, &state.snapshot) else {
+                    return;
+                };
+                if let Some(err) = &snapshot.relations_error {
+                    ui.colored_label(egui::Color32::RED, err);
+                } else {
+                    render_relations(ui, &snapshot.relations_people);
+                }
+            });
+
+            ui.collapsing("Teams", |ui| {
+                let snapshot = {
+                    let Some(snapshot) = snapshot_or_message(ui, &state.snapshot) else {
+                        return;
+                    };
+                    snapshot.clone()
+                };
+                if let Some(err) = &snapshot.teams_error {
+                    ui.colored_label(egui::Color32::RED, err);
+                } else {
+                    render_teams_conversations(
+                        ui,
+                        &mut state,
+                        snapshot.now_key,
+                        &snapshot.teams_chats,
+                        &snapshot.teams_messages,
+                    );
+                }
+            });
         });
     });
 
@@ -4648,107 +4620,6 @@ fn render_activity_timeline(ui: &mut egui::Ui, now_key: i128, rows: &[TimelineRo
             }
         });
     context_clicked
-}
-
-fn render_turn_memory_view(
-    ui: &mut egui::Ui,
-    state: &mut DashboardState,
-    now_key: i128,
-    rows: &[TurnMemoryRow],
-) {
-    if rows.is_empty() {
-        ui.small("No turn memory prompts yet.");
-        return;
-    }
-
-    if state
-        .turn_memory_selected_request
-        .is_none_or(|selected| !rows.iter().any(|row| row.request_id == selected))
-    {
-        state.turn_memory_selected_request = Some(rows[0].request_id);
-    }
-
-    ui.horizontal_wrapped(|ui| {
-        ui.small(format!("Showing {} recent turn contexts.", rows.len()));
-        egui::ComboBox::from_id_salt("turn_memory_request_picker")
-            .selected_text(
-                state
-                    .turn_memory_selected_request
-                    .and_then(|selected| {
-                        rows.iter()
-                            .find(|row| row.request_id == selected)
-                            .map(|row| turn_memory_row_label(now_key, row))
-                    })
-                    .unwrap_or_else(|| "<none>".to_string()),
-            )
-            .show_ui(ui, |ui| {
-                for row in rows {
-                    let selected = state.turn_memory_selected_request == Some(row.request_id);
-                    if ui
-                        .selectable_label(selected, turn_memory_row_label(now_key, row))
-                        .clicked()
-                    {
-                        state.turn_memory_selected_request = Some(row.request_id);
-                    }
-                }
-            });
-    });
-
-    let Some(selected_request) = state.turn_memory_selected_request else {
-        return;
-    };
-    let Some(row) = rows.iter().find(|row| row.request_id == selected_request) else {
-        ui.small("Selected turn context no longer available.");
-        return;
-    };
-
-    ui.small(format!(
-        "turn {} · thought {} · {} message(s)",
-        id_prefix(row.request_id),
-        row.thought_id
-            .map(id_prefix)
-            .unwrap_or_else(|| "-".to_string()),
-        row.context_messages.len()
-    ));
-    if let Some(err) = row.context_error.as_deref() {
-        ui.colored_label(egui::Color32::LIGHT_RED, err);
-    }
-    if row.context_messages.is_empty() {
-        ui.small("No context messages captured for this turn.");
-        return;
-    }
-
-    egui::ScrollArea::vertical()
-        .id_salt("turn_memory_view_scroll")
-        .auto_shrink([false, false])
-        .min_scrolled_height(TURN_MEMORY_HEIGHT)
-        .max_height(TURN_MEMORY_HEIGHT)
-        .show(ui, |ui| {
-            for (idx, message) in row.context_messages.iter().enumerate() {
-                let (label, fill) = turn_memory_role_style(message.role);
-                let chars = message.content.chars().count();
-                ui.horizontal_wrapped(|ui| {
-                    render_timeline_source_chip(ui, label, fill);
-                    ui.small(format!("msg {idx} · {chars}c"));
-                });
-                egui::Frame::NONE
-                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(190)))
-                    .inner_margin(egui::Margin::symmetric(8, 6))
-                    .show(ui, |ui| {
-                        render_blob_aware_text(ui, message.content.as_str(), None, None);
-                    });
-                ui.add_space(6.0);
-            }
-        });
-}
-
-fn turn_memory_row_label(now_key: i128, row: &TurnMemoryRow) -> String {
-    let age = format_age(now_key, row.requested_at);
-    let mut command = row.command.replace('\n', " ");
-    if command.chars().count() > 72 {
-        command = command.chars().take(72).collect::<String>() + "…";
-    }
-    format!("{age} {} {command}", id_prefix(row.request_id))
 }
 
 fn turn_memory_role_style(role: ChatRole) -> (&'static str, egui::Color32) {
