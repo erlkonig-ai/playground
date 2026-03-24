@@ -1253,13 +1253,104 @@ fn cmd_import_all(pile: &Path, branch: Option<&str>, dir: PathBuf) -> Result<()>
             updated += 1;
         }
 
-        if updated > 0 {
-            ws.commit(change, "wiki import-all");
-            repo.push(ws).map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
+        if updated == 0 {
+            eprintln!("Nothing to import (0 changes).");
+            return Ok(());
         }
-        eprintln!("Imported: {} updated, {} skipped, {} conflicts, {} total",
-            updated, skipped, conflicts, entries.len());
-        Ok(())
+
+        // CAS loop: commit, try_push, on conflict re-check versions.
+        loop {
+            ws.commit(change.clone(), "wiki import-all");
+            match repo.try_push(ws) {
+                Ok(None) => {
+                    // Push succeeded.
+                    eprintln!("Imported: {} updated, {} skipped, {} total",
+                        updated, skipped, entries.len());
+                    return Ok(());
+                }
+                Ok(Some(mut conflict_ws)) => {
+                    // Conflict: another agent pushed. Merge and re-check.
+                    conflict_ws.merge(ws).map_err(|e| anyhow::anyhow!("merge: {e:?}"))?;
+                    *ws = conflict_ws;
+                    let new_space = ws.checkout(..)
+                        .map_err(|e| anyhow::anyhow!("re-checkout: {e:?}"))?;
+
+                    // Re-check: are all our target fragments still at the
+                    // version we exported? Drop any that were updated.
+                    let mut new_latest: HashMap<Id, (Id, i128)> = HashMap::new();
+                    for (vid, frag, ts) in find!(
+                        (vid: Id, frag: Id, ts: Value<valueschemas::NsTAIInterval>),
+                        pattern!(&new_space, [{
+                            ?vid @
+                            metadata::tag: &KIND_VERSION_ID,
+                            wiki::fragment: ?frag,
+                            wiki::created_at: ?ts,
+                        }])
+                    ) {
+                        let key = interval_key(ts);
+                        let entry = new_latest.entry(frag).or_insert((vid, key));
+                        if key > entry.1 { *entry = (vid, key); }
+                    }
+
+                    // Rebuild change set, keeping only fragments where
+                    // the latest version still matches our export.
+                    change = TribleSet::new();
+                    updated = 0;
+                    for (frag_id, prev_vid, path) in &work {
+                        let still_latest = new_latest.get(frag_id)
+                            .map_or(false, |(current, _)| *current == *prev_vid);
+                        if !still_latest {
+                            let title = read_title(&new_space, ws, *prev_vid).unwrap_or_default();
+                            eprintln!("CONFLICT (on retry): {} — skipping", title);
+                            continue;
+                        }
+
+                        let new_content = fs::read_to_string(path)
+                            .with_context(|| format!("read {}", path.display()))?;
+                        let existing_content = content_handle_of(&new_space, *prev_vid)
+                            .and_then(|ch| ws.get::<View<str>, _>(ch).ok())
+                            .map(|v| v.as_ref().to_string())
+                            .unwrap_or_default();
+                        if new_content == existing_content { continue; }
+
+                        if let Err(_) = validate_typst(&new_content) { continue; }
+
+                        let tag_ids = tags_of(&new_space, *prev_vid);
+                        let title = read_title(&new_space, ws, *prev_vid).unwrap_or_default();
+                        let content_handle = ws.put(new_content);
+                        let (internal_links, _) = extract_references(
+                            &ws.get::<View<str>, _>(content_handle)
+                                .map_err(|e| anyhow::anyhow!("read: {e:?}"))?.as_ref(),
+                            &new_space,
+                        );
+                        let link_targets: Vec<Id> = internal_links
+                            .into_iter().filter(|&id| id != *frag_id).collect();
+                        let mut all_tags = tag_ids;
+                        all_tags.push(KIND_VERSION_ID);
+                        all_tags.sort(); all_tags.dedup();
+                        let title_handle = ws.put(title);
+                        let version = entity! { _ @
+                            wiki::fragment: frag_id,
+                            wiki::title: title_handle,
+                            wiki::content: content_handle,
+                            wiki::created_at: now_tai(),
+                            metadata::tag*: all_tags.iter(),
+                            wiki::links_to*: link_targets.iter(),
+                        };
+                        change += version;
+                        updated += 1;
+                    }
+
+                    if updated == 0 {
+                        eprintln!("All fragments conflicted on retry — aborting.");
+                        return Ok(());
+                    }
+                    eprintln!("Retrying push with {} remaining updates...", updated);
+                    // Loop back to commit + try_push.
+                }
+                Err(e) => bail!("push failed: {e:?}"),
+            }
+        }
     })
 }
 
