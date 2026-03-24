@@ -188,17 +188,10 @@ enum Command {
         #[arg(long)]
         all: bool,
     },
-    /// Export all fragments to a directory (named by version ID for CAS safety)
-    ExportAll {
-        /// Output directory
-        dir: PathBuf,
-    },
-    /// Re-import edited fragment content. Files must be named <version-id>.typ
-    /// (as produced by export-all). Aborts if any fragment's latest version has
-    /// changed since export (optimistic concurrency / CAS check).
-    ImportAll {
-        /// Input directory containing <version-id>.typ files
-        dir: PathBuf,
+    /// Batch export/import all fragments (version-addressed for CAS safety)
+    Batch {
+        #[command(subcommand)]
+        action: BatchAction,
     },
     /// Check all fragments for common issues: invalid typst, broken links,
     /// truncated IDs, missing format tags.
@@ -214,6 +207,20 @@ enum Command {
     FixTruncated {
         /// File with scheme:prefix lines. Use @path or @- for stdin.
         input: String,
+    },
+}
+
+#[derive(clap::Subcommand)]
+enum BatchAction {
+    /// Export all fragments (version-addressed .typ files)
+    Export {
+        /// Output directory
+        dir: PathBuf,
+    },
+    /// Re-import edited fragments (CAS check: aborts if versions changed)
+    Import {
+        /// Directory containing <version-id>.typ files
+        dir: PathBuf,
     },
 }
 
@@ -2124,8 +2131,10 @@ fn main() -> Result<()> {
             cmd_search(&cli.pile, branch, query, context, all)
         }
         Command::Check { compile } => cmd_check(&cli.pile, branch, compile),
-        Command::ExportAll { dir } => cmd_export_all(&cli.pile, branch, dir),
-        Command::ImportAll { dir } => cmd_import_all(&cli.pile, branch, dir),
+        Command::Batch { action } => match action {
+            BatchAction::Export { dir } => cmd_export_all(&cli.pile, branch, dir),
+            BatchAction::Import { dir } => cmd_import_all(&cli.pile, branch, dir),
+        },
         Command::FixTruncated { input } => cmd_fix_truncated(&cli.pile, branch, input),
     }
 }
