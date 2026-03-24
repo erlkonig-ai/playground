@@ -1268,9 +1268,10 @@ fn cmd_import_all(pile: &Path, branch: Option<&str>, dir: PathBuf) -> Result<()>
                         updated, skipped, entries.len());
                     return Ok(());
                 }
-                Ok(Some(mut conflict_ws)) => {
-                    // Conflict: another agent pushed. Merge and re-check.
-                    conflict_ws.merge(ws).map_err(|e| anyhow::anyhow!("merge: {e:?}"))?;
+                Ok(Some(conflict_ws)) => {
+                    // Conflict: another agent pushed. Start fresh from
+                    // the conflict workspace (don't merge — that would
+                    // bring our stale versions into the new state).
                     *ws = conflict_ws;
                     let new_space = ws.checkout(..)
                         .map_err(|e| anyhow::anyhow!("re-checkout: {e:?}"))?;
