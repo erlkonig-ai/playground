@@ -188,15 +188,16 @@ enum Command {
         #[arg(long)]
         all: bool,
     },
-    /// Export all fragments to a directory (one file per fragment, named by fragment ID)
+    /// Export all fragments to a directory (named by version ID for CAS safety)
     ExportAll {
         /// Output directory
         dir: PathBuf,
     },
-    /// Import fragment content from a directory. For each <fragment-id>.typ file,
-    /// creates a new version if content differs from the latest. Tags are preserved.
+    /// Re-import edited fragment content. Files must be named <version-id>.typ
+    /// (as produced by export-all). Aborts if any fragment's latest version has
+    /// changed since export (optimistic concurrency / CAS check).
     ImportAll {
-        /// Input directory containing <fragment-id>.typ files
+        /// Input directory containing <version-id>.typ files
         dir: PathBuf,
     },
     /// Check all fragments for common issues: invalid typst, broken links,
@@ -1108,7 +1109,7 @@ fn cmd_export_all(pile: &Path, branch: Option<&str>, dir: PathBuf) -> Result<()>
                 *entry = (vid, key);
             }
         }
-        for (frag_id, (vid, _)) in &latest {
+        for (_frag_id, (vid, _)) in &latest {
             // Skip archived
             let tags = tags_of(&space, *vid);
             if tags.contains(&TAG_ARCHIVED_ID) {
@@ -1117,12 +1118,13 @@ fn cmd_export_all(pile: &Path, branch: Option<&str>, dir: PathBuf) -> Result<()>
             let Some(ch) = content_handle_of(&space, *vid) else { continue };
             let content: View<str> = ws.get(ch)
                 .map_err(|e| anyhow::anyhow!("read content: {e:?}"))?;
-            let path = dir.join(format!("{:x}.typ", frag_id));
+            // Name by version ID so import-all can do CAS check.
+            let path = dir.join(format!("{:x}.typ", vid));
             fs::write(&path, content.as_ref())
                 .with_context(|| format!("write {}", path.display()))?;
             count += 1;
         }
-        eprintln!("Exported {} fragments to {}", count, dir.display());
+        eprintln!("Exported {} fragments (version-addressed) to {}", count, dir.display());
         Ok(())
     })
 }
@@ -1133,8 +1135,9 @@ fn cmd_import_all(pile: &Path, branch: Option<&str>, dir: PathBuf) -> Result<()>
         ensure_tag_vocabulary(repo, ws)?;
         let _tag_index = TagIndex::load(ws)?;
 
-        // Collect latest version per fragment (for content comparison + tag inheritance)
-        let mut latest: HashMap<Id, Id> = HashMap::new();
+        // Build version→fragment map and latest version per fragment.
+        let mut vid_to_frag: HashMap<Id, Id> = HashMap::new();
+        let mut latest: HashMap<Id, (Id, i128)> = HashMap::new();
         for (vid, frag, ts) in find!(
             (vid: Id, frag: Id, ts: Value<valueschemas::NsTAIInterval>),
             pattern!(&space, [{
@@ -1144,20 +1147,13 @@ fn cmd_import_all(pile: &Path, branch: Option<&str>, dir: PathBuf) -> Result<()>
                 wiki::created_at: ?ts,
             }])
         ) {
+            vid_to_frag.insert(vid, frag);
             let key = interval_key(ts);
-            let entry = latest.entry(frag).or_insert(vid);
-            let existing_key = find!(
-                existing_ts: Value<valueschemas::NsTAIInterval>,
-                pattern!(&space, [{ *entry @ wiki::created_at: ?existing_ts }])
-            ).next().map(|t| interval_key(t)).unwrap_or(i128::MIN);
-            if key > existing_key {
-                *entry = vid;
+            let entry = latest.entry(frag).or_insert((vid, key));
+            if key > entry.1 {
+                *entry = (vid, key);
             }
         }
-
-        let mut change = TribleSet::new();
-        let mut updated = 0u32;
-        let mut skipped = 0u32;
 
         let entries: Vec<_> = fs::read_dir(&dir)
             .with_context(|| format!("read dir {}", dir.display()))?
@@ -1165,46 +1161,69 @@ fn cmd_import_all(pile: &Path, branch: Option<&str>, dir: PathBuf) -> Result<()>
             .filter(|e| e.path().extension().is_some_and(|ext| ext == "typ"))
             .collect();
 
+        // Phase 1: CAS check — verify all exported versions are still latest.
+        let mut work: Vec<(Id, Id, std::path::PathBuf)> = Vec::new(); // (frag_id, exported_vid, path)
+        let mut conflicts = 0u32;
+
         for entry in &entries {
             let stem = entry.path().file_stem()
                 .and_then(|s| s.to_str())
                 .map(str::to_string);
             let Some(hex) = stem else { continue };
-            let Some(frag_id) = Id::from_hex(hex.trim()) else {
-                eprintln!("skip {}: invalid fragment id", entry.path().display());
+            let Some(exported_vid) = Id::from_hex(hex.trim()) else {
+                eprintln!("skip {}: invalid version id", entry.path().display());
                 continue;
             };
-            let Some(&prev_vid) = latest.get(&frag_id) else {
-                eprintln!("skip {}: unknown fragment", entry.path().display());
-                skipped += 1;
+            let Some(&frag_id) = vid_to_frag.get(&exported_vid) else {
+                eprintln!("skip {}: unknown version (not in wiki)", entry.path().display());
                 continue;
             };
+            let Some(&(current_latest, _)) = latest.get(&frag_id) else {
+                continue;
+            };
+            if current_latest != exported_vid {
+                let title = read_title(&space, ws, current_latest).unwrap_or_default();
+                eprintln!("CONFLICT {}: {} was updated since export (now {:x})",
+                    title, fmt_id(exported_vid), current_latest);
+                conflicts += 1;
+                continue;
+            }
+            work.push((frag_id, exported_vid, entry.path()));
+        }
 
-            let new_content = fs::read_to_string(entry.path())
-                .with_context(|| format!("read {}", entry.path().display()))?;
+        if conflicts > 0 {
+            bail!("{conflicts} conflict(s) detected — aborting. Re-export and try again.");
+        }
+
+        // Phase 2: apply changes.
+        let mut change = TribleSet::new();
+        let mut updated = 0u32;
+        let mut skipped = 0u32;
+
+        for (frag_id, prev_vid, path) in &work {
+            let new_content = fs::read_to_string(path)
+                .with_context(|| format!("read {}", path.display()))?;
 
             // Compare with existing content
-            let existing_content = content_handle_of(&space, prev_vid)
+            let existing_content = content_handle_of(&space, *prev_vid)
                 .and_then(|ch| ws.get::<View<str>, _>(ch).ok())
                 .map(|v| v.as_ref().to_string())
                 .unwrap_or_default();
 
             if new_content == existing_content {
-                continue; // no change
+                continue;
             }
 
             // Inherit tags and title from previous version
-            let tag_ids = tags_of(&space, prev_vid);
-            let title = read_title(&space, ws, prev_vid).unwrap_or_default();
+            let tag_ids = tags_of(&space, *prev_vid);
+            let title = read_title(&space, ws, *prev_vid).unwrap_or_default();
 
-            // Always validate typst
             if let Err(e) = validate_typst(&new_content) {
-                eprintln!("TYPST_ERROR {}: {}", entry.path().display(), e);
+                eprintln!("TYPST_ERROR {}: {}", path.display(), e);
                 skipped += 1;
                 continue;
             }
 
-            // Build new version
             let content_handle = ws.put(new_content);
             let (internal_links, _external) = extract_references(
                 &ws.get::<View<str>, _>(content_handle)
@@ -1213,7 +1232,7 @@ fn cmd_import_all(pile: &Path, branch: Option<&str>, dir: PathBuf) -> Result<()>
             );
             let link_targets: Vec<Id> = internal_links
                 .into_iter()
-                .filter(|&id| id != frag_id)
+                .filter(|&id| id != *frag_id)
                 .collect();
 
             let mut all_tags = tag_ids;
@@ -1223,7 +1242,7 @@ fn cmd_import_all(pile: &Path, branch: Option<&str>, dir: PathBuf) -> Result<()>
 
             let title_handle = ws.put(title);
             let version = entity! { _ @
-                wiki::fragment: &frag_id,
+                wiki::fragment: frag_id,
                 wiki::title: title_handle,
                 wiki::content: content_handle,
                 wiki::created_at: now_tai(),
@@ -1238,7 +1257,8 @@ fn cmd_import_all(pile: &Path, branch: Option<&str>, dir: PathBuf) -> Result<()>
             ws.commit(change, "wiki import-all");
             repo.push(ws).map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
         }
-        eprintln!("Imported: {} updated, {} skipped, {} total files", updated, skipped, entries.len());
+        eprintln!("Imported: {} updated, {} skipped, {} conflicts, {} total",
+            updated, skipped, conflicts, entries.len());
         Ok(())
     })
 }
