@@ -169,7 +169,7 @@ enum Command {
         #[command(subcommand)]
         command: TagCommand,
     },
-    /// Import a file or directory of .typ/.md files into the wiki
+    /// Import a file or directory of .typ files into the wiki
     Import {
         /// File or directory path
         path: PathBuf,
@@ -557,12 +557,12 @@ fn format_date(tai_ns: i128) -> String {
     Formatter::new(epoch, ISO8601_DATE).to_string()
 }
 
-/// Extract `[text](<faculty>:<hex>)` markdown link references from content.
+/// Extract `#link("<faculty>:<hex>")` references from content.
 /// Wiki links resolve against the space — the stored ID is whatever matches
 /// (could be a fragment or version). External links return faculty + raw hex.
 fn extract_references(content: &str, space: &TribleSet) -> (Vec<Id>, Vec<(String, String)>) {
     use regex::Regex;
-    // Matches both markdown [text](scheme:hex) and typst #link("scheme:hex")
+    // Matches typst #link("scheme:hex") and legacy markdown [text](scheme:hex)
     let re = Regex::new(r#"(?:\]\(|#link\(")([a-zA-Z_][a-zA-Z0-9_]*):([0-9a-fA-F]{4,})"#).unwrap();
 
     let mut internal = Vec::new();
@@ -1852,7 +1852,7 @@ fn cmd_tag_mint(pile: &Path, branch: Option<&str>, name: String) -> Result<()> {
 fn cmd_import(pile: &Path, branch: Option<&str>, path: PathBuf, tags: Vec<String>) -> Result<()> {
     let files = if path.is_dir() {
         let mut entries: Vec<PathBuf> = Vec::new();
-        collect_wiki_files(&path, &mut entries)?;
+        collect_typ_files(&path, &mut entries)?;
         entries.sort();
         entries
     } else {
@@ -1860,7 +1860,7 @@ fn cmd_import(pile: &Path, branch: Option<&str>, path: PathBuf, tags: Vec<String
     };
 
     if files.is_empty() {
-        println!("no .typ or .md files found");
+        println!("no .typ files found");
         return Ok(());
     }
 
@@ -1875,8 +1875,8 @@ fn cmd_import(pile: &Path, branch: Option<&str>, path: PathBuf, tags: Vec<String
 
             let title = content
                 .lines()
-                .find(|l| l.starts_with("= ") || l.starts_with("# "))
-                .map(|l| l.trim_start_matches(|c| c == '=' || c == '#').trim().to_string())
+                .find(|l| l.starts_with("= "))
+                .map(|l| l.trim_start_matches('=').trim().to_string())
                 .unwrap_or_else(|| {
                     file.file_stem()
                         .unwrap_or_default()
@@ -1899,13 +1899,13 @@ fn cmd_import(pile: &Path, branch: Option<&str>, path: PathBuf, tags: Vec<String
     })
 }
 
-fn collect_wiki_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+fn collect_typ_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     for entry in fs::read_dir(dir).with_context(|| format!("read dir {}", dir.display()))? {
         let entry = entry?;
         let path = entry.path();
         if path.is_dir() {
-            collect_wiki_files(&path, out)?;
-        } else if path.extension().is_some_and(|e| e == "typ" || e == "md") {
+            collect_typ_files(&path, out)?;
+        } else if path.extension().is_some_and(|e| e == "typ") {
             out.push(path);
         }
     }
