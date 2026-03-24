@@ -1014,6 +1014,17 @@ fn cmd_check(pile: &Path, branch: Option<&str>, try_compile: bool) -> Result<()>
                 }
             }
 
+            // Check: markdown-style links [text](faculty:hex) — should be typst #link("faculty:hex")[text]
+            {
+                let md_link_re = regex::Regex::new(r"\[([^\]]+)\]\(((?:wiki|files):[^)]+)\)").unwrap();
+                for caps in md_link_re.captures_iter(content_str) {
+                    let text = &caps[1];
+                    let url = &caps[2];
+                    eprintln!("MD_LINK      {}  [{}]({})  in {}", frag_hex, text, url, title);
+                    issues += 1;
+                }
+            }
+
             // Check: typst compilation (in-process)
             if try_compile {
                 let world = typst_validate::ValidateWorld::new(content_str);
