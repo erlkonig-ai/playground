@@ -7,7 +7,10 @@
 //! hifitime = "4.2.3"
 //! rand_core = "0.6.4"
 //! regex = "1"
-//! triblespace = "0.22"
+//! triblespace = "0.24"
+//! typst = "0.14"
+//! typst-syntax = "0.14"
+//! comemo = "0.5.1"
 //! ```
 
 use anyhow::{Context, Result, bail};
@@ -199,7 +202,7 @@ enum Command {
     /// Check all fragments for common issues: invalid typst, broken links,
     /// truncated IDs, missing format tags.
     Check {
-        /// Also try compiling typst fragments (requires `typst` on PATH)
+        /// Also try compiling typst fragments (in-process, no external tools needed)
         #[arg(long)]
         compile: bool,
     },
@@ -516,11 +519,11 @@ fn link_label(
 // ── helpers ────────────────────────────────────────────────────────────────
 fn now_tai() -> Value<valueschemas::NsTAIInterval> {
     let now = Epoch::now().unwrap_or(Epoch::from_unix_seconds(0.0));
-    (now, now).to_value()
+    (now, now).try_to_value().expect("TAI interval")
 }
 
 fn interval_key(interval: Value<valueschemas::NsTAIInterval>) -> i128 {
-    let (lower, _): (Epoch, Epoch) = interval.from_value();
+    let (lower, _): (Epoch, Epoch) = interval.try_from_value().expect("TAI interval");
     lower.to_tai_duration().total_nanoseconds()
 }
 
@@ -657,32 +660,84 @@ fn ensure_tag_vocabulary(
     Ok(())
 }
 
-/// Create a new version entity, commit, and push.
-/// Validate typst content by attempting compilation. Returns Ok(()) if valid
-/// or if typst is not on PATH (graceful degradation). Returns Err if typst
-/// compilation fails.
+// ── in-process typst validation ──────────────────────────────────────
+
+mod typst_validate {
+    use typst::foundations::{Bytes, Datetime};
+    use typst::text::{Font, FontBook};
+    use typst::syntax::{FileId, Source, VirtualPath};
+    use typst::diag::FileResult;
+    use typst::utils::LazyHash;
+    use typst::{Library, LibraryExt, World};
+    use typst::layout::PagedDocument;
+
+    pub struct ValidateWorld {
+        library: LazyHash<Library>,
+        book: LazyHash<FontBook>,
+        main_id: FileId,
+        source: Source,
+    }
+
+    impl ValidateWorld {
+        pub fn new(content: &str) -> Self {
+            let main_id = FileId::new(None, VirtualPath::new("main.typ"));
+            let source = Source::new(main_id, content.to_string());
+            Self {
+                library: LazyHash::new(Library::default()),
+                book: LazyHash::new(FontBook::new()),
+                main_id,
+                source,
+            }
+        }
+
+        pub fn validate(&self) -> Result<(), Vec<String>> {
+            let result = typst::compile::<PagedDocument>(self);
+            match result.output {
+                Ok(_) => Ok(()),
+                Err(errors) => {
+                    let msgs: Vec<String> = errors.iter()
+                        // Font errors are expected (minimal world has no fonts).
+                        .filter(|e| !e.message.contains("no font"))
+                        .map(|e| {
+                            let mut msg = e.message.to_string();
+                            if let Some(range) = self.source.range(e.span) {
+                                let line = self.source.text()[..range.start]
+                                    .chars().filter(|&c| c == '\n').count() + 1;
+                                msg = format!("line {line}: {msg}");
+                            }
+                            msg
+                        }).collect();
+                    if msgs.is_empty() { Ok(()) } else { Err(msgs) }
+                }
+            }
+        }
+    }
+
+    impl World for ValidateWorld {
+        fn library(&self) -> &LazyHash<Library> { &self.library }
+        fn book(&self) -> &LazyHash<FontBook> { &self.book }
+        fn main(&self) -> FileId { self.main_id }
+        fn source(&self, id: FileId) -> FileResult<Source> {
+            if id == self.main_id {
+                Ok(self.source.clone())
+            } else {
+                Err(typst::diag::FileError::NotFound(id.vpath().as_rootless_path().into()))
+            }
+        }
+        fn file(&self, id: FileId) -> FileResult<Bytes> {
+            Err(typst::diag::FileError::NotFound(id.vpath().as_rootless_path().into()))
+        }
+        fn font(&self, _index: usize) -> Option<Font> { None }
+        fn today(&self, _offset: Option<i64>) -> Option<Datetime> { None }
+    }
+}
+
+/// Validate typst content by compiling in-process. No temp files, no shell-out.
 fn validate_typst(content: &str) -> Result<()> {
-    let tmp_dir = std::env::temp_dir().join("wiki-validate");
-    let _ = fs::create_dir_all(&tmp_dir);
-    let tmp_file = tmp_dir.join("check.typ");
-    fs::write(&tmp_file, content).context("write temp typst file")?;
-    let tmp_out = tmp_dir.join("check.pdf");
-    let output = std::process::Command::new("typst")
-        .args(["compile", &tmp_file.to_string_lossy(), &tmp_out.to_string_lossy()])
-        .output();
-    let _ = fs::remove_file(&tmp_file);
-    let _ = fs::remove_file(&tmp_out);
-    let _ = fs::remove_dir(&tmp_dir);
-    match output {
-        Ok(o) if o.status.success() => Ok(()),
-        Ok(o) => {
-            let stderr = String::from_utf8_lossy(&o.stderr);
-            bail!("typst compilation failed:\n{}", stderr.trim())
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            Ok(()) // typst not installed — skip validation
-        }
-        Err(e) => bail!("failed to run typst: {e}"),
+    let world = typst_validate::ValidateWorld::new(content);
+    match world.validate() {
+        Ok(()) => Ok(()),
+        Err(errors) => bail!("typst compilation failed:\n{}", errors.join("\n")),
     }
 }
 
@@ -892,9 +947,8 @@ fn cmd_check(pile: &Path, branch: Option<&str>, try_compile: bool) -> Result<()>
             pattern!(&space, [{ ?vid @ metadata::tag: &KIND_VERSION_ID }])
         ).collect();
 
-        let tag_index = TagIndex::load(ws)?;
-        let typst_tag_id = tag_index.by_name.get("typst").copied();
-        let markdown_tag_id = tag_index.by_name.get("markdown").copied();
+        let _tag_index = TagIndex::load(ws)?;
+        // All fragments are typst — no markdown path
 
         let mut issues = 0u32;
         let mut checked = 0u32;
@@ -915,10 +969,7 @@ fn cmd_check(pile: &Path, branch: Option<&str>, try_compile: bool) -> Result<()>
             let title = read_title(&space, ws, *vid).unwrap_or_else(|| "?".into());
             let frag_hex = fmt_id(*frag_id);
 
-            // Determine format (typst is default, markdown only if explicitly tagged)
-            let has_typst = typst_tag_id.is_some_and(|id| tags.contains(&id));
-            let has_markdown = markdown_tag_id.is_some_and(|id| tags.contains(&id));
-            let is_typst = has_typst || !has_markdown; // default to typst
+            // All fragments are typst (no markdown path)
 
             // Read content
             let Some(ch) = content_handle_of(&space, *vid) else {
@@ -963,31 +1014,18 @@ fn cmd_check(pile: &Path, branch: Option<&str>, try_compile: bool) -> Result<()>
                 }
             }
 
-            // Check: typst compilation
-            if try_compile && is_typst {
-                let tmp_file = tmp_dir.join(format!("{}.typ", frag_hex));
-                let tmp_out = tmp_dir.join(format!("{}.pdf", frag_hex));
-                let _ = fs::write(&tmp_file, content_str);
-                let output = std::process::Command::new("typst")
-                    .args(["compile", &tmp_file.to_string_lossy(), &tmp_out.to_string_lossy()])
-                    .output();
-                match output {
-                    Ok(o) if o.status.success() => { compile_ok += 1; }
-                    Ok(o) => {
-                        let stderr = String::from_utf8_lossy(&o.stderr);
-                        let first_line = stderr.lines().next().unwrap_or("unknown error");
-                        eprintln!("TYPST_ERROR  {}  {}  {}", frag_hex, title, first_line);
-                        compile_fail += 1;
-                        issues += 1;
-                    }
-                    Err(e) => {
-                        eprintln!("TYPST_ERROR  {}  {}  {}", frag_hex, title, e);
+            // Check: typst compilation (in-process)
+            if try_compile {
+                let world = typst_validate::ValidateWorld::new(content_str);
+                match world.validate() {
+                    Ok(()) => { compile_ok += 1; }
+                    Err(errors) => {
+                        let first = errors.first().map(|s| s.as_str()).unwrap_or("unknown");
+                        eprintln!("TYPST_ERROR  {}  {}  {}", frag_hex, title, first);
                         compile_fail += 1;
                         issues += 1;
                     }
                 }
-                let _ = fs::remove_file(&tmp_file);
-                let _ = fs::remove_file(&tmp_out);
             }
         }
 
@@ -1082,7 +1120,7 @@ fn cmd_import_all(pile: &Path, branch: Option<&str>, dir: PathBuf) -> Result<()>
     with_wiki(pile, branch, |repo, ws| {
         let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
         ensure_tag_vocabulary(repo, ws)?;
-        let tag_index = TagIndex::load(ws)?;
+        let _tag_index = TagIndex::load(ws)?;
 
         // Collect latest version per fragment (for content comparison + tag inheritance)
         let mut latest: HashMap<Id, Id> = HashMap::new();
@@ -1148,16 +1186,11 @@ fn cmd_import_all(pile: &Path, branch: Option<&str>, dir: PathBuf) -> Result<()>
             let tag_ids = tags_of(&space, prev_vid);
             let title = read_title(&space, ws, prev_vid).unwrap_or_default();
 
-            // Validate typst if tagged
-            let is_typst = tag_ids.iter().any(|id| {
-                tag_index.by_id.get(id).is_some_and(|name| name == "typst")
-            });
-            if is_typst {
-                if let Err(e) = validate_typst(&new_content) {
-                    eprintln!("TYPST_ERROR {}: {}", entry.path().display(), e);
-                    skipped += 1;
-                    continue;
-                }
+            // Always validate typst
+            if let Err(e) = validate_typst(&new_content) {
+                eprintln!("TYPST_ERROR {}: {}", entry.path().display(), e);
+                skipped += 1;
+                continue;
             }
 
             // Build new version
@@ -1216,10 +1249,8 @@ fn cmd_create(
         let mut tag_index = TagIndex::load(ws)?;
         let tag_ids = tag_index.resolve_or_mint(&tags, &mut change, ws)?;
 
-        // Validate typst if tagged
-        if tags.iter().any(|t| t.eq_ignore_ascii_case("typst")) {
-            validate_typst(&content)?;
-        }
+        // Always validate typst compilation
+        validate_typst(&content)?;
 
         let fragment_id = genid().id;
         let content_handle = ws.put(content);
@@ -1267,14 +1298,10 @@ fn cmd_edit(
             read_title(&space, ws, prev_vid).unwrap_or_default()
         });
         // Validate typst if tagged (either explicitly or inherited)
-        let is_typst = tag_ids.iter().any(|id| {
-            tag_index.by_id.get(id).is_some_and(|name| name == "typst")
-        });
         let content_handle = match &content {
             Some(text) => {
-                if is_typst {
-                    validate_typst(text)?;
-                }
+                // Always validate typst compilation
+                validate_typst(text)?;
                 ws.put(text.clone())
             }
             None => content_handle_of(&space, prev_vid)
