@@ -13,7 +13,6 @@ use clap::{CommandFactory, Parser, Subcommand};
 use ed25519_dalek::SigningKey;
 use rand_core::OsRng;
 use std::collections::{HashMap, HashSet};
-use std::fs;
 use std::path::{Path, PathBuf};
 use triblespace::core::metadata;
 use triblespace::core::repo::{Repository, Workspace};
@@ -132,19 +131,6 @@ enum Command {
     Show { id: String },
 }
 
-#[derive(Debug, Clone)]
-struct PersonRecord {
-    id: Id,
-    label: Option<String>,
-    first_name: Option<String>,
-    last_name: Option<String>,
-    display_name: Option<String>,
-    affinity: Option<String>,
-    note: Option<String>,
-    aliases: Vec<String>,
-    teams_user_id: Option<String>,
-    email: Option<String>,
-}
 
 fn fmt_id(id: Id) -> String {
     format!("{id:x}")
@@ -289,134 +275,51 @@ fn ensure_kind_entities(ws: &mut Workspace<Pile<valueschemas::Blake3>>) -> Resul
     Ok(change)
 }
 
-fn load_people(ws: &mut Workspace<Pile<valueschemas::Blake3>>) -> Result<Vec<PersonRecord>> {
-    let space = ws.checkout(..).map_err(|e| anyhow!("checkout: {e:?}"))?;
-    let mut people: HashMap<Id, PersonRecord> = HashMap::new();
+// ── on-demand person queries ─────────────────────────────────────────
 
-    for (person_id,) in find!(
-        (person_id: Id),
-        pattern!(&space, [{ ?person_id @ metadata::tag: &KIND_PERSON_ID }])
-    ) {
-        people.insert(
-            person_id,
-            PersonRecord {
-                id: person_id,
-                label: None,
-                first_name: None,
-                last_name: None,
-                display_name: None,
-                affinity: None,
-                note: None,
-                aliases: Vec::new(),
-                teams_user_id: None,
-                email: None,
-            },
-        );
-    }
+fn person_label(ws: &mut Workspace<Pile<valueschemas::Blake3>>, space: &TribleSet, id: Id) -> Option<String> {
+    find!(h: TextHandle, pattern!(space, [{ id @ metadata::name: ?h }]))
+        .next().and_then(|h| read_text(ws, h).ok())
+}
 
-    for (person_id, handle) in find!(
-        (person_id: Id, handle: TextHandle),
-        pattern!(&space, [{ ?person_id @ metadata::name: ?handle }])
-    ) {
-        if let Some(person) = people.get_mut(&person_id) {
-            let value = read_text(ws, handle)?;
-            if person.label.is_none() {
-                person.label = Some(value);
-            }
-        }
-    }
+fn person_first_name(ws: &mut Workspace<Pile<valueschemas::Blake3>>, space: &TribleSet, id: Id) -> Option<String> {
+    find!(h: TextHandle, pattern!(space, [{ id @ relations::first_name: ?h }]))
+        .next().and_then(|h| read_text(ws, h).ok())
+}
 
-    for (person_id, handle) in find!(
-        (person_id: Id, handle: TextHandle),
-        pattern!(&space, [{ ?person_id @ relations::display_name: ?handle }])
-    ) {
-        if let Some(person) = people.get_mut(&person_id) {
-            let value = read_text(ws, handle)?;
-            if person.display_name.is_none() {
-                person.display_name = Some(value);
-            }
-        }
-    }
+fn person_last_name(ws: &mut Workspace<Pile<valueschemas::Blake3>>, space: &TribleSet, id: Id) -> Option<String> {
+    find!(h: TextHandle, pattern!(space, [{ id @ relations::last_name: ?h }]))
+        .next().and_then(|h| read_text(ws, h).ok())
+}
 
-    for (person_id, handle) in find!(
-        (person_id: Id, handle: TextHandle),
-        pattern!(&space, [{ ?person_id @ relations::first_name: ?handle }])
-    ) {
-        if let Some(person) = people.get_mut(&person_id) {
-            let value = read_text(ws, handle)?;
-            if person.first_name.is_none() {
-                person.first_name = Some(value);
-            }
-        }
-    }
+fn person_display_name(ws: &mut Workspace<Pile<valueschemas::Blake3>>, space: &TribleSet, id: Id) -> Option<String> {
+    find!(h: TextHandle, pattern!(space, [{ id @ relations::display_name: ?h }]))
+        .next().and_then(|h| read_text(ws, h).ok())
+}
 
-    for (person_id, handle) in find!(
-        (person_id: Id, handle: TextHandle),
-        pattern!(&space, [{ ?person_id @ relations::last_name: ?handle }])
-    ) {
-        if let Some(person) = people.get_mut(&person_id) {
-            let value = read_text(ws, handle)?;
-            if person.last_name.is_none() {
-                person.last_name = Some(value);
-            }
-        }
-    }
+fn person_affinity(space: &TribleSet, id: Id) -> Option<String> {
+    find!(v: String, pattern!(space, [{ id @ relations::affinity: ?v }])).next()
+}
 
-    for (person_id, value) in find!(
-        (person_id: Id, value: String),
-        pattern!(&space, [{ ?person_id @ relations::affinity: ?value }])
-    ) {
-        if let Some(person) = people.get_mut(&person_id) {
-            if person.affinity.is_none() {
-                person.affinity = Some(value);
-            }
-        }
-    }
+fn person_note(ws: &mut Workspace<Pile<valueschemas::Blake3>>, space: &TribleSet, id: Id) -> Option<String> {
+    find!(h: TextHandle, pattern!(space, [{ id @ metadata::description: ?h }]))
+        .next().and_then(|h| read_text(ws, h).ok())
+}
 
-    for (person_id, handle) in find!(
-        (person_id: Id, handle: TextHandle),
-        pattern!(&space, [{ ?person_id @ metadata::description: ?handle }])
-    ) {
-        if let Some(person) = people.get_mut(&person_id) {
-            let value = read_text(ws, handle)?;
-            if person.note.is_none() {
-                person.note = Some(value);
-            }
-        }
-    }
+fn person_teams_user_id(space: &TribleSet, id: Id) -> Option<String> {
+    find!(v: String, pattern!(space, [{ id @ relations::teams_user_id: ?v }])).next()
+}
 
-    for (person_id, value) in find!(
-        (person_id: Id, value: String),
-        pattern!(&space, [{ ?person_id @ relations::teams_user_id: ?value }])
-    ) {
-        if let Some(person) = people.get_mut(&person_id) {
-            if person.teams_user_id.is_none() {
-                person.teams_user_id = Some(value);
-            }
-        }
-    }
+fn person_email(space: &TribleSet, id: Id) -> Option<String> {
+    find!(v: String, pattern!(space, [{ id @ relations::email: ?v }])).next()
+}
 
-    for (person_id, value) in find!(
-        (person_id: Id, value: String),
-        pattern!(&space, [{ ?person_id @ relations::email: ?value }])
-    ) {
-        if let Some(person) = people.get_mut(&person_id) {
-            if person.email.is_none() {
-                person.email = Some(value);
-            }
-        }
-    }
+fn person_aliases(space: &TribleSet, id: Id) -> Vec<String> {
+    find!(v: String, pattern!(space, [{ id @ relations::alias: ?v }])).collect()
+}
 
-    for (person_id, value) in find!(
-        (person_id: Id, value: String),
-        pattern!(&space, [{ ?person_id @ relations::alias: ?value }])
-    ) {
-        if let Some(person) = people.get_mut(&person_id) {
-            person.aliases.push(value);
-        }
-    }
-
-    Ok(people.into_values().collect())
+fn all_person_ids(space: &TribleSet) -> Vec<Id> {
+    find!(id: Id, pattern!(space, [{ ?id @ metadata::tag: &KIND_PERSON_ID }])).collect()
 }
 
 fn find_people_by_lookup_key(space: &TribleSet, key: &str) -> HashSet<Id> {
@@ -623,29 +526,33 @@ fn cmd_list(pile: &Path, _branch_name: &str, branch_id: Id, limit: usize) -> Res
         let mut ws = repo
             .pull(branch_id)
             .map_err(|e| anyhow!("pull workspace: {e:?}"))?;
-        let mut people = load_people(&mut ws)?;
-        people.sort_by(|a, b| a.label.cmp(&b.label).then_with(|| a.id.cmp(&b.id)));
+        let space = ws.checkout(..).map_err(|e| anyhow!("checkout: {e:?}"))?;
 
-        if people.is_empty() {
+        let mut ids: Vec<(Option<String>, Id)> = all_person_ids(&space)
+            .into_iter()
+            .map(|id| (person_label(&mut ws, &space, id), id))
+            .collect();
+        ids.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+
+        if ids.is_empty() {
             println!("No people.");
         } else {
-            for person in people.into_iter().take(limit) {
-                let label = person
-                    .label
-                    .clone()
-                    .unwrap_or_else(|| "<unnamed>".to_string());
-                let mut line = format!("[{}] {}", fmt_id(person.id), label);
-                let fallback_name = match (&person.first_name, &person.last_name) {
-                    (Some(first), Some(last)) => Some(format!("{first} {last}")),
-                    (Some(first), None) => Some(first.clone()),
-                    (None, Some(last)) => Some(last.clone()),
+            for (label, id) in ids.into_iter().take(limit) {
+                let label = label.as_deref().unwrap_or("<unnamed>");
+                let mut line = format!("[{}] {}", fmt_id(id), label);
+                let first = person_first_name(&mut ws, &space, id);
+                let last = person_last_name(&mut ws, &space, id);
+                let fallback_name = match (&first, &last) {
+                    (Some(f), Some(l)) => Some(format!("{f} {l}")),
+                    (Some(f), None) => Some(f.clone()),
+                    (None, Some(l)) => Some(l.clone()),
                     (None, None) => None,
                 };
-                let display = person.display_name.as_ref().or(fallback_name.as_ref());
+                let display = person_display_name(&mut ws, &space, id).or(fallback_name);
                 if let Some(display) = display {
                     line.push_str(&format!(" ({display})"));
                 }
-                if let Some(affinity) = &person.affinity {
+                if let Some(affinity) = person_affinity(&space, id) {
                     line.push_str(&format!(" [{affinity}]"));
                 }
                 println!("{line}");
@@ -662,40 +569,37 @@ fn cmd_show(pile: &Path, _branch_name: &str, branch_id: Id, id: String) -> Resul
             .map_err(|e| anyhow!("pull workspace: {e:?}"))?;
         let space = ws.checkout(..).map_err(|e| anyhow!("checkout: {e:?}"))?;
         let person_id = resolve_person_id(&space, &id)?;
-        let people = load_people(&mut ws)?;
-        let Some(person) = people.into_iter().find(|p| p.id == person_id) else {
-            bail!("unknown person id {id}");
-        };
 
-        println!("id: {:x}", person.id);
-        if let Some(label) = person.label {
+        println!("id: {:x}", person_id);
+        if let Some(label) = person_label(&mut ws, &space, person_id) {
             println!("label: {label}");
         }
-        if let Some(first) = person.first_name {
+        if let Some(first) = person_first_name(&mut ws, &space, person_id) {
             println!("first_name: {first}");
         }
-        if let Some(last) = person.last_name {
+        if let Some(last) = person_last_name(&mut ws, &space, person_id) {
             println!("last_name: {last}");
         }
-        if let Some(display) = person.display_name {
+        if let Some(display) = person_display_name(&mut ws, &space, person_id) {
             println!("display_name: {display}");
         }
-        if let Some(affinity) = person.affinity {
+        if let Some(affinity) = person_affinity(&space, person_id) {
             println!("affinity: {affinity}");
         }
-        if let Some(value) = person.teams_user_id {
+        if let Some(value) = person_teams_user_id(&space, person_id) {
             println!("teams_user_id: {value}");
         }
-        if let Some(value) = person.email {
+        if let Some(value) = person_email(&space, person_id) {
             println!("email: {value}");
         }
-        if !person.aliases.is_empty() {
+        let aliases = person_aliases(&space, person_id);
+        if !aliases.is_empty() {
             println!("aliases:");
-            for alias in person.aliases {
+            for alias in aliases {
                 println!("- {alias}");
             }
         }
-        if let Some(note) = person.note {
+        if let Some(note) = person_note(&mut ws, &space, person_id) {
             println!("note:");
             println!("{note}");
         }

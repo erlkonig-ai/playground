@@ -797,186 +797,198 @@ _Live view of the agent pile, exec queue, and message activity._"
         });
     });
 
-    // ── Card 3: Agent (Overview + Agent Config + Context Compaction) ─
+    // ── Overview ─
     nb.view(move |ui| {
         let mut state = dashboard.read_mut(ui);
-        ui.with_padding(padding, |ui| {
-            ui.heading("Agent");
-
-            ui.section("Overview", |ui| {
-                let (pile_path, branches) = {
-                    let Some(snapshot) = snapshot_or_message(ui, &state.snapshot) else {
-                        return;
-                    };
-                    (snapshot.pile_path.clone(), snapshot.branches.clone())
-                };
-
-                ui.horizontal(|ui| {
-                    ui.label(format!("Pile: {}", pile_path.display()));
-                });
-
-                if branches.is_empty() {
-                    return;
-                }
-
-                let mut primary: Vec<BranchEntry> = Vec::new();
-                let mut extra: Vec<BranchEntry> = Vec::new();
-                for branch in branches {
-                    let label = branch.name.as_deref().unwrap_or("<unnamed>");
-                    if label.contains("--orphan-") || label.starts_with('<') {
-                        extra.push(branch);
-                    } else {
-                        primary.push(branch);
-                    }
-                }
-
-                ui.label(format!(
-                    "Branches: {} primary, {} extra",
-                    primary.len(),
-                    extra.len()
-                ));
-
-                ui.label("Primary:");
-                for branch in &primary {
-                    let label = branch.name.as_deref().unwrap_or("<unnamed>");
-                    ui.label(format!("- {label} ({})", id_prefix(branch.id)));
-                }
-
-                if !extra.is_empty() {
-                    let button_label = if state.show_extra_branches {
-                        "Hide extra branches"
-                    } else {
-                        "Show extra branches"
-                    };
-                    if ui.add(Button::new(button_label)).clicked() {
-                        state.show_extra_branches = !state.show_extra_branches;
-                    }
-
-                    if state.show_extra_branches {
-                        ui.add_space(8.0);
-                        ui.label("Extra:");
-                        for branch in &extra {
-                            let label = branch.name.as_deref().unwrap_or("<unnamed>");
-                            ui.label(format!("- {label} ({})", id_prefix(branch.id)));
-                        }
-                    }
-                }
-            });
-
-            ui.section("Agent Config", |ui| {
-                let snapshot = {
-                    let Some(snapshot) = snapshot_or_message(ui, &state.snapshot) else {
-                        return;
-                    };
-                    snapshot.clone()
-                };
-                if let Some(err) = &snapshot.agent_config_error {
-                    ui.colored_label(egui::Color32::RED, err);
-                } else {
-                    render_agent_config(
-                        ui,
-                        &mut state,
-                        snapshot.now_key,
-                        snapshot.agent_config.as_ref(),
-                    );
-                }
-            });
-
-            ui.section("Context Compaction", |ui| {
-                let snapshot = {
-                    let Some(snapshot) = snapshot_or_message(ui, &state.snapshot) else {
-                        return;
-                    };
-                    snapshot.clone()
-                };
-                if snapshot.context_chunks.is_empty() {
-                    ui.label("No context chunks yet.");
-                    return;
-                }
-                render_context_compaction(
-                    ui,
-                    &mut state,
-                    snapshot.now_key,
-                    &snapshot.context_chunks,
-                    snapshot.context_selected.as_ref(),
-                );
-            });
-        });
-    });
-
-    // ── Card 4: Social & Planning (Compass + Messages + Relations + Teams) ─
-    nb.view(move |ui| {
-        let mut state = dashboard.read_mut(ui);
-        ui.with_padding(padding, |ui| {
-            ui.heading("Social & Planning");
-
-            ui.section("Compass", |ui| {
-                let snapshot = {
-                    let Some(snapshot) = snapshot_or_message(ui, &state.snapshot) else {
-                        return;
-                    };
-                    snapshot.clone()
-                };
-                if let Some(err) = &snapshot.compass_error {
-                    ui.colored_label(egui::Color32::RED, err);
-                    return;
-                }
-
-                if snapshot.compass_rows.is_empty() {
-                    ui.label("No goals yet.");
-                    return;
-                }
-                render_compass_swimlanes(
-                    ui,
-                    &mut state.compass_expanded_goal,
-                    &snapshot.compass_rows,
-                    &snapshot.compass_notes,
-                );
-            });
-
-            ui.section("Messages", |ui| {
-                let snapshot = {
-                    let Some(snapshot) = snapshot_or_message(ui, &state.snapshot) else {
-                        return;
-                    };
-                    snapshot.clone()
-                };
-                if let Some(err) = &snapshot.local_message_error {
-                    ui.colored_label(egui::Color32::RED, err);
-                }
-                render_local_composer(ui, &mut state, &snapshot.branches, &snapshot);
-            });
-
-            ui.section("Relations", |ui| {
+        ui.section("Overview", |ui| {
+            let (pile_path, branches) = {
                 let Some(snapshot) = snapshot_or_message(ui, &state.snapshot) else {
                     return;
                 };
-                if let Some(err) = &snapshot.relations_error {
-                    ui.colored_label(egui::Color32::RED, err);
-                } else {
-                    render_relations(ui, &snapshot.relations_people);
-                }
+                (snapshot.pile_path.clone(), snapshot.branches.clone())
+            };
+
+            ui.horizontal(|ui| {
+                ui.label(format!("Pile: {}", pile_path.display()));
             });
 
-            ui.section("Teams", |ui| {
-                let snapshot = {
-                    let Some(snapshot) = snapshot_or_message(ui, &state.snapshot) else {
-                        return;
-                    };
-                    snapshot.clone()
-                };
-                if let Some(err) = &snapshot.teams_error {
-                    ui.colored_label(egui::Color32::RED, err);
+            if branches.is_empty() {
+                return;
+            }
+
+            let mut primary: Vec<BranchEntry> = Vec::new();
+            let mut extra: Vec<BranchEntry> = Vec::new();
+            for branch in branches {
+                let label = branch.name.as_deref().unwrap_or("<unnamed>");
+                if label.contains("--orphan-") || label.starts_with('<') {
+                    extra.push(branch);
                 } else {
-                    render_teams_conversations(
-                        ui,
-                        &mut state,
-                        snapshot.now_key,
-                        &snapshot.teams_chats,
-                        &snapshot.teams_messages,
-                    );
+                    primary.push(branch);
                 }
-            });
+            }
+
+            ui.label(format!(
+                "Branches: {} primary, {} extra",
+                primary.len(),
+                extra.len()
+            ));
+
+            ui.label("Primary:");
+            for branch in &primary {
+                let label = branch.name.as_deref().unwrap_or("<unnamed>");
+                ui.label(format!("- {label} ({})", id_prefix(branch.id)));
+            }
+
+            if !extra.is_empty() {
+                let button_label = if state.show_extra_branches {
+                    "Hide extra branches"
+                } else {
+                    "Show extra branches"
+                };
+                if ui.add(Button::new(button_label)).clicked() {
+                    state.show_extra_branches = !state.show_extra_branches;
+                }
+
+                if state.show_extra_branches {
+                    ui.add_space(8.0);
+                    ui.label("Extra:");
+                    for branch in &extra {
+                        let label = branch.name.as_deref().unwrap_or("<unnamed>");
+                        ui.label(format!("- {label} ({})", id_prefix(branch.id)));
+                    }
+                }
+            }
+        });
+    });
+
+    // ── Agent Config ─
+    nb.view(move |ui| {
+        let mut state = dashboard.read_mut(ui);
+        ui.section("Agent Config", |ui| {
+            let snapshot = {
+                let Some(snapshot) = snapshot_or_message(ui, &state.snapshot) else {
+                    return;
+                };
+                snapshot.clone()
+            };
+            if let Some(err) = &snapshot.agent_config_error {
+                ui.colored_label(egui::Color32::RED, err);
+            } else {
+                render_agent_config(
+                    ui,
+                    &mut state,
+                    snapshot.now_key,
+                    snapshot.agent_config.as_ref(),
+                );
+            }
+        });
+    });
+
+    // ── Context Compaction ─
+    nb.view(move |ui| {
+        let mut state = dashboard.read_mut(ui);
+        ui.section("Context Compaction", |ui| {
+            let snapshot = {
+                let Some(snapshot) = snapshot_or_message(ui, &state.snapshot) else {
+                    return;
+                };
+                snapshot.clone()
+            };
+            if snapshot.context_chunks.is_empty() {
+                ui.label("No context chunks yet.");
+                return;
+            }
+            render_context_compaction(
+                ui,
+                &mut state,
+                snapshot.now_key,
+                &snapshot.context_chunks,
+                snapshot.context_selected.as_ref(),
+            );
+        });
+    });
+
+    // ── Compass ─
+    nb.view(move |ui| {
+        let mut state = dashboard.read_mut(ui);
+        ui.section("Compass", |ui| {
+            let snapshot = {
+                let Some(snapshot) = snapshot_or_message(ui, &state.snapshot) else {
+                    return;
+                };
+                snapshot.clone()
+            };
+            if let Some(err) = &snapshot.compass_error {
+                ui.colored_label(egui::Color32::RED, err);
+                return;
+            }
+
+            if snapshot.compass_rows.is_empty() {
+                ui.label("No goals yet.");
+                return;
+            }
+            render_compass_swimlanes(
+                ui,
+                &mut state.compass_expanded_goal,
+                &snapshot.compass_rows,
+                &snapshot.compass_notes,
+            );
+        });
+    });
+
+    // ── Messages ─
+    nb.view(move |ui| {
+        let mut state = dashboard.read_mut(ui);
+        ui.section("Messages", |ui| {
+            let snapshot = {
+                let Some(snapshot) = snapshot_or_message(ui, &state.snapshot) else {
+                    return;
+                };
+                snapshot.clone()
+            };
+            if let Some(err) = &snapshot.local_message_error {
+                ui.colored_label(egui::Color32::RED, err);
+            }
+            render_local_composer(ui, &mut state, &snapshot.branches, &snapshot);
+        });
+    });
+
+    // ── Relations ─
+    nb.view(move |ui| {
+        let state = dashboard.read_mut(ui);
+        ui.section("Relations", |ui| {
+            let Some(snapshot) = snapshot_or_message(ui, &state.snapshot) else {
+                return;
+            };
+            if let Some(err) = &snapshot.relations_error {
+                ui.colored_label(egui::Color32::RED, err);
+            } else {
+                render_relations(ui, &snapshot.relations_people);
+            }
+        });
+    });
+
+    // ── Teams ─
+    nb.view(move |ui| {
+        let mut state = dashboard.read_mut(ui);
+        ui.section("Teams", |ui| {
+            let snapshot = {
+                let Some(snapshot) = snapshot_or_message(ui, &state.snapshot) else {
+                    return;
+                };
+                snapshot.clone()
+            };
+            if let Some(err) = &snapshot.teams_error {
+                ui.colored_label(egui::Color32::RED, err);
+            } else {
+                render_teams_conversations(
+                    ui,
+                    &mut state,
+                    snapshot.now_key,
+                    &snapshot.teams_chats,
+                    &snapshot.teams_messages,
+                );
+            }
         });
     });
 

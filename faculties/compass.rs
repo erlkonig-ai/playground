@@ -861,75 +861,80 @@ fn cmd_show(pile: &Path, _branch_name: &str, branch_id: Id, id: String) -> Resul
         let mut ws = repo
             .pull(branch_id)
             .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
-        let board = load_board(&mut ws)?;
+        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
 
-        let task = board
-            .tasks
-            .get(&task_id)
-            .ok_or_else(|| anyhow::anyhow!("goal missing"))?;
-        let status_events: Vec<_> = board
-            .status_events
-            .iter()
-            .filter(|ev| ev.task == task_id)
-            .cloned()
-            .collect();
-        let note_events: Vec<_> = board
-            .note_events
-            .iter()
-            .filter(|ev| ev.task == task_id)
-            .cloned()
-            .collect();
-
-        let current_status = status_events
-            .iter()
-            .max_by(|a, b| a.at.cmp(&b.at))
-            .cloned();
+        let title = task_title(&mut ws, &space, task_id);
+        if title.is_empty() {
+            bail!("goal missing");
+        }
 
         println!("Goal {:x}", task_id);
-        println!("Title: {}", task.title);
-        println!("Created: {}", task.created_at);
-        if let Some(status) = current_status {
-            println!("Status: {} (since {})", status.status, status.at);
+        println!("Title: {}", title);
+        println!("Created: {}", task_created_at(&space, task_id));
+
+        if let Some((status, at)) = task_latest_status(&space, task_id) {
+            println!("Status: {} (since {})", status, at);
         }
-        if !task.tags.is_empty() {
-            let mut tags = task.tags.clone();
-            tags.sort();
-            tags.dedup();
+
+        let tags = task_tags(&space, task_id);
+        if !tags.is_empty() {
             println!("Tags: {}", tags.join(", "));
         }
-        if let Some(parent_id) = task.parent {
+
+        if let Some(parent_id) = task_parent(&space, task_id) {
             let parent_hex = fmt_id(parent_id);
-            let parent_label = board
-                .tasks
-                .get(&parent_id)
-                .map(|parent| format!("{} ({parent_hex})", parent.title))
-                .unwrap_or_else(|| parent_hex.clone());
-            println!("Parent: {}", parent_label);
+            let parent_title = task_title(&mut ws, &space, parent_id);
+            if parent_title.is_empty() {
+                println!("Parent: {parent_hex}");
+            } else {
+                println!("Parent: {parent_title} ({parent_hex})");
+            }
         }
 
-        if !status_events.is_empty() {
-            let mut history = status_events;
-            history.sort_by(|a, b| a.at.cmp(&b.at));
+        // Status history for this task.
+        let mut history: Vec<(String, String)> = find!(
+            (status: String, at: String),
+            pattern!(&space, [{
+                _?evt @
+                metadata::tag: &KIND_STATUS_ID,
+                board::task: &task_id,
+                board::status: ?status,
+                board::at: ?at,
+            }])
+        ).collect();
+        if !history.is_empty() {
+            history.sort_by(|a, b| a.1.cmp(&b.1));
             println!();
             println!("Status history:");
-            for ev in history {
-                println!("- {} {}", ev.at, ev.status);
+            for (status, at) in &history {
+                println!("- {at} {status}");
             }
         }
 
-        if !note_events.is_empty() {
-            let mut notes = note_events;
-            notes.sort_by(|a, b| a.at.cmp(&b.at));
+        // Notes for this task.
+        let mut notes: Vec<(String, String)> = find!(
+            (note_handle: TextHandle, at: String),
+            pattern!(&space, [{
+                _?evt @
+                metadata::tag: &KIND_NOTE_ID,
+                board::task: &task_id,
+                board::note: ?note_handle,
+                board::at: ?at,
+            }])
+        )
+        .filter_map(|(h, at)| read_text(&mut ws, h).ok().map(|text| (text, at)))
+        .collect();
+        if !notes.is_empty() {
+            notes.sort_by(|a, b| a.1.cmp(&b.1));
             println!();
             println!("Notes:");
-            for ev in &notes {
-                println!("- {} {}", ev.at, ev.note);
+            for (text, at) in &notes {
+                println!("- {at} {text}");
             }
 
-            // Collect references from all notes.
             let mut all_refs = Vec::new();
-            for ev in &notes {
-                all_refs.extend(extract_references(&ev.note));
+            for (text, _) in &notes {
+                all_refs.extend(extract_references(text));
             }
             all_refs.sort();
             all_refs.dedup();
@@ -959,25 +964,23 @@ fn cmd_prioritize(
         let mut ws = repo
             .pull(branch_id)
             .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
-        let board = load_board(&mut ws)?;
+        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
 
         if higher_id == lower_id {
             bail!("cannot prioritize a goal over itself");
         }
 
         // Build full edge set (explicit + implicit child→parent)
-        let mut edges = active_priority_edges(&board.priority_events);
-        for task in board.tasks.values() {
-            if let Some(parent) = task.parent {
-                edges.insert((task.id, parent));
+        let mut edges = active_priority_edges(&space);
+        for id in all_goal_ids(&space) {
+            if let Some(parent) = task_parent(&space, id) {
+                edges.insert((id, parent));
             }
         }
 
-        // Reject if this would create a cycle (covers ancestor-chain violations too,
-        // since implicit child→parent edges make parent>child a cycle)
         if would_create_cycle(&edges, higher_id, lower_id) {
-            if is_ancestor(&board.tasks, higher_id, lower_id)
-                || is_ancestor(&board.tasks, lower_id, higher_id)
+            if is_ancestor(&space, higher_id, lower_id)
+                || is_ancestor(&space, lower_id, higher_id)
             {
                 bail!("children are implicitly prioritized over their parents");
             }
@@ -999,9 +1002,9 @@ fn cmd_prioritize(
         repo.push(&mut ws)
             .map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
 
-        let h_title = board.tasks.get(&higher_id).map(|t| t.title.as_str()).unwrap_or("?");
-        let l_title = board.tasks.get(&lower_id).map(|t| t.title.as_str()).unwrap_or("?");
-        println!("{h_title} > {l_title}");
+        let h_title = task_title(&mut ws, &space, higher_id);
+        let l_title = task_title(&mut ws, &space, lower_id);
+        println!("{} > {}", if h_title.is_empty() { "?" } else { &h_title }, if l_title.is_empty() { "?" } else { &l_title });
         Ok(())
     })
 }
@@ -1020,9 +1023,9 @@ fn cmd_deprioritize(
         let mut ws = repo
             .pull(branch_id)
             .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
-        let board = load_board(&mut ws)?;
+        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
 
-        let edges = active_priority_edges(&board.priority_events);
+        let edges = active_priority_edges(&space);
         if !edges.contains(&(higher_id, lower_id)) {
             bail!("no active priority relationship between these goals");
         }
@@ -1042,9 +1045,9 @@ fn cmd_deprioritize(
         repo.push(&mut ws)
             .map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
 
-        let h_title = board.tasks.get(&higher_id).map(|t| t.title.as_str()).unwrap_or("?");
-        let l_title = board.tasks.get(&lower_id).map(|t| t.title.as_str()).unwrap_or("?");
-        println!("Removed: {h_title} > {l_title}");
+        let h_title = task_title(&mut ws, &space, higher_id);
+        let l_title = task_title(&mut ws, &space, lower_id);
+        println!("Removed: {} > {}", if h_title.is_empty() { "?" } else { &h_title }, if l_title.is_empty() { "?" } else { &l_title });
         Ok(())
     })
 }
@@ -1054,8 +1057,8 @@ fn cmd_resolve(pile: &Path, _branch_name: &str, branch_id: Id, prefix: String) -
         let mut ws = repo
             .pull(branch_id)
             .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
-        let board = load_board(&mut ws)?;
-        let id = resolve_task_id(&prefix, &board.tasks)?;
+        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let id = resolve_task_id(&prefix, &space)?;
         println!("{:x}", id);
         Ok(())
     })

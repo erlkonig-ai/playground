@@ -18,7 +18,6 @@ use chrono::{
 use clap::{CommandFactory, Parser, Subcommand};
 use hifitime::Epoch;
 use std::collections::HashMap;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 use triblespace::core::blob::schemas::simplearchive::SimpleArchive;
@@ -160,27 +159,6 @@ struct MessageRow {
     created_at: i128,
 }
 
-#[derive(Debug, Clone)]
-struct Task {
-    id: Id,
-    title: String,
-    created_at: String,
-    tags: Vec<String>,
-    parent: Option<Id>,
-}
-
-#[derive(Debug, Clone)]
-struct StatusEvent {
-    task: Id,
-    status: String,
-    at: String,
-}
-
-#[derive(Debug, Clone)]
-struct BoardState {
-    tasks: HashMap<Id, Task>,
-    status_events: Vec<StatusEvent>,
-}
 
 #[derive(Debug, Clone, Default)]
 struct ConfigIdentity {
@@ -226,31 +204,11 @@ fn fmt_id(id: Id) -> String {
     format!("{id:x}")
 }
 
-fn load_relations_labels(
-    repo: &mut Repository<Pile<valueschemas::Blake3>>,
-    branch_id: Id,
-) -> Result<HashMap<Id, String>> {
-    let mut ws = repo
-        .pull(branch_id)
-        .map_err(|e| anyhow!("pull relations workspace: {e:?}"))?;
-    let space = ws
-        .checkout(..)
-        .map_err(|e| anyhow!("checkout relations: {e:?}"))?;
-    let mut labels = HashMap::new();
-    for (person_id, handle) in find!(
-        (person_id: Id, handle: TextHandle),
-        pattern!(&space, [{
-            ?person_id @
-            metadata::tag: &KIND_PERSON_ID,
-            metadata::name: ?handle,
-        }])
-    ) {
-        let Ok(label) = read_text(&mut ws, handle) else {
-            continue;
-        };
-        labels.insert(person_id, label);
-    }
-    Ok(labels)
+fn person_label(ws: &mut Workspace<Pile<valueschemas::Blake3>>, space: &TribleSet, person_id: Id) -> String {
+    find!(h: TextHandle, pattern!(space, [{ person_id @ metadata::name: ?h }]))
+        .next()
+        .and_then(|h| read_text(ws, h).ok())
+        .unwrap_or_else(|| fmt_id(person_id))
 }
 
 fn read_text(ws: &mut Workspace<Pile<valueschemas::Blake3>>, handle: TextHandle) -> Result<String> {
@@ -327,92 +285,35 @@ fn load_reads(space: &TribleSet) -> HashMap<(Id, Id), i128> {
     reads
 }
 
-fn load_board(ws: &mut Workspace<Pile<valueschemas::Blake3>>) -> Result<BoardState> {
-    let space = ws
-        .checkout(..)
-        .map_err(|e| anyhow!("checkout board: {e:?}"))?;
-
-    let mut tasks = HashMap::new();
-    for (task_id, title_handle, created_at) in find!(
-        (task: Id, title: TextHandle, created: String),
-        pattern!(&space, [{
-            ?task @
-                metadata::tag: &KIND_GOAL_ID,
-                board::title: ?title,
-                board::created_at: ?created
-        }])
-    ) {
-        if tasks.contains_key(&task_id) {
-            continue;
-        }
-        let title = read_text(ws, title_handle)?;
-        tasks.insert(
-            task_id,
-            Task {
-                id: task_id,
-                title,
-                created_at,
-                tags: Vec::new(),
-                parent: None,
-            },
-        );
-    }
-
-    for (task_id, tag) in find!(
-        (task: Id, tag: String),
-        pattern!(&space, [{ ?task @ metadata::tag: &KIND_GOAL_ID, board::tag: ?tag }])
-    ) {
-        if let Some(task) = tasks.get_mut(&task_id) {
-            task.tags.push(tag);
-        }
-    }
-
-    for (task_id, parent_id) in find!(
-        (task: Id, parent: Id),
-        pattern!(&space, [{ ?task @ metadata::tag: &KIND_GOAL_ID, board::parent: ?parent }])
-    ) {
-        if let Some(task) = tasks.get_mut(&task_id) {
-            task.parent = Some(parent_id);
-        }
-    }
-
-    let mut status_events = Vec::new();
-    for (task_id, status, at) in find!(
-        (task: Id, status: String, at: String),
-        pattern!(&space, [{
-            _?evt @
-                metadata::tag: &KIND_STATUS_ID,
-                board::task: ?task,
-                board::status: ?status,
-                board::at: ?at
-        }])
-    ) {
-        status_events.push(StatusEvent {
-            task: task_id,
-            status,
-            at,
-        });
-    }
-
-    Ok(BoardState {
-        tasks,
-        status_events,
-    })
+fn task_title(ws: &mut Workspace<Pile<valueschemas::Blake3>>, space: &TribleSet, task_id: Id) -> String {
+    find!(h: TextHandle, pattern!(space, [{ task_id @ board::title: ?h }]))
+        .next()
+        .and_then(|h| read_text(ws, h).ok())
+        .unwrap_or_default()
 }
 
-fn latest_status(events: &[StatusEvent]) -> HashMap<Id, StatusEvent> {
-    let mut latest = HashMap::new();
-    for event in events {
-        latest
-            .entry(event.task)
-            .and_modify(|current: &mut StatusEvent| {
-                if event.at > current.at {
-                    *current = event.clone();
-                }
-            })
-            .or_insert_with(|| event.clone());
-    }
-    latest
+fn task_tags(space: &TribleSet, task_id: Id) -> Vec<String> {
+    let mut tags: Vec<String> = find!(
+        tag: String,
+        pattern!(space, [{ task_id @ metadata::tag: &KIND_GOAL_ID, board::tag: ?tag }])
+    ).collect();
+    tags.sort();
+    tags.dedup();
+    tags
+}
+
+fn task_latest_status(space: &TribleSet, task_id: Id) -> Option<(String, String)> {
+    find!(
+        (status: String, at: String),
+        pattern!(space, [{
+            _?evt @
+            metadata::tag: &KIND_STATUS_ID,
+            board::task: &task_id,
+            board::status: ?status,
+            board::at: ?at,
+        }])
+    )
+    .max_by(|a, b| a.1.cmp(&b.1))
 }
 
 fn load_config_identity(
@@ -488,13 +389,23 @@ fn cmd_show(pile: &Path, message_limit: usize, doing_limit: usize, todo_limit: u
                 "missing persona_id in config (set via `playground config set persona-id <hex-id>`)"
             )
         })?;
-        let party_names = load_relations_labels(repo, relations_branch_id)?;
-        if !party_names.contains_key(&reader_id) {
+        let mut relations_ws = repo
+            .pull(relations_branch_id)
+            .map_err(|e| anyhow!("pull relations workspace: {e:?}"))?;
+        let relations_space = relations_ws.checkout(..).map_err(|e| anyhow!("checkout relations: {e:?}"))?;
+
+        // Verify persona exists in relations.
+        let reader_exists = find!(
+            _id: Id,
+            pattern!(&relations_space, [{ reader_id @ metadata::tag: &KIND_PERSON_ID }])
+        ).next().is_some();
+        if !reader_exists {
             bail!(
                 "persona_id {:x} missing from relations (add via relations faculty)",
                 reader_id
             );
         }
+
         let reads = load_reads(&local_space);
         let mut messages = load_messages(&mut local_ws, &local_space)?;
 
@@ -509,23 +420,14 @@ fn cmd_show(pile: &Path, message_limit: usize, doing_limit: usize, todo_limit: u
         let now_key = interval_key(epoch_interval(now_epoch()));
 
         println!("Orient");
-        let reader_label = party_names
-            .get(&reader_id)
-            .cloned()
-            .unwrap_or_else(|| fmt_id(reader_id));
+        let reader_label = person_label(&mut relations_ws, &relations_space, reader_id);
         println!("Local messages (unread inbox for {}):", reader_label);
         if messages.is_empty() {
             println!("- None");
         } else {
             for msg in &messages {
-                let from_label = party_names
-                    .get(&msg.from)
-                    .cloned()
-                    .unwrap_or_else(|| fmt_id(msg.from));
-                let to_label = party_names
-                    .get(&msg.to)
-                    .cloned()
-                    .unwrap_or_else(|| fmt_id(msg.to));
+                let from_label = person_label(&mut relations_ws, &relations_space, msg.from);
+                let to_label = person_label(&mut relations_ws, &relations_space, msg.to);
                 let age = format_age(now_key, msg.created_at);
                 println!(
                     "- [{}] {} {} -> {} ({})",
@@ -550,30 +452,26 @@ fn cmd_show(pile: &Path, message_limit: usize, doing_limit: usize, todo_limit: u
         let mut compass_ws = repo
             .pull(compass_branch_id)
             .map_err(|e| anyhow!("pull compass workspace: {e:?}"))?;
-        let board = load_board(&mut compass_ws)?;
-        let latest = latest_status(&board.status_events);
+        let compass_space = compass_ws.checkout(..).map_err(|e| anyhow!("checkout compass: {e:?}"))?;
 
-        let mut doing = Vec::new();
-        let mut todo = Vec::new();
-        for task in board.tasks.values() {
-            let status = latest
-                .get(&task.id)
-                .map(|ev| ev.status.to_lowercase())
-                .unwrap_or_else(|| "todo".to_string());
-            let status_at = latest.get(&task.id).map(|ev| ev.at.clone());
-            let sort_key = status_at.as_deref().unwrap_or(&task.created_at);
+        let mut doing: Vec<(String, Id)> = Vec::new();
+        let mut todo: Vec<(String, Id)> = Vec::new();
+        for task_id in find!(id: Id, pattern!(&compass_space, [{ ?id @ metadata::tag: &KIND_GOAL_ID }])) {
+            let (status, status_at) = task_latest_status(&compass_space, task_id)
+                .map(|(s, at)| (s.to_lowercase(), Some(at)))
+                .unwrap_or_else(|| ("todo".to_string(), None));
+            let created_at: String = find!(s: String, pattern!(&compass_space, [{ task_id @ board::created_at: ?s }]))
+                .next().unwrap_or_default();
+            let sort_key = status_at.as_deref().unwrap_or(&created_at).to_string();
             if status == "doing" {
-                doing.push((sort_key.to_string(), task.clone()));
+                doing.push((sort_key, task_id));
             } else if status == "todo" {
-                todo.push((sort_key.to_string(), task.clone()));
+                todo.push((sort_key, task_id));
             }
         }
 
-        let sort_tasks = |tasks: &mut Vec<(String, Task)>| {
-            tasks.sort_by(|a, b| b.0.cmp(&a.0));
-        };
-        sort_tasks(&mut doing);
-        sort_tasks(&mut todo);
+        doing.sort_by(|a, b| b.0.cmp(&a.0));
+        todo.sort_by(|a, b| b.0.cmp(&a.0));
 
         println!();
         println!("Compass:");
@@ -584,18 +482,20 @@ fn cmd_show(pile: &Path, message_limit: usize, doing_limit: usize, todo_limit: u
             if doing.is_empty() {
                 println!("- None");
             } else {
-                for (_key, task) in doing.into_iter().take(doing_limit) {
-                    let tag_suffix = render_tags(&task.tags);
-                    println!("- [{}] {}{}", fmt_id(task.id), task.title, tag_suffix);
+                for (_key, task_id) in doing.into_iter().take(doing_limit) {
+                    let title = task_title(&mut compass_ws, &compass_space, task_id);
+                    let tag_suffix = render_tags(&task_tags(&compass_space, task_id));
+                    println!("- [{}] {}{}", fmt_id(task_id), title, tag_suffix);
                 }
             }
             println!("Todo:");
             if todo.is_empty() {
                 println!("- None");
             } else {
-                for (_key, task) in todo.into_iter().take(todo_limit) {
-                    let tag_suffix = render_tags(&task.tags);
-                    println!("- [{}] {}{}", fmt_id(task.id), task.title, tag_suffix);
+                for (_key, task_id) in todo.into_iter().take(todo_limit) {
+                    let title = task_title(&mut compass_ws, &compass_space, task_id);
+                    let tag_suffix = render_tags(&task_tags(&compass_space, task_id));
+                    println!("- [{}] {}{}", fmt_id(task_id), title, tag_suffix);
                 }
             }
         }
