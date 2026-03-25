@@ -571,22 +571,6 @@ struct TaskRow {
 }
 
 impl TaskRow {
-    fn from(task: &Task, status_at: Option<String>, note_count: usize) -> Self {
-        let mut tags = task.tags.clone();
-        tags.sort();
-        tags.dedup();
-        Self {
-            id: task.id,
-            id_hex: fmt_id(task.id),
-            title: task.title.clone(),
-            tags,
-            created_at: task.created_at.clone(),
-            status_at,
-            note_count,
-            parent: task.parent,
-        }
-    }
-
     fn sort_key(&self) -> &str {
         self.status_at
             .as_deref()
@@ -800,8 +784,8 @@ fn cmd_list(
         let mut ws = repo
             .pull(branch_id)
             .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
-        let board = load_board(&mut ws)?;
-        render_board(&board, &status_filter, &tag_filter, show_done);
+        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        render_board(&mut ws, &space, &status_filter, &tag_filter, show_done);
         Ok(())
     })
 }
