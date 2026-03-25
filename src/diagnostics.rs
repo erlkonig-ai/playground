@@ -668,8 +668,15 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
             if let Err(err) = repo_open_result {
                 state.snapshot = Some(Err(err.to_string()));
             } else if should_refresh_snapshot(&state) {
-                refresh_snapshot(state);
-                state.last_snapshot_refresh_at = Some(Instant::now());
+                if state.snapshot.is_none() {
+                    // First frame: render empty, request immediate repaint so
+                    // the loading state is visible before the blocking scan.
+                    ui.ctx().request_repaint();
+                    state.snapshot = Some(Err("Loading...".to_string()));
+                } else {
+                    refresh_snapshot(state);
+                    state.last_snapshot_refresh_at = Some(Instant::now());
+                }
             }
 
             if !diagnostics_is_headless() {

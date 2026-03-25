@@ -205,10 +205,10 @@ fn fmt_id(id: Id) -> String {
     format!("{id:x}")
 }
 
-fn load_relations_space(
+fn load_relations(
     repo: &mut Repository<Pile<valueschemas::Blake3>>,
     relations_branch_id: Id,
-) -> Result<TribleSet> {
+) -> Result<(TribleSet, Workspace<Pile<valueschemas::Blake3>>)> {
     if repo
         .storage_mut()
         .head(relations_branch_id)
@@ -226,7 +226,7 @@ fn load_relations_space(
     let space = ws
         .checkout(..)
         .map_err(|e| anyhow::anyhow!("checkout relations: {e:?}"))?;
-    Ok(space)
+    Ok((space, ws))
 }
 
 fn resolve_normalized_person_matches(relations_space: &TribleSet, key: &str) -> Vec<Id> {
@@ -275,28 +275,15 @@ fn resolve_person_id(relations_space: &TribleSet, input: &str) -> Result<Id> {
     }
 }
 
-fn load_person_labels(
-    repo: &mut Repository<Pile<valueschemas::Blake3>>,
-    relations_space: &TribleSet,
-) -> HashMap<Id, String> {
-    let mut labels = HashMap::new();
-    let Ok(reader) = repo.storage_mut().reader() else {
-        return labels;
-    };
-    for (person_id, handle) in find!(
-        (person_id: Id, handle: TextHandle),
-        pattern!(&relations_space, [{
-            ?person_id @
-            metadata::tag: &KIND_PERSON_ID,
-            metadata::name: ?handle,
-        }])
-    ) {
-        let Ok(view) = reader.get::<View<str>, _>(handle) else {
-            continue;
-        };
-        labels.insert(person_id, view.as_ref().to_string());
-    }
-    labels
+fn person_label(
+    ws: &mut Workspace<Pile<valueschemas::Blake3>>,
+    space: &TribleSet,
+    person_id: Id,
+) -> String {
+    find!(h: TextHandle, pattern!(space, [{ person_id @ metadata::name: ?h }]))
+        .next()
+        .and_then(|h| load_text(ws, h).ok())
+        .unwrap_or_else(|| fmt_id(person_id))
 }
 
 fn open_repo(path: &Path) -> Result<Repository<Pile<valueschemas::Blake3>>> {
@@ -402,7 +389,7 @@ fn cmd_send(
     to: String,
 ) -> Result<()> {
     with_repo(pile, |repo| {
-        let relations_space = load_relations_space(repo, relations_branch_id)?;
+        let (relations_space, _relations_ws) = load_relations(repo, relations_branch_id)?;
         let from_id = resolve_person_id(&relations_space, &from)?;
         let to_id = resolve_person_id(&relations_space, &to)?;
 
@@ -445,7 +432,7 @@ fn cmd_ack(
     by: String,
 ) -> Result<()> {
     with_repo(pile, |repo| {
-        let relations_space = load_relations_space(repo, relations_branch_id)?;
+        let (relations_space, _relations_ws) = load_relations(repo, relations_branch_id)?;
         let reader_id = resolve_person_id(&relations_space, &by)?;
 
         let mut ws = repo
@@ -485,8 +472,7 @@ fn cmd_list(
     limit: usize,
 ) -> Result<()> {
     with_repo(pile, |repo| {
-        let relations_space = load_relations_space(repo, relations_branch_id)?;
-        let party_names = load_person_labels(repo, &relations_space);
+        let (relations_space, mut relations_ws) = load_relations(repo, relations_branch_id)?;
         let mut ws = repo
             .pull(branch_id)
             .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
@@ -569,14 +555,8 @@ fn cmd_list(
                 continue;
             }
 
-            let from_label = party_names
-                .get(&msg.from)
-                .cloned()
-                .unwrap_or_else(|| fmt_id(msg.from));
-            let to_label = party_names
-                .get(&msg.to)
-                .cloned()
-                .unwrap_or_else(|| fmt_id(msg.to));
+            let from_label = person_label(&mut relations_ws, &relations_space, msg.from);
+            let to_label = person_label(&mut relations_ws, &relations_space, msg.to);
             let status = if incoming {
                 if read.is_some() {
                     "read".to_string()

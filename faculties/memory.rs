@@ -9,8 +9,6 @@
 //! triblespace = "0.22"
 //! ```
 
-use std::collections::HashMap;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -266,40 +264,34 @@ fn main() -> Result<()> {
         let mut ws = repo
             .pull(branch_id)
             .map_err(|e| anyhow!("pull branch {branch_id:x}: {e:?}"))?;
-        let catalog = ws.checkout(..).context("checkout branch")?;
-        let index = load_chunks(&catalog);
+        let space = ws.checkout(..).context("checkout branch")?;
 
         if cli.ids.first().is_some_and(|value| value == "turn") {
             if cli.ids.len() != 2 {
                 bail!("usage: memory turn <turn-id>");
             }
-            return print_turn_facets(&mut ws, &index, &cli.ids[1]);
+            return print_turn_facets(&mut ws, &space, &cli.ids[1]);
         }
 
         let mut first = true;
         for raw in &cli.ids {
-            let chunk = if raw.contains("..") {
-                // Time-range lookup.
+            let chunk_id = if raw.contains("..") {
                 let (start, end) = parse_time_range(raw)?;
-                find_chunk_by_time_range(&index, start, end)
+                find_chunk_by_time_range(&space, start, end)
                     .ok_or_else(|| anyhow!("no memory covers range {raw}"))?
             } else {
-                // Hex prefix fallback.
-                let chunk_id = match resolve_chunk_id(&index, raw) {
-                    Ok(chunk_id) => chunk_id,
+                match resolve_chunk_id(&space, raw) {
+                    Ok(id) => id,
                     Err(err) => {
                         return Err(invalid_memory_id_error(raw, err));
                     }
-                };
-                index
-                    .get(&chunk_id)
-                    .with_context(|| format!("missing chunk {raw}"))?
+                }
             };
             if !first {
                 println!();
             }
             first = false;
-            print_chunk(&mut ws, chunk)?;
+            print_chunk(&mut ws, &space, chunk_id)?;
         }
 
         Ok(())
@@ -363,30 +355,30 @@ fn cmd_create(pile_path: &Path, args: &[String]) -> Result<()> {
                     .map_err(|e| anyhow!("pull memory branch: {e:?}"))?;
                 ws.checkout(..).context("checkout memory branch")?
             };
-            let index = load_chunks(&ctx_catalog);
-
             for link in &memory_refs {
-                let chunk = match link {
+                let chunk_id = match link {
                     MemoryLink::TimeRange(raw, start, end) => {
-                        find_chunk_by_time_range(&index, *start, *end)
+                        find_chunk_by_time_range(&ctx_catalog, *start, *end)
                             .ok_or_else(|| anyhow!("memory link (memory:{raw}) does not match any chunk"))?
                     }
                     MemoryLink::HexId(hex) => {
-                        let chunk_id = resolve_chunk_id(&index, hex)
-                            .map_err(|e| anyhow!("memory link (memory:{hex}): {e}"))?;
-                        index.get(&chunk_id)
-                            .ok_or_else(|| anyhow!("memory link (memory:{hex}) resolved but missing"))?
+                        resolve_chunk_id(&ctx_catalog, hex)
+                            .map_err(|e| anyhow!("memory link (memory:{hex}): {e}"))?
                     }
                 };
-                child_ids.push(chunk.id);
+                child_ids.push(chunk_id);
                 // Track union time span of children.
-                match children_start {
-                    Some(prev) if interval_key(prev) <= interval_key(chunk.start_at) => {}
-                    _ => children_start = Some(chunk.start_at),
+                if let Some(start_v) = chunk_start_at(&ctx_catalog, chunk_id) {
+                    match children_start {
+                        Some(prev) if interval_key(prev) <= interval_key(start_v) => {}
+                        _ => children_start = Some(start_v),
+                    }
                 }
-                match children_end {
-                    Some(prev) if interval_key(prev) >= interval_key(chunk.end_at) => {}
-                    _ => children_end = Some(chunk.end_at),
+                if let Some(end_v) = chunk_end_at(&ctx_catalog, chunk_id) {
+                    match children_end {
+                        Some(prev) if interval_key(prev) >= interval_key(end_v) => {}
+                        _ => children_end = Some(end_v),
+                    }
                 }
             }
         }
@@ -503,53 +495,48 @@ fn cmd_meta(pile_path: &Path, branch_id_raw: Option<&str>, args: &[String]) -> R
         let mut ws = repo
             .pull(branch_id)
             .map_err(|e| anyhow!("pull branch {branch_id:x}: {e:?}"))?;
-        let catalog = ws.checkout(..).context("checkout branch")?;
-        let index = load_chunks(&catalog);
+        let space = ws.checkout(..).context("checkout branch")?;
 
         // Resolve chunk (time range or hex fallback).
         let raw = &args[0];
-        let chunk = if raw.contains("..") {
+        let chunk_id = if raw.contains("..") {
             let (start, end) = parse_time_range(raw)?;
-            find_chunk_by_time_range(&index, start, end)
+            find_chunk_by_time_range(&space, start, end)
                 .ok_or_else(|| anyhow!("no memory covers range {raw}"))?
         } else {
-            let chunk_id = resolve_chunk_id(&index, raw)
-                .map_err(|e| invalid_memory_id_error(raw, e))?;
-            index
-                .get(&chunk_id)
-                .with_context(|| format!("missing chunk {raw}"))?
+            resolve_chunk_id(&space, raw)
+                .map_err(|e| invalid_memory_id_error(raw, e))?
         };
 
         // Print structural metadata.
-        let range = format_time_range(
-            epoch_from_interval(chunk.start_at),
-            epoch_end_from_interval(chunk.end_at),
-        );
-        println!("range: {}", range);
-        println!("id: {:x}", chunk.id);
+        if let (Some(start_v), Some(end_v)) = (chunk_start_at(&space, chunk_id), chunk_end_at(&space, chunk_id)) {
+            let range = format_time_range(
+                epoch_from_interval(start_v),
+                epoch_end_from_interval(end_v),
+            );
+            println!("range: {}", range);
+        }
+        println!("id: {:x}", chunk_id);
 
-        if !chunk.children.is_empty() {
-            let child_ranges: Vec<String> = chunk
-                .children
+        let children = chunk_children(&space, chunk_id);
+        if !children.is_empty() {
+            let child_ranges: Vec<String> = children
                 .iter()
-                .filter_map(|cid| index.get(cid))
-                .map(|c| {
-                    format_time_range(
-                        epoch_from_interval(c.start_at),
-                        epoch_end_from_interval(c.end_at),
-                    )
+                .filter_map(|cid| {
+                    let s = chunk_start_at(&space, *cid)?;
+                    let e = chunk_end_at(&space, *cid)?;
+                    Some(format_time_range(epoch_from_interval(s), epoch_end_from_interval(e)))
                 })
                 .collect();
             println!("children: {}", child_ranges.join(", "));
         }
 
-        if let Some(exec_id) = chunk.about_exec_result {
+        if let Some(exec_id) = chunk_about_exec_result(&space, chunk_id) {
             println!("about_exec_result: {exec_id:x}");
         }
 
-        if let Some(archive_id) = chunk.about_archive_message {
+        if let Some(archive_id) = chunk_about_archive_message(&space, chunk_id) {
             println!("about_archive_message: {archive_id:x}");
-            // Resolve archive metadata if archive branch is available.
             print_archive_meta(repo, &mut ws, archive_id)?;
         }
 
@@ -763,144 +750,6 @@ fn find_archive_by_time_range(
 // show / turn subcommands
 // ---------------------------------------------------------------------------
 
-fn load_chunks(space: &TribleSet) -> HashMap<Id, Chunk> {
-    let mut chunks = HashMap::<Id, Chunk>::new();
-
-    for (chunk_id, summary) in find!(
-        (
-            chunk_id: Id,
-            summary: Value<Handle<Blake3, LongString>>
-        ),
-        pattern!(space, [{
-            ?chunk_id @
-            metadata::tag: &KIND_CHUNK_ID,
-            ctx::summary: ?summary,
-        }])
-    ) {
-        // start_at/end_at populated in a secondary pass below.
-        let zero_epoch = Epoch::from_gregorian_tai(1970, 1, 1, 0, 0, 0, 0);
-        let zero_interval: Value<NsTAIInterval> = (zero_epoch, zero_epoch).to_value();
-        chunks.insert(
-            chunk_id,
-            Chunk {
-                id: chunk_id,
-                summary,
-                start_at: zero_interval,
-                end_at: zero_interval,
-                children: Vec::new(),
-                about_exec_result: None,
-                about_archive_message: None,
-            },
-        );
-    }
-
-    for (chunk_id, child) in find!(
-        (chunk_id: Id, child: Id),
-        pattern!(space, [{
-            ?chunk_id @
-            metadata::tag: &KIND_CHUNK_ID,
-            ctx::child: ?child,
-        }])
-    ) {
-        if let Some(chunk) = chunks.get_mut(&chunk_id) {
-            chunk.children.push(child);
-        }
-    }
-
-    for (chunk_id, child) in find!(
-        (chunk_id: Id, child: Id),
-        pattern!(space, [{
-            ?chunk_id @
-            metadata::tag: &KIND_CHUNK_ID,
-            ctx::left: ?child,
-        }])
-    ) {
-        if let Some(chunk) = chunks.get_mut(&chunk_id) {
-            chunk.children.push(child);
-        }
-    }
-
-    for (chunk_id, child) in find!(
-        (chunk_id: Id, child: Id),
-        pattern!(space, [{
-            ?chunk_id @
-            metadata::tag: &KIND_CHUNK_ID,
-            ctx::right: ?child,
-        }])
-    ) {
-        if let Some(chunk) = chunks.get_mut(&chunk_id) {
-            chunk.children.push(child);
-        }
-    }
-
-    for (chunk_id, exec_id) in find!(
-        (chunk_id: Id, exec_id: Id),
-        pattern!(space, [{
-            ?chunk_id @
-            metadata::tag: &KIND_CHUNK_ID,
-            ctx::about_exec_result: ?exec_id,
-        }])
-    ) {
-        if let Some(chunk) = chunks.get_mut(&chunk_id) {
-            chunk.about_exec_result = Some(exec_id);
-        }
-    }
-
-    for (chunk_id, archive_id) in find!(
-        (chunk_id: Id, archive_id: Id),
-        pattern!(space, [{
-            ?chunk_id @
-            metadata::tag: &KIND_CHUNK_ID,
-            ctx::about_archive_message: ?archive_id,
-        }])
-    ) {
-        if let Some(chunk) = chunks.get_mut(&chunk_id) {
-            chunk.about_archive_message = Some(archive_id);
-        }
-    }
-
-    for (chunk_id, start_at) in find!(
-        (chunk_id: Id, start_at: Value<NsTAIInterval>),
-        pattern!(space, [{
-            ?chunk_id @
-            metadata::tag: &KIND_CHUNK_ID,
-            ctx::start_at: ?start_at,
-        }])
-    ) {
-        if let Some(chunk) = chunks.get_mut(&chunk_id) {
-            chunk.start_at = start_at;
-        }
-    }
-
-    for (chunk_id, end_at) in find!(
-        (chunk_id: Id, end_at: Value<NsTAIInterval>),
-        pattern!(space, [{
-            ?chunk_id @
-            metadata::tag: &KIND_CHUNK_ID,
-            ctx::end_at: ?end_at,
-        }])
-    ) {
-        if let Some(chunk) = chunks.get_mut(&chunk_id) {
-            chunk.end_at = end_at;
-        }
-    }
-
-    let start_by_id: HashMap<Id, i128> = chunks
-        .values()
-        .map(|c| (c.id, interval_key(c.start_at)))
-        .collect();
-    for chunk in chunks.values_mut() {
-        chunk.children.sort_by_key(|child_id| {
-            (
-                start_by_id.get(child_id).copied().unwrap_or(i128::MAX),
-                *child_id,
-            )
-        });
-        chunk.children.dedup();
-    }
-
-    chunks
-}
 
 fn print_chunk(ws: &mut Workspace<Pile<Blake3>>, space: &TribleSet, chunk_id: Id) -> Result<()> {
     let handle = chunk_summary_handle(space, chunk_id)
@@ -966,28 +815,25 @@ fn print_turn_facets(ws: &mut Workspace<Pile<Blake3>>, space: &TribleSet, raw: &
         bail!("multiple turn_id values match prefix '{prefix}' (use a longer prefix)");
     }
 
-    let mut chunks: Vec<&Chunk> = turn_matches
-        .iter()
-        .filter_map(|(_, chunk_id)| index.get(chunk_id))
-        .collect();
-    chunks.sort_unstable_by(|a, b| {
-        let a_width = epoch_end_from_interval(a.end_at).to_tai_duration().total_nanoseconds()
-            - epoch_from_interval(a.start_at).to_tai_duration().total_nanoseconds();
-        let b_width = epoch_end_from_interval(b.end_at).to_tai_duration().total_nanoseconds()
-            - epoch_from_interval(b.start_at).to_tai_duration().total_nanoseconds();
-        a_width.cmp(&b_width).then(a.id.cmp(&b.id))
+    let mut chunk_ids: Vec<Id> = turn_matches.iter().map(|(_, cid)| *cid).collect();
+    chunk_ids.sort_unstable_by(|a, b| {
+        let a_width = chunk_end_at(space, *a).map(|v| epoch_end_from_interval(v).to_tai_duration().total_nanoseconds()).unwrap_or(0)
+            - chunk_start_at(space, *a).map(|v| epoch_from_interval(v).to_tai_duration().total_nanoseconds()).unwrap_or(0);
+        let b_width = chunk_end_at(space, *b).map(|v| epoch_end_from_interval(v).to_tai_duration().total_nanoseconds()).unwrap_or(0)
+            - chunk_start_at(space, *b).map(|v| epoch_from_interval(v).to_tai_duration().total_nanoseconds()).unwrap_or(0);
+        a_width.cmp(&b_width).then(a.cmp(b))
     });
 
     println!(
         "turn {} has {} memory facet(s)",
         fmt_id(first_turn),
-        chunks.len()
+        chunk_ids.len()
     );
-    for (i, chunk) in chunks.iter().enumerate() {
+    for (i, chunk_id) in chunk_ids.iter().enumerate() {
         if i > 0 {
             println!();
         }
-        print_chunk(ws, chunk)?;
+        print_chunk(ws, space, *chunk_id)?;
     }
 
     Ok(())
