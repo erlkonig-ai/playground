@@ -98,15 +98,46 @@ struct Cli {
     ids: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
-struct Chunk {
-    id: Id,
-    summary: Value<Handle<Blake3, LongString>>,
-    start_at: Value<NsTAIInterval>,
-    end_at: Value<NsTAIInterval>,
-    children: Vec<Id>,
-    about_exec_result: Option<Id>,
-    about_archive_message: Option<Id>,
+// ── on-demand chunk queries ───────────────────────────────────────────
+// Chunks are queried directly from the TribleSet — no pre-materialization.
+
+fn chunk_summary_handle(space: &TribleSet, id: Id) -> Option<Value<Handle<Blake3, LongString>>> {
+    find!(h: Value<Handle<Blake3, LongString>>, pattern!(space, [{ id @ ctx::summary: ?h }])).next()
+}
+
+fn chunk_start_at(space: &TribleSet, id: Id) -> Option<Value<NsTAIInterval>> {
+    find!(v: Value<NsTAIInterval>, pattern!(space, [{ id @ ctx::start_at: ?v }])).next()
+}
+
+fn chunk_end_at(space: &TribleSet, id: Id) -> Option<Value<NsTAIInterval>> {
+    find!(v: Value<NsTAIInterval>, pattern!(space, [{ id @ ctx::end_at: ?v }])).next()
+}
+
+fn chunk_children(space: &TribleSet, id: Id) -> Vec<Id> {
+    let mut children: Vec<Id> = Vec::new();
+    children.extend(find!(c: Id, pattern!(space, [{ id @ ctx::child: ?c }])));
+    children.extend(find!(c: Id, pattern!(space, [{ id @ ctx::left: ?c }])));
+    children.extend(find!(c: Id, pattern!(space, [{ id @ ctx::right: ?c }])));
+    // Sort children by their start_at time.
+    children.sort_by_key(|child_id| {
+        chunk_start_at(space, *child_id)
+            .map(interval_key)
+            .unwrap_or(i128::MAX)
+    });
+    children.dedup();
+    children
+}
+
+fn chunk_about_exec_result(space: &TribleSet, id: Id) -> Option<Id> {
+    find!(v: Id, pattern!(space, [{ id @ ctx::about_exec_result: ?v }])).next()
+}
+
+fn chunk_about_archive_message(space: &TribleSet, id: Id) -> Option<Id> {
+    find!(v: Id, pattern!(space, [{ id @ ctx::about_archive_message: ?v }])).next()
+}
+
+fn all_chunk_ids(space: &TribleSet) -> Vec<Id> {
+    find!(id: Id, pattern!(space, [{ ?id @ metadata::tag: &KIND_CHUNK_ID }])).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -163,52 +194,47 @@ fn epoch_end_from_interval(interval: Value<NsTAIInterval>) -> Epoch {
 /// Find the best chunk covering a query time range.
 /// Prefers: narrowest chunk that fully contains the query (most specific).
 /// Fallback: best partial overlap.
-fn find_chunk_by_time_range<'a>(
-    chunks: &'a HashMap<Id, Chunk>,
+fn find_chunk_by_time_range(
+    space: &TribleSet,
     query_start: Epoch,
     query_end: Epoch,
-) -> Option<&'a Chunk> {
+) -> Option<Id> {
     let query_start_ns = query_start.to_tai_duration().total_nanoseconds();
     let query_end_ns = query_end.to_tai_duration().total_nanoseconds();
 
-    let mut best_cover: Option<(&Chunk, i128)> = None; // (chunk, width)
-    let mut best_overlap: Option<(&Chunk, i128)> = None;
+    let mut best_cover: Option<(Id, i128)> = None;
+    let mut best_overlap: Option<(Id, i128)> = None;
 
-    for chunk in chunks.values() {
-        let chunk_start = epoch_from_interval(chunk.start_at)
-            .to_tai_duration()
-            .total_nanoseconds();
-        let chunk_end = epoch_end_from_interval(chunk.end_at)
-            .to_tai_duration()
-            .total_nanoseconds();
+    for chunk_id in all_chunk_ids(space) {
+        let start_val = chunk_start_at(space, chunk_id);
+        let end_val = chunk_end_at(space, chunk_id);
+        let (Some(start_v), Some(end_v)) = (start_val, end_val) else { continue };
 
-        // Check overlap.
+        let chunk_start = epoch_from_interval(start_v).to_tai_duration().total_nanoseconds();
+        let chunk_end = epoch_end_from_interval(end_v).to_tai_duration().total_nanoseconds();
+
         if chunk_start > query_end_ns || chunk_end < query_start_ns {
             continue;
         }
 
-        // Full containment: chunk covers the entire query. Prefer narrowest.
         if chunk_start <= query_start_ns && chunk_end >= query_end_ns {
             let width = chunk_end - chunk_start;
             match best_cover {
                 Some((_, prev_width)) if prev_width <= width => {}
-                _ => best_cover = Some((chunk, width)),
+                _ => best_cover = Some((chunk_id, width)),
             }
         }
 
-        // Track best overlap (by overlap duration).
         let overlap_start = chunk_start.max(query_start_ns);
         let overlap_end = chunk_end.min(query_end_ns);
         let overlap = overlap_end.saturating_sub(overlap_start);
         match best_overlap {
             Some((_, prev_overlap)) if prev_overlap >= overlap => {}
-            _ => best_overlap = Some((chunk, overlap)),
+            _ => best_overlap = Some((chunk_id, overlap)),
         }
     }
 
-    best_cover
-        .map(|(c, _)| c)
-        .or(best_overlap.map(|(c, _)| c))
+    best_cover.map(|(id, _)| id).or(best_overlap.map(|(id, _)| id))
 }
 
 fn main() -> Result<()> {
@@ -876,8 +902,10 @@ fn load_chunks(space: &TribleSet) -> HashMap<Id, Chunk> {
     chunks
 }
 
-fn print_chunk(ws: &mut Workspace<Pile<Blake3>>, chunk: &Chunk) -> Result<()> {
-    let summary: View<str> = ws.get(chunk.summary).context("read chunk summary")?;
+fn print_chunk(ws: &mut Workspace<Pile<Blake3>>, space: &TribleSet, chunk_id: Id) -> Result<()> {
+    let handle = chunk_summary_handle(space, chunk_id)
+        .ok_or_else(|| anyhow!("chunk {:x} has no summary", chunk_id))?;
+    let summary: View<str> = ws.get(handle).context("read chunk summary")?;
     print!("{}", summary.trim_end());
     println!();
     Ok(())
@@ -887,11 +915,11 @@ fn fmt_id(id: Id) -> String {
     format!("{id:x}")
 }
 
-fn resolve_chunk_id(index: &HashMap<Id, Chunk>, raw: &str) -> Result<Id> {
+fn resolve_chunk_id(space: &TribleSet, raw: &str) -> Result<Id> {
     let prefix = normalize_prefix(raw)?;
 
     let mut chunk_matches = Vec::new();
-    for chunk_id in index.keys().copied() {
+    for chunk_id in all_chunk_ids(space) {
         if id_starts_with(chunk_id, prefix.as_str()) {
             chunk_matches.push(chunk_id);
         }
@@ -904,8 +932,8 @@ fn resolve_chunk_id(index: &HashMap<Id, Chunk>, raw: &str) -> Result<Id> {
         _ => {}
     }
 
-    for chunk in index.values() {
-        if let Some(turn_id) = chunk.about_exec_result {
+    for chunk_id in all_chunk_ids(space) {
+        if let Some(turn_id) = chunk_about_exec_result(space, chunk_id) {
             if id_starts_with(turn_id, prefix.as_str()) {
                 bail!("turn id `{prefix}` is not a chunk id; use `memory turn {prefix}`");
             }
@@ -915,13 +943,13 @@ fn resolve_chunk_id(index: &HashMap<Id, Chunk>, raw: &str) -> Result<Id> {
     bail!("no chunk id matches prefix '{prefix}'")
 }
 
-fn print_turn_facets(ws: &mut Workspace<Pile<Blake3>>, index: &HashMap<Id, Chunk>, raw: &str) -> Result<()> {
+fn print_turn_facets(ws: &mut Workspace<Pile<Blake3>>, space: &TribleSet, raw: &str) -> Result<()> {
     let prefix = normalize_prefix(raw)?;
     let mut turn_matches = Vec::new();
-    for chunk in index.values() {
-        if let Some(turn_id) = chunk.about_exec_result {
+    for chunk_id in all_chunk_ids(space) {
+        if let Some(turn_id) = chunk_about_exec_result(space, chunk_id) {
             if id_starts_with(turn_id, prefix.as_str()) {
-                turn_matches.push((turn_id, chunk.id));
+                turn_matches.push((turn_id, chunk_id));
             }
         }
     }

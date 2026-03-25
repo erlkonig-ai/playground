@@ -1,4 +1,4 @@
-use ed25519_dalek::{SecretKey, SigningKey};
+use ed25519_dalek::SigningKey;
 use eframe::egui;
 use hifitime::Epoch;
 use rand::rngs::OsRng;
@@ -21,14 +21,13 @@ use triblespace::core::value::schemas::time::NsTAIInterval;
 use triblespace::macros::{entity, find, id_hex, pattern, pattern_changes};
 use triblespace::prelude::valueschemas::{GenId, U256BE};
 use triblespace::prelude::{
-    Attribute, BlobStore, BlobStoreGet, BranchStore, ToBlob, ToValue, TryFromValue, TryToValue,
+    Attribute, BlobStore, BlobStoreGet, BranchStore, ToBlob, TryFromValue, TryToValue,
     View,
 };
 
 use GORBIE::NotebookConfig;
 use GORBIE::NotebookCtx;
 use GORBIE::cards::DEFAULT_CARD_PADDING;
-use GORBIE::md;
 use GORBIE::themes::colorhash;
 use GORBIE::widgets::{Button, TextField};
 
@@ -588,33 +587,27 @@ struct BranchSnapshot {
 }
 
 fn diagnostics_ui(nb: &mut NotebookCtx) {
-    let padding = DEFAULT_CARD_PADDING;
+    let _padding = DEFAULT_CARD_PADDING;
     let dashboard = nb.state(
         "playground-diagnostics",
         DashboardState::default(),
         move |ui, state| {
-            ui.with_padding(padding, |ui| {
-                md!(
-                    ui,
-                    "# Playground Diagnostics\n\
-_Live view of the agent pile, exec queue, and message activity._"
-                );
+            // Open repo and refresh snapshot (must happen before section renders).
+            let repo_open_result = ensure_repo_open(state);
+            let mut picker_branches = Vec::new();
+            if repo_open_result.is_ok() {
+                if let Some(repo) = state.repo.as_mut() {
+                    picker_branches = list_branches(repo.storage_mut()).unwrap_or_default();
+                    picker_branches
+                        .sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
+                }
+            }
 
-                ui.separator();
-                ui.heading("Config");
+            ui.section("Config", |ui| {
                 ui.horizontal(|ui| {
                     ui.label("Pile");
                     ui.add(TextField::singleline(&mut state.config.pile_path));
                 });
-                let mut picker_branches = Vec::new();
-                let repo_open_result = ensure_repo_open(state);
-                if repo_open_result.is_ok() {
-                    if let Some(repo) = state.repo.as_mut() {
-                        picker_branches = list_branches(repo.storage_mut()).unwrap_or_default();
-                        picker_branches
-                            .sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
-                    }
-                }
                 ui.horizontal(|ui| {
                     ui.label("Config branches");
                     render_branch_picker(
@@ -670,29 +663,26 @@ _Live view of the agent pile, exec queue, and message activity._"
                     );
                 });
 
-                if let Err(err) = repo_open_result {
-                    state.snapshot = Some(Err(err.to_string()));
-                } else {
-                    if should_refresh_snapshot(&state) {
-                        refresh_snapshot(state);
-                        state.last_snapshot_refresh_at = Some(Instant::now());
-                    }
-                }
-                if diagnostics_is_headless() {
-                    // In headless capture we only need one snapshot.
-                } else {
-                    ui.ctx()
-                        .request_repaint_after(Duration::from_millis(SNAPSHOT_REFRESH_MS));
-                }
             });
+
+            if let Err(err) = repo_open_result {
+                state.snapshot = Some(Err(err.to_string()));
+            } else if should_refresh_snapshot(&state) {
+                refresh_snapshot(state);
+                state.last_snapshot_refresh_at = Some(Instant::now());
+            }
+
+            if !diagnostics_is_headless() {
+                ui.ctx()
+                    .request_repaint_after(Duration::from_millis(SNAPSHOT_REFRESH_MS));
+            }
         },
     );
 
     // ── Card 2: Main view (Activity timeline + context float) ──────
     nb.view(move |ui| {
         let mut state = dashboard.read_mut(ui);
-        ui.with_padding(padding, |ui| {
-            ui.heading("Activity timeline");
+        ui.section("Activity", |ui| {
             let mut timeline_limit_changed = false;
             ui.horizontal_wrapped(|ui| {
                 ui.small("Recent events:");
