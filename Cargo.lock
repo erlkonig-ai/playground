@@ -4,9 +4,9 @@ version = 4
 
 [[package]]
 name = "GORBIE"
-version = "0.9.0"
+version = "0.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "24a1f627deb91c8f26aa4c058634e4c86e90805b90a829a7a42ecc67b7c05198"
+checksum = "8bea9c9bc790287272ae0fb10da388e882e0867318b413de4cfe2cf36f7cdac3"
 dependencies = [
  "ctrlc",
  "dark-light",

@@ -153,44 +153,11 @@ enum Command {
     },
 }
 
-#[derive(Debug, Clone)]
-struct Task {
-    id: Id,
-    title: String,
-    created_at: String,
-    tags: Vec<String>,
-    parent: Option<Id>,
-}
+// ── on-demand board queries ───────────────────────────────────────────
+// All data lives in the TribleSet; we query directly via find!() instead
+// of pre-materializing into Rust structs.
 
-#[derive(Debug, Clone)]
-struct StatusEvent {
-    task: Id,
-    status: String,
-    at: String,
-}
-
-#[derive(Debug, Clone)]
-struct NoteEvent {
-    task: Id,
-    note: String,
-    at: String,
-}
-
-#[derive(Debug, Clone)]
-struct PriorityEvent {
-    higher: Id,
-    lower: Id,
-    at: String,
-    active: bool,
-}
-
-#[derive(Debug, Clone)]
-struct BoardState {
-    tasks: HashMap<Id, Task>,
-    status_events: Vec<StatusEvent>,
-    note_events: Vec<NoteEvent>,
-    priority_events: Vec<PriorityEvent>,
-}
+/// Query helpers that operate directly on the checked-out TribleSet + workspace.
 
 fn now_stamp() -> String {
     let format = format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]Z");
@@ -297,128 +264,51 @@ fn with_repo<T>(
     result
 }
 
-fn load_board(ws: &mut Workspace<Pile<valueschemas::Blake3>>) -> Result<BoardState> {
-    let space = ws
-        .checkout(..)
-        .map_err(|e| anyhow::anyhow!("checkout board: {e:?}"))?;
+fn task_title(ws: &mut Workspace<Pile<valueschemas::Blake3>>, space: &TribleSet, task_id: Id) -> String {
+    find!(h: TextHandle, pattern!(space, [{ task_id @ board::title: ?h }]))
+        .next()
+        .and_then(|h| read_text(ws, h).ok())
+        .unwrap_or_default()
+}
 
-    let mut tasks = HashMap::new();
-    let task_rows: Vec<(Id, TextHandle, String)> = find!(
-        (task: Id, title: TextHandle, created: String),
-        pattern!(&space, [{
-            ?task @
-                metadata::tag: &KIND_GOAL_ID,
-                board::title: ?title,
-                board::created_at: ?created
+fn task_tags(space: &TribleSet, task_id: Id) -> Vec<String> {
+    let mut tags: Vec<String> = find!(
+        tag: String,
+        pattern!(space, [{ task_id @ metadata::tag: &KIND_GOAL_ID, board::tag: ?tag }])
+    ).collect();
+    tags.sort();
+    tags.dedup();
+    tags
+}
+
+fn task_parent(space: &TribleSet, task_id: Id) -> Option<Id> {
+    find!(p: Id, pattern!(space, [{ task_id @ board::parent: ?p }])).next()
+}
+
+fn task_created_at(space: &TribleSet, task_id: Id) -> String {
+    find!(s: String, pattern!(space, [{ task_id @ board::created_at: ?s }]))
+        .next()
+        .unwrap_or_default()
+}
+
+/// Latest status for a task.
+fn task_latest_status(space: &TribleSet, task_id: Id) -> Option<(String, String)> {
+    find!(
+        (status: String, at: String),
+        pattern!(space, [{
+            _?evt @
+            metadata::tag: &KIND_STATUS_ID,
+            board::task: &task_id,
+            board::status: ?status,
+            board::at: ?at,
         }])
     )
-    .collect();
+    .max_by(|a, b| a.1.cmp(&b.1))
+}
 
-    for (task_id, title_handle, created_at) in task_rows {
-        if tasks.contains_key(&task_id) {
-            continue;
-        }
-        let title =
-            read_text(ws, title_handle).map_err(|e| anyhow::anyhow!("read title: {e:?}"))?;
-        tasks.insert(
-            task_id,
-            Task {
-                id: task_id,
-                title,
-                created_at,
-                tags: Vec::new(),
-                parent: None,
-            },
-        );
-    }
-
-    for (task_id, tag) in find!(
-        (task: Id, tag: String),
-        pattern!(&space, [{ ?task @ metadata::tag: &KIND_GOAL_ID, board::tag: ?tag }])
-    ) {
-        if let Some(task) = tasks.get_mut(&task_id) {
-            task.tags.push(tag);
-        }
-    }
-
-    for (task_id, parent_id) in find!(
-        (task: Id, parent: Id),
-        pattern!(&space, [{ ?task @ metadata::tag: &KIND_GOAL_ID, board::parent: ?parent }])
-    ) {
-        if let Some(task) = tasks.get_mut(&task_id) {
-            task.parent = Some(parent_id);
-        }
-    }
-
-    let mut status_events = Vec::new();
-    for (task_id, status, at) in find!(
-        (task: Id, status: String, at: String),
-        pattern!(&space, [{
-            _?evt @
-                metadata::tag: &KIND_STATUS_ID,
-                board::task: ?task,
-                board::status: ?status,
-                board::at: ?at
-        }])
-    ) {
-        status_events.push(StatusEvent {
-            task: task_id,
-            status,
-            at,
-        });
-    }
-
-    let mut note_events = Vec::new();
-    for (task_id, note_handle, at) in find!(
-        (task: Id, note: TextHandle, at: String),
-        pattern!(&space, [{
-            _?evt @
-                metadata::tag: &KIND_NOTE_ID,
-                board::task: ?task,
-                board::note: ?note,
-                board::at: ?at
-        }])
-    ) {
-        let note = read_text(ws, note_handle).map_err(|e| anyhow::anyhow!("read note: {e:?}"))?;
-        note_events.push(NoteEvent {
-            task: task_id,
-            note,
-            at,
-        });
-    }
-
-    let mut priority_events = Vec::new();
-    for (higher, lower, at) in find!(
-        (higher: Id, lower: Id, at: String),
-        pattern!(&space, [{
-            _?evt @
-                metadata::tag: &KIND_PRIORITIZE_ID,
-                board::higher: ?higher,
-                board::lower: ?lower,
-                board::at: ?at
-        }])
-    ) {
-        priority_events.push(PriorityEvent { higher, lower, at, active: true });
-    }
-    for (higher, lower, at) in find!(
-        (higher: Id, lower: Id, at: String),
-        pattern!(&space, [{
-            _?evt @
-                metadata::tag: &KIND_DEPRIORITIZE_ID,
-                board::higher: ?higher,
-                board::lower: ?lower,
-                board::at: ?at
-        }])
-    ) {
-        priority_events.push(PriorityEvent { higher, lower, at, active: false });
-    }
-
-    Ok(BoardState {
-        tasks,
-        status_events,
-        note_events,
-        priority_events,
-    })
+/// All goal IDs.
+fn all_goal_ids(space: &TribleSet) -> Vec<Id> {
+    find!(id: Id, pattern!(space, [{ ?id @ metadata::tag: &KIND_GOAL_ID }])).collect()
 }
 
 fn read_text(ws: &mut Workspace<Pile<valueschemas::Blake3>>, handle: TextHandle) -> Result<String> {
@@ -440,16 +330,16 @@ fn parse_full_id(input: &str) -> Result<Id> {
     })
 }
 
-fn resolve_task_id(input: &str, tasks: &HashMap<Id, Task>) -> Result<Id> {
+fn resolve_task_id(input: &str, space: &TribleSet) -> Result<Id> {
     let needle = input.trim().to_lowercase();
     if needle.is_empty() {
         bail!("goal id is empty");
     }
     let mut matches = Vec::new();
-    for id in tasks.keys() {
+    for id in all_goal_ids(space) {
         let hex = format!("{id:x}");
         if hex.starts_with(&needle) {
-            matches.push(*id);
+            matches.push(id);
         }
     }
     match matches.len() {
@@ -463,62 +353,60 @@ fn resolve_task_id(input: &str, tasks: &HashMap<Id, Task>) -> Result<Id> {
     }
 }
 
-fn latest_status(events: &[StatusEvent]) -> HashMap<Id, StatusEvent> {
-    let mut latest = HashMap::new();
-    for event in events {
-        latest
-            .entry(event.task)
-            .and_modify(|current: &mut StatusEvent| {
-                if event.at > current.at {
-                    *current = event.clone();
-                }
-            })
-            .or_insert_with(|| event.clone());
+/// Compute active priority edges from the space.
+fn active_priority_edges(space: &TribleSet) -> HashSet<(Id, Id)> {
+    let mut latest: HashMap<(Id, Id), (String, bool)> = HashMap::new();
+    for (higher, lower, at) in find!(
+        (higher: Id, lower: Id, at: String),
+        pattern!(space, [{
+            _?evt @
+            metadata::tag: &KIND_PRIORITIZE_ID,
+            board::higher: ?higher,
+            board::lower: ?lower,
+            board::at: ?at,
+        }])
+    ) {
+        latest.entry((higher, lower))
+            .and_modify(|(cur_at, cur_active)| { if at > *cur_at { *cur_at = at.clone(); *cur_active = true; } })
+            .or_insert((at, true));
     }
-    latest
-}
-
-fn notes_by_task(events: &[NoteEvent]) -> HashMap<Id, Vec<NoteEvent>> {
-    let mut notes = HashMap::<Id, Vec<NoteEvent>>::new();
-    for event in events {
-        notes.entry(event.task).or_default().push(event.clone());
+    for (higher, lower, at) in find!(
+        (higher: Id, lower: Id, at: String),
+        pattern!(space, [{
+            _?evt @
+            metadata::tag: &KIND_DEPRIORITIZE_ID,
+            board::higher: ?higher,
+            board::lower: ?lower,
+            board::at: ?at,
+        }])
+    ) {
+        latest.entry((higher, lower))
+            .and_modify(|(cur_at, cur_active)| { if at > *cur_at { *cur_at = at.clone(); *cur_active = false; } })
+            .or_insert((at, false));
     }
-    notes
-}
-
-/// Compute active priority edges from the event log.
-fn active_priority_edges(events: &[PriorityEvent]) -> HashSet<(Id, Id)> {
-    let mut latest: HashMap<(Id, Id), &PriorityEvent> = HashMap::new();
-    for event in events {
-        let key = (event.higher, event.lower);
-        latest
-            .entry(key)
-            .and_modify(|current| {
-                if event.at > current.at {
-                    *current = event;
-                }
-            })
-            .or_insert(event);
-    }
-    latest
-        .into_iter()
-        .filter(|(_, ev)| ev.active)
-        .map(|(k, _)| k)
-        .collect()
+    latest.into_iter().filter(|(_, (_, active))| *active).map(|(k, _)| k).collect()
 }
 
 /// Check if `to` is an ancestor of `from` in the parent tree.
-fn is_ancestor(tasks: &HashMap<Id, Task>, from: Id, to: Id) -> bool {
+fn is_ancestor(space: &TribleSet, from: Id, to: Id) -> bool {
     let mut current = from;
     loop {
         if current == to {
             return true;
         }
-        match tasks.get(&current).and_then(|t| t.parent) {
+        match task_parent(space, current) {
             Some(parent) => current = parent,
             None => return false,
         }
     }
+}
+
+/// Count notes for a task.
+fn note_count(space: &TribleSet, task_id: Id) -> usize {
+    find!(
+        _n: TextHandle,
+        pattern!(space, [{ _?evt @ metadata::tag: &KIND_NOTE_ID, board::task: &task_id, board::note: ?_n }])
+    ).count()
 }
 
 /// Check if adding (higher, lower) would create a cycle in the priority DAG.
@@ -584,23 +472,28 @@ fn priority_ranks(task_ids: &[Id], edges: &HashSet<(Id, Id)>) -> HashMap<Id, usi
     ranks
 }
 
-fn render_board(state: &BoardState, status_filter: &[String], tag_filter: &[String], show_done: bool) {
-    let status_map = latest_status(&state.status_events);
-    let note_map = notes_by_task(&state.note_events);
-    let mut priority_edges = active_priority_edges(&state.priority_events);
+fn render_board(
+    ws: &mut Workspace<Pile<valueschemas::Blake3>>,
+    space: &TribleSet,
+    status_filter: &[String],
+    tag_filter: &[String],
+    show_done: bool,
+) {
+    let goal_ids = all_goal_ids(space);
+    let mut priority_edges = active_priority_edges(space);
     // Implicit: children must be done before parents → child > parent
-    for task in state.tasks.values() {
-        if let Some(parent) = task.parent {
-            priority_edges.insert((task.id, parent));
+    for &id in &goal_ids {
+        if let Some(parent) = task_parent(space, id) {
+            priority_edges.insert((id, parent));
         }
     }
+
     let mut columns: HashMap<String, Vec<TaskRow>> = HashMap::new();
 
-    for task in state.tasks.values() {
-        let status_event = status_map.get(&task.id);
-        let status = status_event
-            .map(|ev| ev.status.clone())
-            .unwrap_or_else(|| "todo".to_string());
+    for &task_id in &goal_ids {
+        let (status, status_at) = task_latest_status(space, task_id)
+            .map(|(s, at)| (s, Some(at)))
+            .unwrap_or_else(|| ("todo".to_string(), None));
 
         if status_filter.is_empty() {
             if !show_done && status == "done" {
@@ -610,17 +503,20 @@ fn render_board(state: &BoardState, status_filter: &[String], tag_filter: &[Stri
             continue;
         }
 
-        if !tag_filter.is_empty() && !task.tags.iter().any(|t| tag_filter.contains(t)) {
+        let tags = task_tags(space, task_id);
+        if !tag_filter.is_empty() && !tags.iter().any(|t| tag_filter.contains(t)) {
             continue;
         }
 
-        let note_count = note_map.get(&task.id).map(|n| n.len()).unwrap_or(0);
-        let status_at = status_event.map(|ev| ev.at.clone());
+        let title = task_title(ws, space, task_id);
+        let created_at = task_created_at(space, task_id);
+        let notes = note_count(space, task_id);
+        let parent = task_parent(space, task_id);
 
         columns
             .entry(status)
             .or_default()
-            .push(TaskRow::from(task, status_at, note_count));
+            .push(TaskRow { id: task_id, id_hex: fmt_id(task_id), title, tags, created_at, status_at, note_count: notes, parent });
     }
 
     let mut ordered_statuses = Vec::new();

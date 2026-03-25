@@ -803,7 +803,7 @@ _Live view of the agent pile, exec queue, and message activity._"
         ui.with_padding(padding, |ui| {
             ui.heading("Agent");
 
-            ui.collapsing("Overview", |ui| {
+            ui.section("Overview", |ui| {
                 let (pile_path, branches) = {
                     let Some(snapshot) = snapshot_or_message(ui, &state.snapshot) else {
                         return;
@@ -863,7 +863,7 @@ _Live view of the agent pile, exec queue, and message activity._"
                 }
             });
 
-            ui.collapsing("Agent Config", |ui| {
+            ui.section("Agent Config", |ui| {
                 let snapshot = {
                     let Some(snapshot) = snapshot_or_message(ui, &state.snapshot) else {
                         return;
@@ -882,7 +882,7 @@ _Live view of the agent pile, exec queue, and message activity._"
                 }
             });
 
-            ui.collapsing("Context Compaction", |ui| {
+            ui.section("Context Compaction", |ui| {
                 let snapshot = {
                     let Some(snapshot) = snapshot_or_message(ui, &state.snapshot) else {
                         return;
@@ -910,7 +910,7 @@ _Live view of the agent pile, exec queue, and message activity._"
         ui.with_padding(padding, |ui| {
             ui.heading("Social & Planning");
 
-            ui.collapsing("Compass", |ui| {
+            ui.section("Compass", |ui| {
                 let snapshot = {
                     let Some(snapshot) = snapshot_or_message(ui, &state.snapshot) else {
                         return;
@@ -934,7 +934,7 @@ _Live view of the agent pile, exec queue, and message activity._"
                 );
             });
 
-            ui.collapsing("Messages", |ui| {
+            ui.section("Messages", |ui| {
                 let snapshot = {
                     let Some(snapshot) = snapshot_or_message(ui, &state.snapshot) else {
                         return;
@@ -947,7 +947,7 @@ _Live view of the agent pile, exec queue, and message activity._"
                 render_local_composer(ui, &mut state, &snapshot.branches, &snapshot);
             });
 
-            ui.collapsing("Relations", |ui| {
+            ui.section("Relations", |ui| {
                 let Some(snapshot) = snapshot_or_message(ui, &state.snapshot) else {
                     return;
                 };
@@ -958,7 +958,7 @@ _Live view of the agent pile, exec queue, and message activity._"
                 }
             });
 
-            ui.collapsing("Teams", |ui| {
+            ui.section("Teams", |ui| {
                 let snapshot = {
                     let Some(snapshot) = snapshot_or_message(ui, &state.snapshot) else {
                         return;
