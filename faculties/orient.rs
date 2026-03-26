@@ -155,7 +155,6 @@ struct MessageRow {
     id: Id,
     from: Id,
     to: Id,
-    body: String,
     created_at: i128,
 }
 
@@ -218,40 +217,35 @@ fn read_text(ws: &mut Workspace<Pile<valueschemas::Blake3>>, handle: TextHandle)
     Ok(view.to_string())
 }
 
-fn load_messages(
-    ws: &mut Workspace<Pile<valueschemas::Blake3>>,
-    space: &TribleSet,
-) -> Result<Vec<MessageRow>> {
-    let mut messages = Vec::new();
-    for (message_id, from, to, body, created_at) in find!(
-        (
-            message_id: Id,
-            from: Id,
-            to: Id,
-            body: TextHandle,
-            created_at: Value<valueschemas::NsTAIInterval>
-        ),
-        pattern!(&space, [{
+/// Load messages without resolving body blobs — sorted newest first.
+fn load_message_ids(space: &TribleSet) -> Vec<MessageRow> {
+    let mut messages: Vec<MessageRow> = find!(
+        (message_id: Id, from: Id, to: Id, created_at: Value<valueschemas::NsTAIInterval>),
+        pattern!(space, [{
             ?message_id @
             metadata::tag: &KIND_MESSAGE_ID,
             local::from: ?from,
             local::to: ?to,
-            local::body: ?body,
             local::created_at: ?created_at,
         }])
-    ) {
-        let body_text = read_text(ws, body)?;
-        messages.push(MessageRow {
-            id: message_id,
-            from,
-            to,
-            body: body_text,
-            created_at: interval_key(created_at),
-        });
-    }
-    messages.sort_by_key(|msg| msg.created_at);
-    messages.reverse();
-    Ok(messages)
+    )
+    .map(|(id, from, to, created_at)| MessageRow {
+        id, from, to, created_at: interval_key(created_at),
+    })
+    .collect();
+    messages.sort_by_key(|msg| std::cmp::Reverse(msg.created_at));
+    messages
+}
+
+fn resolve_message_body(
+    ws: &mut Workspace<Pile<valueschemas::Blake3>>,
+    space: &TribleSet,
+    msg_id: Id,
+) -> String {
+    find!(h: TextHandle, pattern!(space, [{ msg_id @ local::body: ?h }]))
+        .next()
+        .and_then(|h| read_text(ws, h).ok())
+        .unwrap_or_default()
 }
 
 fn load_reads(space: &TribleSet) -> HashMap<(Id, Id), i128> {
@@ -407,25 +401,23 @@ fn cmd_show(pile: &Path, message_limit: usize, doing_limit: usize, todo_limit: u
         }
 
         let reads = load_reads(&local_space);
-        let mut messages = load_messages(&mut local_ws, &local_space)?;
+        let all_messages = load_message_ids(&local_space);
 
-        let mut unread: Vec<MessageRow> = messages
+        let unread: Vec<&MessageRow> = all_messages
             .iter()
             .filter(|msg| msg.to == reader_id && !reads.contains_key(&(msg.id, reader_id)))
-            .cloned()
+            .take(message_limit)
             .collect();
-        unread.truncate(message_limit);
-        messages = unread;
 
         let now_key = interval_key(epoch_interval(now_epoch()));
 
         println!("Orient");
         let reader_label = person_label(&mut relations_ws, &relations_space, reader_id);
         println!("Local messages (unread inbox for {}):", reader_label);
-        if messages.is_empty() {
+        if unread.is_empty() {
             println!("- None");
         } else {
-            for msg in &messages {
+            for msg in &unread {
                 let from_label = person_label(&mut relations_ws, &relations_space, msg.from);
                 let to_label = person_label(&mut relations_ws, &relations_space, msg.to);
                 let age = format_age(now_key, msg.created_at);
@@ -437,10 +429,12 @@ fn cmd_show(pile: &Path, message_limit: usize, doing_limit: usize, todo_limit: u
                     to_label,
                     "unread",
                 );
-                if msg.body.is_empty() {
+                // Resolve body lazily — only for displayed messages.
+                let body = resolve_message_body(&mut local_ws, &local_space, msg.id);
+                if body.is_empty() {
                     println!("    ");
                 } else {
-                    for line in msg.body.lines() {
+                    for line in body.lines() {
                         println!("    {}", line.trim_end_matches('\r'));
                     }
                 }

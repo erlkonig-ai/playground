@@ -806,7 +806,7 @@ fn create_thought_and_request(
     prev_cover: &mut Option<MemoryCoverState>,
 ) -> Result<ModelRequestInfo> {
     let mut ws = pull_workspace(repo, branch_id, "pull workspace for thought")?;
-    let catalog = ws.checkout(..).context("checkout workspace")?;
+    let catalog = ws.checkout(..).context("checkout workspace")?.into_facts();
 
     if let Some(exec_result_id) = about_exec_result {
         if let Some(thought_id) = thought_for_exec_result(&catalog, exec_result_id) {
@@ -824,7 +824,7 @@ fn create_thought_and_request(
     let memory_catalog = match repo.ensure_branch(MEMORY_BRANCH_NAME, None) {
         Ok(memory_branch_id) => {
             let mut memory_ws = pull_workspace(repo, memory_branch_id, "pull memory branch")?;
-            memory_ws.checkout(..).context("checkout memory branch")?
+            memory_ws.checkout(..).context("checkout memory branch")?.into_facts()
         }
         Err(_) => TribleSet::new(),
     };
@@ -936,7 +936,7 @@ fn retry_model_request(
 ) -> Result<ModelRequestInfo> {
     if let Some(thought_id) = thought_id {
         let mut ws = pull_workspace(repo, branch_id, "pull workspace for model retry")?;
-        let catalog = ws.checkout(..).context("checkout workspace for retry")?;
+        let catalog = ws.checkout(..).context("checkout workspace for retry")?.into_facts();
 
         let Some(context_handle) = thought_context_handle(&catalog, thought_id) else {
             return Err(anyhow!("thought {thought_id:x} missing context for retry"));

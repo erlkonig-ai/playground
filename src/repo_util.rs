@@ -89,9 +89,10 @@ pub(crate) fn refresh_cached_checkout(
         return Ok(TribleSet::new());
     }
 
-    let delta = ws
+    let checkout = ws
         .checkout(*cached_head..head)
         .context("checkout from cached head to current head")?;
+    let delta = checkout.into_facts();
     let mut data = cached_catalog.clone();
     data += delta.clone();
 

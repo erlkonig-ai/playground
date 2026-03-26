@@ -218,6 +218,22 @@ struct DashboardState {
     repo: Option<Repository<Pile>>,
     repo_open_path: Option<PathBuf>,
     signing_key: SigningKey,
+    // Per-branch cached state (workspace for blob access, catalog for queries)
+    config_catalog: TribleSet,
+    config_head: Option<CommitHandle>,
+    exec_catalog: TribleSet,
+    exec_head: Option<CommitHandle>,
+    compass_catalog: TribleSet,
+    compass_head: Option<CommitHandle>,
+    local_messages_catalog: TribleSet,
+    local_messages_head: Option<CommitHandle>,
+    relations_catalog: TribleSet,
+    relations_head: Option<CommitHandle>,
+    teams_catalog: TribleSet,
+    teams_head: Option<CommitHandle>,
+    branches: Vec<BranchEntry>,
+    now_key: i128,
+    // Compat: snapshot built from catalogs for render functions
     snapshot: Option<Result<DashboardSnapshot, String>>,
     show_extra_branches: bool,
     local_draft: String,
@@ -254,6 +270,22 @@ impl Default for DashboardState {
             repo: None,
             repo_open_path: None,
             signing_key: random_signing_key(),
+            // Per-branch cached state
+            config_catalog: TribleSet::new(),
+            config_head: None,
+            exec_catalog: TribleSet::new(),
+            exec_head: None,
+            compass_catalog: TribleSet::new(),
+            compass_head: None,
+            local_messages_catalog: TribleSet::new(),
+            local_messages_head: None,
+            relations_catalog: TribleSet::new(),
+            relations_head: None,
+            teams_catalog: TribleSet::new(),
+            teams_head: None,
+            branches: Vec::new(),
+            now_key: 0,
+            // Compat
             snapshot: None,
             show_extra_branches: false,
             local_draft: String::new(),
@@ -579,7 +611,10 @@ struct DashboardSnapshot {
     now_key: i128,
 }
 
+/// Legacy per-branch snapshot; kept for compat with DashboardSnapshot.branch_data.
+/// Phase 2 will remove this along with the branch_data field.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct BranchSnapshot {
     head: Option<CommitHandle>,
     data: TribleSet,
@@ -1058,36 +1093,60 @@ fn ensure_repo_open(state: &mut DashboardState) -> Result<(), String> {
             .map_err(|err| format!("create repository: {err:?}"))?;
         state.repo = Some(repo);
         state.repo_open_path = Some(open_path);
+        // Reset per-branch cached state — old workspaces reference the previous pile.
+        
+        state.config_catalog = TribleSet::new();
+        state.config_head = None;
+        
+        state.exec_catalog = TribleSet::new();
+        state.exec_head = None;
+        
+        state.compass_catalog = TribleSet::new();
+        state.compass_head = None;
+        
+        state.local_messages_catalog = TribleSet::new();
+        state.local_messages_head = None;
+        
+        state.relations_catalog = TribleSet::new();
+        state.relations_head = None;
+        
+        state.teams_catalog = TribleSet::new();
+        state.teams_head = None;
+        state.branches.clear();
+        state.snapshot = None;
     }
     Ok(())
 }
 
 fn refresh_snapshot(state: &mut DashboardState) {
-    let previous = state
-        .snapshot
-        .as_ref()
-        .and_then(|result| result.as_ref().ok())
-        .cloned();
-    let config = state.config.clone();
-    let context_selected = state.context_selected_chunk;
-    let context_show_children = state.context_show_children;
-    let context_show_origins = state.context_show_origins;
-    let timeline_limit = state.timeline_limit;
-    let repo = match state.repo.as_mut() {
-        Some(repo) => repo,
-        None => {
-            state.snapshot = Some(Err("Repository not open.".to_string()));
-            return;
-        }
-    };
-    let result = load_snapshot(
-        repo,
-        &config,
-        previous,
-        context_selected,
-        context_show_children,
-        context_show_origins,
-        timeline_limit,
+    // Capture previous heads for delta detection
+    let prev_config_head = state.config_head;
+    let prev_exec_head = state.exec_head;
+    let prev_compass_head = state.compass_head;
+    let prev_local_messages_head = state.local_messages_head;
+    let prev_relations_head = state.relations_head;
+    let prev_teams_head = state.teams_head;
+
+    // Phase 1: refresh per-branch catalogs
+    refresh_catalogs(state);
+
+    // Phase 1b compat: build old DashboardSnapshot from catalogs for render functions.
+    // Determine which roles changed by comparing heads.
+    let config_changed = state.config_head != prev_config_head;
+    let exec_changed = state.exec_head != prev_exec_head;
+    let compass_changed = state.compass_head != prev_compass_head;
+    let local_messages_changed = state.local_messages_head != prev_local_messages_head;
+    let relations_changed = state.relations_head != prev_relations_head;
+    let teams_changed = state.teams_head != prev_teams_head;
+
+    let result = build_snapshot_from_catalogs(
+        state,
+        config_changed,
+        exec_changed,
+        compass_changed,
+        local_messages_changed,
+        relations_changed,
+        teams_changed,
     );
     if let Ok(snapshot) = &result {
         if let Some(agent_config) = snapshot.agent_config.as_ref() {
@@ -1095,6 +1154,296 @@ fn refresh_snapshot(state: &mut DashboardState) {
         }
     }
     state.snapshot = Some(result);
+}
+
+/// Refresh per-branch workspace + catalog state from the repository.
+fn refresh_catalogs(state: &mut DashboardState) {
+    let repo = match state.repo.as_mut() {
+        Some(r) => r,
+        None => return,
+    };
+
+    // Auto-create well-known branches so the dashboard never errors on a missing name.
+    for name in [
+        "config",
+        "cognition",
+        "compass",
+        "local-messages",
+        "relations",
+        "teams",
+        "archive",
+        "web",
+        "media",
+    ] {
+        let _ = repo.ensure_branch(name, None);
+    }
+
+    state.branches = list_branches(repo.storage_mut()).unwrap_or_default();
+
+    let branch_lookup = BranchLookup::new(&state.branches);
+
+    // Helper: resolve branch names, pull workspaces, checkout and union catalogs.
+    // Returns (workspace_for_blob_access, catalog, single_head_for_change_detection).
+    // The head is only meaningful for single-branch configs; multi-branch always re-checkouts.
+    fn refresh_role(
+        repo: &mut Repository<Pile>,
+        branch_lookup: &BranchLookup,
+        branch_names: &str,
+        prev_head: Option<CommitHandle>,
+        prev_catalog: &TribleSet,
+    ) -> Option<(TribleSet, Option<CommitHandle>)> {
+        let refs = parse_branch_list(branch_names);
+        let ids = resolve_branch_ids(branch_lookup, &refs).ok()?;
+        if ids.is_empty() {
+            return None;
+        }
+
+        // Single-branch fast path: check head for change detection
+        if ids.len() == 1 {
+            let mut ws = repo.pull(ids[0]).ok()?;
+            let head = ws.head();
+            if head == prev_head && !prev_catalog.is_empty() {
+                return Some((prev_catalog.clone(), head));
+            }
+            let catalog = if head.is_some() {
+                ws.checkout(..).ok()?.into_facts()
+            } else {
+                TribleSet::new()
+            };
+            return Some((catalog, head));
+        }
+
+        // Multi-branch: always do full checkout (no head-based caching)
+        let mut catalog = TribleSet::new();
+        for branch_id in &ids {
+            let mut ws = repo.pull(*branch_id).ok()?;
+            if ws.head().is_some() {
+                let checkout = ws.checkout(..).ok()?;
+                catalog += checkout.into_facts();
+            }
+        }
+
+        Some((catalog, None))
+    }
+
+    if let Some((catalog, head)) = refresh_role(
+        repo,
+        &branch_lookup,
+        &state.config.config_branches.clone(),
+        state.config_head,
+        &state.config_catalog,
+    ) {
+        
+        state.config_catalog = catalog;
+        state.config_head = head;
+    }
+
+    if let Some((catalog, head)) = refresh_role(
+        repo,
+        &branch_lookup,
+        &state.config.exec_branches.clone(),
+        state.exec_head,
+        &state.exec_catalog,
+    ) {
+        
+        state.exec_catalog = catalog;
+        state.exec_head = head;
+    }
+
+    if let Some((catalog, head)) = refresh_role(
+        repo,
+        &branch_lookup,
+        &state.config.compass_branches.clone(),
+        state.compass_head,
+        &state.compass_catalog,
+    ) {
+        
+        state.compass_catalog = catalog;
+        state.compass_head = head;
+    }
+
+    if let Some((catalog, head)) = refresh_role(
+        repo,
+        &branch_lookup,
+        &state.config.local_message_branches.clone(),
+        state.local_messages_head,
+        &state.local_messages_catalog,
+    ) {
+        
+        state.local_messages_catalog = catalog;
+        state.local_messages_head = head;
+    }
+
+    if let Some((catalog, head)) = refresh_role(
+        repo,
+        &branch_lookup,
+        &state.config.relations_branches.clone(),
+        state.relations_head,
+        &state.relations_catalog,
+    ) {
+        
+        state.relations_catalog = catalog;
+        state.relations_head = head;
+    }
+
+    if let Some((catalog, head)) = refresh_role(
+        repo,
+        &branch_lookup,
+        &state.config.teams_branches.clone(),
+        state.teams_head,
+        &state.teams_catalog,
+    ) {
+        
+        state.teams_catalog = catalog;
+        state.teams_head = head;
+    }
+
+    state.now_key = epoch_key(now_epoch());
+}
+
+/// Compatibility layer: build a DashboardSnapshot from per-branch catalogs.
+/// This allows render functions to continue using the old snapshot format
+/// while we migrate them to query catalogs directly in Phase 2.
+///
+/// The `*_changed` flags indicate whether each role's head commit advanced
+/// since the last refresh, which controls whether cached data is reused.
+fn build_snapshot_from_catalogs(
+    state: &mut DashboardState,
+    config_changed: bool,
+    exec_changed: bool,
+    compass_changed: bool,
+    local_messages_changed: bool,
+    relations_changed: bool,
+    teams_changed: bool,
+) -> Result<DashboardSnapshot, String> {
+    let pile_path = PathBuf::from(&state.config.pile_path);
+    let config = state.config.clone();
+    let now_key = state.now_key;
+
+    // Synthesise delta TribleSets for the compat layer.
+    // When a role changed, use the full catalog as the delta (conservative but correct);
+    // when unchanged, use an empty set so build_snapshot can skip re-collection.
+    let config_delta = if config_changed { state.config_catalog.clone() } else { TribleSet::new() };
+    let exec_delta = if exec_changed { state.exec_catalog.clone() } else { TribleSet::new() };
+    let compass_delta = if compass_changed { state.compass_catalog.clone() } else { TribleSet::new() };
+    let local_delta = if local_messages_changed { state.local_messages_catalog.clone() } else { TribleSet::new() };
+    let relations_delta = if relations_changed { state.relations_catalog.clone() } else { TribleSet::new() };
+    let teams_delta = if teams_changed { state.teams_catalog.clone() } else { TribleSet::new() };
+
+    // Determine error messages from branch resolution
+    let branch_lookup = BranchLookup::new(&state.branches);
+    let agent_config_error = resolve_branch_ids(&branch_lookup, &parse_branch_list(&config.config_branches)).err();
+    let exec_error = resolve_branch_ids(&branch_lookup, &parse_branch_list(&config.exec_branches)).err();
+    let compass_error = resolve_branch_ids(&branch_lookup, &parse_branch_list(&config.compass_branches)).err();
+    let local_message_error = resolve_branch_ids(&branch_lookup, &parse_branch_list(&config.local_message_branches)).err();
+    let relations_error = resolve_branch_ids(&branch_lookup, &parse_branch_list(&config.relations_branches)).err();
+    let teams_error = resolve_branch_ids(&branch_lookup, &parse_branch_list(&config.teams_branches)).err();
+
+    // Clone catalogs and branches before taking a mutable borrow on workspaces
+    let config_catalog = state.config_catalog.clone();
+    let exec_catalog = state.exec_catalog.clone();
+    let compass_catalog = state.compass_catalog.clone();
+    let local_messages_catalog = state.local_messages_catalog.clone();
+    let relations_catalog = state.relations_catalog.clone();
+    let teams_catalog = state.teams_catalog.clone();
+    let branches = state.branches.clone();
+    let context_selected_chunk = state.context_selected_chunk;
+    let context_show_children = state.context_show_children;
+    let context_show_origins = state.context_show_origins;
+    let timeline_limit = state.timeline_limit;
+
+    // Take the previous snapshot for reuse (avoids borrow conflict with &mut self)
+    let previous_snapshot = state.snapshot.take();
+    let previous = previous_snapshot
+        .as_ref()
+        .and_then(|r| r.as_ref().ok());
+    let previous_for_reuse = previous.filter(|s| s.pile_path == pile_path);
+
+    // Pull a fresh workspace for blob access (any branch will do — blobs are content-addressed).
+    let ws = {
+        let repo = match state.repo.as_mut() {
+            Some(r) => r,
+            None => {
+                state.snapshot = Some(Err("Repository not open.".to_string()));
+                return Err("Repository not open.".to_string());
+            }
+        };
+        // Try the exec branch first, fall back to others
+        let branch_name = &state.config.exec_branches;
+        let refs = parse_branch_list(branch_name);
+        let branch_entries = list_branches(repo.storage_mut()).unwrap_or_default();
+        let branch_lookup = BranchLookup::new(&branch_entries);
+        resolve_branch_ids(&branch_lookup, &refs)
+            .ok()
+            .and_then(|ids| ids.first().copied())
+            .and_then(|id| repo.pull(id).ok())
+    };
+
+    let Some(mut ws) = ws else {
+        return Ok(DashboardSnapshot {
+            pile_path,
+            branches,
+            branch_data: HashMap::new(),
+            exec_error,
+            agent_config: None,
+            agent_config_error,
+            context_chunks: Vec::new(),
+            context_selected: None,
+            exec_rows: Vec::new(),
+            reasoning_summaries: Vec::new(),
+            reason_rows: Vec::new(),
+            turn_memory_rows: Vec::new(),
+            local_message_rows: Vec::new(),
+            compass_status_rows: Vec::new(),
+            timeline_rows: Vec::new(),
+            timeline_total_rows: 0,
+            compass_rows: Vec::new(),
+            compass_notes: HashMap::new(),
+            compass_error,
+            local_message_error,
+            local_me_id: None,
+            local_peer_id: None,
+            relations_people: Vec::new(),
+            relations_error,
+            relations_labels: HashMap::new(),
+            teams_messages: Vec::new(),
+            teams_chats: Vec::new(),
+            teams_error,
+            labels: HashMap::new(),
+            now_key,
+        });
+    };
+
+    Ok(build_snapshot(
+        config_catalog,
+        exec_catalog,
+        compass_catalog,
+        local_messages_catalog,
+        relations_catalog,
+        teams_catalog,
+        pile_path,
+        branches,
+        HashMap::new(), // branch_data no longer tracked per-id
+        agent_config_error,
+        exec_error,
+        compass_error,
+        local_message_error,
+        relations_error,
+        teams_error,
+        &config,
+        &mut ws,
+        previous_for_reuse,
+        &config_delta,
+        &exec_delta,
+        &compass_delta,
+        &local_delta,
+        &relations_delta,
+        &teams_delta,
+        context_selected_chunk,
+        context_show_children,
+        context_show_origins,
+        timeline_limit,
+    ))
 }
 
 fn should_refresh_snapshot(state: &DashboardState) -> bool {
@@ -1130,174 +1479,6 @@ fn apply_branch_defaults_from_agent_config(state: &mut DashboardState, config: &
     }
 
     state.config_last_applied_id = Some(config.id);
-}
-
-fn load_snapshot(
-    repo: &mut Repository<Pile>,
-    config: &DashboardConfig,
-    previous: Option<DashboardSnapshot>,
-    context_selected_chunk: Option<Id>,
-    context_show_children: bool,
-    context_show_origins: bool,
-    timeline_limit: usize,
-) -> Result<DashboardSnapshot, String> {
-    let pile_path = PathBuf::from(&config.pile_path);
-    let previous_for_reuse = previous
-        .as_ref()
-        .filter(|snapshot| snapshot.pile_path == pile_path);
-
-    // Auto-create well-known branches so the dashboard never errors on a missing name.
-    for name in [
-        "config",
-        "cognition",
-        "compass",
-        "local-messages",
-        "relations",
-        "teams",
-        "archive",
-        "web",
-        "media",
-    ] {
-        let _ = repo.ensure_branch(name, None);
-    }
-
-    let branches = list_branches(repo.storage_mut())?;
-    let mut previous_map = previous_for_reuse
-        .map(|snapshot| snapshot.branch_data.clone())
-        .unwrap_or_default();
-
-    let config_refs = parse_branch_list(&config.config_branches);
-    let exec_refs = parse_branch_list(&config.exec_branches);
-    let compass_refs = parse_branch_list(&config.compass_branches);
-    let local_refs = parse_branch_list(&config.local_message_branches);
-    let relations_refs = parse_branch_list(&config.relations_branches);
-    let teams_refs = parse_branch_list(&config.teams_branches);
-
-    let branch_lookup = BranchLookup::new(&branches);
-    let config_res = resolve_branch_ids(&branch_lookup, &config_refs);
-    let exec_res = resolve_branch_ids(&branch_lookup, &exec_refs);
-    let compass_res = resolve_branch_ids(&branch_lookup, &compass_refs);
-    let local_res = resolve_branch_ids(&branch_lookup, &local_refs);
-    let relations_res = resolve_branch_ids(&branch_lookup, &relations_refs);
-    let teams_res = resolve_branch_ids(&branch_lookup, &teams_refs);
-
-    let agent_config_error = config_res.as_ref().err().cloned();
-    let exec_error = exec_res.as_ref().err().cloned();
-    let compass_error = compass_res.as_ref().err().cloned();
-    let local_message_error = local_res.as_ref().err().cloned();
-    let relations_error = relations_res.as_ref().err().cloned();
-    let teams_error = teams_res.as_ref().err().cloned();
-
-    let config_ids = config_res.unwrap_or_default();
-    let exec_ids = exec_res.unwrap_or_default();
-    let compass_ids = compass_res.unwrap_or_default();
-    let local_ids = local_res.unwrap_or_default();
-    let relations_ids = relations_res.unwrap_or_default();
-    let teams_ids = teams_res.unwrap_or_default();
-
-    let mut needed_ids: Vec<Id> = Vec::new();
-    extend_unique(&mut needed_ids, &config_ids);
-    extend_unique(&mut needed_ids, &exec_ids);
-    extend_unique(&mut needed_ids, &compass_ids);
-    extend_unique(&mut needed_ids, &local_ids);
-    extend_unique(&mut needed_ids, &relations_ids);
-    extend_unique(&mut needed_ids, &teams_ids);
-
-    let mut branch_data: HashMap<Id, BranchSnapshot> = HashMap::new();
-    let mut reader_ws: Option<Workspace<Pile>> = None;
-
-    for branch_id in &needed_ids {
-        let snapshot = load_branch_snapshot(repo, *branch_id, previous_map.remove(branch_id))?;
-        if reader_ws.is_none() {
-            reader_ws = Some(
-                repo.pull(*branch_id)
-                    .map_err(|err| format!("pull branch: {err:?}"))?,
-            );
-        }
-        branch_data.insert(*branch_id, snapshot);
-    }
-
-    let config_data = union_branches(&branch_data, &config_ids);
-    let exec_data = union_branches(&branch_data, &exec_ids);
-    let compass_data = union_branches(&branch_data, &compass_ids);
-    let local_data = union_branches(&branch_data, &local_ids);
-    let relations_data = union_branches(&branch_data, &relations_ids);
-    let teams_data = union_branches(&branch_data, &teams_ids);
-    let config_delta = union_branch_deltas(&branch_data, &config_ids);
-    let exec_delta = union_branch_deltas(&branch_data, &exec_ids);
-    let compass_delta = union_branch_deltas(&branch_data, &compass_ids);
-    let local_delta = union_branch_deltas(&branch_data, &local_ids);
-    let relations_delta = union_branch_deltas(&branch_data, &relations_ids);
-    let teams_delta = union_branch_deltas(&branch_data, &teams_ids);
-
-    let mut reader_ws = if let Some(ws) = reader_ws {
-        ws
-    } else {
-        let now_key = epoch_key(now_epoch());
-        return Ok(DashboardSnapshot {
-            pile_path,
-            branches,
-            branch_data,
-            exec_error,
-            agent_config: None,
-            agent_config_error,
-            context_chunks: Vec::new(),
-            context_selected: None,
-            exec_rows: Vec::new(),
-            reasoning_summaries: Vec::new(),
-            reason_rows: Vec::new(),
-            turn_memory_rows: Vec::new(),
-            local_message_rows: Vec::new(),
-            compass_status_rows: Vec::new(),
-            timeline_rows: Vec::new(),
-            timeline_total_rows: 0,
-            compass_rows: Vec::new(),
-            compass_notes: HashMap::new(),
-            compass_error,
-            local_message_error,
-            local_me_id: None,
-            local_peer_id: None,
-            relations_people: Vec::new(),
-            relations_error,
-            relations_labels: HashMap::new(),
-            teams_messages: Vec::new(),
-            teams_chats: Vec::new(),
-            teams_error,
-            labels: HashMap::new(),
-            now_key,
-        });
-    };
-
-    Ok(build_snapshot(
-        config_data,
-        exec_data,
-        compass_data,
-        local_data,
-        relations_data,
-        teams_data,
-        pile_path,
-        branches,
-        branch_data,
-        agent_config_error,
-        exec_error,
-        compass_error,
-        local_message_error,
-        relations_error,
-        teams_error,
-        config,
-        &mut reader_ws,
-        previous_for_reuse,
-        &config_delta,
-        &exec_delta,
-        &compass_delta,
-        &local_delta,
-        &relations_delta,
-        &teams_delta,
-        context_selected_chunk,
-        context_show_children,
-        context_show_origins,
-        timeline_limit,
-    ))
 }
 
 fn build_snapshot(
@@ -1637,77 +1818,6 @@ fn parse_branch_list(raw: &str) -> Vec<String> {
 fn resolve_branch_ids(lookup: &BranchLookup, refs: &[String]) -> Result<Vec<Id>, String> {
     let (ids, _) = resolve_branch_ids_with_notes(lookup, refs)?;
     Ok(ids)
-}
-
-fn extend_unique(out: &mut Vec<Id>, ids: &[Id]) {
-    for id in ids {
-        if !out.contains(id) {
-            out.push(*id);
-        }
-    }
-}
-
-fn load_branch_snapshot(
-    repo: &mut Repository<Pile>,
-    branch_id: Id,
-    previous: Option<BranchSnapshot>,
-) -> Result<BranchSnapshot, String> {
-    let mut ws = repo
-        .pull(branch_id)
-        .map_err(|err| format!("pull branch: {err:?}"))?;
-    let head = ws.head();
-    let (data, delta) = if let Some(prev_snapshot) = previous {
-        if prev_snapshot.head == head {
-            (prev_snapshot.data, TribleSet::new())
-        } else if let (Some(prev_head), Some(_)) = (prev_snapshot.head, head) {
-            match ws.checkout(prev_head..) {
-                Ok(delta) => {
-                    let mut data = prev_snapshot.data;
-                    if !delta.is_empty() {
-                        data += delta.clone();
-                    }
-                    (data, delta)
-                }
-                Err(_) => {
-                    let data = ws.checkout(..).map_err(|err| format!("checkout: {err}"))?;
-                    let delta = data.difference(&prev_snapshot.data);
-                    (data, delta)
-                }
-            }
-        } else if head.is_none() {
-            (TribleSet::new(), TribleSet::new())
-        } else {
-            let data = ws.checkout(..).map_err(|err| format!("checkout: {err}"))?;
-            (data.clone(), data)
-        }
-    } else if head.is_none() {
-        (TribleSet::new(), TribleSet::new())
-    } else {
-        let data = ws.checkout(..).map_err(|err| format!("checkout: {err}"))?;
-        (data.clone(), data)
-    };
-
-    Ok(BranchSnapshot { head, data, delta })
-}
-
-fn union_branches(branch_data: &HashMap<Id, BranchSnapshot>, ids: &[Id]) -> TribleSet {
-    let mut union = TribleSet::new();
-    for id in ids {
-        if let Some(snapshot) = branch_data.get(id) {
-            union += snapshot.data.clone();
-        }
-    }
-    union
-}
-
-fn union_branch_deltas(branch_data: &HashMap<Id, BranchSnapshot>, ids: &[Id]) -> TribleSet {
-    let mut union = TribleSet::new();
-    for id in ids {
-        if let Some(snapshot) = branch_data.get(id) {
-            union += snapshot.delta.clone();
-        }
-    }
-    union
 }
 
 fn collect_agent_config(data: &TribleSet, ws: &mut Workspace<Pile>) -> Option<AgentConfigRow> {
@@ -4148,7 +4258,7 @@ fn ensure_local_metadata(ws: &mut Workspace<Pile>) -> Result<TribleSet, String> 
     let space = if ws.head().is_none() {
         TribleSet::new()
     } else {
-        ws.checkout(..).map_err(|err| format!("checkout: {err}"))?
+        ws.checkout(..).map_err(|err| format!("checkout: {err}"))?.into_facts()
     };
     let mut change = TribleSet::new();
 
