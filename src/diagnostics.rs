@@ -978,15 +978,186 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
 
     // ── Relations ─
     nb.view(move |ui| {
-        let state = dashboard.read_mut(ui);
+        let mut state = dashboard.read_mut(ui);
+
+        // Pull a workspace for blob reads before entering the section closure.
+        let relations_branches = state.config.relations_branches.clone();
+        let mut ws = state.repo.as_mut().and_then(|repo| {
+            let branch_entries = list_branches(repo.storage_mut()).ok()?;
+            let lookup = BranchLookup::new(&branch_entries);
+            let refs = parse_branch_list(&relations_branches);
+            let ids = resolve_branch_ids(&lookup, &refs).ok()?;
+            repo.pull(*ids.first()?).ok()
+        });
+
         ui.section("Relations", |ui| {
-            let Some(snapshot) = snapshot_or_message(ui, &state.snapshot) else {
+            // Show branch resolution error when the configured branch can't be found.
+            if state.relations_co.is_none() && !state.config.relations_branches.trim().is_empty() {
+                let branch_lookup = BranchLookup::new(&state.branches);
+                let refs = parse_branch_list(&state.config.relations_branches);
+                if let Err(err) = resolve_branch_ids(&branch_lookup, &refs) {
+                    ui.colored_label(egui::Color32::RED, err);
+                    return;
+                }
+            }
+
+            let data = catalog(&state.relations_co);
+            if data.is_empty() {
+                ui.label("No relations.");
                 return;
-            };
-            if let Some(err) = &snapshot.relations_error {
-                ui.colored_label(egui::Color32::RED, err);
-            } else {
-                render_relations(ui, &snapshot.relations_people);
+            }
+
+            let person_ids: Vec<Id> = find!(
+                person_id: Id,
+                pattern!(data, [{ ?person_id @ metadata::tag: &RELATIONS_KIND_PERSON_ID }])
+            )
+            .collect();
+
+            if person_ids.is_empty() {
+                ui.label("No relations.");
+                return;
+            }
+
+            // Collect and sort people by label for stable ordering.
+            struct PersonEntry {
+                id: Id,
+                label: Option<String>,
+                first_name: Option<String>,
+                last_name: Option<String>,
+                display_name: Option<String>,
+                affinity: Option<String>,
+                teams_user_id: Option<String>,
+                email: Option<String>,
+                note: Option<String>,
+                aliases: Vec<String>,
+            }
+
+            let mut people: Vec<PersonEntry> = person_ids
+                .into_iter()
+                .map(|id| PersonEntry {
+                    id,
+                    label: None,
+                    first_name: None,
+                    last_name: None,
+                    display_name: None,
+                    affinity: None,
+                    teams_user_id: None,
+                    email: None,
+                    note: None,
+                    aliases: Vec::new(),
+                })
+                .collect();
+
+            // Resolve blob-backed attributes.
+            for person in &mut people {
+                let pid = person.id;
+
+                for handle in find!(
+                    handle: Value<Handle<Blake3, LongString>>,
+                    pattern!(data, [{ &pid @ metadata::name: ?handle }])
+                ) {
+                    if person.label.is_none() {
+                        person.label = ws.as_mut().and_then(|w| load_text(w, handle));
+                    }
+                }
+                for handle in find!(
+                    handle: Value<Handle<Blake3, LongString>>,
+                    pattern!(data, [{ &pid @ relations::display_name: ?handle }])
+                ) {
+                    if person.display_name.is_none() {
+                        person.display_name = ws.as_mut().and_then(|w| load_text(w, handle));
+                    }
+                }
+                for handle in find!(
+                    handle: Value<Handle<Blake3, LongString>>,
+                    pattern!(data, [{ &pid @ relations::first_name: ?handle }])
+                ) {
+                    if person.first_name.is_none() {
+                        person.first_name = ws.as_mut().and_then(|w| load_text(w, handle));
+                    }
+                }
+                for handle in find!(
+                    handle: Value<Handle<Blake3, LongString>>,
+                    pattern!(data, [{ &pid @ relations::last_name: ?handle }])
+                ) {
+                    if person.last_name.is_none() {
+                        person.last_name = ws.as_mut().and_then(|w| load_text(w, handle));
+                    }
+                }
+                for handle in find!(
+                    handle: Value<Handle<Blake3, LongString>>,
+                    pattern!(data, [{ &pid @ metadata::description: ?handle }])
+                ) {
+                    if person.note.is_none() {
+                        person.note = ws.as_mut().and_then(|w| load_text(w, handle));
+                    }
+                }
+
+                // ShortString attributes — no blob read needed.
+                for value in find!(
+                    value: String,
+                    pattern!(data, [{ &pid @ relations::affinity: ?value }])
+                ) {
+                    if person.affinity.is_none() {
+                        person.affinity = Some(value);
+                    }
+                }
+                for value in find!(
+                    value: String,
+                    pattern!(data, [{ &pid @ relations::teams_user_id: ?value }])
+                ) {
+                    if person.teams_user_id.is_none() {
+                        person.teams_user_id = Some(value);
+                    }
+                }
+                for value in find!(
+                    value: String,
+                    pattern!(data, [{ &pid @ relations::email: ?value }])
+                ) {
+                    if person.email.is_none() {
+                        person.email = Some(value);
+                    }
+                }
+                for value in find!(
+                    value: String,
+                    pattern!(data, [{ &pid @ relations::alias: ?value }])
+                ) {
+                    person.aliases.push(value);
+                }
+            }
+
+            people.sort_by(|a, b| a.label.cmp(&b.label).then_with(|| a.id.cmp(&b.id)));
+
+            // Render.
+            ui.set_min_height(RELATIONS_SCROLL_HEIGHT);
+            for person in &people {
+                let label = person.label.as_deref().unwrap_or("<unnamed>");
+                ui.label(format!("[{}] {}", id_prefix(person.id), label));
+                let full_name = match (&person.first_name, &person.last_name) {
+                    (Some(first), Some(last)) => Some(format!("{first} {last}")),
+                    (Some(first), None) => Some(first.clone()),
+                    (None, Some(last)) => Some(last.clone()),
+                    (None, None) => None,
+                };
+                if let Some(name) = person.display_name.as_ref().or(full_name.as_ref()) {
+                    ui.small(name);
+                }
+                if let Some(affinity) = &person.affinity {
+                    ui.small(format!("affinity: {affinity}"));
+                }
+                if let Some(teams) = &person.teams_user_id {
+                    ui.small(format!("teams: {teams}"));
+                }
+                if let Some(email) = &person.email {
+                    ui.small(format!("email: {email}"));
+                }
+                if !person.aliases.is_empty() {
+                    ui.small(format!("aliases: {}", person.aliases.join(", ")));
+                }
+                if let Some(note) = &person.note {
+                    ui.small(format!("note: {}", truncate_single_line(note, 120)));
+                }
+                ui.add_space(8.0);
             }
         });
     });
@@ -5638,43 +5809,6 @@ fn render_person_chip(ui: &mut egui::Ui, label: &str, fill: egui::Color32) {
         .show(ui, |ui| {
             ui.label(egui::RichText::new(label).color(text_color).small());
         });
-}
-
-fn render_relations(ui: &mut egui::Ui, people: &[RelationRow]) {
-    if people.is_empty() {
-        ui.label("No relations.");
-        return;
-    }
-    ui.set_min_height(RELATIONS_SCROLL_HEIGHT);
-    for person in people {
-        let label = person.label.as_deref().unwrap_or("<unnamed>");
-        ui.label(format!("[{}] {}", id_prefix(person.id), label));
-        let full_name = match (&person.first_name, &person.last_name) {
-            (Some(first), Some(last)) => Some(format!("{first} {last}")),
-            (Some(first), None) => Some(first.clone()),
-            (None, Some(last)) => Some(last.clone()),
-            (None, None) => None,
-        };
-        if let Some(name) = person.display_name.as_ref().or(full_name.as_ref()) {
-            ui.small(name);
-        }
-        if let Some(affinity) = &person.affinity {
-            ui.small(format!("affinity: {affinity}"));
-        }
-        if let Some(teams) = &person.teams_user_id {
-            ui.small(format!("teams: {teams}"));
-        }
-        if let Some(email) = &person.email {
-            ui.small(format!("email: {email}"));
-        }
-        if !person.aliases.is_empty() {
-            ui.small(format!("aliases: {}", person.aliases.join(", ")));
-        }
-        if let Some(note) = &person.note {
-            ui.small(format!("note: {}", truncate_single_line(note, 120)));
-        }
-        ui.add_space(8.0);
-    }
 }
 
 fn parse_response_json(raw: &str) -> Option<JsonValue> {
