@@ -13,7 +13,7 @@ use triblespace::core::blob::schemas::simplearchive::SimpleArchive;
 use triblespace::core::id::{ExclusiveId, Id};
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::Pile;
-use triblespace::core::repo::{BlobStoreMeta, Repository, Workspace};
+use triblespace::core::repo::{BlobStoreMeta, Checkout, Repository, Workspace};
 use triblespace::core::trible::TribleSet;
 use triblespace::core::value::Value;
 use triblespace::core::value::schemas::hash::{Blake3, Handle};
@@ -218,19 +218,16 @@ struct DashboardState {
     repo: Option<Repository<Pile>>,
     repo_open_path: Option<PathBuf>,
     signing_key: SigningKey,
-    // Per-branch cached state (workspace for blob access, catalog for queries)
-    config_catalog: TribleSet,
-    config_head: Option<CommitHandle>,
-    exec_catalog: TribleSet,
-    exec_head: Option<CommitHandle>,
-    compass_catalog: TribleSet,
-    compass_head: Option<CommitHandle>,
-    local_messages_catalog: TribleSet,
-    local_messages_head: Option<CommitHandle>,
-    relations_catalog: TribleSet,
-    relations_head: Option<CommitHandle>,
-    teams_catalog: TribleSet,
-    teams_head: Option<CommitHandle>,
+    // Per-branch state — Checkout pattern (triblespace 0.26).
+    // Checkout = TribleSet (facts) + CommitSet (continuation token).
+    // .facts() for queries, .commits() for next delta, += for merge.
+    // None = not yet loaded (first refresh does full checkout).
+    config_co: Option<Checkout>,
+    exec_co: Option<Checkout>,
+    compass_co: Option<Checkout>,
+    local_messages_co: Option<Checkout>,
+    relations_co: Option<Checkout>,
+    teams_co: Option<Checkout>,
     branches: Vec<BranchEntry>,
     now_key: i128,
     // Compat: snapshot built from catalogs for render functions
@@ -271,18 +268,12 @@ impl Default for DashboardState {
             repo_open_path: None,
             signing_key: random_signing_key(),
             // Per-branch cached state
-            config_catalog: TribleSet::new(),
-            config_head: None,
-            exec_catalog: TribleSet::new(),
-            exec_head: None,
-            compass_catalog: TribleSet::new(),
-            compass_head: None,
-            local_messages_catalog: TribleSet::new(),
-            local_messages_head: None,
-            relations_catalog: TribleSet::new(),
-            relations_head: None,
-            teams_catalog: TribleSet::new(),
-            teams_head: None,
+            config_co: None,
+            exec_co: None,
+            compass_co: None,
+            local_messages_co: None,
+            relations_co: None,
+            teams_co: None,
             branches: Vec::new(),
             now_key: 0,
             // Compat
@@ -1093,25 +1084,13 @@ fn ensure_repo_open(state: &mut DashboardState) -> Result<(), String> {
             .map_err(|err| format!("create repository: {err:?}"))?;
         state.repo = Some(repo);
         state.repo_open_path = Some(open_path);
-        // Reset per-branch cached state — old workspaces reference the previous pile.
-        
-        state.config_catalog = TribleSet::new();
-        state.config_head = None;
-        
-        state.exec_catalog = TribleSet::new();
-        state.exec_head = None;
-        
-        state.compass_catalog = TribleSet::new();
-        state.compass_head = None;
-        
-        state.local_messages_catalog = TribleSet::new();
-        state.local_messages_head = None;
-        
-        state.relations_catalog = TribleSet::new();
-        state.relations_head = None;
-        
-        state.teams_catalog = TribleSet::new();
-        state.teams_head = None;
+        // Reset per-branch cached state — old checkouts reference the previous pile.
+        state.config_co = None;
+        state.exec_co = None;
+        state.compass_co = None;
+        state.local_messages_co = None;
+        state.relations_co = None;
+        state.teams_co = None;
         state.branches.clear();
         state.snapshot = None;
     }
@@ -1119,25 +1098,25 @@ fn ensure_repo_open(state: &mut DashboardState) -> Result<(), String> {
 }
 
 fn refresh_snapshot(state: &mut DashboardState) {
-    // Capture previous heads for delta detection
-    let prev_config_head = state.config_head;
-    let prev_exec_head = state.exec_head;
-    let prev_compass_head = state.compass_head;
-    let prev_local_messages_head = state.local_messages_head;
-    let prev_relations_head = state.relations_head;
-    let prev_teams_head = state.teams_head;
+    // Capture previous fact counts for change detection.
+    let prev_config_len = catalog(&state.config_co).len();
+    let prev_exec_len = catalog(&state.exec_co).len();
+    let prev_compass_len = catalog(&state.compass_co).len();
+    let prev_local_messages_len = catalog(&state.local_messages_co).len();
+    let prev_relations_len = catalog(&state.relations_co).len();
+    let prev_teams_len = catalog(&state.teams_co).len();
 
-    // Phase 1: refresh per-branch catalogs
+    // Phase 1: refresh per-branch checkouts
     refresh_catalogs(state);
 
     // Phase 1b compat: build old DashboardSnapshot from catalogs for render functions.
-    // Determine which roles changed by comparing heads.
-    let config_changed = state.config_head != prev_config_head;
-    let exec_changed = state.exec_head != prev_exec_head;
-    let compass_changed = state.compass_head != prev_compass_head;
-    let local_messages_changed = state.local_messages_head != prev_local_messages_head;
-    let relations_changed = state.relations_head != prev_relations_head;
-    let teams_changed = state.teams_head != prev_teams_head;
+    // Determine which roles changed by comparing fact counts.
+    let config_changed = catalog(&state.config_co).len() != prev_config_len;
+    let exec_changed = catalog(&state.exec_co).len() != prev_exec_len;
+    let compass_changed = catalog(&state.compass_co).len() != prev_compass_len;
+    let local_messages_changed = catalog(&state.local_messages_co).len() != prev_local_messages_len;
+    let relations_changed = catalog(&state.relations_co).len() != prev_relations_len;
+    let teams_changed = catalog(&state.teams_co).len() != prev_teams_len;
 
     let result = build_snapshot_from_catalogs(
         state,
@@ -1154,6 +1133,12 @@ fn refresh_snapshot(state: &mut DashboardState) {
         }
     }
     state.snapshot = Some(result);
+}
+
+/// Extract the facts TribleSet from an `Option<Checkout>`, returning an empty set if None.
+fn catalog(co: &Option<Checkout>) -> &TribleSet {
+    static EMPTY: std::sync::LazyLock<TribleSet> = std::sync::LazyLock::new(TribleSet::new);
+    co.as_ref().map(|c| c.facts()).unwrap_or(&EMPTY)
 }
 
 /// Refresh per-branch workspace + catalog state from the repository.
@@ -1182,121 +1167,82 @@ fn refresh_catalogs(state: &mut DashboardState) {
 
     let branch_lookup = BranchLookup::new(&state.branches);
 
-    // Helper: resolve branch names, pull workspaces, checkout and union catalogs.
-    // Returns (workspace_for_blob_access, catalog, single_head_for_change_detection).
-    // The head is only meaningful for single-branch configs; multi-branch always re-checkouts.
+    /// Resolve branch names, pull workspace, and update the checkout in place.
+    /// - If `co` is None (first load): full checkout via `ws.checkout(..)`.
+    /// - If `co` is Some (incremental): delta checkout via `ws.checkout(co.commits()..)`,
+    ///   then merge with `co += &delta`.
+    /// Multi-branch configs union the checkouts from all branches.
     fn refresh_role(
         repo: &mut Repository<Pile>,
         branch_lookup: &BranchLookup,
         branch_names: &str,
-        prev_head: Option<CommitHandle>,
-        prev_catalog: &TribleSet,
-    ) -> Option<(TribleSet, Option<CommitHandle>)> {
+        co: &mut Option<Checkout>,
+    ) {
         let refs = parse_branch_list(branch_names);
-        let ids = resolve_branch_ids(branch_lookup, &refs).ok()?;
-        if ids.is_empty() {
-            return None;
-        }
+        let ids = match resolve_branch_ids(branch_lookup, &refs) {
+            Ok(ids) if !ids.is_empty() => ids,
+            _ => return,
+        };
 
-        // Single-branch fast path: check head for change detection
         if ids.len() == 1 {
-            let mut ws = repo.pull(ids[0]).ok()?;
-            let head = ws.head();
-            if head == prev_head && !prev_catalog.is_empty() {
-                return Some((prev_catalog.clone(), head));
-            }
-            let catalog = if head.is_some() {
-                ws.checkout(..).ok()?.into_facts()
-            } else {
-                TribleSet::new()
+            // Single-branch path: incremental checkout when possible.
+            let mut ws = match repo.pull(ids[0]) {
+                Ok(ws) => ws,
+                Err(_) => return,
             };
-            return Some((catalog, head));
-        }
-
-        // Multi-branch: always do full checkout (no head-based caching)
-        let mut catalog = TribleSet::new();
-        for branch_id in &ids {
-            let mut ws = repo.pull(*branch_id).ok()?;
-            if ws.head().is_some() {
-                let checkout = ws.checkout(..).ok()?;
-                catalog += checkout.into_facts();
+            if ws.head().is_none() {
+                // Branch has no commits — clear checkout.
+                *co = None;
+                return;
             }
+            match co {
+                Some(existing) => {
+                    // Incremental: checkout only new commits since last time.
+                    if let Ok(delta) = ws.checkout(existing.commits()..) {
+                        *existing += &delta;
+                    }
+                }
+                None => {
+                    // First load: full checkout.
+                    if let Ok(full) = ws.checkout(..) {
+                        *co = Some(full);
+                    }
+                }
+            }
+        } else {
+            // Multi-branch: always do full checkout and union all branches.
+            let mut merged: Option<Checkout> = None;
+            for branch_id in &ids {
+                let mut ws = match repo.pull(*branch_id) {
+                    Ok(ws) => ws,
+                    Err(_) => continue,
+                };
+                if ws.head().is_some() {
+                    if let Ok(checkout) = ws.checkout(..) {
+                        match &mut merged {
+                            Some(m) => *m += &checkout,
+                            None => merged = Some(checkout),
+                        }
+                    }
+                }
+            }
+            *co = merged;
         }
-
-        Some((catalog, None))
     }
 
-    if let Some((catalog, head)) = refresh_role(
-        repo,
-        &branch_lookup,
-        &state.config.config_branches.clone(),
-        state.config_head,
-        &state.config_catalog,
-    ) {
-        
-        state.config_catalog = catalog;
-        state.config_head = head;
-    }
+    let config_branches = state.config.config_branches.clone();
+    let exec_branches = state.config.exec_branches.clone();
+    let compass_branches = state.config.compass_branches.clone();
+    let local_message_branches = state.config.local_message_branches.clone();
+    let relations_branches = state.config.relations_branches.clone();
+    let teams_branches = state.config.teams_branches.clone();
 
-    if let Some((catalog, head)) = refresh_role(
-        repo,
-        &branch_lookup,
-        &state.config.exec_branches.clone(),
-        state.exec_head,
-        &state.exec_catalog,
-    ) {
-        
-        state.exec_catalog = catalog;
-        state.exec_head = head;
-    }
-
-    if let Some((catalog, head)) = refresh_role(
-        repo,
-        &branch_lookup,
-        &state.config.compass_branches.clone(),
-        state.compass_head,
-        &state.compass_catalog,
-    ) {
-        
-        state.compass_catalog = catalog;
-        state.compass_head = head;
-    }
-
-    if let Some((catalog, head)) = refresh_role(
-        repo,
-        &branch_lookup,
-        &state.config.local_message_branches.clone(),
-        state.local_messages_head,
-        &state.local_messages_catalog,
-    ) {
-        
-        state.local_messages_catalog = catalog;
-        state.local_messages_head = head;
-    }
-
-    if let Some((catalog, head)) = refresh_role(
-        repo,
-        &branch_lookup,
-        &state.config.relations_branches.clone(),
-        state.relations_head,
-        &state.relations_catalog,
-    ) {
-        
-        state.relations_catalog = catalog;
-        state.relations_head = head;
-    }
-
-    if let Some((catalog, head)) = refresh_role(
-        repo,
-        &branch_lookup,
-        &state.config.teams_branches.clone(),
-        state.teams_head,
-        &state.teams_catalog,
-    ) {
-        
-        state.teams_catalog = catalog;
-        state.teams_head = head;
-    }
+    refresh_role(repo, &branch_lookup, &config_branches, &mut state.config_co);
+    refresh_role(repo, &branch_lookup, &exec_branches, &mut state.exec_co);
+    refresh_role(repo, &branch_lookup, &compass_branches, &mut state.compass_co);
+    refresh_role(repo, &branch_lookup, &local_message_branches, &mut state.local_messages_co);
+    refresh_role(repo, &branch_lookup, &relations_branches, &mut state.relations_co);
+    refresh_role(repo, &branch_lookup, &teams_branches, &mut state.teams_co);
 
     state.now_key = epoch_key(now_epoch());
 }
@@ -1323,12 +1269,12 @@ fn build_snapshot_from_catalogs(
     // Synthesise delta TribleSets for the compat layer.
     // When a role changed, use the full catalog as the delta (conservative but correct);
     // when unchanged, use an empty set so build_snapshot can skip re-collection.
-    let config_delta = if config_changed { state.config_catalog.clone() } else { TribleSet::new() };
-    let exec_delta = if exec_changed { state.exec_catalog.clone() } else { TribleSet::new() };
-    let compass_delta = if compass_changed { state.compass_catalog.clone() } else { TribleSet::new() };
-    let local_delta = if local_messages_changed { state.local_messages_catalog.clone() } else { TribleSet::new() };
-    let relations_delta = if relations_changed { state.relations_catalog.clone() } else { TribleSet::new() };
-    let teams_delta = if teams_changed { state.teams_catalog.clone() } else { TribleSet::new() };
+    let config_delta = if config_changed { catalog(&state.config_co).clone() } else { TribleSet::new() };
+    let exec_delta = if exec_changed { catalog(&state.exec_co).clone() } else { TribleSet::new() };
+    let compass_delta = if compass_changed { catalog(&state.compass_co).clone() } else { TribleSet::new() };
+    let local_delta = if local_messages_changed { catalog(&state.local_messages_co).clone() } else { TribleSet::new() };
+    let relations_delta = if relations_changed { catalog(&state.relations_co).clone() } else { TribleSet::new() };
+    let teams_delta = if teams_changed { catalog(&state.teams_co).clone() } else { TribleSet::new() };
 
     // Determine error messages from branch resolution
     let branch_lookup = BranchLookup::new(&state.branches);
@@ -1340,12 +1286,12 @@ fn build_snapshot_from_catalogs(
     let teams_error = resolve_branch_ids(&branch_lookup, &parse_branch_list(&config.teams_branches)).err();
 
     // Clone catalogs and branches before taking a mutable borrow on workspaces
-    let config_catalog = state.config_catalog.clone();
-    let exec_catalog = state.exec_catalog.clone();
-    let compass_catalog = state.compass_catalog.clone();
-    let local_messages_catalog = state.local_messages_catalog.clone();
-    let relations_catalog = state.relations_catalog.clone();
-    let teams_catalog = state.teams_catalog.clone();
+    let config_catalog = catalog(&state.config_co).clone();
+    let exec_catalog = catalog(&state.exec_co).clone();
+    let compass_catalog = catalog(&state.compass_co).clone();
+    let local_messages_catalog = catalog(&state.local_messages_co).clone();
+    let relations_catalog = catalog(&state.relations_co).clone();
+    let teams_catalog = catalog(&state.teams_co).clone();
     let branches = state.branches.clone();
     let context_selected_chunk = state.context_selected_chunk;
     let context_show_children = state.context_show_children;
