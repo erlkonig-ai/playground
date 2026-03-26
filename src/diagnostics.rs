@@ -823,25 +823,20 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
     // ── Overview ─
     nb.view(move |ui| {
         let mut state = dashboard.read_mut(ui);
+        let pile_path = state.config.pile_path.clone();
+        let branches = state.branches.clone();
         ui.section("Overview", |ui| {
-            let (pile_path, branches) = {
-                let Some(snapshot) = snapshot_or_message(ui, &state.snapshot) else {
-                    return;
-                };
-                (snapshot.pile_path.clone(), snapshot.branches.clone())
-            };
-
             ui.horizontal(|ui| {
-                ui.label(format!("Pile: {}", pile_path.display()));
+                ui.label(format!("Pile: {pile_path}"));
             });
 
             if branches.is_empty() {
                 return;
             }
 
-            let mut primary: Vec<BranchEntry> = Vec::new();
-            let mut extra: Vec<BranchEntry> = Vec::new();
-            for branch in branches {
+            let mut primary: Vec<&BranchEntry> = Vec::new();
+            let mut extra: Vec<&BranchEntry> = Vec::new();
+            for branch in &branches {
                 let label = branch.name.as_deref().unwrap_or("<unnamed>");
                 if label.contains("--orphan-") || label.starts_with('<') {
                     extra.push(branch);
@@ -887,23 +882,31 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
     // ── Agent Config ─
     nb.view(move |ui| {
         let mut state = dashboard.read_mut(ui);
+
+        // Pull a workspace for blob reads before entering the section closure.
+        let config_branches = state.config.config_branches.clone();
+        let mut ws = state.repo.as_mut().and_then(|repo| {
+            let branch_entries = list_branches(repo.storage_mut()).ok()?;
+            let lookup = BranchLookup::new(&branch_entries);
+            let refs = parse_branch_list(&config_branches);
+            let ids = resolve_branch_ids(&lookup, &refs).ok()?;
+            repo.pull(*ids.first()?).ok()
+        });
+
         ui.section("Agent Config", |ui| {
-            let snapshot = {
-                let Some(snapshot) = snapshot_or_message(ui, &state.snapshot) else {
+            // Show branch resolution error when the configured branch can't be found.
+            if state.config_co.is_none() && !state.config.config_branches.trim().is_empty() {
+                let branch_lookup = BranchLookup::new(&state.branches);
+                let refs = parse_branch_list(&state.config.config_branches);
+                if let Err(err) = resolve_branch_ids(&branch_lookup, &refs) {
+                    ui.colored_label(egui::Color32::RED, err);
                     return;
-                };
-                snapshot.clone()
-            };
-            if let Some(err) = &snapshot.agent_config_error {
-                ui.colored_label(egui::Color32::RED, err);
-            } else {
-                render_agent_config(
-                    ui,
-                    &mut state,
-                    snapshot.now_key,
-                    snapshot.agent_config.as_ref(),
-                );
+                }
             }
+
+            let data = catalog(&state.config_co).clone();
+            let now_key = state.now_key;
+            render_agent_config(ui, &mut state.config_reveal_secrets, now_key, &data, &mut ws);
         });
     });
 
@@ -4591,55 +4594,123 @@ fn latest_results(
 
 fn render_agent_config(
     ui: &mut egui::Ui,
-    state: &mut DashboardState,
+    reveal_secrets: &mut bool,
     now_key: i128,
-    config: Option<&AgentConfigRow>,
+    data: &TribleSet,
+    ws: &mut Option<Workspace<Pile>>,
 ) {
-    let Some(config) = config else {
+    if data.is_empty() {
+        ui.label("No config entries.");
+        return;
+    }
+
+    // Find the latest config entity.
+    let mut latest: Option<(Id, i128)> = None;
+    for (config_id, updated_at) in find!(
+        (config_id: Id, updated_at: Value<NsTAIInterval>),
+        pattern!(data, [{
+            ?config_id @
+            metadata::tag: playground_config::kind_config,
+            playground_config::updated_at: ?updated_at,
+        }])
+    ) {
+        let key = interval_key(updated_at);
+        if latest.map_or(true, |(_, current)| key > current) {
+            latest = Some((config_id, key));
+        }
+    }
+
+    let Some((config_id, updated_key)) = latest else {
         ui.label("No config entries.");
         return;
     };
-
-    let updated = format_age(now_key, config.updated_at);
+    let updated = format_age(now_key, Some(updated_key));
     ui.label(format!(
         "Latest config: {} (updated {updated})",
-        id_prefix(config.id)
+        id_prefix(config_id)
     ));
     ui.add_space(8.0);
+
+    // Helper closures for inline attribute loading.
+    let load_str = |entity_id: Id, attr: Attribute<Handle<Blake3, LongString>>, ws: &mut Option<Workspace<Pile>>| -> Option<String> {
+        find!(
+            handle: Value<Handle<Blake3, LongString>>,
+            pattern!(data, [{ entity_id @ attr: ?handle }])
+        )
+        .next()
+        .and_then(|handle| ws.as_mut().and_then(|w| load_text(w, handle)))
+    };
+    let load_id = |entity_id: Id, attr: Attribute<GenId>| -> Option<Id> {
+        load_optional_id_attr(data, entity_id, attr)
+    };
+    let load_u64 = |entity_id: Id, attr: Attribute<U256BE>| -> Option<u64> {
+        load_optional_u64_attr(data, entity_id, attr)
+    };
+
+    // Resolve model profile: if an active profile is set, use the latest profile entry.
+    let persona_id = load_id(config_id, playground_config::persona_id);
+    let branch = load_str(config_id, playground_config::branch, ws);
+    let author = load_str(config_id, playground_config::author, ws);
+    let author_role = load_str(config_id, playground_config::author_role, ws);
+    let poll_ms = load_u64(config_id, playground_config::poll_ms);
+    let model_profile_id = load_id(config_id, playground_config::active_model_profile_id);
+    let (model_entity_id, model_profile_name) = if let Some(profile_id) = model_profile_id {
+        if let Some(entry_id) = latest_model_profile_entry_id(data, profile_id) {
+            let name = load_str(entry_id, metadata::name, ws);
+            (entry_id, name)
+        } else {
+            (config_id, None)
+        }
+    } else {
+        (config_id, None)
+    };
+
+    let model_name = load_str(model_entity_id, playground_config::model_name, ws);
+    let model_base_url = load_str(model_entity_id, playground_config::model_base_url, ws);
+    let model_reasoning_effort = load_str(model_entity_id, playground_config::model_reasoning_effort, ws);
+    let model_stream = load_u64(model_entity_id, playground_config::model_stream).map(|v| v != 0);
+    let model_context_window_tokens = load_u64(model_entity_id, playground_config::model_context_window_tokens);
+    let model_max_output_tokens = load_u64(model_entity_id, playground_config::model_max_output_tokens);
+    let model_context_safety_margin_tokens = load_u64(model_entity_id, playground_config::model_context_safety_margin_tokens);
+    let model_chars_per_token = load_u64(model_entity_id, playground_config::model_chars_per_token);
+    let model_api_key = load_str(model_entity_id, playground_config::model_api_key, ws);
+    let tavily_api_key = load_str(config_id, playground_config::tavily_api_key, ws);
+    let exa_api_key = load_str(config_id, playground_config::exa_api_key, ws);
+    let exec_default_cwd = load_str(config_id, playground_config::exec_default_cwd, ws);
+    let exec_sandbox_profile = load_id(config_id, playground_config::exec_sandbox_profile);
+    let system_prompt = load_str(config_id, playground_config::system_prompt, ws);
 
     egui::Grid::new("agent_config_grid")
         .striped(true)
         .spacing(egui::Vec2::new(12.0, 6.0))
         .show(ui, |ui| {
             ui.label("config_id");
-            ui.monospace(format!("{:x}", config.id));
+            ui.monospace(format!("{:x}", config_id));
             ui.end_row();
 
             ui.label("persona_id");
             ui.monospace(
-                config
-                    .persona_id
+                persona_id
                     .map(|id| format!("{id:x}"))
                     .unwrap_or_else(|| "-".to_string()),
             );
             ui.end_row();
 
             ui.label("branch");
-            ui.label(config.branch.as_deref().unwrap_or("-"));
+            ui.label(branch.as_deref().unwrap_or("-"));
             ui.end_row();
 
             ui.label("author");
-            ui.label(config.author.as_deref().unwrap_or("-"));
+            ui.label(author.as_deref().unwrap_or("-"));
             ui.end_row();
 
             ui.label("author_role");
-            ui.label(config.author_role.as_deref().unwrap_or("-"));
+            ui.label(author_role.as_deref().unwrap_or("-"));
             ui.end_row();
 
             ui.label("poll_ms");
             ui.monospace(
-                config
-                    .poll_ms
+                poll_ms
                     .map(|value| value.to_string())
                     .unwrap_or_else(|| "-".to_string()),
             );
@@ -4647,29 +4718,28 @@ fn render_agent_config(
 
             ui.label("model.profile");
             ui.horizontal(|ui| {
-                ui.label(config.model_profile_name.as_deref().unwrap_or("-"));
-                if let Some(id) = config.model_profile_id {
+                ui.label(model_profile_name.as_deref().unwrap_or("-"));
+                if let Some(id) = model_profile_id {
                     ui.monospace(format!("({id:x})"));
                 }
             });
             ui.end_row();
 
             ui.label("model.model");
-            ui.label(config.model_name.as_deref().unwrap_or("-"));
+            ui.label(model_name.as_deref().unwrap_or("-"));
             ui.end_row();
 
             ui.label("model.base_url");
-            ui.label(config.model_base_url.as_deref().unwrap_or("-"));
+            ui.label(model_base_url.as_deref().unwrap_or("-"));
             ui.end_row();
 
             ui.label("model.reasoning_effort");
-            ui.label(config.model_reasoning_effort.as_deref().unwrap_or("-"));
+            ui.label(model_reasoning_effort.as_deref().unwrap_or("-"));
             ui.end_row();
 
             ui.label("model.stream");
             ui.monospace(
-                config
-                    .model_stream
+                model_stream
                     .map(|value| value.to_string())
                     .unwrap_or_else(|| "-".to_string()),
             );
@@ -4677,8 +4747,7 @@ fn render_agent_config(
 
             ui.label("model.context_window_tokens");
             ui.monospace(
-                config
-                    .model_context_window_tokens
+                model_context_window_tokens
                     .map(|value| value.to_string())
                     .unwrap_or_else(|| "-".to_string()),
             );
@@ -4686,8 +4755,7 @@ fn render_agent_config(
 
             ui.label("model.max_output_tokens");
             ui.monospace(
-                config
-                    .model_max_output_tokens
+                model_max_output_tokens
                     .map(|value| value.to_string())
                     .unwrap_or_else(|| "-".to_string()),
             );
@@ -4695,8 +4763,7 @@ fn render_agent_config(
 
             ui.label("model.context_safety_margin_tokens");
             ui.monospace(
-                config
-                    .model_context_safety_margin_tokens
+                model_context_safety_margin_tokens
                     .map(|value| value.to_string())
                     .unwrap_or_else(|| "-".to_string()),
             );
@@ -4704,8 +4771,7 @@ fn render_agent_config(
 
             ui.label("model.chars_per_token");
             ui.monospace(
-                config
-                    .model_chars_per_token
+                model_chars_per_token
                     .map(|value| value.to_string())
                     .unwrap_or_else(|| "-".to_string()),
             );
@@ -4713,22 +4779,22 @@ fn render_agent_config(
 
             ui.label("model.api_key");
             ui.horizontal(|ui| {
-                let Some(key) = config.model_api_key.as_deref() else {
+                let Some(key) = model_api_key.as_deref() else {
                     ui.label("-");
                     return;
                 };
-                if state.config_reveal_secrets {
+                if *reveal_secrets {
                     ui.monospace(key);
                 } else {
                     ui.monospace(mask_secret(key));
                 }
-                let button = if state.config_reveal_secrets {
+                let button = if *reveal_secrets {
                     "Hide"
                 } else {
                     "Reveal"
                 };
                 if ui.add(Button::new(button)).clicked() {
-                    state.config_reveal_secrets = !state.config_reveal_secrets;
+                    *reveal_secrets = !*reveal_secrets;
                     ui.ctx().request_repaint();
                 }
             });
@@ -4736,22 +4802,22 @@ fn render_agent_config(
 
             ui.label("integrations.tavily_api_key");
             ui.horizontal(|ui| {
-                let Some(key) = config.tavily_api_key.as_deref() else {
+                let Some(key) = tavily_api_key.as_deref() else {
                     ui.label("-");
                     return;
                 };
-                if state.config_reveal_secrets {
+                if *reveal_secrets {
                     ui.monospace(key);
                 } else {
                     ui.monospace(mask_secret(key));
                 }
-                let button = if state.config_reveal_secrets {
+                let button = if *reveal_secrets {
                     "Hide"
                 } else {
                     "Reveal"
                 };
                 if ui.add(Button::new(button)).clicked() {
-                    state.config_reveal_secrets = !state.config_reveal_secrets;
+                    *reveal_secrets = !*reveal_secrets;
                     ui.ctx().request_repaint();
                 }
             });
@@ -4759,42 +4825,41 @@ fn render_agent_config(
 
             ui.label("integrations.exa_api_key");
             ui.horizontal(|ui| {
-                let Some(key) = config.exa_api_key.as_deref() else {
+                let Some(key) = exa_api_key.as_deref() else {
                     ui.label("-");
                     return;
                 };
-                if state.config_reveal_secrets {
+                if *reveal_secrets {
                     ui.monospace(key);
                 } else {
                     ui.monospace(mask_secret(key));
                 }
-                let button = if state.config_reveal_secrets {
+                let button = if *reveal_secrets {
                     "Hide"
                 } else {
                     "Reveal"
                 };
                 if ui.add(Button::new(button)).clicked() {
-                    state.config_reveal_secrets = !state.config_reveal_secrets;
+                    *reveal_secrets = !*reveal_secrets;
                     ui.ctx().request_repaint();
                 }
             });
             ui.end_row();
 
             ui.label("exec.default_cwd");
-            ui.label(config.exec_default_cwd.as_deref().unwrap_or("-"));
+            ui.label(exec_default_cwd.as_deref().unwrap_or("-"));
             ui.end_row();
 
             ui.label("exec.sandbox_profile");
             ui.monospace(
-                config
-                    .exec_sandbox_profile
+                exec_sandbox_profile
                     .map(|id| format!("{id:x}"))
                     .unwrap_or_else(|| "-".to_string()),
             );
             ui.end_row();
         });
 
-    if let Some(prompt) = config.system_prompt.as_deref() {
+    if let Some(prompt) = system_prompt.as_deref() {
         ui.add_space(8.0);
         ui.label(egui::RichText::new("System prompt").monospace());
         egui::Frame::NONE
