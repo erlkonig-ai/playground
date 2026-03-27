@@ -6,6 +6,7 @@
 //! ed25519-dalek = "2.1.1"
 //! hifitime = "4.2.3"
 //! rand_core = "0.6.4"
+//! itertools = "0.14"
 //! regex = "1"
 //! triblespace = "0.26"
 //! typst = "0.14"
@@ -17,6 +18,7 @@ use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, Parser, Subcommand};
 use ed25519_dalek::SigningKey;
 use hifitime::Epoch;
+use itertools::Itertools;
 use hifitime::efmt::Formatter;
 use hifitime::efmt::consts::ISO8601_DATE;
 use rand_core::OsRng;
@@ -545,8 +547,7 @@ fn now_tai() -> Value<valueschemas::NsTAIInterval> {
 
 /// Build a map of fragment → (latest_version_id, timestamp) in one pass.
 fn latest_versions(space: &TribleSet) -> HashMap<Id, (Id, Lower)> {
-    let mut latest: HashMap<Id, (Id, Lower)> = HashMap::new();
-    for (vid, frag, ts) in find!(
+    find!(
         (vid: Id, frag: Id, ts: Lower),
         pattern!(space, [{
             ?vid @
@@ -554,13 +555,12 @@ fn latest_versions(space: &TribleSet) -> HashMap<Id, (Id, Lower)> {
             wiki::fragment: ?frag,
             wiki::created_at: ?ts,
         }])
-    ) {
-        let entry = latest.entry(frag).or_insert((vid, ts));
-        if ts > entry.1 {
-            *entry = (vid, ts);
-        }
-    }
-    latest
+    )
+    .into_grouping_map_by(|(_, frag, _)| *frag)
+    .max_by_key(|_, (_, _, ts)| *ts)
+    .into_iter()
+    .map(|(frag, (vid, _, ts))| (frag, (vid, ts)))
+    .collect()
 }
 
 fn fmt_id(id: Id) -> String {
