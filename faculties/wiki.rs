@@ -781,6 +781,18 @@ fn commit_version(
         .filter(|&id| id != fragment_id)
         .collect();
 
+    // Warn if any link targets are fragments instead of versions.
+    for &target in &link_targets {
+        let is_version = find!(
+            _tag: Id,
+            pattern!(space, [{ target @ metadata::tag: &KIND_VERSION_ID }])
+        ).next().is_some();
+        if !is_version {
+            eprintln!("WARNING: link target {:x} is a fragment, not a version. \
+                Use the version ID for stable references.", target);
+        }
+    }
+
     let title_handle = ws.put(title.to_owned());
 
     let version = entity! { _ @
@@ -1686,17 +1698,9 @@ fn cmd_list(
                 continue;
             }
 
-            // Backlink tag filter: check tags of latest versions that link TO this one.
+            // Backlink tag filter: check tags of latest versions that link TO this version.
             if has_backlink_filter {
                 let mut backlink_tags: Vec<Id> = Vec::new();
-                for source_vid in find!(
-                    src: Id,
-                    pattern!(&space, [{ ?src @ wiki::links_to: frag_id }])
-                ) {
-                    if latest_vids.contains(&source_vid) {
-                        backlink_tags.extend(tags_of(&space, source_vid));
-                    }
-                }
                 for source_vid in find!(
                     src: Id,
                     pattern!(&space, [{ ?src @ wiki::links_to: vid }])
