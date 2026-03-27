@@ -1673,6 +1673,10 @@ fn cmd_list(
             .collect();
         entries.sort_by(|a, b| b.2.cmp(&a.2));
 
+        // Set of latest version IDs for backlink filtering.
+        let latest_vids: std::collections::HashSet<Id> =
+            entries.iter().map(|(_, vid, _)| *vid).collect();
+
         for (frag_id, vid, created_at) in &entries {
             let tags = tags_of(&space, *vid);
             if !show_all && tags.contains(&TAG_ARCHIVED_ID) {
@@ -1682,22 +1686,24 @@ fn cmd_list(
                 continue;
             }
 
-            // Backlink tag filter: check tags of fragments that link TO this one.
+            // Backlink tag filter: check tags of latest versions that link TO this one.
             if has_backlink_filter {
-                // Find all versions that link to this fragment (or any of its versions).
                 let mut backlink_tags: Vec<Id> = Vec::new();
                 for source_vid in find!(
                     src: Id,
                     pattern!(&space, [{ ?src @ wiki::links_to: frag_id }])
                 ) {
-                    backlink_tags.extend(tags_of(&space, source_vid));
+                    if latest_vids.contains(&source_vid) {
+                        backlink_tags.extend(tags_of(&space, source_vid));
+                    }
                 }
-                // Also check links to the version ID.
                 for source_vid in find!(
                     src: Id,
                     pattern!(&space, [{ ?src @ wiki::links_to: vid }])
                 ) {
-                    backlink_tags.extend(tags_of(&space, source_vid));
+                    if latest_vids.contains(&source_vid) {
+                        backlink_tags.extend(tags_of(&space, source_vid));
+                    }
                 }
 
                 if !with_bl_ids.is_empty()
