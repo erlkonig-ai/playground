@@ -2,12 +2,13 @@
 //! ```cargo
 //! [dependencies]
 //! anyhow = "1.0"
+//! blake3 = "1"
 //! clap = { version = "4.5.4", features = ["derive", "env"] }
 //! ed25519-dalek = "2.1.1"
 //! hifitime = "4.2.3"
 //! rand_core = "0.6.4"
 //! regex = "1"
-//! triblespace = "0.24"
+//! triblespace = "0.26"
 //! typst = "0.14"
 //! typst-syntax = "0.14"
 //! comemo = "0.5.1"
@@ -570,29 +571,68 @@ fn format_date(tai_ns: i128) -> String {
     Formatter::new(epoch, ISO8601_DATE).to_string()
 }
 
-/// Extract `#link("<faculty>:<hex>")` references from content.
-/// Wiki links resolve against the space — the stored ID is whatever matches
-/// (could be a fragment or version). External links return faculty + raw hex.
-fn extract_references(content: &str, space: &TribleSet) -> (Vec<Id>, Vec<(String, String)>) {
+/// Derive a deterministic attribute ID from a link type name.
+/// Uses blake3(name) truncated to 16 bytes, matching the ImportAttribute pattern.
+#[allow(dead_code)]
+fn link_type_attribute_id(name: &str) -> Id {
+    let digest = blake3::hash(format!("wiki:link_type:{name}").as_bytes());
+    let bytes = digest.as_bytes();
+    let mut raw = [0u8; 16];
+    raw.copy_from_slice(&bytes[bytes.len() - 16..]);
+    // Ensure it's a valid non-zero ID.
+    raw[0] |= 0x01;
+    Id::new(raw).expect("derived link type ID")
+}
+
+/// A resolved wiki link with an optional type.
+struct WikiLink {
+    target: Id,
+    /// Link type name (e.g. "reviews", "cites"). None for untyped mentions.
+    link_type: Option<String>,
+}
+
+/// Extract `#link("<faculty>:<hex>")` and `#link("<faculty>:<type>:<hex>")` references.
+/// Wiki links resolve against the space. External links return faculty + raw hex.
+fn extract_references(content: &str, space: &TribleSet) -> (Vec<WikiLink>, Vec<(String, String)>) {
     use regex::Regex;
-    // Matches typst #link("scheme:hex") and legacy markdown [text](scheme:hex)
-    let re = Regex::new(r#"(?:\]\(|#link\(")([a-zA-Z_][a-zA-Z0-9_]*):([0-9a-fA-F]{4,})"#).unwrap();
+    // Matches:
+    //   wiki:hex                    (untyped)
+    //   wiki:reviews:hex            (typed)
+    //   files:hex                   (external)
+    //   legacy markdown [text](scheme:hex)
+    let re = Regex::new(
+        r#"(?:\]\(|#link\(")([a-zA-Z_][a-zA-Z0-9_]*):((?:[a-zA-Z_][a-zA-Z0-9_]*:)?[0-9a-fA-F]{4,})"#
+    ).unwrap();
 
     let mut internal = Vec::new();
     let mut external = Vec::new();
     for caps in re.captures_iter(content) {
         let faculty = &caps[1];
-        let hex = &caps[2];
+        let rest = &caps[2];
         if faculty == "wiki" {
+            // Check for typed link: "type:hex" vs just "hex"
+            let (link_type, hex) = if let Some(colon) = rest.find(':') {
+                let t = &rest[..colon];
+                let h = &rest[colon + 1..];
+                // Only treat as typed if the part before : is not all hex
+                if t.chars().all(|c| c.is_ascii_hexdigit()) {
+                    (None, rest) // it's just a long hex string
+                } else {
+                    (Some(t.to_string()), h)
+                }
+            } else {
+                (None, rest)
+            };
             if let Ok(id) = resolve_fragment_prefix(space, hex) {
-                internal.push(id);
+                internal.push(WikiLink { target: id, link_type });
             }
         } else {
-            external.push((faculty.to_string(), hex.to_string()));
+            external.push((faculty.to_string(), rest.to_string()));
         }
     }
-    internal.sort();
-    internal.dedup();
+    // Dedup by target (keep first occurrence's type).
+    internal.sort_by_key(|l| l.target);
+    internal.dedup_by_key(|l| l.target);
     external.sort();
     external.dedup();
     (internal, external)
@@ -776,22 +816,25 @@ fn commit_version(
         .get(content)
         .map_err(|e| anyhow::anyhow!("read content for link extraction: {e:?}"))?;
     let (internal_links, _external) = extract_references(content_text.as_ref(), space);
-    let link_targets: Vec<Id> = internal_links
+    let wiki_links: Vec<WikiLink> = internal_links
         .into_iter()
-        .filter(|&id| id != fragment_id)
+        .filter(|l| l.target != fragment_id)
         .collect();
 
     // Warn if any link targets are fragments instead of versions.
-    for &target in &link_targets {
+    for link in &wiki_links {
         let is_version = find!(
             _tag: Id,
-            pattern!(space, [{ target @ metadata::tag: &KIND_VERSION_ID }])
+            pattern!(space, [{ link.target @ metadata::tag: &KIND_VERSION_ID }])
         ).next().is_some();
         if !is_version {
             eprintln!("WARNING: link target {:x} is a fragment, not a version. \
-                Use the version ID for stable references.", target);
+                Use the version ID for stable references.", link.target);
         }
     }
+
+    // All links go into links_to (generic backlink index).
+    let link_targets: Vec<Id> = wiki_links.iter().map(|l| l.target).collect();
 
     let title_handle = ws.put(title.to_owned());
 
@@ -805,6 +848,18 @@ fn commit_version(
     };
     let version_id = version.root().expect("version should be rooted");
     change += version;
+
+    // Typed links: write derived attributes alongside links_to.
+    for link in &wiki_links {
+        if let Some(ref type_name) = link.link_type {
+            let attr_id = link_type_attribute_id(type_name);
+            let target_val = valueschemas::GenId::value_from(link.target);
+            let t = triblespace::core::trible::Trible::force(&version_id, &attr_id, &target_val);
+            let mut ts = TribleSet::new();
+            ts.insert(&t);
+            change += ts;
+        }
+    }
 
     ws.commit(change, message);
     repo.push(ws).map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
@@ -833,7 +888,7 @@ fn find_links(
             let content: View<str> = ws.get(ch)
                 .map_err(|e| anyhow::anyhow!("read content: {e:?}"))?;
             let (internal, _) = extract_references(content.as_ref(), space);
-            outgoing = internal.into_iter().filter(|&t| t != id).collect();
+            outgoing = internal.into_iter().map(|l| l.target).filter(|&t| t != id).collect();
         }
     }
     outgoing.sort();
@@ -1253,7 +1308,7 @@ fn cmd_import_all(pile: &Path, branch: Option<&str>, dir: PathBuf) -> Result<()>
                     &space,
                 );
                 let link_targets: Vec<Id> = internal_links
-                    .into_iter().filter(|&id| id != *frag_id).collect();
+                    .into_iter().map(|l| l.target).filter(|&id| id != *frag_id).collect();
                 let mut all_tags = tag_ids;
                 all_tags.push(KIND_VERSION_ID);
                 all_tags.sort(); all_tags.dedup();
