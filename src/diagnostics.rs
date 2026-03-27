@@ -18,7 +18,7 @@ use triblespace::core::trible::TribleSet;
 use triblespace::core::value::Value;
 use triblespace::core::value::schemas::hash::{Blake3, Handle};
 use triblespace::core::value::schemas::time::NsTAIInterval;
-use triblespace::macros::{entity, find, id_hex, pattern, pattern_changes};
+use triblespace::macros::{entity, find, id_hex, pattern};
 use triblespace::prelude::valueschemas::{GenId, U256BE};
 use triblespace::prelude::{
     Attribute, BlobStore, BlobStoreGet, BranchStore, ToBlob, TryFromValue, TryToValue,
@@ -28,7 +28,7 @@ use triblespace::prelude::{
 use GORBIE::NotebookConfig;
 use GORBIE::NotebookCtx;
 use GORBIE::cards::DEFAULT_CARD_PADDING;
-use GORBIE::themes::colorhash;
+use GORBIE::themes::{self, colorhash};
 use GORBIE::widgets::{Button, TextField};
 
 use crate::blob_refs::{PromptChunk, split_blob_refs};
@@ -100,7 +100,7 @@ mod reason_events {
     }
 }
 
-type CommitHandle = Value<Handle<Blake3, SimpleArchive>>;
+// ── Layout constants ────────────────────────────────────────────────
 const ACTIVITY_TIMELINE_HEIGHT: f32 = 980.0;
 const TURN_MEMORY_MAX_ROWS: usize = 160;
 const TIMELINE_DEFAULT_LIMIT: usize = 300;
@@ -110,10 +110,35 @@ const TIMELINE_LIMIT_MAX: usize = 50_000;
 const CONTEXT_TREE_HEIGHT: f32 = 720.0;
 const CONTEXT_ORIGIN_LIMIT: usize = 64;
 const LOCAL_COMPOSE_HEIGHT: f32 = 80.0;
-const RELATIONS_SCROLL_HEIGHT: f32 = 260.0;
 const TEAMS_SCROLL_HEIGHT: f32 = 520.0;
-const TEAMS_CHAT_LIST_WIDTH: f32 = 220.0;
-const SNAPSHOT_REFRESH_MS: u64 = 1000;
+const CATALOG_REFRESH_MS: u64 = 1000;
+
+// ── RAL color palette ──────────────────────────────────────────────
+// All colors drawn from the industrial RAL palette for visual consistency.
+
+fn color_shell() -> egui::Color32 { themes::ral(5024) }      // pastel blue
+fn color_cognition() -> egui::Color32 { themes::ral(4011) }   // pearl violet
+fn color_teams() -> egui::Color32 { themes::ral(5012) }       // light blue
+fn color_local_msg() -> egui::Color32 { themes::ral(6032) }   // signal green
+fn color_goals() -> egui::Color32 { themes::ral(1012) }       // lemon yellow
+
+fn color_system() -> egui::Color32 { themes::ral(5014) }      // pigeon blue
+fn color_user() -> egui::Color32 { themes::ral(6033) }        // mint turquoise
+fn color_assistant() -> egui::Color32 { themes::ral(4005) }   // blue lilac
+
+fn color_todo() -> egui::Color32 { themes::ral(6018) }        // yellow green
+fn color_doing() -> egui::Color32 { themes::ral(1003) }       // signal yellow
+fn color_blocked() -> egui::Color32 { themes::ral(3020) }     // traffic red
+fn color_done() -> egui::Color32 { themes::ral(5005) }        // signal blue
+
+fn color_unread() -> egui::Color32 { themes::ral(2010) }      // signal orange
+fn color_read() -> egui::Color32 { themes::ral(6017) }        // may green
+fn color_sent() -> egui::Color32 { themes::ral(7000) }        // squirrel grey
+fn color_readby() -> egui::Color32 { themes::ral(5015) }      // sky blue
+fn color_other() -> egui::Color32 { themes::ral(4008) }       // signal violet
+
+fn color_muted() -> egui::Color32 { themes::ral(7012) }       // basalt grey
+fn color_frame() -> egui::Color32 { themes::ral(7016) }       // anthracite grey
 
 static DIAGNOSTICS_PILE_OVERRIDE: OnceLock<Option<PathBuf>> = OnceLock::new();
 static DIAGNOSTICS_HEADLESS: AtomicBool = AtomicBool::new(false);
@@ -230,9 +255,6 @@ struct DashboardState {
     teams_co: Option<Checkout>,
     branches: Vec<BranchEntry>,
     now_key: i128,
-    // Compat: snapshot built from catalogs for render functions
-    snapshot: Option<Result<DashboardSnapshot, String>>,
-    show_extra_branches: bool,
     local_draft: String,
     local_send_error: Option<String>,
     local_send_notice: Option<String>,
@@ -246,7 +268,7 @@ struct DashboardState {
     context_show_children: bool,
     context_show_origins: bool,
     timeline_limit: usize,
-    last_snapshot_refresh_at: Option<Instant>,
+    last_refresh_at: Option<Instant>,
 }
 
 impl Drop for DashboardState {
@@ -276,9 +298,6 @@ impl Default for DashboardState {
             teams_co: None,
             branches: Vec::new(),
             now_key: 0,
-            // Compat
-            snapshot: None,
-            show_extra_branches: false,
             local_draft: String::new(),
             local_send_error: None,
             local_send_notice: None,
@@ -292,7 +311,7 @@ impl Default for DashboardState {
             context_show_children: false,
             context_show_origins: false,
             timeline_limit: TIMELINE_DEFAULT_LIMIT,
-            last_snapshot_refresh_at: None,
+            last_refresh_at: None,
         }
     }
 }
@@ -364,7 +383,6 @@ struct TeamsChatRow {
 
 #[derive(Debug, Clone)]
 struct ReasoningSummaryRow {
-    result_id: Id,
     created_at: Option<i128>,
     summary: String,
     input_tokens: Option<u64>,
@@ -375,7 +393,6 @@ struct ReasoningSummaryRow {
 
 #[derive(Debug, Clone)]
 struct ReasonRow {
-    id: Id,
     created_at: Option<i128>,
     text: String,
     turn_id: Option<Id>,
@@ -386,9 +403,6 @@ struct ReasonRow {
 #[derive(Debug, Clone)]
 struct TurnMemoryRow {
     request_id: Id,
-    command: String,
-    requested_at: Option<i128>,
-    thought_id: Option<Id>,
     context_messages: Vec<ChatMessage>,
     context_error: Option<String>,
 }
@@ -541,84 +555,13 @@ struct RelationRow {
     aliases: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
-struct AgentConfigRow {
-    id: Id,
-    updated_at: Option<i128>,
-    persona_id: Option<Id>,
-    branch: Option<String>,
-    author: Option<String>,
-    author_role: Option<String>,
-    poll_ms: Option<u64>,
-    model_profile_id: Option<Id>,
-    model_profile_name: Option<String>,
-    model_name: Option<String>,
-    model_base_url: Option<String>,
-    model_reasoning_effort: Option<String>,
-    model_stream: Option<bool>,
-    model_context_window_tokens: Option<u64>,
-    model_max_output_tokens: Option<u64>,
-    model_context_safety_margin_tokens: Option<u64>,
-    model_chars_per_token: Option<u64>,
-    model_api_key: Option<String>,
-    tavily_api_key: Option<String>,
-    exa_api_key: Option<String>,
-    exec_default_cwd: Option<String>,
-    exec_sandbox_profile: Option<Id>,
-    system_prompt: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-struct DashboardSnapshot {
-    pile_path: PathBuf,
-    branches: Vec<BranchEntry>,
-    branch_data: HashMap<Id, BranchSnapshot>,
-    exec_error: Option<String>,
-    agent_config: Option<AgentConfigRow>,
-    agent_config_error: Option<String>,
-    context_chunks: Vec<ContextChunkRow>,
-    context_selected: Option<ContextSelectedRow>,
-    exec_rows: Vec<ExecRow>,
-    reasoning_summaries: Vec<ReasoningSummaryRow>,
-    reason_rows: Vec<ReasonRow>,
-    turn_memory_rows: Vec<TurnMemoryRow>,
-    local_message_rows: Vec<LocalMessageRow>,
-    compass_status_rows: Vec<CompassStatusRow>,
-    timeline_rows: Vec<TimelineRow>,
-    timeline_total_rows: usize,
-    compass_rows: Vec<(CompassTaskRow, usize)>,
-    compass_notes: HashMap<Id, Vec<CompassNoteRow>>,
-    compass_error: Option<String>,
-    local_message_error: Option<String>,
-    local_me_id: Option<Id>,
-    local_peer_id: Option<Id>,
-    relations_people: Vec<RelationRow>,
-    relations_error: Option<String>,
-    relations_labels: HashMap<Id, String>,
-    teams_messages: Vec<TeamsMessageRow>,
-    teams_chats: Vec<TeamsChatRow>,
-    teams_error: Option<String>,
-    labels: HashMap<Id, String>,
-    now_key: i128,
-}
-
-/// Legacy per-branch snapshot; kept for compat with DashboardSnapshot.branch_data.
-/// Phase 2 will remove this along with the branch_data field.
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-struct BranchSnapshot {
-    head: Option<CommitHandle>,
-    data: TribleSet,
-    delta: TribleSet,
-}
-
 fn diagnostics_ui(nb: &mut NotebookCtx) {
     let _padding = DEFAULT_CARD_PADDING;
     let dashboard = nb.state(
         "playground-diagnostics",
         DashboardState::default(),
         move |ui, state| {
-            // Open repo and refresh snapshot (must happen before section renders).
+            // Open repo and refresh catalogs (must happen before section renders).
             let repo_open_result = ensure_repo_open(state);
             let mut picker_branches = Vec::new();
             if repo_open_result.is_ok() {
@@ -630,84 +573,51 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
             }
 
             ui.section("Config", |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("Pile");
-                    ui.add(TextField::singleline(&mut state.config.pile_path));
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Config branches");
-                    render_branch_picker(
-                        ui,
-                        "config_branch_picker",
-                        &picker_branches,
-                        &mut state.config.config_branches,
-                    );
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Exec branches");
-                    render_branch_picker(
-                        ui,
-                        "exec_branch_picker",
-                        &picker_branches,
-                        &mut state.config.exec_branches,
-                    );
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Compass branches");
-                    render_branch_picker(
-                        ui,
-                        "compass_branch_picker",
-                        &picker_branches,
-                        &mut state.config.compass_branches,
-                    );
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Local message branches");
-                    render_branch_picker(
-                        ui,
-                        "local_message_branch_picker",
-                        &picker_branches,
-                        &mut state.config.local_message_branches,
-                    );
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Relations branches");
-                    render_branch_picker(
-                        ui,
-                        "relations_branch_picker",
-                        &picker_branches,
-                        &mut state.config.relations_branches,
-                    );
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Teams branches");
-                    render_branch_picker(
-                        ui,
-                        "teams_branch_picker",
-                        &picker_branches,
-                        &mut state.config.teams_branches,
-                    );
-                });
+                ui.grid(|g| {
+                    g.third(|ui| { ui.label(egui::RichText::new("Pile").color(color_muted())); });
+                    g.two_thirds(|ui| { ui.add(TextField::singleline(&mut state.config.pile_path)); });
 
+                    g.third(|ui| { ui.label(egui::RichText::new("Config").color(color_muted())); });
+                    g.two_thirds(|ui| {
+                        render_branch_picker(ui, "config_branch_picker", &picker_branches, &mut state.config.config_branches);
+                    });
+
+                    g.third(|ui| { ui.label(egui::RichText::new("Exec").color(color_muted())); });
+                    g.two_thirds(|ui| {
+                        render_branch_picker(ui, "exec_branch_picker", &picker_branches, &mut state.config.exec_branches);
+                    });
+
+                    g.third(|ui| { ui.label(egui::RichText::new("Compass").color(color_muted())); });
+                    g.two_thirds(|ui| {
+                        render_branch_picker(ui, "compass_branch_picker", &picker_branches, &mut state.config.compass_branches);
+                    });
+
+                    g.third(|ui| { ui.label(egui::RichText::new("Local msgs").color(color_muted())); });
+                    g.two_thirds(|ui| {
+                        render_branch_picker(ui, "local_message_branch_picker", &picker_branches, &mut state.config.local_message_branches);
+                    });
+
+                    g.third(|ui| { ui.label(egui::RichText::new("Relations").color(color_muted())); });
+                    g.two_thirds(|ui| {
+                        render_branch_picker(ui, "relations_branch_picker", &picker_branches, &mut state.config.relations_branches);
+                    });
+
+                    g.third(|ui| { ui.label(egui::RichText::new("Teams").color(color_muted())); });
+                    g.two_thirds(|ui| {
+                        render_branch_picker(ui, "teams_branch_picker", &picker_branches, &mut state.config.teams_branches);
+                    });
+                });
             });
 
-            if let Err(err) = repo_open_result {
-                state.snapshot = Some(Err(err.to_string()));
-            } else if should_refresh_snapshot(&state) {
-                if state.snapshot.is_none() {
-                    // First frame: render empty, request immediate repaint so
-                    // the loading state is visible before the blocking scan.
-                    ui.ctx().request_repaint();
-                    state.snapshot = Some(Err("Loading...".to_string()));
-                } else {
-                    refresh_snapshot(state);
-                    state.last_snapshot_refresh_at = Some(Instant::now());
-                }
+            if repo_open_result.is_ok() && should_refresh(&state) {
+                refresh_catalogs(state);
+                apply_branch_defaults(state);
+                state.last_refresh_at = Some(Instant::now());
             }
 
             if !diagnostics_is_headless() {
                 ui.ctx()
-                    .request_repaint_after(Duration::from_millis(SNAPSHOT_REFRESH_MS));
+                    .request_repaint_after(Duration::from_millis(CATALOG_REFRESH_MS));
             }
         },
     );
@@ -715,7 +625,37 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
     // ── Card 2: Main view (Activity timeline + context float) ──────
     nb.view(move |ui| {
         let mut state = dashboard.read_mut(ui);
+
+        // Pull workspace for blob reads.
+        let exec_branches = state.config.exec_branches.clone();
+        let mut ws = state.repo.as_mut().and_then(|repo| {
+            let branch_entries = list_branches(repo.storage_mut()).ok()?;
+            let lookup = BranchLookup::new(&branch_entries);
+            let refs = parse_branch_list(&exec_branches);
+            let ids = resolve_branch_ids(&lookup, &refs).ok()?;
+            repo.pull(*ids.first()?).ok()
+        });
+
+        // Clone all catalogs needed for the timeline.
+        let exec_data = catalog(&state.exec_co).clone();
+        let local_data = catalog(&state.local_messages_co).clone();
+        let teams_data = catalog(&state.teams_co).clone();
+        let compass_data = catalog(&state.compass_co).clone();
+        let relations_data = catalog(&state.relations_co).clone();
+        let now_key = state.now_key;
+        let timeline_limit = state.timeline_limit;
+
+        let exec_branch_err =
+            if state.exec_co.is_none() && !state.config.exec_branches.trim().is_empty() {
+                let branch_lookup = BranchLookup::new(&state.branches);
+                let refs = parse_branch_list(&state.config.exec_branches);
+                resolve_branch_ids(&branch_lookup, &refs).err()
+            } else {
+                None
+            };
+
         ui.section("Activity", |ui| {
+            ui.grid(|g| g.full(|ui| {
             let mut timeline_limit_changed = false;
             ui.horizontal_wrapped(|ui| {
                 ui.small("Recent events:");
@@ -745,43 +685,76 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
                 }
             });
             if timeline_limit_changed {
-                refresh_snapshot(&mut state);
-                state.last_snapshot_refresh_at = Some(Instant::now());
+                // Force catalog refresh on next frame.
+                state.last_refresh_at = None;
             }
 
-            let snapshot = {
-                let Some(snapshot) = snapshot_or_message(ui, &state.snapshot) else {
-                    return;
-                };
-                snapshot.clone()
-            };
-
-            if snapshot.timeline_rows.is_empty() {
-                ui.small("No activity yet.");
-            } else if snapshot.timeline_rows.len() < snapshot.timeline_total_rows {
-                ui.small(format!(
-                    "Showing latest {} of {} events.",
-                    snapshot.timeline_rows.len(),
-                    snapshot.timeline_total_rows
-                ));
-            } else {
-                ui.small(format!("{} events.", snapshot.timeline_total_rows));
-            }
-
-            if let Some(err) = &snapshot.exec_error {
+            if let Some(err) = &exec_branch_err {
                 ui.colored_label(egui::Color32::RED, format!("Exec branch: {err}"));
             }
-            if snapshot.timeline_rows.is_empty() {
-                ui.label("No activity yet.");
+
+            // Build the timeline from all catalogs.
+            let Some(ref mut ws) = ws else {
+                if exec_data.is_empty() {
+                    ui.label("No activity yet.");
+                } else {
+                    ui.label("No workspace available for blob reads.");
+                }
+                return;
+            };
+
+            let exec_rows = collect_exec_rows(&exec_data, ws);
+            let reasoning_summaries = collect_reasoning_summaries(&exec_data, ws);
+            let reason_rows = collect_reason_rows(&exec_data, ws);
+            let local_message_rows = collect_local_messages(&local_data, ws);
+            let (teams_messages, teams_chats) = collect_teams_messages(&teams_data, ws);
+            let compass_rows = collect_compass_rows(&compass_data, ws);
+            let compass_status_rows = collect_compass_status_rows(&compass_data);
+            let compass_notes = collect_compass_notes(&compass_data, ws);
+            let labels = collect_labels(&exec_data, ws);
+            let relations_people = collect_relations_people(&relations_data, ws);
+            let relations_labels = collect_relations_labels(&relations_people);
+            let local_me_id = resolve_person_ref(&relations_people, &state.config.local_me);
+
+            let (timeline_rows, timeline_total_rows) = build_activity_timeline(
+                &exec_rows,
+                &reasoning_summaries,
+                &reason_rows,
+                &local_message_rows,
+                local_me_id,
+                &relations_labels,
+                &teams_messages,
+                &teams_chats,
+                &compass_rows,
+                &compass_status_rows,
+                &compass_notes,
+                &labels,
+                timeline_limit,
+            );
+
+            if timeline_rows.is_empty() {
+                ui.small("No activity yet.");
+            } else if timeline_rows.len() < timeline_total_rows {
+                ui.small(format!(
+                    "Showing latest {} of {} events.",
+                    timeline_rows.len(),
+                    timeline_total_rows
+                ));
+            } else {
+                ui.small(format!("{timeline_total_rows} events."));
+            }
+
+            if timeline_rows.is_empty() {
                 return;
             }
-            if let Some(request_id) = render_activity_timeline(ui, snapshot.now_key, &snapshot.timeline_rows) {
+            if let Some(request_id) = render_activity_timeline(ui, now_key, &timeline_rows) {
                 state.context_float_request_id = Some(request_id);
             }
 
             // Render context float if one is open.
             if let Some(request_id) = state.context_float_request_id {
-                if let Some(row) = snapshot.turn_memory_rows.iter().find(|r| r.request_id == request_id) {
+                let turn_memory_rows = collect_turn_memory_rows(&exec_data, &exec_rows, ws);
+                if let Some(row) = turn_memory_rows.iter().find(|r| r.request_id == request_id) {
                     let row = row.clone();
                     ui.push_id(request_id, |ui| {
                         let resp = ui.float(|ui| {
@@ -802,7 +775,7 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
                                         ui.small(format!("msg {idx} · {chars}c"));
                                     });
                                     egui::Frame::NONE
-                                        .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(190)))
+                                        .stroke(egui::Stroke::new(1.0, color_muted()))
                                         .inner_margin(egui::Margin::symmetric(8, 6))
                                         .show(ui, |ui| {
                                             render_blob_aware_text(ui, message.content.as_str(), None, None);
@@ -817,65 +790,117 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
                     });
                 }
             }
+            }));
         });
     });
 
     // ── Overview ─
     nb.view(move |ui| {
-        let mut state = dashboard.read_mut(ui);
+        let state = dashboard.read_mut(ui);
         let pile_path = state.config.pile_path.clone();
         let branches = state.branches.clone();
         ui.section("Overview", |ui| {
-            ui.horizontal(|ui| {
-                ui.label(format!("Pile: {pile_path}"));
-            });
+            ui.grid(|g| {
+                // Pile path in a monospace frame (full width).
+                g.full(|ui| {
+                    let frame_bg = color_frame();
+                    let frame_text = colorhash::text_color_on(frame_bg);
+                    egui::Frame::NONE
+                        .fill(frame_bg)
+                        .corner_radius(egui::CornerRadius::same(4))
+                        .inner_margin(egui::Margin::symmetric(8, 4))
+                        .show(ui, |ui| {
+                            ui.set_min_width(ui.available_width());
+                            ui.label(egui::RichText::new(&pile_path).monospace().small().color(frame_text));
+                        });
+                });
 
-            if branches.is_empty() {
-                return;
-            }
-
-            let mut primary: Vec<&BranchEntry> = Vec::new();
-            let mut extra: Vec<&BranchEntry> = Vec::new();
-            for branch in &branches {
-                let label = branch.name.as_deref().unwrap_or("<unnamed>");
-                if label.contains("--orphan-") || label.starts_with('<') {
-                    extra.push(branch);
-                } else {
-                    primary.push(branch);
-                }
-            }
-
-            ui.label(format!(
-                "Branches: {} primary, {} extra",
-                primary.len(),
-                extra.len()
-            ));
-
-            ui.label("Primary:");
-            for branch in &primary {
-                let label = branch.name.as_deref().unwrap_or("<unnamed>");
-                ui.label(format!("- {label} ({})", id_prefix(branch.id)));
-            }
-
-            if !extra.is_empty() {
-                let button_label = if state.show_extra_branches {
-                    "Hide extra branches"
-                } else {
-                    "Show extra branches"
-                };
-                if ui.add(Button::new(button_label)).clicked() {
-                    state.show_extra_branches = !state.show_extra_branches;
-                }
-
-                if state.show_extra_branches {
-                    ui.add_space(8.0);
-                    ui.label("Extra:");
-                    for branch in &extra {
+                if !branches.is_empty() {
+                    let mut primary: Vec<&BranchEntry> = Vec::new();
+                    let mut extra: Vec<&BranchEntry> = Vec::new();
+                    for branch in &branches {
                         let label = branch.name.as_deref().unwrap_or("<unnamed>");
-                        ui.label(format!("- {label} ({})", id_prefix(branch.id)));
+                        if label.contains("--orphan-") || label.starts_with('<') {
+                            extra.push(branch);
+                        } else {
+                            primary.push(branch);
+                        }
+                    }
+
+                    g.full(|ui| {
+                        ui.small(format!(
+                            "{} branches ({} primary, {} extra)",
+                            branches.len(),
+                            primary.len(),
+                            extra.len(),
+                        ));
+                    });
+
+                    // Primary branches as colored chips (3 per row).
+                    for branch in &primary {
+                        let name = branch.name.as_deref().unwrap_or("<unnamed>");
+                        let fill = colorhash::ral_categorical(name.as_bytes());
+                        let text_color = colorhash::text_color_on(fill);
+                        g.third(|ui| {
+                            let w = ui.available_width();
+                            egui::Frame::NONE
+                                .fill(fill)
+                                .corner_radius(egui::CornerRadius::same(5))
+                                .inner_margin(egui::Margin::symmetric(8, 2))
+                                .show(ui, |ui| {
+                                    ui.set_min_width(w - 16.0);
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 4.0;
+                                        ui.label(egui::RichText::new(name).color(text_color).small());
+                                        ui.label(
+                                            egui::RichText::new(id_prefix(branch.id))
+                                                .monospace()
+                                                .color(color_muted())
+                                                .small(),
+                                        );
+                                    });
+                                });
+                        });
+                    }
+
+                    // Extra branches in a collapsed section.
+                    if !extra.is_empty() {
+                        g.full(|ui| {
+                            ui.section_collapsed(&format!("{} extra branches", extra.len()), |ui| {
+                                ui.grid(|g| {
+                                    for branch in &extra {
+                                        let name = branch.name.as_deref().unwrap_or("<unnamed>");
+                                        let fill = colorhash::ral_categorical(name.as_bytes());
+                                        let text_color = colorhash::text_color_on(fill);
+                                        g.third(|ui| {
+                                            let w = ui.available_width();
+                                            egui::Frame::NONE
+                                                .fill(fill)
+                                                .corner_radius(egui::CornerRadius::same(5))
+                                                .inner_margin(egui::Margin::symmetric(8, 2))
+                                                .show(ui, |ui| {
+                                                    ui.set_min_width(w - 16.0);
+                                                    ui.horizontal(|ui| {
+                                                        ui.spacing_mut().item_spacing.x = 4.0;
+                                                        ui.label(
+                                                            egui::RichText::new(name).color(text_color).small(),
+                                                        );
+                                                        ui.label(
+                                                            egui::RichText::new(id_prefix(branch.id))
+                                                                .monospace()
+                                                                .color(color_muted())
+                                                                .small(),
+                                                        );
+                                                    });
+                                                });
+                                        });
+                                    }
+                                });
+                            });
+                        });
                     }
                 }
-            }
+            });
         });
     });
 
@@ -894,6 +919,7 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
         });
 
         ui.section("Agent Config", |ui| {
+            ui.grid(|g| g.full(|ui| {
             // Show branch resolution error when the configured branch can't be found.
             if state.config_co.is_none() && !state.config.config_branches.trim().is_empty() {
                 let branch_lookup = BranchLookup::new(&state.branches);
@@ -907,75 +933,136 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
             let data = catalog(&state.config_co).clone();
             let now_key = state.now_key;
             render_agent_config(ui, &mut state.config_reveal_secrets, now_key, &data, &mut ws);
+            }));
         });
     });
 
     // ── Context Compaction ─
     nb.view(move |ui| {
         let mut state = dashboard.read_mut(ui);
+
+        // Pull workspace for blob reads.
+        let exec_branches = state.config.exec_branches.clone();
+        let mut ws = state.repo.as_mut().and_then(|repo| {
+            let branch_entries = list_branches(repo.storage_mut()).ok()?;
+            let lookup = BranchLookup::new(&branch_entries);
+            let refs = parse_branch_list(&exec_branches);
+            let ids = resolve_branch_ids(&lookup, &refs).ok()?;
+            repo.pull(*ids.first()?).ok()
+        });
+
+        let exec_data = catalog(&state.exec_co).clone();
+        let now_key = state.now_key;
+        let context_selected_chunk = state.context_selected_chunk;
+        let context_show_children = state.context_show_children;
+        let context_show_origins = state.context_show_origins;
+
         ui.section("Context Compaction", |ui| {
-            let snapshot = {
-                let Some(snapshot) = snapshot_or_message(ui, &state.snapshot) else {
-                    return;
-                };
-                snapshot.clone()
-            };
-            if snapshot.context_chunks.is_empty() {
+            ui.grid(|g| g.full(|ui| {
+            let chunks = collect_context_chunks(&exec_data);
+            if chunks.is_empty() {
                 ui.label("No context chunks yet.");
                 return;
             }
-            render_context_compaction(
-                ui,
-                &mut state,
-                snapshot.now_key,
-                &snapshot.context_chunks,
-                snapshot.context_selected.as_ref(),
-            );
+            let selected = ws.as_mut().map(|ws| {
+                build_context_selected(
+                    ws,
+                    &chunks,
+                    context_selected_chunk,
+                    context_show_children,
+                    context_show_origins,
+                )
+            }).flatten();
+            render_context_compaction(ui, &mut state, now_key, &chunks, selected.as_ref());
+            }));
         });
     });
 
     // ── Compass ─
     nb.view(move |ui| {
         let mut state = dashboard.read_mut(ui);
-        ui.section("Compass", |ui| {
-            let snapshot = {
-                let Some(snapshot) = snapshot_or_message(ui, &state.snapshot) else {
-                    return;
-                };
-                snapshot.clone()
+
+        // Clone branch name before entering the section closure to avoid borrow conflicts.
+        let compass_branches = state.config.compass_branches.clone();
+        let mut ws = state.repo.as_mut().and_then(|repo| {
+            let branch_entries = list_branches(repo.storage_mut()).ok()?;
+            let lookup = BranchLookup::new(&branch_entries);
+            let refs = parse_branch_list(&compass_branches);
+            let ids = resolve_branch_ids(&lookup, &refs).ok()?;
+            repo.pull(*ids.first()?).ok()
+        });
+
+        // Resolve branch error and clone the catalog before the section closure
+        // so we don't hold an immutable borrow on state while also borrowing it mutably.
+        let compass_branch_err =
+            if state.compass_co.is_none() && !state.config.compass_branches.trim().is_empty() {
+                let branch_lookup = BranchLookup::new(&state.branches);
+                let refs = parse_branch_list(&state.config.compass_branches);
+                resolve_branch_ids(&branch_lookup, &refs).err()
+            } else {
+                None
             };
-            if let Some(err) = &snapshot.compass_error {
+        let compass_data = catalog(&state.compass_co).clone();
+
+        ui.section("Compass", |ui| {
+            ui.grid(|g| g.full(|ui| {
+            if let Some(err) = compass_branch_err {
                 ui.colored_label(egui::Color32::RED, err);
                 return;
             }
 
-            if snapshot.compass_rows.is_empty() {
-                ui.label("No goals yet.");
-                return;
-            }
-            render_compass_swimlanes(
+            render_compass_swimlanes_live(
                 ui,
                 &mut state.compass_expanded_goal,
-                &snapshot.compass_rows,
-                &snapshot.compass_notes,
+                &compass_data,
+                &mut ws,
             );
+            }));
         });
     });
 
     // ── Messages ─
     nb.view(move |ui| {
         let mut state = dashboard.read_mut(ui);
-        ui.section("Messages", |ui| {
-            let snapshot = {
-                let Some(snapshot) = snapshot_or_message(ui, &state.snapshot) else {
-                    return;
-                };
-                snapshot.clone()
+
+        // Pull workspace for relations blob reads (person labels).
+        let relations_branches = state.config.relations_branches.clone();
+        let mut ws = state.repo.as_mut().and_then(|repo| {
+            let branch_entries = list_branches(repo.storage_mut()).ok()?;
+            let lookup = BranchLookup::new(&branch_entries);
+            let refs = parse_branch_list(&relations_branches);
+            let ids = resolve_branch_ids(&lookup, &refs).ok()?;
+            repo.pull(*ids.first()?).ok()
+        });
+
+        // Collect relations for person picker.
+        let relations_data = catalog(&state.relations_co).clone();
+        let people = if let Some(ref mut ws) = ws {
+            collect_relations_people(&relations_data, ws)
+        } else {
+            Vec::new()
+        };
+        let relations_labels = collect_relations_labels(&people);
+        let local_me_id = resolve_person_ref(&people, &state.config.local_me);
+        let local_peer_id = resolve_person_ref(&people, &state.config.local_peer);
+        let branches = state.branches.clone();
+
+        let local_message_err =
+            if state.local_messages_co.is_none() && !state.config.local_message_branches.trim().is_empty() {
+                let branch_lookup = BranchLookup::new(&state.branches);
+                let refs = parse_branch_list(&state.config.local_message_branches);
+                resolve_branch_ids(&branch_lookup, &refs).err()
+            } else {
+                None
             };
-            if let Some(err) = &snapshot.local_message_error {
+
+        ui.section("Messages", |ui| {
+            ui.grid(|g| g.full(|ui| {
+            if let Some(err) = local_message_err {
                 ui.colored_label(egui::Color32::RED, err);
             }
-            render_local_composer(ui, &mut state, &snapshot.branches, &snapshot);
+            render_local_composer(ui, &mut state, &branches, &people, &relations_labels, local_me_id, local_peer_id);
+            }));
         });
     });
 
@@ -1131,61 +1218,106 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
 
             people.sort_by(|a, b| a.label.cmp(&b.label).then_with(|| a.id.cmp(&b.id)));
 
-            // Render.
-            ui.set_min_height(RELATIONS_SCROLL_HEIGHT);
-            for person in &people {
-                let label = person.label.as_deref().unwrap_or("<unnamed>");
-                ui.label(format!("[{}] {}", id_prefix(person.id), label));
-                let full_name = match (&person.first_name, &person.last_name) {
-                    (Some(first), Some(last)) => Some(format!("{first} {last}")),
-                    (Some(first), None) => Some(first.clone()),
-                    (None, Some(last)) => Some(last.clone()),
-                    (None, None) => None,
-                };
-                if let Some(name) = person.display_name.as_ref().or(full_name.as_ref()) {
-                    ui.small(name);
+            // Render person cards.
+            ui.small(format!("{} people", people.len()));
+            ui.grid(|g| {
+                for person in &people {
+                    let label = person.label.as_deref().unwrap_or("<unnamed>");
+                    let fill = colorhash::ral_categorical(label.as_bytes());
+                    let full_name = match (&person.first_name, &person.last_name) {
+                        (Some(first), Some(last)) => Some(format!("{first} {last}")),
+                        (Some(first), None) => Some(first.clone()),
+                        (None, Some(last)) => Some(last.clone()),
+                        (None, None) => None,
+                    };
+
+                    g.half(|ui| {
+                        let w = ui.available_width();
+                        egui::Frame::NONE
+                            .fill(color_frame())
+                            .corner_radius(egui::CornerRadius::same(4))
+                            .inner_margin(egui::Margin::symmetric(10, 8))
+                            .show(ui, |ui| {
+                                ui.set_min_width(w - 20.0);
+                                // Header: colored name chip + ID
+                                ui.horizontal(|ui| {
+                                    render_person_chip(ui, label, fill);
+                                    ui.small(
+                                        egui::RichText::new(id_prefix(person.id))
+                                            .monospace()
+                                            .color(color_muted()),
+                                    );
+                                    if let Some(affinity) = &person.affinity {
+                                        render_person_chip(ui, affinity, color_muted());
+                                    }
+                                });
+
+                                // Details row
+                                let mut details = Vec::new();
+                                if let Some(name) = person.display_name.as_ref().or(full_name.as_ref()) {
+                                    details.push(name.clone());
+                                }
+                                if let Some(email) = &person.email {
+                                    details.push(email.clone());
+                                }
+                                if let Some(teams) = &person.teams_user_id {
+                                    details.push(format!("teams: {teams}"));
+                                }
+                                if !details.is_empty() {
+                                    ui.small(details.join(" · "));
+                                }
+                                if !person.aliases.is_empty() {
+                                    ui.small(format!("aliases: {}", person.aliases.join(", ")));
+                                }
+                                if let Some(note) = &person.note {
+                                    ui.small(
+                                        egui::RichText::new(truncate_single_line(note, 120))
+                                            .color(color_muted()),
+                                    );
+                                }
+                            });
+                    });
                 }
-                if let Some(affinity) = &person.affinity {
-                    ui.small(format!("affinity: {affinity}"));
-                }
-                if let Some(teams) = &person.teams_user_id {
-                    ui.small(format!("teams: {teams}"));
-                }
-                if let Some(email) = &person.email {
-                    ui.small(format!("email: {email}"));
-                }
-                if !person.aliases.is_empty() {
-                    ui.small(format!("aliases: {}", person.aliases.join(", ")));
-                }
-                if let Some(note) = &person.note {
-                    ui.small(format!("note: {}", truncate_single_line(note, 120)));
-                }
-                ui.add_space(8.0);
-            }
+            });
         });
     });
 
     // ── Teams ─
     nb.view(move |ui| {
         let mut state = dashboard.read_mut(ui);
-        ui.section("Teams", |ui| {
-            let snapshot = {
-                let Some(snapshot) = snapshot_or_message(ui, &state.snapshot) else {
-                    return;
-                };
-                snapshot.clone()
-            };
-            if let Some(err) = &snapshot.teams_error {
-                ui.colored_label(egui::Color32::RED, err);
+
+        // Pull workspace for blob reads.
+        let teams_branches = state.config.teams_branches.clone();
+        let mut ws = state.repo.as_mut().and_then(|repo| {
+            let branch_entries = list_branches(repo.storage_mut()).ok()?;
+            let lookup = BranchLookup::new(&branch_entries);
+            let refs = parse_branch_list(&teams_branches);
+            let ids = resolve_branch_ids(&lookup, &refs).ok()?;
+            repo.pull(*ids.first()?).ok()
+        });
+
+        let teams_branch_err =
+            if state.teams_co.is_none() && !state.config.teams_branches.trim().is_empty() {
+                let branch_lookup = BranchLookup::new(&state.branches);
+                let refs = parse_branch_list(&state.config.teams_branches);
+                resolve_branch_ids(&branch_lookup, &refs).err()
             } else {
-                render_teams_conversations(
-                    ui,
-                    &mut state,
-                    snapshot.now_key,
-                    &snapshot.teams_chats,
-                    &snapshot.teams_messages,
-                );
+                None
+            };
+        let teams_data = catalog(&state.teams_co).clone();
+        let now_key = state.now_key;
+
+        ui.section("Teams", |ui| {
+            ui.grid(|g| g.full(|ui| {
+            if let Some(err) = teams_branch_err {
+                ui.colored_label(egui::Color32::RED, err);
+            } else if let Some(ref mut ws) = ws {
+                let (messages, chats) = collect_teams_messages(&teams_data, ws);
+                render_teams_conversations(ui, &mut state, now_key, &chats, &messages);
+            } else if !teams_data.is_empty() {
+                ui.label("No workspace available for blob reads.");
             }
+            }));
         });
     });
 
@@ -1217,22 +1349,6 @@ pub fn run_diagnostics(
     Ok(())
 }
 
-fn snapshot_or_message<'a>(
-    ui: &mut egui::Ui,
-    snapshot: &'a Option<Result<DashboardSnapshot, String>>,
-) -> Option<&'a DashboardSnapshot> {
-    match snapshot {
-        None => {
-            ui.label("No snapshot yet.");
-            None
-        }
-        Some(Err(err)) => {
-            ui.colored_label(egui::Color32::RED, err);
-            None
-        }
-        Some(Ok(snapshot)) => Some(snapshot),
-    }
-}
 
 fn ensure_repo_open(state: &mut DashboardState) -> Result<(), String> {
     let open_path = PathBuf::from(state.config.pile_path.trim());
@@ -1266,47 +1382,79 @@ fn ensure_repo_open(state: &mut DashboardState) -> Result<(), String> {
         state.relations_co = None;
         state.teams_co = None;
         state.branches.clear();
-        state.snapshot = None;
     }
     Ok(())
 }
 
-fn refresh_snapshot(state: &mut DashboardState) {
-    // Capture previous fact counts for change detection.
-    let prev_config_len = catalog(&state.config_co).len();
-    let prev_exec_len = catalog(&state.exec_co).len();
-    let prev_compass_len = catalog(&state.compass_co).len();
-    let prev_local_messages_len = catalog(&state.local_messages_co).len();
-    let prev_relations_len = catalog(&state.relations_co).len();
-    let prev_teams_len = catalog(&state.teams_co).len();
+fn should_refresh(state: &DashboardState) -> bool {
+    if diagnostics_is_headless() {
+        return true;
+    }
+    match state.last_refresh_at {
+        None => true,
+        Some(last) => last.elapsed() >= Duration::from_millis(CATALOG_REFRESH_MS),
+    }
+}
 
-    // Phase 1: refresh per-branch checkouts
-    refresh_catalogs(state);
+/// Apply branch name defaults from the latest agent config in the config catalog.
+fn apply_branch_defaults(state: &mut DashboardState) {
+    let config_data = catalog(&state.config_co);
+    if config_data.is_empty() {
+        return;
+    }
 
-    // Phase 1b compat: build old DashboardSnapshot from catalogs for render functions.
-    // Determine which roles changed by comparing fact counts.
-    let config_changed = catalog(&state.config_co).len() != prev_config_len;
-    let exec_changed = catalog(&state.exec_co).len() != prev_exec_len;
-    let compass_changed = catalog(&state.compass_co).len() != prev_compass_len;
-    let local_messages_changed = catalog(&state.local_messages_co).len() != prev_local_messages_len;
-    let relations_changed = catalog(&state.relations_co).len() != prev_relations_len;
-    let teams_changed = catalog(&state.teams_co).len() != prev_teams_len;
-
-    let result = build_snapshot_from_catalogs(
-        state,
-        config_changed,
-        exec_changed,
-        compass_changed,
-        local_messages_changed,
-        relations_changed,
-        teams_changed,
-    );
-    if let Ok(snapshot) = &result {
-        if let Some(agent_config) = snapshot.agent_config.as_ref() {
-            apply_branch_defaults_from_agent_config(state, agent_config);
+    // Find the latest config entity by updated_at.
+    let mut latest: Option<(Id, i128)> = None;
+    for (config_id, updated_at) in find!(
+        (config_id: Id, updated_at: Value<NsTAIInterval>),
+        pattern!(config_data, [{
+            ?config_id @
+            metadata::tag: playground_config::kind_config,
+            playground_config::updated_at: ?updated_at,
+        }])
+    ) {
+        let key = interval_key(updated_at);
+        if latest.map_or(true, |(_, current)| key > current) {
+            latest = Some((config_id, key));
         }
     }
-    state.snapshot = Some(result);
+
+    let Some((config_id, _)) = latest else {
+        return;
+    };
+
+    if state.config_last_applied_id == Some(config_id) {
+        return;
+    }
+
+    // Extract the branch name (ShortString, no blob read needed for lookup).
+    // The branch field is a blob handle — pull a workspace for the read.
+    let branch = state.repo.as_mut().and_then(|repo| {
+        let branch_entries = list_branches(repo.storage_mut()).ok()?;
+        let lookup = BranchLookup::new(&branch_entries);
+        let refs = parse_branch_list(&state.config.config_branches);
+        let ids = resolve_branch_ids(&lookup, &refs).ok()?;
+        let mut ws = repo.pull(*ids.first()?).ok()?;
+        load_optional_string_attr(config_data, &mut ws, config_id, playground_config::branch)
+    });
+
+    if let Some(branch) = branch {
+        state.config.exec_branches = branch;
+    }
+    if state.config.compass_branches.is_empty() {
+        state.config.compass_branches = "compass".to_string();
+    }
+    if state.config.local_message_branches.is_empty() {
+        state.config.local_message_branches = "local-messages".to_string();
+    }
+    if state.config.relations_branches.is_empty() {
+        state.config.relations_branches = "relations".to_string();
+    }
+    if state.config.teams_branches.is_empty() {
+        state.config.teams_branches = "teams".to_string();
+    }
+
+    state.config_last_applied_id = Some(config_id);
 }
 
 /// Extract the facts TribleSet from an `Option<Checkout>`, returning an empty set if None.
@@ -1419,375 +1567,6 @@ fn refresh_catalogs(state: &mut DashboardState) {
     refresh_role(repo, &branch_lookup, &teams_branches, &mut state.teams_co);
 
     state.now_key = epoch_key(now_epoch());
-}
-
-/// Compatibility layer: build a DashboardSnapshot from per-branch catalogs.
-/// This allows render functions to continue using the old snapshot format
-/// while we migrate them to query catalogs directly in Phase 2.
-///
-/// The `*_changed` flags indicate whether each role's head commit advanced
-/// since the last refresh, which controls whether cached data is reused.
-fn build_snapshot_from_catalogs(
-    state: &mut DashboardState,
-    config_changed: bool,
-    exec_changed: bool,
-    compass_changed: bool,
-    local_messages_changed: bool,
-    relations_changed: bool,
-    teams_changed: bool,
-) -> Result<DashboardSnapshot, String> {
-    let pile_path = PathBuf::from(&state.config.pile_path);
-    let config = state.config.clone();
-    let now_key = state.now_key;
-
-    // Synthesise delta TribleSets for the compat layer.
-    // When a role changed, use the full catalog as the delta (conservative but correct);
-    // when unchanged, use an empty set so build_snapshot can skip re-collection.
-    let config_delta = if config_changed { catalog(&state.config_co).clone() } else { TribleSet::new() };
-    let exec_delta = if exec_changed { catalog(&state.exec_co).clone() } else { TribleSet::new() };
-    let compass_delta = if compass_changed { catalog(&state.compass_co).clone() } else { TribleSet::new() };
-    let local_delta = if local_messages_changed { catalog(&state.local_messages_co).clone() } else { TribleSet::new() };
-    let relations_delta = if relations_changed { catalog(&state.relations_co).clone() } else { TribleSet::new() };
-    let teams_delta = if teams_changed { catalog(&state.teams_co).clone() } else { TribleSet::new() };
-
-    // Determine error messages from branch resolution
-    let branch_lookup = BranchLookup::new(&state.branches);
-    let agent_config_error = resolve_branch_ids(&branch_lookup, &parse_branch_list(&config.config_branches)).err();
-    let exec_error = resolve_branch_ids(&branch_lookup, &parse_branch_list(&config.exec_branches)).err();
-    let compass_error = resolve_branch_ids(&branch_lookup, &parse_branch_list(&config.compass_branches)).err();
-    let local_message_error = resolve_branch_ids(&branch_lookup, &parse_branch_list(&config.local_message_branches)).err();
-    let relations_error = resolve_branch_ids(&branch_lookup, &parse_branch_list(&config.relations_branches)).err();
-    let teams_error = resolve_branch_ids(&branch_lookup, &parse_branch_list(&config.teams_branches)).err();
-
-    // Clone catalogs and branches before taking a mutable borrow on workspaces
-    let config_catalog = catalog(&state.config_co).clone();
-    let exec_catalog = catalog(&state.exec_co).clone();
-    let compass_catalog = catalog(&state.compass_co).clone();
-    let local_messages_catalog = catalog(&state.local_messages_co).clone();
-    let relations_catalog = catalog(&state.relations_co).clone();
-    let teams_catalog = catalog(&state.teams_co).clone();
-    let branches = state.branches.clone();
-    let context_selected_chunk = state.context_selected_chunk;
-    let context_show_children = state.context_show_children;
-    let context_show_origins = state.context_show_origins;
-    let timeline_limit = state.timeline_limit;
-
-    // Take the previous snapshot for reuse (avoids borrow conflict with &mut self)
-    let previous_snapshot = state.snapshot.take();
-    let previous = previous_snapshot
-        .as_ref()
-        .and_then(|r| r.as_ref().ok());
-    let previous_for_reuse = previous.filter(|s| s.pile_path == pile_path);
-
-    // Pull a fresh workspace for blob access (any branch will do — blobs are content-addressed).
-    let ws = {
-        let repo = match state.repo.as_mut() {
-            Some(r) => r,
-            None => {
-                state.snapshot = Some(Err("Repository not open.".to_string()));
-                return Err("Repository not open.".to_string());
-            }
-        };
-        // Try the exec branch first, fall back to others
-        let branch_name = &state.config.exec_branches;
-        let refs = parse_branch_list(branch_name);
-        let branch_entries = list_branches(repo.storage_mut()).unwrap_or_default();
-        let branch_lookup = BranchLookup::new(&branch_entries);
-        resolve_branch_ids(&branch_lookup, &refs)
-            .ok()
-            .and_then(|ids| ids.first().copied())
-            .and_then(|id| repo.pull(id).ok())
-    };
-
-    let Some(mut ws) = ws else {
-        return Ok(DashboardSnapshot {
-            pile_path,
-            branches,
-            branch_data: HashMap::new(),
-            exec_error,
-            agent_config: None,
-            agent_config_error,
-            context_chunks: Vec::new(),
-            context_selected: None,
-            exec_rows: Vec::new(),
-            reasoning_summaries: Vec::new(),
-            reason_rows: Vec::new(),
-            turn_memory_rows: Vec::new(),
-            local_message_rows: Vec::new(),
-            compass_status_rows: Vec::new(),
-            timeline_rows: Vec::new(),
-            timeline_total_rows: 0,
-            compass_rows: Vec::new(),
-            compass_notes: HashMap::new(),
-            compass_error,
-            local_message_error,
-            local_me_id: None,
-            local_peer_id: None,
-            relations_people: Vec::new(),
-            relations_error,
-            relations_labels: HashMap::new(),
-            teams_messages: Vec::new(),
-            teams_chats: Vec::new(),
-            teams_error,
-            labels: HashMap::new(),
-            now_key,
-        });
-    };
-
-    Ok(build_snapshot(
-        config_catalog,
-        exec_catalog,
-        compass_catalog,
-        local_messages_catalog,
-        relations_catalog,
-        teams_catalog,
-        pile_path,
-        branches,
-        HashMap::new(), // branch_data no longer tracked per-id
-        agent_config_error,
-        exec_error,
-        compass_error,
-        local_message_error,
-        relations_error,
-        teams_error,
-        &config,
-        &mut ws,
-        previous_for_reuse,
-        &config_delta,
-        &exec_delta,
-        &compass_delta,
-        &local_delta,
-        &relations_delta,
-        &teams_delta,
-        context_selected_chunk,
-        context_show_children,
-        context_show_origins,
-        timeline_limit,
-    ))
-}
-
-fn should_refresh_snapshot(state: &DashboardState) -> bool {
-    if diagnostics_is_headless() {
-        return true;
-    }
-    match state.last_snapshot_refresh_at {
-        None => true,
-        Some(last) => last.elapsed() >= Duration::from_millis(SNAPSHOT_REFRESH_MS),
-    }
-}
-
-fn apply_branch_defaults_from_agent_config(state: &mut DashboardState, config: &AgentConfigRow) {
-    if state.config_last_applied_id == Some(config.id) {
-        return;
-    }
-
-    // Use well-known branch names as defaults for diagnostics selectors.
-    if let Some(branch) = config.branch.as_deref() {
-        state.config.exec_branches = branch.to_string();
-    }
-    if state.config.compass_branches.is_empty() {
-        state.config.compass_branches = "compass".to_string();
-    }
-    if state.config.local_message_branches.is_empty() {
-        state.config.local_message_branches = "local-messages".to_string();
-    }
-    if state.config.relations_branches.is_empty() {
-        state.config.relations_branches = "relations".to_string();
-    }
-    if state.config.teams_branches.is_empty() {
-        state.config.teams_branches = "teams".to_string();
-    }
-
-    state.config_last_applied_id = Some(config.id);
-}
-
-fn build_snapshot(
-    config_data: TribleSet,
-    exec_data: TribleSet,
-    compass_data: TribleSet,
-    local_data: TribleSet,
-    relations_data: TribleSet,
-    teams_data: TribleSet,
-    pile_path: PathBuf,
-    branches: Vec<BranchEntry>,
-    branch_data: HashMap<Id, BranchSnapshot>,
-    agent_config_error: Option<String>,
-    exec_error: Option<String>,
-    compass_error: Option<String>,
-    local_message_error: Option<String>,
-    relations_error: Option<String>,
-    teams_error: Option<String>,
-    config: &DashboardConfig,
-    ws: &mut Workspace<Pile>,
-    previous: Option<&DashboardSnapshot>,
-    config_delta: &TribleSet,
-    exec_delta: &TribleSet,
-    compass_delta: &TribleSet,
-    local_delta: &TribleSet,
-    relations_delta: &TribleSet,
-    teams_delta: &TribleSet,
-    context_selected_chunk: Option<Id>,
-    context_show_children: bool,
-    context_show_origins: bool,
-    timeline_limit: usize,
-) -> DashboardSnapshot {
-    let now_key = epoch_key(now_epoch());
-    let (relations_people, relations_labels) = if relations_delta.is_empty() {
-        if let Some(previous) = previous {
-            (
-                previous.relations_people.clone(),
-                previous.relations_labels.clone(),
-            )
-        } else {
-            let rows = collect_relations_people(&relations_data, ws);
-            let labels = collect_relations_labels(&rows);
-            (rows, labels)
-        }
-    } else {
-        let rows = collect_relations_people(&relations_data, ws);
-        let labels = collect_relations_labels(&rows);
-        (rows, labels)
-    };
-    let local_me_id = resolve_person_ref(&relations_people, &config.local_me);
-    let local_peer_id = resolve_person_ref(&relations_people, &config.local_peer);
-    let agent_config = if config_delta.is_empty() {
-        previous.and_then(|snapshot| snapshot.agent_config.clone())
-    } else {
-        collect_agent_config(&config_data, ws)
-    };
-    let exec_rows = collect_exec_rows_incremental(
-        &exec_data,
-        exec_delta,
-        previous.map(|snapshot| snapshot.exec_rows.as_slice()),
-        ws,
-    );
-    let reasoning_summaries = collect_reasoning_summaries_incremental(
-        &exec_data,
-        exec_delta,
-        previous.map(|snapshot| snapshot.reasoning_summaries.as_slice()),
-        ws,
-    );
-    let reason_rows = collect_reason_rows_incremental(
-        &exec_data,
-        exec_delta,
-        previous.map(|snapshot| snapshot.reason_rows.as_slice()),
-        ws,
-    );
-    let turn_memory_rows = if exec_delta.is_empty() {
-        previous
-            .map(|snapshot| snapshot.turn_memory_rows.clone())
-            .unwrap_or_else(|| collect_turn_memory_rows(&exec_data, &exec_rows, ws))
-    } else {
-        collect_turn_memory_rows(&exec_data, &exec_rows, ws)
-    };
-    let context_chunks = if exec_delta.is_empty() {
-        previous
-            .map(|snapshot| snapshot.context_chunks.clone())
-            .unwrap_or_else(|| collect_context_chunks(&exec_data))
-    } else {
-        collect_context_chunks(&exec_data)
-    };
-    let context_selected = build_context_selected(
-        ws,
-        &context_chunks,
-        context_selected_chunk,
-        context_show_children,
-        context_show_origins,
-    );
-    let (compass_rows, compass_status_rows, compass_notes) = if compass_delta.is_empty() {
-        if let Some(previous) = previous {
-            (
-                previous.compass_rows.clone(),
-                previous.compass_status_rows.clone(),
-                previous.compass_notes.clone(),
-            )
-        } else {
-            (
-                collect_compass_rows(&compass_data, ws),
-                collect_compass_status_rows(&compass_data),
-                collect_compass_notes(&compass_data, ws),
-            )
-        }
-    } else {
-        (
-            collect_compass_rows(&compass_data, ws),
-            collect_compass_status_rows(&compass_data),
-            collect_compass_notes(&compass_data, ws),
-        )
-    };
-    let local_message_rows = collect_local_messages_incremental(
-        &local_data,
-        local_delta,
-        previous.map(|snapshot| snapshot.local_message_rows.as_slice()),
-        ws,
-    );
-    let (teams_messages, teams_chats) = if teams_delta.is_empty() {
-        if let Some(previous) = previous {
-            (
-                previous.teams_messages.clone(),
-                previous.teams_chats.clone(),
-            )
-        } else {
-            collect_teams_messages(&teams_data, ws)
-        }
-    } else {
-        collect_teams_messages(&teams_data, ws)
-    };
-    let labels = if exec_delta.is_empty() {
-        previous
-            .map(|snapshot| snapshot.labels.clone())
-            .unwrap_or_else(|| collect_labels(&exec_data, ws))
-    } else {
-        collect_labels(&exec_data, ws)
-    };
-    let (timeline_rows, timeline_total_rows) = build_activity_timeline(
-        &exec_rows,
-        &reasoning_summaries,
-        &reason_rows,
-        &local_message_rows,
-        local_me_id,
-        &relations_labels,
-        &teams_messages,
-        &teams_chats,
-        &compass_rows,
-        &compass_status_rows,
-        &compass_notes,
-        &labels,
-        timeline_limit,
-    );
-
-    DashboardSnapshot {
-        pile_path,
-        branches,
-        branch_data,
-        exec_error,
-        agent_config,
-        agent_config_error,
-        context_chunks,
-        context_selected,
-        exec_rows,
-        reasoning_summaries,
-        reason_rows,
-        turn_memory_rows,
-        local_message_rows,
-        compass_status_rows,
-        timeline_rows,
-        timeline_total_rows,
-        compass_rows,
-        compass_notes,
-        compass_error,
-        local_message_error,
-        local_me_id,
-        local_peer_id,
-        relations_people,
-        relations_error,
-        relations_labels,
-        teams_messages,
-        teams_chats,
-        teams_error,
-        labels,
-        now_key,
-    }
 }
 
 fn list_branches(pile: &mut Pile<Blake3>) -> Result<Vec<BranchEntry>, String> {
@@ -1940,119 +1719,6 @@ fn resolve_branch_ids(lookup: &BranchLookup, refs: &[String]) -> Result<Vec<Id>,
     Ok(ids)
 }
 
-fn collect_agent_config(data: &TribleSet, ws: &mut Workspace<Pile>) -> Option<AgentConfigRow> {
-    let mut latest: Option<(Id, i128)> = None;
-    for (config_id, updated_at) in find!(
-        (config_id: Id, updated_at: Value<NsTAIInterval>),
-        pattern!(data, [{
-            ?config_id @
-            metadata::tag: playground_config::kind_config,
-            playground_config::updated_at: ?updated_at,
-        }])
-    ) {
-        let key = interval_key(updated_at);
-        if latest.map_or(true, |(_, current)| key > current) {
-            latest = Some((config_id, key));
-        }
-    }
-
-    let Some((config_id, updated_key)) = latest else {
-        return None;
-    };
-
-    let persona_id = load_optional_id_attr(data, config_id, playground_config::persona_id);
-    let branch = load_optional_string_attr(data, ws, config_id, playground_config::branch);
-    let author = load_optional_string_attr(data, ws, config_id, playground_config::author);
-    let author_role =
-        load_optional_string_attr(data, ws, config_id, playground_config::author_role);
-    let poll_ms = load_optional_u64_attr(data, config_id, playground_config::poll_ms);
-    let model_profile_id =
-        load_optional_id_attr(data, config_id, playground_config::active_model_profile_id);
-    let (model_entity_id, model_profile_name) = if let Some(profile_id) = model_profile_id {
-        if let Some(entry_id) = latest_model_profile_entry_id(data, profile_id) {
-            (
-                entry_id,
-                load_optional_string_attr(data, ws, entry_id, metadata::name),
-            )
-        } else {
-            (config_id, None)
-        }
-    } else {
-        (config_id, None)
-    };
-
-    let model_name =
-        load_optional_string_attr(data, ws, model_entity_id, playground_config::model_name);
-    let model_base_url =
-        load_optional_string_attr(data, ws, model_entity_id, playground_config::model_base_url);
-    let model_reasoning_effort = load_optional_string_attr(
-        data,
-        ws,
-        model_entity_id,
-        playground_config::model_reasoning_effort,
-    );
-    let model_stream = load_optional_u64_attr(data, model_entity_id, playground_config::model_stream)
-        .map(|value| value != 0);
-    let model_context_window_tokens = load_optional_u64_attr(
-        data,
-        model_entity_id,
-        playground_config::model_context_window_tokens,
-    );
-    let model_max_output_tokens = load_optional_u64_attr(
-        data,
-        model_entity_id,
-        playground_config::model_max_output_tokens,
-    );
-    let model_context_safety_margin_tokens = load_optional_u64_attr(
-        data,
-        model_entity_id,
-        playground_config::model_context_safety_margin_tokens,
-    );
-    let model_chars_per_token = load_optional_u64_attr(
-        data,
-        model_entity_id,
-        playground_config::model_chars_per_token,
-    );
-    let model_api_key =
-        load_optional_string_attr(data, ws, model_entity_id, playground_config::model_api_key);
-    let tavily_api_key =
-        load_optional_string_attr(data, ws, config_id, playground_config::tavily_api_key);
-    let exa_api_key =
-        load_optional_string_attr(data, ws, config_id, playground_config::exa_api_key);
-    let exec_default_cwd =
-        load_optional_string_attr(data, ws, config_id, playground_config::exec_default_cwd);
-    let exec_sandbox_profile =
-        load_optional_id_attr(data, config_id, playground_config::exec_sandbox_profile);
-    let system_prompt =
-        load_optional_string_attr(data, ws, config_id, playground_config::system_prompt);
-
-    Some(AgentConfigRow {
-        id: config_id,
-        updated_at: Some(updated_key),
-        persona_id,
-        branch,
-        author,
-        author_role,
-        poll_ms,
-        model_profile_id,
-        model_profile_name,
-        model_name,
-        model_base_url,
-        model_reasoning_effort,
-        model_stream,
-        model_context_window_tokens,
-        model_max_output_tokens,
-        model_context_safety_margin_tokens,
-        model_chars_per_token,
-        model_api_key,
-        tavily_api_key,
-        exa_api_key,
-        exec_default_cwd,
-        exec_sandbox_profile,
-        system_prompt,
-    })
-}
-
 fn latest_model_profile_entry_id(data: &TribleSet, profile_id: Id) -> Option<Id> {
     let mut latest: Option<(Id, i128)> = None;
     for (entry_id, updated_at) in find!(
@@ -2087,179 +1753,6 @@ fn load_optional_u64_attr(data: &TribleSet, entity_id: Id, attr: Attribute<U256B
     )
     .next()
     .and_then(|v| v.try_from_value::<u64>().ok())
-}
-
-fn load_optional_interval_attr(
-    data: &TribleSet,
-    entity_id: Id,
-    attr: Attribute<NsTAIInterval>,
-) -> Option<i128> {
-    find!(
-        value: Value<NsTAIInterval>,
-        pattern!(data, [{ entity_id @ attr: ?value }])
-    )
-    .next()
-    .map(|value| interval_key(value))
-}
-
-fn collect_exec_rows_incremental(
-    data: &TribleSet,
-    delta: &TribleSet,
-    previous: Option<&[ExecRow]>,
-    ws: &mut Workspace<Pile>,
-) -> Vec<ExecRow> {
-    let Some(previous_rows) = previous else {
-        return collect_exec_rows(data, ws);
-    };
-    if delta.is_empty() {
-        return previous_rows.to_vec();
-    }
-
-    let changed_request_ids = collect_changed_exec_request_ids(data, delta);
-    if changed_request_ids.is_empty() {
-        return previous_rows.to_vec();
-    }
-
-    let mut rows: HashMap<Id, ExecRow> = previous_rows
-        .iter()
-        .cloned()
-        .map(|row| (row.request_id, row))
-        .collect();
-    for request_id in changed_request_ids {
-        if let Some(row) = collect_exec_row(data, ws, request_id) {
-            rows.insert(request_id, row);
-        }
-    }
-    sort_exec_rows(rows)
-}
-
-fn collect_changed_exec_request_ids(data: &TribleSet, delta: &TribleSet) -> HashSet<Id> {
-    let mut ids = HashSet::new();
-    for request_id in find!(
-        request_id: Id,
-        pattern_changes!(data, delta, [{
-            ?request_id @
-            metadata::tag: playground_exec::kind_command_request,
-        }])
-    ) {
-        ids.insert(request_id);
-    }
-    for request_id in find!(
-        request_id: Id,
-        pattern_changes!(data, delta, [{ ?request_id @ playground_exec::requested_at: _?requested_at }])
-    ) {
-        ids.insert(request_id);
-    }
-    for request_id in find!(
-        request_id: Id,
-        pattern_changes!(data, delta, [{ _?event_id @ playground_exec::about_request: ?request_id }])
-    ) {
-        ids.insert(request_id);
-    }
-    ids
-}
-
-fn collect_exec_row(data: &TribleSet, ws: &mut Workspace<Pile>, request_id: Id) -> Option<ExecRow> {
-    let command_handle = find!(
-        command: Value<Handle<Blake3, LongString>>,
-        pattern!(data, [{
-            request_id @
-            metadata::tag: playground_exec::kind_command_request,
-            playground_exec::command_text: ?command,
-        }])
-    )
-    .next()?;
-    let command = load_text(ws, command_handle).unwrap_or_else(|| "<missing>".to_string());
-    let requested_at = load_optional_interval_attr(data, request_id, playground_exec::requested_at);
-
-    let mut progress: Option<ProgressInfo> = None;
-    for event_id in find!(
-        event_id: Id,
-        pattern!(data, [{
-            ?event_id @
-            metadata::tag: playground_exec::kind_in_progress,
-            playground_exec::about_request: request_id,
-        }])
-    ) {
-        let info = ProgressInfo {
-            attempt: load_optional_u64_attr(data, event_id, playground_exec::attempt).unwrap_or(0),
-            started_at: load_optional_interval_attr(data, event_id, playground_exec::started_at),
-            worker: load_optional_id_attr(data, event_id, playground_exec::worker),
-        };
-        let replace = progress.as_ref().is_none_or(|existing| {
-            info.attempt > existing.attempt
-                || (info.attempt == existing.attempt
-                    && info.started_at.unwrap_or(i128::MIN)
-                        > existing.started_at.unwrap_or(i128::MIN))
-        });
-        if replace {
-            progress = Some(info);
-        }
-    }
-
-    let mut result: Option<ResultInfo> = None;
-    for event_id in find!(
-        event_id: Id,
-        pattern!(data, [{
-            ?event_id @
-            metadata::tag: playground_exec::kind_command_result,
-            playground_exec::about_request: request_id,
-        }])
-    ) {
-        let info = ResultInfo {
-            attempt: load_optional_u64_attr(data, event_id, playground_exec::attempt).unwrap_or(0),
-            finished_at: load_optional_interval_attr(data, event_id, playground_exec::finished_at),
-            exit_code: load_optional_u64_attr(data, event_id, playground_exec::exit_code),
-            stdout_text: load_optional_string_attr(
-                data,
-                ws,
-                event_id,
-                playground_exec::stdout_text,
-            ),
-            stderr_text: load_optional_string_attr(
-                data,
-                ws,
-                event_id,
-                playground_exec::stderr_text,
-            ),
-            error: load_optional_string_attr(data, ws, event_id, playground_exec::error),
-        };
-        let replace = result.as_ref().is_none_or(|existing| {
-            info.attempt > existing.attempt
-                || (info.attempt == existing.attempt
-                    && info.finished_at.unwrap_or(i128::MIN)
-                        > existing.finished_at.unwrap_or(i128::MIN))
-        });
-        if replace {
-            result = Some(info);
-        }
-    }
-
-    let status = if let Some(result) = result.as_ref() {
-        if result.error.is_some() {
-            ExecStatus::Failed
-        } else {
-            ExecStatus::Done
-        }
-    } else if progress.is_some() {
-        ExecStatus::Running
-    } else {
-        ExecStatus::Pending
-    };
-
-    Some(ExecRow {
-        request_id,
-        command,
-        status,
-        requested_at,
-        started_at: progress.as_ref().and_then(|info| info.started_at),
-        finished_at: result.as_ref().and_then(|info| info.finished_at),
-        exit_code: result.as_ref().and_then(|info| info.exit_code),
-        worker: progress.as_ref().and_then(|info| info.worker),
-        stdout_text: result.as_ref().and_then(|info| info.stdout_text.clone()),
-        stderr_text: result.as_ref().and_then(|info| info.stderr_text.clone()),
-        error: result.as_ref().and_then(|info| info.error.clone()),
-    })
 }
 
 fn sort_exec_rows(rows: HashMap<Id, ExecRow>) -> Vec<ExecRow> {
@@ -2410,120 +1903,11 @@ fn collect_turn_memory_rows(
 
         rows.push(TurnMemoryRow {
             request_id: exec.request_id,
-            command: exec.command.clone(),
-            requested_at: exec.requested_at,
-            thought_id,
             context_messages,
             context_error,
         });
     }
     rows
-}
-
-fn collect_local_messages_incremental(
-    data: &TribleSet,
-    delta: &TribleSet,
-    previous: Option<&[LocalMessageRow]>,
-    ws: &mut Workspace<Pile>,
-) -> Vec<LocalMessageRow> {
-    let Some(previous_rows) = previous else {
-        return collect_local_messages(data, ws);
-    };
-    if delta.is_empty() {
-        return previous_rows.to_vec();
-    }
-    let changed_message_ids = collect_changed_local_message_ids(data, delta);
-    if changed_message_ids.is_empty() {
-        return previous_rows.to_vec();
-    }
-    let mut rows: HashMap<Id, LocalMessageRow> = previous_rows
-        .iter()
-        .cloned()
-        .map(|row| (row.id, row))
-        .collect();
-    for message_id in changed_message_ids {
-        if let Some(row) = collect_local_message_row(data, ws, message_id) {
-            rows.insert(message_id, row);
-        }
-    }
-    let mut list: Vec<LocalMessageRow> = rows.into_values().collect();
-    list.sort_by_key(|row| row.created_at.unwrap_or(i128::MIN));
-    list
-}
-
-fn collect_changed_local_message_ids(data: &TribleSet, delta: &TribleSet) -> HashSet<Id> {
-    let mut ids = HashSet::new();
-    for message_id in find!(
-        message_id: Id,
-        pattern_changes!(data, delta, [{
-            ?message_id @
-            metadata::tag: &LOCAL_KIND_MESSAGE_ID,
-        }])
-    ) {
-        ids.insert(message_id);
-    }
-    for message_id in find!(
-        message_id: Id,
-        pattern_changes!(data, delta, [{
-            _?read_id @
-            metadata::tag: &LOCAL_KIND_READ_ID,
-            local_messages::about_message: ?message_id,
-        }])
-    ) {
-        ids.insert(message_id);
-    }
-    ids
-}
-
-fn collect_local_message_row(
-    data: &TribleSet,
-    ws: &mut Workspace<Pile>,
-    message_id: Id,
-) -> Option<LocalMessageRow> {
-    let message = find!(
-        (
-            from: Id,
-            to: Id,
-            body_handle: Value<Handle<Blake3, LongString>>,
-            created_at: Value<NsTAIInterval>
-        ),
-        pattern!(&data, [{
-            message_id @
-            metadata::tag: &LOCAL_KIND_MESSAGE_ID,
-            local_messages::from: ?from,
-            local_messages::to: ?to,
-            local_messages::body: ?body_handle,
-            local_messages::created_at: ?created_at,
-        }])
-    )
-    .next()?;
-    let (from, to, body_handle, created_at) = message;
-    let body = load_text(ws, body_handle).unwrap_or_else(|| "<missing>".to_string());
-
-    let mut readers: HashSet<Id> = HashSet::new();
-    for reader_id in find!(
-        reader_id: Id,
-        pattern!(&data, [{
-            _?read_id @
-            metadata::tag: &LOCAL_KIND_READ_ID,
-            local_messages::about_message: message_id,
-            local_messages::reader: ?reader_id,
-            local_messages::read_at: _?read_at,
-        }])
-    ) {
-        readers.insert(reader_id);
-    }
-
-    let mut reader_list: Vec<Id> = readers.into_iter().collect();
-    reader_list.sort_by_key(|id| format!("{id:x}"));
-    Some(LocalMessageRow {
-        id: message_id,
-        created_at: Some(interval_key(created_at)),
-        from_id: from,
-        to_id: to,
-        body,
-        readers: reader_list,
-    })
 }
 
 fn collect_local_messages(data: &TribleSet, ws: &mut Workspace<Pile>) -> Vec<LocalMessageRow> {
@@ -2885,161 +2269,6 @@ fn load_optional_string_attr(
     .and_then(|handle| load_text(ws, handle))
 }
 
-fn sort_reasoning_summaries(rows: HashMap<Id, ReasoningSummaryRow>) -> Vec<ReasoningSummaryRow> {
-    let mut list: Vec<ReasoningSummaryRow> = rows.into_values().collect();
-    list.sort_by_key(|row| row.created_at.unwrap_or(i128::MIN));
-    list.reverse();
-    list
-}
-
-fn collect_reasoning_summaries_incremental(
-    data: &TribleSet,
-    delta: &TribleSet,
-    previous: Option<&[ReasoningSummaryRow]>,
-    ws: &mut Workspace<Pile>,
-) -> Vec<ReasoningSummaryRow> {
-    let Some(previous_rows) = previous else {
-        return collect_reasoning_summaries(data, ws);
-    };
-    if delta.is_empty() {
-        return previous_rows.to_vec();
-    }
-    let changed_result_ids = collect_changed_result_ids(data, delta);
-    if changed_result_ids.is_empty() {
-        return previous_rows.to_vec();
-    }
-
-    let mut rows: HashMap<Id, ReasoningSummaryRow> = previous_rows
-        .iter()
-        .cloned()
-        .map(|row| (row.result_id, row))
-        .collect();
-    for result_id in changed_result_ids {
-        if let Some(row) = collect_reasoning_summary_row(data, ws, result_id) {
-            rows.insert(result_id, row);
-        }
-    }
-    sort_reasoning_summaries(rows)
-}
-
-fn collect_changed_result_ids(data: &TribleSet, delta: &TribleSet) -> HashSet<Id> {
-    let mut ids = HashSet::new();
-    for result_id in find!(
-        result_id: Id,
-        pattern_changes!(data, delta, [{ ?result_id @ metadata::tag: model_chat::kind_result }])
-    ) {
-        ids.insert(result_id);
-    }
-    for result_id in find!(
-        result_id: Id,
-        pattern_changes!(data, delta, [{ ?result_id @ model_chat::reasoning_text: _?reasoning_handle }])
-    ) {
-        ids.insert(result_id);
-    }
-    for result_id in find!(
-        result_id: Id,
-        pattern_changes!(data, delta, [{ ?result_id @ model_chat::response_raw: _?raw_handle }])
-    ) {
-        ids.insert(result_id);
-    }
-    for result_id in find!(
-        result_id: Id,
-        pattern_changes!(data, delta, [{ ?result_id @ model_chat::finished_at: _?finished_at }])
-    ) {
-        ids.insert(result_id);
-    }
-    for result_id in find!(
-        result_id: Id,
-        pattern_changes!(data, delta, [{ ?result_id @ model_chat::input_tokens: _?v }])
-    ) {
-        ids.insert(result_id);
-    }
-    ids
-}
-
-fn collect_reasoning_summary_row(
-    data: &TribleSet,
-    ws: &mut Workspace<Pile>,
-    result_id: Id,
-) -> Option<ReasoningSummaryRow> {
-    let finished_at = find!(
-        finished_at: Value<NsTAIInterval>,
-        pattern!(data, [{
-            result_id @
-            metadata::tag: model_chat::kind_result,
-            model_chat::finished_at: ?finished_at,
-        }])
-    )
-    .next()
-    .map(|finished_at| interval_key(finished_at))?;
-
-    let summary = if let Some(reasoning_handle) = find!(
-        reasoning_handle: Value<Handle<Blake3, LongString>>,
-        pattern!(data, [{
-            result_id @
-            metadata::tag: model_chat::kind_result,
-            model_chat::reasoning_text: ?reasoning_handle,
-        }])
-    )
-    .next()
-    {
-        load_text(ws, reasoning_handle).unwrap_or_default()
-    } else if let Some(raw_handle) = find!(
-        raw_handle: Value<Handle<Blake3, LongString>>,
-        pattern!(data, [{
-            result_id @
-            metadata::tag: model_chat::kind_result,
-            model_chat::response_raw: ?raw_handle,
-        }])
-    )
-    .next()
-    {
-        let raw = load_text(ws, raw_handle).unwrap_or_default();
-        let response_json = parse_response_json(&raw)?;
-        let summaries = extract_reasoning_summaries(&response_json);
-        summaries.join("\n")
-    } else {
-        String::new()
-    };
-
-    let input_tokens = find!(
-        v: Value<U256BE>,
-        pattern!(data, [{ result_id @ model_chat::input_tokens: ?v }])
-    ).next().and_then(|v| u256be_to_u64(v));
-
-    let output_tokens = find!(
-        v: Value<U256BE>,
-        pattern!(data, [{ result_id @ model_chat::output_tokens: ?v }])
-    ).next().and_then(|v| u256be_to_u64(v));
-
-    let cache_creation_input_tokens = find!(
-        v: Value<U256BE>,
-        pattern!(data, [{ result_id @ model_chat::cache_creation_input_tokens: ?v }])
-    ).next().and_then(|v| u256be_to_u64(v));
-
-    let cache_read_input_tokens = find!(
-        v: Value<U256BE>,
-        pattern!(data, [{ result_id @ model_chat::cache_read_input_tokens: ?v }])
-    ).next().and_then(|v| u256be_to_u64(v));
-
-    let has_content = !summary.trim().is_empty()
-        || input_tokens.is_some()
-        || output_tokens.is_some();
-    if !has_content {
-        return None;
-    }
-
-    Some(ReasoningSummaryRow {
-        result_id,
-        created_at: Some(finished_at),
-        summary,
-        input_tokens,
-        output_tokens,
-        cache_creation_input_tokens,
-        cache_read_input_tokens,
-    })
-}
-
 fn collect_reasoning_summaries(
     data: &TribleSet,
     ws: &mut Workspace<Pile>,
@@ -3120,7 +2349,6 @@ fn collect_reasoning_summaries(
         }
 
         rows.push(ReasoningSummaryRow {
-            result_id,
             created_at: Some(interval_key(finished_at)),
             summary,
             input_tokens: it,
@@ -3132,141 +2360,6 @@ fn collect_reasoning_summaries(
     rows.sort_by_key(|row| row.created_at.unwrap_or(i128::MIN));
     rows.reverse();
     rows
-}
-
-fn sort_reason_rows(rows: HashMap<Id, ReasonRow>) -> Vec<ReasonRow> {
-    let mut list: Vec<ReasonRow> = rows.into_values().collect();
-    list.sort_by_key(|row| row.created_at.unwrap_or(i128::MIN));
-    list.reverse();
-    list
-}
-
-fn collect_reason_rows_incremental(
-    data: &TribleSet,
-    delta: &TribleSet,
-    previous: Option<&[ReasonRow]>,
-    ws: &mut Workspace<Pile>,
-) -> Vec<ReasonRow> {
-    let Some(previous_rows) = previous else {
-        return collect_reason_rows(data, ws);
-    };
-    if delta.is_empty() {
-        return previous_rows.to_vec();
-    }
-    let changed_reason_ids = collect_changed_reason_ids(data, delta);
-    if changed_reason_ids.is_empty() {
-        return previous_rows.to_vec();
-    }
-    let mut rows: HashMap<Id, ReasonRow> = previous_rows
-        .iter()
-        .cloned()
-        .map(|row| (row.id, row))
-        .collect();
-    for reason_id in changed_reason_ids {
-        if let Some(row) = collect_reason_row(data, ws, reason_id) {
-            rows.insert(reason_id, row);
-        }
-    }
-    sort_reason_rows(rows)
-}
-
-fn collect_changed_reason_ids(data: &TribleSet, delta: &TribleSet) -> HashSet<Id> {
-    let mut ids = HashSet::new();
-    for reason_id in find!(
-        reason_id: Id,
-        pattern_changes!(data, delta, [{ ?reason_id @ metadata::tag: &REASON_KIND_EVENT_ID }])
-    ) {
-        ids.insert(reason_id);
-    }
-    for reason_id in find!(
-        reason_id: Id,
-        pattern_changes!(data, delta, [{ ?reason_id @ reason_events::text: _?text }])
-    ) {
-        ids.insert(reason_id);
-    }
-    for reason_id in find!(
-        reason_id: Id,
-        pattern_changes!(data, delta, [{ ?reason_id @ reason_events::created_at: _?at }])
-    ) {
-        ids.insert(reason_id);
-    }
-    for reason_id in find!(
-        reason_id: Id,
-        pattern_changes!(data, delta, [{ ?reason_id @ reason_events::about_turn: _?turn_id }])
-    ) {
-        ids.insert(reason_id);
-    }
-    for reason_id in find!(
-        reason_id: Id,
-        pattern_changes!(data, delta, [{ ?reason_id @ reason_events::worker: _?worker_id }])
-    ) {
-        ids.insert(reason_id);
-    }
-    for reason_id in find!(
-        reason_id: Id,
-        pattern_changes!(data, delta, [{ ?reason_id @ reason_events::command_text: _?command_handle }])
-    ) {
-        ids.insert(reason_id);
-    }
-    ids
-}
-
-fn collect_reason_row(
-    data: &TribleSet,
-    ws: &mut Workspace<Pile>,
-    reason_id: Id,
-) -> Option<ReasonRow> {
-    let (text_handle, created_at) = find!(
-        (
-            text_handle: Value<Handle<Blake3, LongString>>,
-            created_at: Value<NsTAIInterval>
-        ),
-        pattern!(data, [{
-            reason_id @
-            metadata::tag: &REASON_KIND_EVENT_ID,
-            reason_events::text: ?text_handle,
-            reason_events::created_at: ?created_at,
-        }])
-    )
-    .next()?;
-    let text = load_text(ws, text_handle)?;
-    let turn_id = find!(
-        turn_id: Id,
-        pattern!(data, [{
-            reason_id @
-            metadata::tag: &REASON_KIND_EVENT_ID,
-            reason_events::about_turn: ?turn_id,
-        }])
-    )
-    .next();
-    let worker_id = find!(
-        worker_id: Id,
-        pattern!(data, [{
-            reason_id @
-            metadata::tag: &REASON_KIND_EVENT_ID,
-            reason_events::worker: ?worker_id,
-        }])
-    )
-    .next();
-    let command_text = find!(
-        command_handle: Value<Handle<Blake3, LongString>>,
-        pattern!(data, [{
-            reason_id @
-            metadata::tag: &REASON_KIND_EVENT_ID,
-            reason_events::command_text: ?command_handle,
-        }])
-    )
-    .next()
-    .and_then(|command_handle| load_text(ws, command_handle));
-
-    Some(ReasonRow {
-        id: reason_id,
-        created_at: Some(interval_key(created_at)),
-        text,
-        turn_id,
-        worker_id,
-        command_text,
-    })
 }
 
 fn collect_reason_rows(data: &TribleSet, ws: &mut Workspace<Pile>) -> Vec<ReasonRow> {
@@ -3328,7 +2421,6 @@ fn collect_reason_rows(data: &TribleSet, ws: &mut Workspace<Pile>) -> Vec<Reason
             continue;
         };
         rows.push(ReasonRow {
-            id: reason_id,
             created_at: Some(interval_key(created_at)),
             text,
             turn_id: turn_by_reason.get(&reason_id).copied(),
@@ -3956,69 +3048,94 @@ fn render_local_composer(
     ui: &mut egui::Ui,
     state: &mut DashboardState,
     branches: &[BranchEntry],
-    snapshot: &DashboardSnapshot,
+    people: &[RelationRow],
+    labels: &HashMap<Id, String>,
+    me_id: Option<Id>,
+    peer_id: Option<Id>,
 ) {
-    let me_label = snapshot
-        .local_me_id
-        .and_then(|id| snapshot.relations_labels.get(&id).cloned())
+    let me_label = me_id
+        .and_then(|id| labels.get(&id).cloned())
         .unwrap_or_else(|| state.config.local_me.clone());
-    let peer_label = snapshot
-        .local_peer_id
-        .and_then(|id| snapshot.relations_labels.get(&id).cloned())
+    let peer_label = peer_id
+        .and_then(|id| labels.get(&id).cloned())
         .unwrap_or_else(|| state.config.local_peer.clone());
 
+    let accent = color_local_msg();
+    let me_fill = me_id
+        .map(|id| colorhash::ral_categorical(id.as_ref()))
+        .unwrap_or(color_muted());
+    let peer_fill = peer_id
+        .map(|id| colorhash::ral_categorical(id.as_ref()))
+        .unwrap_or(color_muted());
+
     ui.horizontal(|ui| {
-        ui.label("Me");
+        render_person_chip(ui, "Me", me_fill);
         render_person_picker(
             ui,
             "local_me_picker",
-            &snapshot.relations_people,
-            snapshot.local_me_id,
+            people,
+            me_id,
             &mut state.config.local_me,
         );
         ui.add_space(10.0);
-        ui.label("Peer");
+        render_person_chip(ui, "Peer", peer_fill);
         render_person_picker(
             ui,
             "local_peer_picker",
-            &snapshot.relations_people,
-            snapshot.local_peer_id,
+            people,
+            peer_id,
             &mut state.config.local_peer,
         );
     });
 
-    ui.small(format!("{me_label} → {peer_label}"));
-    let me_known = snapshot.local_me_id.is_some();
-    let peer_known = snapshot.local_peer_id.is_some();
+    // Direction indicator: colored chips for me → peer.
+    ui.horizontal(|ui| {
+        render_person_chip(ui, &me_label, me_fill);
+        ui.label(egui::RichText::new("\u{2192}").color(color_muted()).small());
+        render_person_chip(ui, &peer_label, peer_fill);
+    });
+
+    let me_known = me_id.is_some();
+    let peer_known = peer_id.is_some();
     if !(me_known && peer_known) {
         ui.small("Select Me and Peer from Relations to enable sending.");
     }
 
-    let response = ui.add_sized(
-        [ui.available_width(), LOCAL_COMPOSE_HEIGHT],
-        TextField::multiline(&mut state.local_draft),
-    );
-    if state.local_draft.trim().is_empty() && !response.has_focus() {
-        let hint_pos = response.rect.left_top() + egui::vec2(10.0, 6.0);
-        ui.painter().text(
-            hint_pos,
-            egui::Align2::LEFT_TOP,
-            "Type a message...",
-            egui::TextStyle::Small.resolve(ui.style()),
-            ui.visuals().weak_text_color(),
-        );
-    }
-    if response.changed() {
-        state.local_send_error = None;
-        state.local_send_notice = None;
-    }
+    // Compose area with subtle accent frame.
+    egui::Frame::NONE
+        .stroke(egui::Stroke::new(1.0, themes::blend(accent, color_frame(), 0.5)))
+        .corner_radius(egui::CornerRadius::same(4))
+        .inner_margin(egui::Margin::same(4))
+        .show(ui, |ui| {
+            let response = ui.add_sized(
+                [ui.available_width(), LOCAL_COMPOSE_HEIGHT],
+                TextField::multiline(&mut state.local_draft),
+            );
+            if state.local_draft.trim().is_empty() && !response.has_focus() {
+                let hint_pos = response.rect.left_top() + egui::vec2(10.0, 6.0);
+                ui.painter().text(
+                    hint_pos,
+                    egui::Align2::LEFT_TOP,
+                    "Type a message...",
+                    egui::TextStyle::Small.resolve(ui.style()),
+                    ui.visuals().weak_text_color(),
+                );
+            }
+            if response.changed() {
+                state.local_send_error = None;
+                state.local_send_notice = None;
+            }
+        });
 
     ui.horizontal(|ui| {
         let can_send = me_known && peer_known && !state.local_draft.trim().is_empty();
-        if ui.add_enabled(can_send, Button::new("Send")).clicked() {
-            send_local_message_from_ui(state, branches, snapshot);
+        if ui
+            .add_enabled(can_send, Button::new("Send").fill(accent))
+            .clicked()
+        {
+            send_local_message_from_ui(state, branches, me_id, peer_id);
         }
-        if ui.add(Button::new("Clear")).clicked() {
+        if ui.add(Button::new("Clear").fill(color_frame())).clicked() {
             state.local_draft.clear();
             state.local_send_error = None;
             state.local_send_notice = None;
@@ -4048,6 +3165,7 @@ fn render_person_picker(
         .unwrap_or_else(|| raw.trim().to_string());
     egui::ComboBox::from_id_salt(id_salt)
         .selected_text(selected_text)
+        .width(ui.available_width())
         .show_ui(ui, |ui| {
             for person in people {
                 let label = person.label.as_deref().unwrap_or("<unnamed>");
@@ -4106,6 +3224,7 @@ fn render_branch_picker(
     let mut changed = false;
     egui::ComboBox::from_id_salt(id_salt)
         .selected_text(selected_text)
+        .width(ui.available_width())
         .show_ui(ui, |ui| {
             if ui.button("Clear").clicked() {
                 selected.clear();
@@ -4152,36 +3271,83 @@ fn branch_ref(branch: &BranchEntry, name_counts: &HashMap<String, usize>) -> Str
 }
 
 fn render_teams_conversations(
-    ui: &mut egui::Ui,
+    ui: &mut GORBIE::CardCtx<'_>,
     state: &mut DashboardState,
     now_key: i128,
     chats: &[TeamsChatRow],
     messages: &[TeamsMessageRow],
 ) {
-    ui.horizontal(|ui| {
-        ui.vertical(|ui| {
-            ui.set_min_width(TEAMS_CHAT_LIST_WIDTH);
+    ui.grid(|g| {
+        // ── Chat list pane (4 cols) ──
+        g.third(|ui| {
             ui.set_min_height(TEAMS_SCROLL_HEIGHT);
             ui.label("Chats");
+            ui.add_space(6.0);
+
+            // "All chats" entry — distinct style: Teams accent border, no count chip.
             let all_selected = state.teams_selected_chat.is_none();
-            if ui.selectable_label(all_selected, "All chats").clicked() {
+            let all_bg = if all_selected {
+                color_frame()
+            } else {
+                egui::Color32::TRANSPARENT
+            };
+            let resp = egui::Frame::NONE
+                .fill(all_bg)
+                .stroke(egui::Stroke::new(1.0, color_teams()))
+                .corner_radius(egui::CornerRadius::same(4))
+                .inner_margin(egui::Margin::symmetric(10, 6))
+                .show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new("All chats")
+                            .color(color_teams())
+                            .strong(),
+                    );
+                })
+                .response;
+            if resp.interact(egui::Sense::click()).clicked() {
                 state.teams_selected_chat = None;
             }
+
             ui.add_space(6.0);
+
             for chat in chats {
                 let selected = state.teams_selected_chat == Some(chat.id);
-                let label = format!("{} ({})", chat.label, chat.message_count);
-                if ui.selectable_label(selected, label).clicked() {
+                let card_bg = if selected {
+                    color_frame()
+                } else {
+                    egui::Color32::TRANSPARENT
+                };
+                let resp = egui::Frame::NONE
+                    .fill(card_bg)
+                    .corner_radius(egui::CornerRadius::same(4))
+                    .inner_margin(egui::Margin::symmetric(10, 6))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(&chat.label);
+                            // Message count chip
+                            render_goal_chip(
+                                ui,
+                                &chat.message_count.to_string(),
+                                color_muted(),
+                            );
+                        });
+                        // Age in muted text
+                        ui.label(
+                            egui::RichText::new(format_age(now_key, chat.last_at))
+                                .small()
+                                .color(color_muted()),
+                        );
+                    })
+                    .response;
+                if resp.interact(egui::Sense::click()).clicked() {
                     state.teams_selected_chat = Some(chat.id);
                 }
-                ui.small(format_age(now_key, chat.last_at));
-                ui.add_space(4.0);
+                ui.add_space(6.0);
             }
         });
 
-        ui.add_space(12.0);
-
-        ui.vertical(|ui| {
+        // ── Message pane (8 cols) ──
+        g.two_thirds(|ui| {
             ui.set_min_height(TEAMS_SCROLL_HEIGHT);
             let selected_chat = state.teams_selected_chat;
             let title = match selected_chat {
@@ -4193,6 +3359,7 @@ fn render_teams_conversations(
                 None => "All chats",
             };
             ui.label(title);
+            ui.add_space(6.0);
 
             for row in messages {
                 if let Some(chat_id) = selected_chat {
@@ -4202,20 +3369,36 @@ fn render_teams_conversations(
                 }
                 let author = row.author_name.as_deref().unwrap_or("<unknown>");
                 let age = format_age(now_key, row.created_at);
-                let chat_label = chats
-                    .iter()
-                    .find(|chat| chat.id == row.chat_id)
-                    .map(|chat| chat.label.as_str())
-                    .unwrap_or("<chat>");
+                let author_color = colorhash::ral_categorical(author.as_bytes());
 
-                let meta = if selected_chat.is_some() {
-                    format!("{author} · {age}")
-                } else {
-                    format!("{chat_label} · {author} · {age}")
-                };
-                ui.small(meta);
-                render_blob_aware_text(ui, row.content.as_str(), None, None);
-                ui.add_space(8.0);
+                egui::Frame::NONE
+                    .fill(color_frame())
+                    .corner_radius(egui::CornerRadius::same(4))
+                    .inner_margin(egui::Margin::symmetric(10, 6))
+                    .show(ui, |ui| {
+                        // Header: author chip · chat label (when showing all) · age
+                        ui.horizontal(|ui| {
+                            render_person_chip(ui, author, author_color);
+                            if selected_chat.is_none() {
+                                let chat_label = chats
+                                    .iter()
+                                    .find(|chat| chat.id == row.chat_id)
+                                    .map(|chat| chat.label.as_str())
+                                    .unwrap_or("<chat>");
+                                ui.label(
+                                    egui::RichText::new(chat_label)
+                                        .small()
+                                        .color(color_muted()),
+                                );
+                            }
+                            ui.label(
+                                egui::RichText::new(age).small().color(color_muted()),
+                            );
+                        });
+                        // Message body
+                        render_blob_aware_text(ui, row.content.as_str(), None, None);
+                    });
+                ui.add_space(6.0);
             }
         });
     });
@@ -4281,7 +3464,8 @@ fn short_digest(hex: &str) -> String {
 fn send_local_message_from_ui(
     state: &mut DashboardState,
     branches: &[BranchEntry],
-    snapshot: &DashboardSnapshot,
+    me_id: Option<Id>,
+    peer_id: Option<Id>,
 ) {
     state.local_send_error = None;
     state.local_send_notice = None;
@@ -4307,14 +3491,14 @@ fn send_local_message_from_ui(
         }
     };
 
-    let Some(from_id) = snapshot.local_me_id else {
+    let Some(from_id) = me_id else {
         state.local_send_error = Some(format!(
             "Unknown me '{}' (check Relations branch).",
             state.config.local_me
         ));
         return;
     };
-    let Some(to_id) = snapshot.local_peer_id else {
+    let Some(to_id) = peer_id else {
         state.local_send_error = Some(format!(
             "Unknown peer '{}' (check Relations branch).",
             state.config.local_peer
@@ -4680,43 +3864,38 @@ fn render_agent_config(
     let exec_sandbox_profile = load_id(config_id, playground_config::exec_sandbox_profile);
     let system_prompt = load_str(config_id, playground_config::system_prompt, ws);
 
+    let config_row = |ui: &mut egui::Ui, label: &str, value: &str| {
+        ui.label(egui::RichText::new(label).color(color_muted()));
+        ui.label(value);
+        ui.end_row();
+    };
+    let config_row_mono = |ui: &mut egui::Ui, label: &str, value: &str| {
+        ui.label(egui::RichText::new(label).color(color_muted()));
+        ui.monospace(value);
+        ui.end_row();
+    };
+    let config_header = |ui: &mut egui::Ui, label: &str| {
+        let fill = colorhash::ral_categorical(label.as_bytes());
+        let text_color = colorhash::text_color_on(fill);
+        ui.label(egui::RichText::new(label).strong().color(text_color).background_color(fill));
+        ui.label("");
+        ui.end_row();
+    };
+
     egui::Grid::new("agent_config_grid")
         .striped(true)
         .spacing(egui::Vec2::new(12.0, 6.0))
         .show(ui, |ui| {
-            ui.label("config_id");
-            ui.monospace(format!("{:x}", config_id));
-            ui.end_row();
+            config_header(ui, "Identity");
+            config_row_mono(ui, "config", &id_prefix(config_id));
+            config_row_mono(ui, "persona", &persona_id.map(|id| id_prefix(id)).unwrap_or_else(|| "-".to_string()));
+            config_row(ui, "branch", branch.as_deref().unwrap_or("-"));
+            config_row(ui, "author", author.as_deref().unwrap_or("-"));
+            config_row(ui, "role", author_role.as_deref().unwrap_or("-"));
+            config_row_mono(ui, "poll ms", &poll_ms.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string()));
 
-            ui.label("persona_id");
-            ui.monospace(
-                persona_id
-                    .map(|id| format!("{id:x}"))
-                    .unwrap_or_else(|| "-".to_string()),
-            );
-            ui.end_row();
-
-            ui.label("branch");
-            ui.label(branch.as_deref().unwrap_or("-"));
-            ui.end_row();
-
-            ui.label("author");
-            ui.label(author.as_deref().unwrap_or("-"));
-            ui.end_row();
-
-            ui.label("author_role");
-            ui.label(author_role.as_deref().unwrap_or("-"));
-            ui.end_row();
-
-            ui.label("poll_ms");
-            ui.monospace(
-                poll_ms
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "-".to_string()),
-            );
-            ui.end_row();
-
-            ui.label("model.profile");
+            config_header(ui, "Model");
+            ui.label(egui::RichText::new("profile").color(color_muted()));
             ui.horizontal(|ui| {
                 ui.label(model_profile_name.as_deref().unwrap_or("-"));
                 if let Some(id) = model_profile_id {
@@ -4725,59 +3904,17 @@ fn render_agent_config(
             });
             ui.end_row();
 
-            ui.label("model.model");
-            ui.label(model_name.as_deref().unwrap_or("-"));
-            ui.end_row();
+            config_row(ui, "model", model_name.as_deref().unwrap_or("-"));
+            config_row(ui, "base url", model_base_url.as_deref().unwrap_or("-"));
+            config_row(ui, "reasoning", model_reasoning_effort.as_deref().unwrap_or("-"));
+            config_row_mono(ui, "stream", &model_stream.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string()));
+            config_row_mono(ui, "context window", &model_context_window_tokens.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string()));
+            config_row_mono(ui, "max output", &model_max_output_tokens.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string()));
+            config_row_mono(ui, "safety margin", &model_context_safety_margin_tokens.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string()));
+            config_row_mono(ui, "chars/token", &model_chars_per_token.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string()));
 
-            ui.label("model.base_url");
-            ui.label(model_base_url.as_deref().unwrap_or("-"));
-            ui.end_row();
-
-            ui.label("model.reasoning_effort");
-            ui.label(model_reasoning_effort.as_deref().unwrap_or("-"));
-            ui.end_row();
-
-            ui.label("model.stream");
-            ui.monospace(
-                model_stream
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "-".to_string()),
-            );
-            ui.end_row();
-
-            ui.label("model.context_window_tokens");
-            ui.monospace(
-                model_context_window_tokens
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "-".to_string()),
-            );
-            ui.end_row();
-
-            ui.label("model.max_output_tokens");
-            ui.monospace(
-                model_max_output_tokens
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "-".to_string()),
-            );
-            ui.end_row();
-
-            ui.label("model.context_safety_margin_tokens");
-            ui.monospace(
-                model_context_safety_margin_tokens
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "-".to_string()),
-            );
-            ui.end_row();
-
-            ui.label("model.chars_per_token");
-            ui.monospace(
-                model_chars_per_token
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "-".to_string()),
-            );
-            ui.end_row();
-
-            ui.label("model.api_key");
+            config_header(ui, "API Keys");
+            ui.label(egui::RichText::new("model key").color(color_muted()));
             ui.horizontal(|ui| {
                 let Some(key) = model_api_key.as_deref() else {
                     ui.label("-");
@@ -4800,7 +3937,7 @@ fn render_agent_config(
             });
             ui.end_row();
 
-            ui.label("integrations.tavily_api_key");
+            ui.label(egui::RichText::new("tavily key").color(color_muted()));
             ui.horizontal(|ui| {
                 let Some(key) = tavily_api_key.as_deref() else {
                     ui.label("-");
@@ -4823,7 +3960,7 @@ fn render_agent_config(
             });
             ui.end_row();
 
-            ui.label("integrations.exa_api_key");
+            ui.label(egui::RichText::new("exa key").color(color_muted()));
             ui.horizontal(|ui| {
                 let Some(key) = exa_api_key.as_deref() else {
                     ui.label("-");
@@ -4846,24 +3983,16 @@ fn render_agent_config(
             });
             ui.end_row();
 
-            ui.label("exec.default_cwd");
-            ui.label(exec_default_cwd.as_deref().unwrap_or("-"));
-            ui.end_row();
-
-            ui.label("exec.sandbox_profile");
-            ui.monospace(
-                exec_sandbox_profile
-                    .map(|id| format!("{id:x}"))
-                    .unwrap_or_else(|| "-".to_string()),
-            );
-            ui.end_row();
+            config_header(ui, "Execution");
+            config_row(ui, "default cwd", exec_default_cwd.as_deref().unwrap_or("-"));
+            config_row_mono(ui, "sandbox", &exec_sandbox_profile.map(|id| id_prefix(id)).unwrap_or_else(|| "-".to_string()));
         });
 
     if let Some(prompt) = system_prompt.as_deref() {
         ui.add_space(8.0);
         ui.label(egui::RichText::new("System prompt").monospace());
         egui::Frame::NONE
-            .fill(egui::Color32::from_gray(55))
+            .fill(color_frame())
             .corner_radius(egui::CornerRadius::same(6))
             .inner_margin(egui::Margin::symmetric(10, 8))
             .show(ui, |ui| {
@@ -4917,7 +4046,7 @@ fn render_activity_timeline(ui: &mut egui::Ui, now_key: i128, rows: &[TimelineRo
                 if let Some(id) = render_timeline_row(ui, now_key, row) {
                     context_clicked = Some(id);
                 }
-                ui.add_space(8.0);
+                ui.add_space(6.0);
             }
         });
     context_clicked
@@ -4925,9 +4054,9 @@ fn render_activity_timeline(ui: &mut egui::Ui, now_key: i128, rows: &[TimelineRo
 
 fn turn_memory_role_style(role: ChatRole) -> (&'static str, egui::Color32) {
     match role {
-        ChatRole::System => ("system", egui::Color32::from_rgb(104, 122, 151)),
-        ChatRole::User => ("user", egui::Color32::from_rgb(82, 138, 118)),
-        ChatRole::Assistant => ("assistant", egui::Color32::from_rgb(120, 108, 166)),
+        ChatRole::System => ("system", color_system()),
+        ChatRole::User => ("user", color_user()),
+        ChatRole::Assistant => ("assistant", color_assistant()),
     }
 }
 
@@ -4956,11 +4085,37 @@ fn render_context_compaction(
     let mut leaf_counts: HashMap<Id, usize> = HashMap::new();
 
     ui.horizontal_wrapped(|ui| {
-        ui.label("Frontier:");
+        ui.label(egui::RichText::new("Frontier:").color(color_muted()));
         for root in &roots {
             let count = context_leaf_count(root.id, &by_id, &mut leaf_counts);
-            let label = format!("{} ({})", id_prefix(root.id), count);
-            if ui.add(Button::new(label)).clicked() {
+            let is_selected = state.context_selected_chunk == Some(root.id);
+            let fill = if is_selected {
+                color_cognition()
+            } else {
+                color_frame()
+            };
+            let text_color = colorhash::text_color_on(fill);
+            let chip_resp = egui::Frame::NONE
+                .fill(fill)
+                .corner_radius(egui::CornerRadius::same(5))
+                .inner_margin(egui::Margin::symmetric(8, 3))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        ui.label(
+                            egui::RichText::new(id_prefix(root.id))
+                                .monospace()
+                                .small()
+                                .color(text_color),
+                        );
+                        ui.label(
+                            egui::RichText::new(format!("{count}"))
+                                .small()
+                                .color(text_color),
+                        );
+                    });
+                });
+            if chip_resp.response.interact(egui::Sense::click()).clicked() {
                 state.context_selection_stack.clear();
                 state.context_selected_chunk = Some(root.id);
                 state.context_show_origins = false;
@@ -5016,6 +4171,167 @@ fn context_leaf_count(
     count
 }
 
+fn context_chunk_label(
+    ui: &egui::Ui,
+    selected: bool,
+    id: Id,
+    start: &str,
+    end: &str,
+    count: usize,
+    exec_id: Option<Id>,
+) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+
+    let mono = egui::FontId::monospace(11.0);
+    let prop = egui::FontId::proportional(12.0);
+    let prop_small = egui::FontId::proportional(11.0);
+    let bg = ui.visuals().window_fill;
+
+    // Selection dot
+    if selected {
+        job.append(
+            "\u{25CF} ",
+            0.0,
+            egui::text::TextFormat {
+                font_id: prop_small.clone(),
+                color: color_cognition(),
+                background: bg,
+                ..Default::default()
+            },
+        );
+    }
+
+    // ID badge: monospace on dark frame
+    let id_fill = color_frame();
+    let id_text = colorhash::text_color_on(id_fill);
+    job.append(
+        &format!(" {} ", id_prefix(id)),
+        0.0,
+        egui::text::TextFormat {
+            font_id: mono.clone(),
+            color: id_text,
+            background: id_fill,
+            ..Default::default()
+        },
+    );
+
+    // Time range
+    job.append(
+        &format!("  {start} .. {end}  "),
+        0.0,
+        egui::text::TextFormat {
+            font_id: prop.clone(),
+            color: color_muted(),
+            background: bg,
+            ..Default::default()
+        },
+    );
+
+    // Leaf count badge
+    let leaf_fill = color_frame();
+    let leaf_text = colorhash::text_color_on(leaf_fill);
+    job.append(
+        &format!(" {count} leaves "),
+        0.0,
+        egui::text::TextFormat {
+            font_id: prop_small.clone(),
+            color: leaf_text,
+            background: leaf_fill,
+            ..Default::default()
+        },
+    );
+
+    // Exec chip (if present)
+    if let Some(eid) = exec_id {
+        let exec_fill = color_shell();
+        let exec_text = colorhash::text_color_on(exec_fill);
+        job.append(
+            &format!(" exec {} ", id_prefix(eid)),
+            4.0,
+            egui::text::TextFormat {
+                font_id: mono,
+                color: exec_text,
+                background: exec_fill,
+                ..Default::default()
+            },
+        );
+    }
+
+    job
+}
+
+fn context_leaf_label(
+    ui: &egui::Ui,
+    id: Id,
+    age: &str,
+    exec_id: Option<Id>,
+) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+
+    let mono = egui::FontId::monospace(11.0);
+    let prop = egui::FontId::proportional(12.0);
+    let prop_small = egui::FontId::proportional(11.0);
+    let bg = ui.visuals().window_fill;
+
+    // ID badge
+    let id_fill = color_frame();
+    let id_text = colorhash::text_color_on(id_fill);
+    job.append(
+        &format!(" {} ", id_prefix(id)),
+        0.0,
+        egui::text::TextFormat {
+            font_id: mono.clone(),
+            color: id_text,
+            background: id_fill,
+            ..Default::default()
+        },
+    );
+
+    // Age
+    job.append(
+        &format!("  {age}  "),
+        0.0,
+        egui::text::TextFormat {
+            font_id: prop.clone(),
+            color: color_muted(),
+            background: bg,
+            ..Default::default()
+        },
+    );
+
+    // Leaf tag
+    let leaf_fill = color_frame();
+    let leaf_text = colorhash::text_color_on(leaf_fill);
+    job.append(
+        " leaf ",
+        0.0,
+        egui::text::TextFormat {
+            font_id: prop_small,
+            color: leaf_text,
+            background: leaf_fill,
+            ..Default::default()
+        },
+    );
+
+    // Exec chip (if present)
+    if let Some(eid) = exec_id {
+        let exec_fill = color_shell();
+        let exec_text = colorhash::text_color_on(exec_fill);
+        job.append(
+            &format!(" exec {} ", id_prefix(eid)),
+            4.0,
+            egui::text::TextFormat {
+                font_id: mono,
+                color: exec_text,
+                background: exec_fill,
+                ..Default::default()
+            },
+        );
+    }
+
+    job
+}
+
 fn render_context_chunk_node(
     ui: &mut egui::Ui,
     state: &mut DashboardState,
@@ -5033,16 +4349,11 @@ fn render_context_chunk_node(
     let start = format_age(now_key, node.start_at);
     let end = format_age(now_key, node.end_at);
 
-    let mut label = format!(
-        "{}{} {start}..{end} leaves:{count}",
-        if selected { "*" } else { " " },
-        id_prefix(node.id),
+    let label = context_chunk_label(
+        ui, selected, node.id, &start, &end, count, node.about_exec_result,
     );
-    if let Some(exec_id) = node.about_exec_result {
-        label.push_str(&format!("  exec:{}", id_prefix(exec_id)));
-    }
 
-    let response = egui::CollapsingHeader::new(egui::RichText::new(label).monospace())
+    let response = egui::CollapsingHeader::new(label)
         .id_salt(format!("context_chunk::{node_id:x}"))
         .show(ui, |ui| {
             for child_id in &node.children {
@@ -5085,10 +4396,49 @@ fn render_context_selected_details(
     let count = context_leaf_count(selected_id, by_id, leaf_counts);
     let start = format_age(now_key, node.start_at);
     let end = format_age(now_key, node.end_at);
-    ui.monospace(format!(
-        "selected: {} {start}..{end} leaves:{count}",
-        id_prefix(node.id)
-    ));
+
+    // Structured header with badges instead of monospace dump.
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        ui.label(egui::RichText::new("Selected").color(color_muted()));
+
+        // ID badge
+        let id_fill = color_cognition();
+        let id_text = colorhash::text_color_on(id_fill);
+        egui::Frame::NONE
+            .fill(id_fill)
+            .corner_radius(egui::CornerRadius::same(3))
+            .inner_margin(egui::Margin::symmetric(5, 2))
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(id_prefix(node.id))
+                        .monospace()
+                        .small()
+                        .color(id_text),
+                );
+            });
+
+        // Time range
+        ui.label(
+            egui::RichText::new(format!("{start} .. {end}"))
+                .color(color_muted()),
+        );
+
+        // Leaf count badge
+        let leaf_fill = color_frame();
+        let leaf_text = colorhash::text_color_on(leaf_fill);
+        egui::Frame::NONE
+            .fill(leaf_fill)
+            .corner_radius(egui::CornerRadius::same(3))
+            .inner_margin(egui::Margin::symmetric(5, 2))
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(format!("{count} leaves"))
+                        .small()
+                        .color(leaf_text),
+                );
+            });
+    });
 
     ui.horizontal(|ui| {
         if !state.context_selection_stack.is_empty() {
@@ -5170,18 +4520,55 @@ fn render_context_selected_details(
             let child_end = format_age(now_key, child_node.end_at);
 
             egui::Frame::NONE
-                .stroke(egui::Stroke::new(
-                    1.0,
-                    egui::Color32::from_rgb(210, 210, 210),
-                ))
+                .stroke(egui::Stroke::new(1.0, color_muted()))
                 .inner_margin(egui::Margin::symmetric(10, 8))
                 .show(ui, |ui| {
                     ui.horizontal_wrapped(|ui| {
-                        ui.monospace(format!(
-                            "child[{}]: {} {child_start}..{child_end} leaves:{child_count}",
-                            child.index,
-                            id_prefix(child.chunk_id),
-                        ));
+                        ui.spacing_mut().item_spacing.x = 4.0;
+
+                        // Index label
+                        ui.label(
+                            egui::RichText::new(format!("child[{}]", child.index))
+                                .color(color_muted()),
+                        );
+
+                        // ID badge
+                        let id_fill = color_frame();
+                        let id_text = colorhash::text_color_on(id_fill);
+                        egui::Frame::NONE
+                            .fill(id_fill)
+                            .corner_radius(egui::CornerRadius::same(3))
+                            .inner_margin(egui::Margin::symmetric(4, 1))
+                            .show(ui, |ui| {
+                                ui.label(
+                                    egui::RichText::new(id_prefix(child.chunk_id))
+                                        .monospace()
+                                        .small()
+                                        .color(id_text),
+                                );
+                            });
+
+                        // Time range
+                        ui.label(
+                            egui::RichText::new(format!("{child_start} .. {child_end}"))
+                                .color(color_muted()),
+                        );
+
+                        // Leaf count badge
+                        let leaf_fill = color_frame();
+                        let leaf_text = colorhash::text_color_on(leaf_fill);
+                        egui::Frame::NONE
+                            .fill(leaf_fill)
+                            .corner_radius(egui::CornerRadius::same(3))
+                            .inner_margin(egui::Margin::symmetric(4, 1))
+                            .show(ui, |ui| {
+                                ui.label(
+                                    egui::RichText::new(format!("{child_count} leaves"))
+                                        .small()
+                                        .color(leaf_text),
+                                );
+                            });
+
                         if ui.add(Button::new("Focus")).clicked() {
                             state.context_selection_stack.push(selected_id);
                             state.context_selected_chunk = Some(child.chunk_id);
@@ -5220,12 +4607,13 @@ fn render_context_selected_details(
 
     for origin in &selected.origins {
         let age = format_age(now_key, origin.end_at);
-        let exec = origin
-            .exec_result_id
-            .map(id_prefix)
-            .unwrap_or_else(|| "-".to_string());
-        let title = format!("{age}  leaf {}  exec:{exec}", id_prefix(origin.chunk_id));
-        egui::CollapsingHeader::new(egui::RichText::new(title).monospace())
+        let origin_label = context_leaf_label(
+            ui,
+            origin.chunk_id,
+            &age,
+            origin.exec_result_id,
+        );
+        egui::CollapsingHeader::new(origin_label)
             .id_salt(format!("context_origin::{:x}", origin.chunk_id))
             .default_open(false)
             .show(ui, |ui| {
@@ -5245,6 +4633,42 @@ fn render_context_selected_details(
                 );
             });
     }
+}
+
+fn format_tokens_compact(n: u64) -> String {
+    if n >= 1_000_000 {
+        let m = n as f64 / 1_000_000.0;
+        if m >= 100.0 {
+            format!("{:.0}M", m)
+        } else if m >= 10.0 {
+            format!("{:.1}M", m)
+        } else {
+            format!("{:.2}M", m)
+        }
+    } else if n >= 1_000 {
+        let k = n as f64 / 1_000.0;
+        if k >= 100.0 {
+            format!("{:.0}k", k)
+        } else if k >= 10.0 {
+            format!("{:.1}k", k)
+        } else {
+            format!("{:.2}k", k)
+        }
+    } else {
+        n.to_string()
+    }
+}
+
+fn render_timeline_ctx_chip(ui: &mut egui::Ui, fill: egui::Color32) -> egui::Response {
+    let text_color = colorhash::text_color_on(fill);
+    egui::Frame::NONE
+        .fill(fill)
+        .corner_radius(egui::CornerRadius::same(5))
+        .inner_margin(egui::Margin::symmetric(6, 1))
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new("ctx").small().color(text_color))
+        })
+        .inner
 }
 
 fn render_timeline_row(ui: &mut egui::Ui, now_key: i128, row: &TimelineRow) -> Option<Id> {
@@ -5268,7 +4692,8 @@ fn render_timeline_row(ui: &mut egui::Ui, now_key: i128, row: &TimelineRow) -> O
         } => {
             ui.horizontal_wrapped(|ui| {
                 ui.label(format!("{}: {}", exec_status_text(*status), command));
-                if ui.small_button("ctx").on_hover_text("Show model context for this turn").clicked() {
+                let chip_resp = render_timeline_ctx_chip(ui, source_color);
+                if chip_resp.on_hover_text("Show model context for this turn").clicked() {
                     context_clicked = Some(*request_id);
                 }
             });
@@ -5313,6 +4738,8 @@ fn render_timeline_row(ui: &mut egui::Ui, now_key: i128, row: &TimelineRow) -> O
                 } else {
                     format!("Output ({})", output_meta.join(" · "))
                 };
+                let frame_bg = color_frame();
+                let muted = color_muted();
                 egui::CollapsingHeader::new(title)
                     .id_salt(format!("timeline_shell_output_{request_id:x}"))
                     .default_open(false)
@@ -5322,19 +4749,47 @@ fn render_timeline_row(ui: &mut egui::Ui, now_key: i128, row: &TimelineRow) -> O
                             .filter(|text| !text.trim().is_empty())
                         {
                             ui.small("stdout");
-                            render_blob_aware_text(ui, text, None, None);
+                            egui::Frame::NONE
+                                .fill(frame_bg)
+                                .stroke(egui::Stroke::new(1.0, muted))
+                                .corner_radius(egui::CornerRadius::same(4))
+                                .inner_margin(egui::Margin::same(6))
+                                .show(ui, |ui| {
+                                    render_blob_aware_text(ui, text, None, None);
+                                });
                         }
                         if let Some(text) = stderr_text
                             .as_deref()
                             .filter(|text| !text.trim().is_empty())
                         {
+                            ui.add_space(6.0);
                             ui.small("stderr");
-                            render_blob_aware_text(ui, text, Some(egui::Color32::LIGHT_RED), None);
+                            egui::Frame::NONE
+                                .fill(frame_bg)
+                                .stroke(egui::Stroke::new(1.0, muted))
+                                .corner_radius(egui::CornerRadius::same(4))
+                                .inner_margin(egui::Margin::same(6))
+                                .show(ui, |ui| {
+                                    render_blob_aware_text(
+                                        ui,
+                                        text,
+                                        Some(egui::Color32::LIGHT_RED),
+                                        None,
+                                    );
+                                });
                         }
                         if let Some(text) = error.as_deref().filter(|text| !text.trim().is_empty())
                         {
+                            ui.add_space(6.0);
                             ui.small("error");
-                            ui.colored_label(egui::Color32::LIGHT_RED, text);
+                            egui::Frame::NONE
+                                .fill(frame_bg)
+                                .stroke(egui::Stroke::new(1.0, muted))
+                                .corner_radius(egui::CornerRadius::same(4))
+                                .inner_margin(egui::Margin::same(6))
+                                .show(ui, |ui| {
+                                    ui.colored_label(egui::Color32::LIGHT_RED, text);
+                                });
                         }
                     });
             }
@@ -5352,7 +4807,7 @@ fn render_timeline_row(ui: &mut egui::Ui, now_key: i128, row: &TimelineRow) -> O
             );
             if input_tokens.is_some() || output_tokens.is_some() {
                 let f = |v: &Option<u64>| -> String {
-                    v.map_or("-".into(), |n| n.to_string())
+                    v.map_or("-".into(), format_tokens_compact)
                 };
                 ui.small(format!(
                     "in={} out={} cache_r={} cache_w={}",
@@ -5425,11 +4880,11 @@ fn render_timeline_row(ui: &mut egui::Ui, now_key: i128, row: &TimelineRow) -> O
 
 fn timeline_source_style(source: TimelineSource) -> (&'static str, egui::Color32) {
     match source {
-        TimelineSource::Shell => ("shell", egui::Color32::from_rgb(92, 132, 201)),
-        TimelineSource::Cognition => ("mind", egui::Color32::from_rgb(123, 107, 168)),
-        TimelineSource::Teams => ("teams", egui::Color32::from_rgb(69, 124, 184)),
-        TimelineSource::LocalMessages => ("local", egui::Color32::from_rgb(67, 149, 112)),
-        TimelineSource::Goals => ("goals", egui::Color32::from_rgb(202, 168, 68)),
+        TimelineSource::Shell => ("shell", color_shell()),
+        TimelineSource::Cognition => ("mind", color_cognition()),
+        TimelineSource::Teams => ("teams", color_teams()),
+        TimelineSource::LocalMessages => ("local", color_local_msg()),
+        TimelineSource::Goals => ("goals", color_goals()),
     }
 }
 
@@ -5467,65 +4922,219 @@ fn render_timeline_local_message(
     };
     let from_chip_color = colorhash::ral_categorical(from_id.as_ref());
     let to_chip_color = colorhash::ral_categorical(to_id.as_ref());
-    let bubble_color = from_chip_color;
-    let text_color = colorhash::text_color_on(bubble_color);
+    // Subtle tint: blend sender color toward the frame background so body text stays readable.
+    let bubble_tint = themes::blend(from_chip_color, color_frame(), 0.8);
+    let text_color = colorhash::text_color_on(bubble_tint);
 
     ui.with_layout(align, |ui| {
         ui.vertical(|ui| {
             ui.horizontal(|ui| {
                 render_person_chip(ui, from_label, from_chip_color);
-                ui.small("→");
+                ui.label(egui::RichText::new("\u{2192}").color(color_muted()).small());
                 render_person_chip(ui, to_label, to_chip_color);
                 ui.add_space(6.0);
                 render_local_status_chip(ui, status);
             });
             egui::Frame::NONE
-                .fill(bubble_color)
+                .fill(bubble_tint)
+                .stroke(egui::Stroke::new(1.0, from_chip_color))
                 .corner_radius(egui::CornerRadius::same(6))
                 .inner_margin(egui::Margin::symmetric(10, 6))
                 .show(ui, |ui| {
                     ui.set_max_width(bubble_width);
                     render_blob_aware_text(ui, body, Some(text_color), Some(bubble_width));
                 });
-            ui.small(meta);
+            ui.label(egui::RichText::new(meta).color(color_muted()).small());
         });
     });
 }
 
 fn render_timeline_goal_event(ui: &mut egui::Ui, goal: &CompassTaskRow, detail: Option<String>) {
-    render_goal_card(ui, goal, 0.0);
+    // Compact inline goal summary for the timeline (not the full swimlane card).
+    let status_bg = status_color(&goal.status);
+    ui.horizontal_wrapped(|ui| {
+        render_goal_chip(ui, &goal.status, status_bg);
+        ui.label(
+            egui::RichText::new(&goal.title).monospace(),
+        );
+        ui.label(
+            egui::RichText::new(format!("[{}]", goal.id_prefix))
+                .monospace()
+                .color(color_muted()),
+        );
+    });
     if let Some(detail) = detail {
-        ui.add(
-            egui::Label::new(egui::RichText::new(detail).monospace())
-                .wrap_mode(egui::TextWrapMode::Wrap),
+        ui.label(
+            egui::RichText::new(detail).small().color(color_muted()),
         );
     }
 }
 
-fn render_compass_swimlanes(
+/// Queries the compass catalog directly and renders swimlane layout.
+fn render_compass_swimlanes_live(
     ui: &mut egui::Ui,
     expanded_goal: &mut Option<Id>,
-    rows: &[(CompassTaskRow, usize)],
-    notes: &HashMap<Id, Vec<CompassNoteRow>>,
+    data: &TribleSet,
+    ws: &mut Option<Workspace<Pile>>,
 ) {
-    if rows.is_empty() {
+    // ── Collect goals ──
+    let mut tasks: HashMap<Id, CompassTaskRow> = HashMap::new();
+
+    for (task_id, title_handle, created_at) in find!(
+        (
+            task_id: Id,
+            title_handle: Value<Handle<Blake3, LongString>>,
+            created_at: String
+        ),
+        pattern!(data, [{
+            ?task_id @
+            metadata::tag: &COMPASS_KIND_GOAL_ID,
+            compass::title: ?title_handle,
+            compass::created_at: ?created_at,
+        }])
+    ) {
+        if tasks.contains_key(&task_id) {
+            continue;
+        }
+        let title = ws
+            .as_mut()
+            .and_then(|w| load_text(w, title_handle))
+            .unwrap_or_else(|| "<missing>".to_string());
+        tasks.insert(
+            task_id,
+            CompassTaskRow {
+                id: task_id,
+                id_prefix: id_prefix(task_id),
+                title,
+                tags: Vec::new(),
+                created_at,
+                status: "todo".to_string(),
+                status_at: None,
+                note_count: 0,
+                parent: None,
+            },
+        );
+    }
+
+    if tasks.is_empty() {
         ui.label("No goals yet.");
         return;
     }
 
+    // ── Tags ──
+    for (task_id, tag) in find!(
+        (task_id: Id, tag: String),
+        pattern!(data, [{ ?task_id @ metadata::tag: &COMPASS_KIND_GOAL_ID, compass::tag: ?tag }])
+    ) {
+        if let Some(task) = tasks.get_mut(&task_id) {
+            task.tags.push(tag);
+        }
+    }
+
+    // ── Parents ──
+    for (task_id, parent_id) in find!(
+        (task_id: Id, parent_id: Id),
+        pattern!(data, [{
+            ?task_id @
+            metadata::tag: &COMPASS_KIND_GOAL_ID,
+            compass::parent: ?parent_id,
+        }])
+    ) {
+        if let Some(task) = tasks.get_mut(&task_id) {
+            task.parent = Some(parent_id);
+        }
+    }
+
+    // ── Latest status per goal ──
+    let mut status_map: HashMap<Id, (String, String)> = HashMap::new();
+    for (task_id, status, at) in find!(
+        (task_id: Id, status: String, at: String),
+        pattern!(data, [{
+            _?event @
+            metadata::tag: &COMPASS_KIND_STATUS_ID,
+            compass::task: ?task_id,
+            compass::status: ?status,
+            compass::at: ?at,
+        }])
+    ) {
+        status_map
+            .entry(task_id)
+            .and_modify(|current| {
+                if at > current.1 {
+                    *current = (status.clone(), at.clone());
+                }
+            })
+            .or_insert_with(|| (status, at));
+    }
+
+    // ── Note counts ──
+    let mut note_counts: HashMap<Id, usize> = HashMap::new();
+    for task_id in find!(
+        task_id: Id,
+        pattern!(data, [{
+            _?event @
+            metadata::tag: &COMPASS_KIND_NOTE_ID,
+            compass::task: ?task_id,
+        }])
+    ) {
+        *note_counts.entry(task_id).or_insert(0) += 1;
+    }
+
+    // ── Apply status & note counts to tasks ──
+    for task in tasks.values_mut() {
+        if let Some((status, at)) = status_map.get(&task.id) {
+            task.status = status.clone();
+            task.status_at = Some(at.clone());
+        }
+        if let Some(count) = note_counts.get(&task.id) {
+            task.note_count = *count;
+        }
+        task.tags.sort();
+        task.tags.dedup();
+    }
+
+    let rows = order_compass_rows(tasks.into_values().collect());
+
+    // ── Query notes on demand (only for expanded goal) ──
+    let notes: HashMap<Id, Vec<CompassNoteRow>> = if let Some(goal_id) = *expanded_goal {
+        let mut map: HashMap<Id, Vec<CompassNoteRow>> = HashMap::new();
+        for (note_handle, at) in find!(
+            (note_handle: Value<Handle<Blake3, LongString>>, at: String),
+            pattern!(data, [{
+                _?event @
+                metadata::tag: &COMPASS_KIND_NOTE_ID,
+                compass::task: &goal_id,
+                compass::note: ?note_handle,
+                compass::at: ?at,
+            }])
+        ) {
+            let body = ws
+                .as_mut()
+                .and_then(|w| load_text(w, note_handle))
+                .unwrap_or_else(|| "<missing>".to_string());
+            map.entry(goal_id).or_default().push(CompassNoteRow { at, body });
+        }
+        for notes in map.values_mut() {
+            notes.sort_by(|a, b| b.at.cmp(&a.at));
+        }
+        map
+    } else {
+        HashMap::new()
+    };
+
+    // ── Render swimlanes ──
     let render_lanes = |ui: &mut egui::Ui| {
         ui.spacing_mut().item_spacing.y = 0.0;
 
         let mut counts: HashMap<&str, usize> = HashMap::new();
         let mut extra_statuses: HashSet<&str> = HashSet::new();
-        for (row, _) in rows {
+        for (row, _) in &rows {
             *counts.entry(row.status.as_str()).or_insert(0) += 1;
             if !COMPASS_DEFAULT_STATUSES.contains(&row.status.as_str()) {
                 extra_statuses.insert(row.status.as_str());
             }
         }
 
-        // Always show the canonical lanes (including done) so the UI keeps its shape.
         let mut statuses: Vec<String> = COMPASS_DEFAULT_STATUSES
             .iter()
             .map(|s| (*s).to_string())
@@ -5536,15 +5145,13 @@ fn render_compass_swimlanes(
 
         for status in statuses {
             let count = counts.get(status.as_str()).copied().unwrap_or(0);
-            render_compass_swimlane(ui, expanded_goal, notes, rows, &status, count);
+            render_compass_swimlane(ui, expanded_goal, &notes, &rows, &status, count);
         }
     };
 
-    // Headless captures render each card into a GPU texture; clamp height to avoid
-    // exceeding backend texture limits when there are many goals.
     if diagnostics_is_headless() {
         egui::ScrollArea::vertical()
-            .id_salt("compass_headless_scroll")
+            .id_salt("compass_live_headless_scroll")
             .max_height(1600.0)
             .show(ui, |ui| ui.scope(render_lanes));
     } else {
@@ -5595,119 +5202,116 @@ fn render_compass_swimlane(
 
 fn status_color(status: &str) -> egui::Color32 {
     match status {
-        // Status colors: ready (green), caution (yellow), danger (red), ice (blue).
-        "todo" => egui::Color32::from_rgb(70, 150, 95),
-        "doing" => egui::Color32::from_rgb(200, 170, 60),
-        "blocked" => egui::Color32::from_rgb(170, 70, 70),
-        "done" => egui::Color32::from_rgb(65, 110, 170),
-        _ => egui::Color32::from_rgb(95, 95, 95),
+        "todo" => color_todo(),
+        "doing" => color_doing(),
+        "blocked" => color_blocked(),
+        "done" => color_done(),
+        _ => color_muted(),
     }
 }
 
-fn draw_goal_status_bar(ui: &egui::Ui, rect: egui::Rect, color: egui::Color32) {
-    // Draw inside the border so the thin outline stays crisp.
-    let inset = 1.0;
-    let bar_height = 4.0;
-    let min = egui::pos2(rect.left() + inset, rect.top() + inset);
-    let max = egui::pos2(rect.right() - inset, rect.top() + inset + bar_height);
-    ui.painter()
-        .rect_filled(egui::Rect::from_min_max(min, max), 0.0, color);
-}
-
-fn goal_right_text(row: &CompassTaskRow) -> String {
-    let mut right_parts: Vec<String> = Vec::new();
-    if !row.tags.is_empty() {
-        right_parts.push(
-            row.tags
-                .iter()
-                .map(|tag| format!("#{tag}"))
-                .collect::<Vec<_>>()
-                .join(" "),
-        );
-    }
-    if row.note_count > 0 {
-        right_parts.push(format!("{}n", row.note_count));
-    }
-    if let Some(parent) = row.parent {
-        right_parts.push(format!("^{}", id_prefix(parent)));
-    }
-    right_parts.push(format!("[{}]", row.id_prefix));
-    right_parts.join(" · ")
+fn render_goal_chip(ui: &mut egui::Ui, label: &str, fill: egui::Color32) {
+    let text_color = colorhash::text_color_on(fill);
+    egui::Frame::NONE
+        .fill(fill)
+        .corner_radius(egui::CornerRadius::same(4))
+        .inner_margin(egui::Margin::symmetric(6, 1))
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new(label).small().color(text_color));
+        });
 }
 
 fn render_goal_card(ui: &mut egui::Ui, row: &CompassTaskRow, dep_indent: f32) -> egui::Response {
-    let right_text = goal_right_text(row);
-    let outline = ui.visuals().widgets.noninteractive.bg_stroke;
-    let bar_color = status_color(&row.status);
-    let inner = ui
-        .horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 0.0;
-            if dep_indent > 0.0 {
-                ui.add_space(dep_indent);
-            }
+    let status_bg = status_color(&row.status);
+    let card_bg = color_frame();
 
-            egui::Frame::NONE
-                .fill(egui::Color32::TRANSPARENT)
-                .stroke(outline)
-                .corner_radius(egui::CornerRadius::same(0))
-                .inner_margin(egui::Margin {
-                    left: 10,
-                    right: 10,
-                    top: 6,
-                    bottom: 6,
-                })
-                .show(ui, |ui| {
-                    // Fill the full remaining width so cards don't shrink to just their text.
-                    let available_width = ui.available_width();
-                    ui.set_min_width(available_width);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        if dep_indent > 0.0 {
+            ui.add_space(dep_indent);
+        }
 
-                    let title = row.title.clone();
-                    ui.horizontal(|ui| {
-                        let right_width = if right_text.is_empty() {
-                            0.0
-                        } else {
-                            let font_id = egui::TextStyle::Monospace.resolve(ui.style());
-                            ui.fonts_mut(|fonts| {
-                                fonts
-                                    .layout_no_wrap(
-                                        right_text.clone(),
-                                        font_id,
-                                        egui::Color32::WHITE,
-                                    )
-                                    .size()
-                                    .x
-                            })
-                        };
-                        let gap = 12.0;
-                        let title_width = (ui.available_width() - right_width - gap).max(40.0);
-                        ui.add_sized(
-                            [title_width, 0.0],
-                            egui::Label::new(egui::RichText::new(title).monospace())
-                                .halign(egui::Align::LEFT)
-                                .wrap_mode(egui::TextWrapMode::Truncate),
-                        );
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(ui.available_width(), 0.0),
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                if !right_text.is_empty() {
-                                    ui.add(
-                                        egui::Label::new(
-                                            egui::RichText::new(&right_text).monospace(),
-                                        )
-                                        .halign(egui::Align::RIGHT)
-                                        .wrap_mode(egui::TextWrapMode::Truncate),
-                                    );
-                                }
-                            },
-                        );
+        egui::Frame::NONE
+            .fill(card_bg)
+            .corner_radius(egui::CornerRadius::same(4))
+            .inner_margin(egui::Margin {
+                left: 10,
+                right: 10,
+                top: 6,
+                bottom: 6,
+            })
+            .show(ui, |ui| {
+                let available_width = ui.available_width();
+                ui.set_min_width(available_width);
+
+                // ── Row 1: status chip · title · [id] (and ^parent) ──
+                ui.horizontal(|ui| {
+                    render_goal_chip(ui, &row.status, status_bg);
+                    ui.add_space(6.0);
+
+                    // Right-aligned id/parent label: measure width first.
+                    let id_text = if let Some(parent) = row.parent {
+                        format!("^{} [{}]", id_prefix(parent), row.id_prefix)
+                    } else {
+                        format!("[{}]", row.id_prefix)
+                    };
+                    let font_id = egui::TextStyle::Monospace.resolve(ui.style());
+                    let id_width = ui.fonts_mut(|fonts| {
+                        fonts
+                            .layout_no_wrap(id_text.clone(), font_id, egui::Color32::WHITE)
+                            .size()
+                            .x
                     });
-                })
-        })
-        .inner;
+                    let gap = 12.0;
+                    let title_width = (ui.available_width() - id_width - gap).max(40.0);
 
-    draw_goal_status_bar(ui, inner.response.rect, bar_color);
-    inner.response
+                    ui.add_sized(
+                        [title_width, 0.0],
+                        egui::Label::new(egui::RichText::new(&row.title).monospace())
+                            .halign(egui::Align::LEFT)
+                            .wrap_mode(egui::TextWrapMode::Truncate),
+                    );
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(ui.available_width(), 0.0),
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            ui.label(
+                                egui::RichText::new(&id_text)
+                                    .monospace()
+                                    .color(color_muted()),
+                            );
+                        },
+                    );
+                });
+
+                // ── Row 2: tag chips + note badge (only when there is something to show) ──
+                let has_tags = !row.tags.is_empty();
+                let has_notes = row.note_count > 0;
+                if has_tags || has_notes {
+                    ui.add_space(3.0);
+                    ui.horizontal_wrapped(|ui| {
+                        for tag in &row.tags {
+                            let tag_bg = colorhash::ral_categorical(tag.as_bytes());
+                            render_goal_chip(ui, &format!("#{tag}"), tag_bg);
+                        }
+                        if has_notes {
+                            let muted = color_muted();
+                            render_goal_chip(
+                                ui,
+                                &format!(
+                                    "{} note{}",
+                                    row.note_count,
+                                    if row.note_count == 1 { "" } else { "s" }
+                                ),
+                                muted,
+                            );
+                        }
+                    });
+                }
+            })
+    })
+    .inner
+    .response
 }
 
 fn render_compass_swimlane_row(
@@ -5787,7 +5391,7 @@ fn render_compass_swimlane_row(
     // Draw a small "dependency gutter" to the left of the goal box.
     let rect = response_rect;
     let painter = ui.painter();
-    let stroke = egui::Stroke::new(1.2, egui::Color32::from_gray(130));
+    let stroke = egui::Stroke::new(1.2, color_muted());
     for idx in 0..dep_lines {
         let x = rect.left() - dep_indent + 4.0 + (idx as f32 * DEP_LINE_STEP);
         let y1 = rect.top() + 0.5;
@@ -5843,11 +5447,11 @@ fn local_message_status_text(status: &LocalMessageStatus) -> String {
 
 fn local_message_status_color(status: &LocalMessageStatus) -> egui::Color32 {
     match status {
-        LocalMessageStatus::Unread => egui::Color32::from_rgb(202, 118, 45),
-        LocalMessageStatus::Read => egui::Color32::from_rgb(69, 141, 92),
-        LocalMessageStatus::Sent => egui::Color32::from_rgb(107, 118, 130),
-        LocalMessageStatus::ReadBy(_) => egui::Color32::from_rgb(74, 126, 183),
-        LocalMessageStatus::Other => egui::Color32::from_rgb(122, 104, 164),
+        LocalMessageStatus::Unread => color_unread(),
+        LocalMessageStatus::Read => color_read(),
+        LocalMessageStatus::Sent => color_sent(),
+        LocalMessageStatus::ReadBy(_) => color_readby(),
+        LocalMessageStatus::Other => color_other(),
     }
 }
 
