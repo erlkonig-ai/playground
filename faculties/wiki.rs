@@ -2,7 +2,6 @@
 //! ```cargo
 //! [dependencies]
 //! anyhow = "1.0"
-//! blake3 = "1"
 //! clap = { version = "4.5.4", features = ["derive", "env"] }
 //! ed25519-dalek = "2.1.1"
 //! hifitime = "4.2.3"
@@ -571,19 +570,6 @@ fn format_date(tai_ns: i128) -> String {
     Formatter::new(epoch, ISO8601_DATE).to_string()
 }
 
-/// Derive a deterministic attribute ID from a link type name.
-/// Uses blake3(name) truncated to 16 bytes, matching the ImportAttribute pattern.
-#[allow(dead_code)]
-fn link_type_attribute_id(name: &str) -> Id {
-    let digest = blake3::hash(format!("wiki:link_type:{name}").as_bytes());
-    let bytes = digest.as_bytes();
-    let mut raw = [0u8; 16];
-    raw.copy_from_slice(&bytes[bytes.len() - 16..]);
-    // Ensure it's a valid non-zero ID.
-    raw[0] |= 0x01;
-    Id::new(raw).expect("derived link type ID")
-}
-
 /// A resolved wiki link with an optional type.
 struct WikiLink {
     target: Id,
@@ -852,12 +838,9 @@ fn commit_version(
     // Typed links: write derived attributes alongside links_to.
     for link in &wiki_links {
         if let Some(ref type_name) = link.link_type {
-            let attr_id = link_type_attribute_id(type_name);
-            let target_val = valueschemas::GenId::value_from(link.target);
-            let t = triblespace::core::trible::Trible::force(&version_id, &attr_id, &target_val);
-            let mut ts = TribleSet::new();
-            ts.insert(&t);
-            change += ts;
+            let attr = triblespace::core::attribute::Attribute::<valueschemas::GenId>::from_name(type_name);
+            let eid = ExclusiveId::force_ref(&version_id);
+            change += entity! { eid @ attr: &link.target };
         }
     }
 
