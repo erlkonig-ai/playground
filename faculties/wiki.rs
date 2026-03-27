@@ -355,7 +355,7 @@ fn version_fragment(space: &TribleSet, version_id: Id) -> Option<Id> {
 /// Find the latest version ID for a fragment (by created_at).
 fn latest_version_of(space: &TribleSet, fragment_id: Id) -> Option<Id> {
     find!(
-        (vid: Id, ts: Value<valueschemas::NsTAIInterval>),
+        (vid: Id, ts: Lower),
         pattern!(space, [{
             ?vid @
             metadata::tag: &KIND_VERSION_ID,
@@ -363,14 +363,14 @@ fn latest_version_of(space: &TribleSet, fragment_id: Id) -> Option<Id> {
             wiki::created_at: ?ts,
         }])
     )
-    .max_by_key(|(_, ts)| interval_key(*ts))
+    .max_by_key(|(_, ts)| *ts)
     .map(|(vid, _)| vid)
 }
 
 /// All version IDs of a fragment, sorted oldest-first.
 fn version_history_of(space: &TribleSet, fragment_id: Id) -> Vec<Id> {
-    let mut versions: Vec<(Id, i128)> = find!(
-        (vid: Id, ts: Value<valueschemas::NsTAIInterval>),
+    let mut versions: Vec<(Id, Lower)> = find!(
+        (vid: Id, ts: Lower),
         pattern!(space, [{
             ?vid @
             metadata::tag: &KIND_VERSION_ID,
@@ -378,7 +378,6 @@ fn version_history_of(space: &TribleSet, fragment_id: Id) -> Vec<Id> {
             wiki::created_at: ?ts,
         }])
     )
-    .map(|(vid, ts)| (vid, interval_key(ts)))
     .collect();
     versions.sort_by_key(|(_, ts)| *ts);
     versions.into_iter().map(|(vid, _)| vid).collect()
@@ -410,13 +409,13 @@ fn content_handle_of(space: &TribleSet, vid: Id) -> Option<TextHandle> {
 }
 
 /// Get created_at timestamp for a version entity.
-fn created_at_of(space: &TribleSet, vid: Id) -> Option<i128> {
+fn created_at_of(space: &TribleSet, vid: Id) -> Option<Lower> {
     find!(
-        (ts: Value<valueschemas::NsTAIInterval>),
+        (ts: Lower),
         pattern!(space, [{ vid @ wiki::created_at: ?ts }])
     )
     .next()
-    .map(|(ts,)| interval_key(ts))
+    .map(|(ts,)| ts)
 }
 
 /// Get tags for a version entity (excluding KIND_VERSION).
@@ -537,14 +536,31 @@ fn link_label(
 }
 
 // ── helpers ────────────────────────────────────────────────────────────────
+use triblespace::core::value::schemas::time::Lower;
+
 fn now_tai() -> Value<valueschemas::NsTAIInterval> {
     let now = Epoch::now().unwrap_or(Epoch::from_unix_seconds(0.0));
     (now, now).try_to_value().expect("TAI interval")
 }
 
-fn interval_key(interval: Value<valueschemas::NsTAIInterval>) -> i128 {
-    let (lower, _): (Epoch, Epoch) = interval.try_from_value().expect("TAI interval");
-    lower.to_tai_duration().total_nanoseconds()
+/// Build a map of fragment → (latest_version_id, timestamp) in one pass.
+fn latest_versions(space: &TribleSet) -> HashMap<Id, (Id, Lower)> {
+    let mut latest: HashMap<Id, (Id, Lower)> = HashMap::new();
+    for (vid, frag, ts) in find!(
+        (vid: Id, frag: Id, ts: Lower),
+        pattern!(space, [{
+            ?vid @
+            metadata::tag: &KIND_VERSION_ID,
+            wiki::fragment: ?frag,
+            wiki::created_at: ?ts,
+        }])
+    ) {
+        let entry = latest.entry(frag).or_insert((vid, ts));
+        if ts > entry.1 {
+            *entry = (vid, ts);
+        }
+    }
+    latest
 }
 
 fn fmt_id(id: Id) -> String {
@@ -565,14 +581,9 @@ fn load_value_or_file(raw: &str, label: &str) -> Result<String> {
     Ok(raw.to_string())
 }
 
-/// Format TAI nanoseconds as ISO 8601 date (e.g. "2026-03-11").
-fn format_date(tai_ns: i128) -> String {
-    // Inverse of Duration::total_nanoseconds().
-    const NANOS_PER_CENTURY: i128 = 3_155_760_000_000_000_000;
-    let centuries = (tai_ns / NANOS_PER_CENTURY) as i16;
-    let nanos = (tai_ns % NANOS_PER_CENTURY) as u64;
-    let dur = hifitime::Duration::from_parts(centuries, nanos);
-    let epoch = Epoch::from_tai_duration(dur);
+/// Format a `Lower` timestamp as ISO 8601 date (e.g. "2026-03-11").
+fn format_date(ts: Lower) -> String {
+    let epoch = Epoch::from_tai_duration(hifitime::Duration::from_total_nanoseconds(ts.0));
     Formatter::new(epoch, ISO8601_DATE).to_string()
 }
 
@@ -992,23 +1003,7 @@ fn cmd_check(pile: &Path, branch: Option<&str>, try_compile: bool) -> Result<()>
     with_wiki(pile, branch, |_repo, ws| {
         let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
 
-        // Collect latest version per fragment
-        let mut latest: HashMap<Id, (Id, i128)> = HashMap::new();
-        for (vid, frag, ts) in find!(
-            (vid: Id, frag: Id, ts: Value<valueschemas::NsTAIInterval>),
-            pattern!(&space, [{
-                ?vid @
-                metadata::tag: &KIND_VERSION_ID,
-                wiki::fragment: ?frag,
-                wiki::created_at: ?ts,
-            }])
-        ) {
-            let key = interval_key(ts);
-            let entry = latest.entry(frag).or_insert((vid, key));
-            if key > entry.1 {
-                *entry = (vid, key);
-            }
-        }
+        let latest = latest_versions(&space);
 
         // Collect ALL known IDs for link checking (fragments + every version, not just latest)
         let all_frag_ids: std::collections::HashSet<Id> = latest.keys().copied().collect();
@@ -1161,23 +1156,7 @@ fn cmd_export_all(pile: &Path, branch: Option<&str>, dir: PathBuf) -> Result<()>
     with_wiki(pile, branch, |_repo, ws| {
         let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
         let mut count = 0u32;
-        // Collect latest version per fragment
-        let mut latest: HashMap<Id, (Id, i128)> = HashMap::new();
-        for (vid, frag, ts) in find!(
-            (vid: Id, frag: Id, ts: Value<valueschemas::NsTAIInterval>),
-            pattern!(&space, [{
-                ?vid @
-                metadata::tag: &KIND_VERSION_ID,
-                wiki::fragment: ?frag,
-                wiki::created_at: ?ts,
-            }])
-        ) {
-            let key = interval_key(ts);
-            let entry = latest.entry(frag).or_insert((vid, key));
-            if key > entry.1 {
-                *entry = (vid, key);
-            }
-        }
+        let latest = latest_versions(&space);
         for (_frag_id, (vid, _)) in &latest {
             // Skip archived
             let tags = tags_of(&space, *vid);
@@ -1246,21 +1225,7 @@ fn cmd_import_all(pile: &Path, branch: Option<&str>, dir: PathBuf) -> Result<()>
             let space = ws.checkout(..)
                 .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
 
-            // Find latest version per fragment.
-            let mut curr_latest: HashMap<Id, (Id, i128)> = HashMap::new();
-            for (vid, frag, ts) in find!(
-                (vid: Id, frag: Id, ts: Value<valueschemas::NsTAIInterval>),
-                pattern!(&space, [{
-                    ?vid @
-                    metadata::tag: &KIND_VERSION_ID,
-                    wiki::fragment: ?frag,
-                    wiki::created_at: ?ts,
-                }])
-            ) {
-                let key = interval_key(ts);
-                let entry = curr_latest.entry(frag).or_insert((vid, key));
-                if key > entry.1 { *entry = (vid, key); }
-            }
+            let curr_latest = latest_versions(&space);
 
             // Build change set: only fragments whose latest version matches export.
             let mut change = TribleSet::new();
@@ -1435,7 +1400,7 @@ fn cmd_show(pile: &Path, branch: Option<&str>, id: String, follow_latest: bool) 
             .map_err(|e| anyhow::anyhow!("read content: {e:?}"))?;
         let title = read_title(&space, ws, vid).unwrap_or_default();
         let tags = tags_of(&space, vid);
-        let created_at = created_at_of(&space, vid).unwrap_or(0);
+        let created_at = created_at_of(&space, vid).unwrap_or(Lower(0));
 
         println!("# {title}");
         println!(
@@ -1721,22 +1686,9 @@ fn cmd_list(
         let has_backlink_filter = !with_bl_ids.is_empty() || !without_bl_ids.is_empty()
             || !with_bl_type_attrs.is_empty() || !without_bl_type_attrs.is_empty();
 
-        // Build latest version per fragment in a single pass.
-        let mut latest: HashMap<Id, (Id, i128)> = HashMap::new(); // frag -> (vid, created_at)
-        for (vid, frag, ts) in find!(
-            (vid: Id, frag: Id, ts: Value<valueschemas::NsTAIInterval>),
-            pattern!(&space, [{
-                ?vid @ metadata::tag: &KIND_VERSION_ID, wiki::fragment: ?frag, wiki::created_at: ?ts,
-            }])
-        ) {
-            let ts_key = interval_key(ts);
-            let entry = latest.entry(frag).or_insert((vid, ts_key));
-            if ts_key > entry.1 {
-                *entry = (vid, ts_key);
-            }
-        }
+        let latest = latest_versions(&space);
 
-        let mut entries: Vec<(Id, Id, i128)> = latest.into_iter()
+        let mut entries: Vec<(Id, Id, Lower)> = latest.into_iter()
             .map(|(frag, (vid, ts))| (frag, vid, ts))
             .collect();
         entries.sort_by(|a, b| b.2.cmp(&a.2));
@@ -1848,7 +1800,7 @@ fn cmd_history(pile: &Path, branch: Option<&str>, id: String) -> Result<()> {
 
         for (i, vid) in history.iter().enumerate() {
             let title = read_title(&space, ws, *vid).unwrap_or_default();
-            let ts = created_at_of(&space, *vid).unwrap_or(0);
+            let ts = created_at_of(&space, *vid).unwrap_or(Lower(0));
             let tags = tags_of(&space, *vid);
             println!(
                 "  v{}  {}  {}  {}{}",
@@ -2067,22 +2019,9 @@ fn cmd_search(
         let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
         let tag_index = TagIndex::load(ws)?;
 
-        // Build latest version per fragment.
-        let mut latest: HashMap<Id, (Id, i128)> = HashMap::new();
-        for (vid, frag, ts) in find!(
-            (vid: Id, frag: Id, ts: Value<valueschemas::NsTAIInterval>),
-            pattern!(&space, [{
-                ?vid @ metadata::tag: &KIND_VERSION_ID, wiki::fragment: ?frag, wiki::created_at: ?ts,
-            }])
-        ) {
-            let ts_key = interval_key(ts);
-            let entry = latest.entry(frag).or_insert((vid, ts_key));
-            if ts_key > entry.1 {
-                *entry = (vid, ts_key);
-            }
-        }
+        let latest = latest_versions(&space);
 
-        let mut hits: Vec<(Id, Id, i128, String, Vec<Id>, Vec<String>)> = Vec::new();
+        let mut hits: Vec<(Id, Id, Lower, String, Vec<Id>, Vec<String>)> = Vec::new();
 
         for (&frag_id, &(vid, created_at)) in &latest {
             let tags = tags_of(&space, vid);
