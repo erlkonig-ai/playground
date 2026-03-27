@@ -161,6 +161,12 @@ enum Command {
         /// Only show fragments that do NOT have a backlink from a fragment with this tag
         #[arg(long)]
         without_backlink_tag: Vec<String>,
+        /// Only show fragments that have a typed backlink (e.g. "reviews", "cites")
+        #[arg(long)]
+        with_backlink_type: Vec<String>,
+        /// Only show fragments that do NOT have a typed backlink of this type
+        #[arg(long)]
+        without_backlink_type: Vec<String>,
         /// Include archived fragments
         #[arg(long)]
         all: bool,
@@ -1679,6 +1685,8 @@ fn cmd_list(
     filter_tags: Vec<String>,
     with_backlink_tag: Vec<String>,
     without_backlink_tag: Vec<String>,
+    with_backlink_type: Vec<String>,
+    without_backlink_type: Vec<String>,
     show_all: bool,
 ) -> Result<()> {
     with_wiki(pile, branch, |_repo, ws| {
@@ -1701,7 +1709,17 @@ fn cmd_list(
             .iter()
             .filter_map(|name| tag_index.by_name.get(&name.trim().to_lowercase()).copied())
             .collect();
-        let has_backlink_filter = !with_bl_ids.is_empty() || !without_bl_ids.is_empty();
+        // Derive attribute IDs for typed backlink filters.
+        let with_bl_type_attrs: Vec<(String, triblespace::core::attribute::Attribute<valueschemas::GenId>)> =
+            with_backlink_type.iter()
+                .map(|name| (name.clone(), triblespace::core::attribute::Attribute::<valueschemas::GenId>::from_name(name)))
+                .collect();
+        let without_bl_type_attrs: Vec<(String, triblespace::core::attribute::Attribute<valueschemas::GenId>)> =
+            without_backlink_type.iter()
+                .map(|name| (name.clone(), triblespace::core::attribute::Attribute::<valueschemas::GenId>::from_name(name)))
+                .collect();
+        let has_backlink_filter = !with_bl_ids.is_empty() || !without_bl_ids.is_empty()
+            || !with_bl_type_attrs.is_empty() || !without_bl_type_attrs.is_empty();
 
         // Build latest version per fragment in a single pass.
         let mut latest: HashMap<Id, (Id, i128)> = HashMap::new(); // frag -> (vid, created_at)
@@ -1757,6 +1775,27 @@ fn cmd_list(
                     && without_bl_ids.iter().any(|t| backlink_tags.contains(t))
                 {
                     continue;
+                }
+
+                // Typed backlink filter: check if any latest version has a
+                // derived-attribute link of the given type pointing to this version.
+                if !with_bl_type_attrs.is_empty() {
+                    let all_present = with_bl_type_attrs.iter().all(|(_, attr)| {
+                        find!(
+                            src: Id,
+                            pattern!(&space, [{ ?src @ attr: vid }])
+                        ).any(|src| latest_vids.contains(&src))
+                    });
+                    if !all_present { continue; }
+                }
+                if !without_bl_type_attrs.is_empty() {
+                    let any_present = without_bl_type_attrs.iter().any(|(_, attr)| {
+                        find!(
+                            src: Id,
+                            pattern!(&space, [{ ?src @ attr: vid }])
+                        ).any(|src| latest_vids.contains(&src))
+                    });
+                    if any_present { continue; }
                 }
             }
 
@@ -2214,8 +2253,8 @@ fn main() -> Result<()> {
         Command::Restore { id } => cmd_restore(&cli.pile, branch, id),
         Command::Revert { id, to } => cmd_revert(&cli.pile, branch, id, to),
         Command::Links { id } => cmd_links(&cli.pile, branch, id),
-        Command::List { tag, with_backlink_tag, without_backlink_tag, all } =>
-            cmd_list(&cli.pile, branch, tag, with_backlink_tag, without_backlink_tag, all),
+        Command::List { tag, with_backlink_tag, without_backlink_tag, with_backlink_type, without_backlink_type, all } =>
+            cmd_list(&cli.pile, branch, tag, with_backlink_tag, without_backlink_tag, with_backlink_type, without_backlink_type, all),
         Command::History { id } => cmd_history(&cli.pile, branch, id),
         Command::Tag { command: tag_cmd } => match tag_cmd {
             TagCommand::Add { id, name } => cmd_tag_add(&cli.pile, branch, id, name),
