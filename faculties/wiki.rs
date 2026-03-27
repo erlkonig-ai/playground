@@ -150,11 +150,17 @@ enum Command {
         /// Fragment id (full 32-char hex id)
         id: String,
     },
-    /// List fragments, optionally filtered by tag
+    /// List fragments, optionally filtered by tag and backlink structure
     List {
         /// Filter by tag name
         #[arg(long)]
         tag: Vec<String>,
+        /// Only show fragments that have a backlink from a fragment with this tag
+        #[arg(long)]
+        with_backlink_tag: Vec<String>,
+        /// Only show fragments that do NOT have a backlink from a fragment with this tag
+        #[arg(long)]
+        without_backlink_tag: Vec<String>,
         /// Include archived fragments
         #[arg(long)]
         all: bool,
@@ -1621,6 +1627,8 @@ fn cmd_list(
     pile: &Path,
     branch: Option<&str>,
     filter_tags: Vec<String>,
+    with_backlink_tag: Vec<String>,
+    without_backlink_tag: Vec<String>,
     show_all: bool,
 ) -> Result<()> {
     with_wiki(pile, branch, |_repo, ws| {
@@ -1634,6 +1642,16 @@ fn cmd_list(
                 tag_index.by_name.get(&name).copied()
             })
             .collect();
+
+        let with_bl_ids: Vec<Id> = with_backlink_tag
+            .iter()
+            .filter_map(|name| tag_index.by_name.get(&name.trim().to_lowercase()).copied())
+            .collect();
+        let without_bl_ids: Vec<Id> = without_backlink_tag
+            .iter()
+            .filter_map(|name| tag_index.by_name.get(&name.trim().to_lowercase()).copied())
+            .collect();
+        let has_backlink_filter = !with_bl_ids.is_empty() || !without_bl_ids.is_empty();
 
         // Build latest version per fragment in a single pass.
         let mut latest: HashMap<Id, (Id, i128)> = HashMap::new(); // frag -> (vid, created_at)
@@ -1662,6 +1680,36 @@ fn cmd_list(
             }
             if !filter_ids.is_empty() && !filter_ids.iter().all(|ft| tags.contains(ft)) {
                 continue;
+            }
+
+            // Backlink tag filter: check tags of fragments that link TO this one.
+            if has_backlink_filter {
+                // Find all versions that link to this fragment (or any of its versions).
+                let mut backlink_tags: Vec<Id> = Vec::new();
+                for source_vid in find!(
+                    src: Id,
+                    pattern!(&space, [{ ?src @ wiki::links_to: frag_id }])
+                ) {
+                    backlink_tags.extend(tags_of(&space, source_vid));
+                }
+                // Also check links to the version ID.
+                for source_vid in find!(
+                    src: Id,
+                    pattern!(&space, [{ ?src @ wiki::links_to: vid }])
+                ) {
+                    backlink_tags.extend(tags_of(&space, source_vid));
+                }
+
+                if !with_bl_ids.is_empty()
+                    && !with_bl_ids.iter().all(|t| backlink_tags.contains(t))
+                {
+                    continue;
+                }
+                if !without_bl_ids.is_empty()
+                    && without_bl_ids.iter().any(|t| backlink_tags.contains(t))
+                {
+                    continue;
+                }
             }
 
             let title = read_title(&space, ws, *vid).unwrap_or_default();
@@ -2118,7 +2166,8 @@ fn main() -> Result<()> {
         Command::Restore { id } => cmd_restore(&cli.pile, branch, id),
         Command::Revert { id, to } => cmd_revert(&cli.pile, branch, id, to),
         Command::Links { id } => cmd_links(&cli.pile, branch, id),
-        Command::List { tag, all } => cmd_list(&cli.pile, branch, tag, all),
+        Command::List { tag, with_backlink_tag, without_backlink_tag, all } =>
+            cmd_list(&cli.pile, branch, tag, with_backlink_tag, without_backlink_tag, all),
         Command::History { id } => cmd_history(&cli.pile, branch, id),
         Command::Tag { command: tag_cmd } => match tag_cmd {
             TagCommand::Add { id, name } => cmd_tag_add(&cli.pile, branch, id, name),
