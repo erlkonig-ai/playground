@@ -106,13 +106,13 @@ enum Command {
         /// Entity id (32 hex chars) or content hash (64 hex chars)
         id: String,
     },
-    /// Extract a file, directory, or import to disk
+    /// Extract a file, directory, or import.
+    /// Use @- to write to stdout, or omit for the stored filename.
     Get {
         /// Entity id (32 hex chars) or content hash (64 hex chars) (file, directory, or import)
         id: String,
-        /// Output path (default: original name in current directory)
-        #[arg(long, short)]
-        output: Option<PathBuf>,
+        /// Output path. Omit to use the stored filename. Use @- for stdout.
+        output: Option<String>,
     },
     /// Add a tag to a file
     Tag {
@@ -909,7 +909,7 @@ fn cmd_show(
 fn cmd_get(
     ws: &mut Workspace<Pile<valueschemas::Blake3>>,
     id: &str,
-    output: Option<&Path>,
+    output: Option<&str>,
 ) -> Result<()> {
     let space = ws
         .checkout(..)
@@ -923,28 +923,38 @@ fn cmd_get(
         eid
     };
 
+    let to_stdout = output == Some("@-");
+
     if is_file(&space, target) {
         let h = content_handle_of(&space, target)
             .ok_or_else(|| anyhow::anyhow!("no content for file"))?;
         let bytes: anybytes::Bytes = ws.get::<anybytes::Bytes, _>(h)
             .map_err(|e| anyhow::anyhow!("get blob: {e:?}"))?;
 
-        let out_path = if let Some(p) = output {
-            p.to_path_buf()
+        if to_stdout {
+            use std::io::Write;
+            std::io::stdout().write_all(bytes.as_ref())
+                .context("write to stdout")?;
         } else {
-            let fname = read_name(&space, ws, target).unwrap_or_else(|| "file.bin".into());
-            PathBuf::from(fname)
-        };
-
-        fs::write(&out_path, bytes.as_ref())
-            .with_context(|| format!("write {}", out_path.display()))?;
-        println!("Wrote {} ({})", out_path.display(), human_size(bytes.len() as u64));
+            let out_path = if let Some(p) = output {
+                PathBuf::from(p)
+            } else {
+                let fname = read_name(&space, ws, target).unwrap_or_else(|| "file.bin".into());
+                PathBuf::from(fname)
+            };
+            fs::write(&out_path, bytes.as_ref())
+                .with_context(|| format!("write {}", out_path.display()))?;
+            eprintln!("Wrote {} ({})", out_path.display(), human_size(bytes.len() as u64));
+        }
     } else if is_directory(&space, target) {
+        if to_stdout {
+            bail!("cannot write directory to stdout");
+        }
         let dir_name = read_name(&space, ws, target).unwrap_or_else(|| "extracted".into());
-        let out_dir = output.map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from(&dir_name));
+        let out_dir = output.map(PathBuf::from).unwrap_or_else(|| PathBuf::from(&dir_name));
         let mut stats = TreeStats { files: 0, dirs: 0, bytes: 0 };
         extract_tree(&space, ws, target, &out_dir, &mut stats)?;
-        println!(
+        eprintln!(
             "Extracted to {} ({} files, {} dirs, {})",
             out_dir.display(), stats.files, stats.dirs, human_size(stats.bytes),
         );
