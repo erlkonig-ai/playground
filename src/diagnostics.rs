@@ -1,7 +1,5 @@
-use ed25519_dalek::SigningKey;
 use eframe::egui;
 use hifitime::Epoch;
-use rand::rngs::OsRng;
 use serde_json::Value as JsonValue;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -29,6 +27,7 @@ use GORBIE::NotebookConfig;
 use GORBIE::NotebookCtx;
 use GORBIE::cards::DEFAULT_CARD_PADDING;
 use GORBIE::themes::{self, colorhash};
+use GORBIE::widgets::triblespace::PileRepoState;
 use GORBIE::widgets::{Button, TextField};
 
 use crate::blob_refs::{PromptChunk, split_blob_refs};
@@ -207,7 +206,6 @@ mod relations {
 
 #[derive(Clone, Debug)]
 struct DashboardConfig {
-    pile_path: String,
     config_branches: String,
     exec_branches: String,
     compass_branches: String,
@@ -220,12 +218,7 @@ struct DashboardConfig {
 
 impl Default for DashboardConfig {
     fn default() -> Self {
-        let default_pile = diagnostics_default_pile().unwrap_or_else(|| {
-            let repo_root = repo_root();
-            repo_root.join("self.pile")
-        });
         Self {
-            pile_path: default_pile.to_string_lossy().to_string(),
             config_branches: "config".to_string(),
             exec_branches: "main".to_string(),
             compass_branches: "compass".to_string(),
@@ -238,11 +231,17 @@ impl Default for DashboardConfig {
     }
 }
 
+fn default_pile_path() -> String {
+    let default_pile = diagnostics_default_pile().unwrap_or_else(|| {
+        let repo_root = repo_root();
+        repo_root.join("self.pile")
+    });
+    default_pile.to_string_lossy().to_string()
+}
+
 struct DashboardState {
     config: DashboardConfig,
-    repo: Option<Repository<Pile>>,
-    repo_open_path: Option<PathBuf>,
-    signing_key: SigningKey,
+    pile: PileRepoState,
     // Per-branch state — Checkout pattern (triblespace 0.26).
     // Checkout = TribleSet (facts) + CommitSet (continuation token).
     // .facts() for queries, .commits() for next delta, += for merge.
@@ -271,24 +270,11 @@ struct DashboardState {
     last_refresh_at: Option<Instant>,
 }
 
-impl Drop for DashboardState {
-    fn drop(&mut self) {
-        if let Some(repo) = self.repo.take() {
-            let pile = repo.into_storage();
-            if let Err(err) = pile.close() {
-                eprintln!("warning: failed to close pile cleanly: {err:?}");
-            }
-        }
-    }
-}
-
 impl Default for DashboardState {
     fn default() -> Self {
         Self {
             config: DashboardConfig::default(),
-            repo: None,
-            repo_open_path: None,
-            signing_key: random_signing_key(),
+            pile: PileRepoState::new(default_pile_path()),
             // Per-branch cached state
             config_co: None,
             exec_co: None,
@@ -561,21 +547,64 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
         "playground-diagnostics",
         DashboardState::default(),
         move |ui, state| {
-            // Open repo and refresh catalogs (must happen before section renders).
-            let repo_open_result = ensure_repo_open(state);
+            // Poll the background pile opener; if it just finished, clear cached checkouts.
+            let was_opening = state.pile.is_opening();
+            state.pile.poll();
+            if was_opening && !state.pile.is_opening() && state.pile.is_open() {
+                state.config_co = None;
+                state.exec_co = None;
+                state.compass_co = None;
+                state.local_messages_co = None;
+                state.relations_co = None;
+                state.teams_co = None;
+                state.branches.clear();
+            }
+
+            // Detect path change: if the edited path differs from the open path, close and reopen.
+            let edited_path = PathBuf::from(state.pile.pile_path().trim());
+            let path_changed = state.pile.open_path().map_or(false, |p| p != edited_path);
+            if path_changed {
+                state.pile.close();
+                state.config_co = None;
+                state.exec_co = None;
+                state.compass_co = None;
+                state.local_messages_co = None;
+                state.relations_co = None;
+                state.teams_co = None;
+                state.branches.clear();
+            }
+
+            // Auto-open: if the pile is not open and not opening and no error, start opening.
+            if !state.pile.is_open() && !state.pile.is_opening() && state.pile.last_error().is_none() {
+                state.pile.open();
+            }
+
+            if state.pile.is_opening() {
+                ui.ctx().request_repaint();
+            }
+
             let mut picker_branches = Vec::new();
-            if repo_open_result.is_ok() {
-                if let Some(repo) = state.repo.as_mut() {
-                    picker_branches = list_branches(repo.storage_mut()).unwrap_or_default();
-                    picker_branches
-                        .sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
-                }
+            if let Some(repo) = state.pile.repo_mut() {
+                picker_branches = list_branches(repo.storage_mut()).unwrap_or_default();
+                picker_branches
+                    .sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
             }
 
             ui.section("Config", |ui| {
                 ui.grid(|g| {
                     g.third(|ui| { ui.label(egui::RichText::new("Pile").color(color_muted())); });
-                    g.two_thirds(|ui| { ui.add(TextField::singleline(&mut state.config.pile_path)); });
+                    g.two_thirds(|ui| {
+                        let progress = if state.pile.is_opening() {
+                            // Bouncing segment animation while loading.
+                            let t = ui.input(|i| i.time) as f32;
+                            let pos = (t * 1.5).sin() * 0.5 + 0.5; // 0..1 ping-pong
+                            let width = 0.2;
+                            Some((pos - width * 0.5).max(0.0)..(pos + width * 0.5).min(1.0))
+                        } else {
+                            None
+                        };
+                        ui.add(TextField::singleline(state.pile.pile_path_mut()).progress(progress));
+                    });
 
                     g.third(|ui| { ui.label(egui::RichText::new("Config").color(color_muted())); });
                     g.two_thirds(|ui| {
@@ -609,7 +638,7 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
                 });
             });
 
-            if repo_open_result.is_ok() && should_refresh(&state) {
+            if state.pile.is_open() && should_refresh(&state) {
                 refresh_catalogs(state);
                 apply_branch_defaults(state);
                 state.last_refresh_at = Some(Instant::now());
@@ -628,7 +657,7 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
 
         // Pull workspace for blob reads.
         let exec_branches = state.config.exec_branches.clone();
-        let mut ws = state.repo.as_mut().and_then(|repo| {
+        let mut ws = state.pile.repo_mut().and_then(|repo| {
             let branch_entries = list_branches(repo.storage_mut()).ok()?;
             let lookup = BranchLookup::new(&branch_entries);
             let refs = parse_branch_list(&exec_branches);
@@ -797,7 +826,7 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
     // ── Overview ─
     nb.view(move |ui| {
         let state = dashboard.read_mut(ui);
-        let pile_path = state.config.pile_path.clone();
+        let pile_path = state.pile.pile_path().to_owned();
         let branches = state.branches.clone();
         ui.section("Overview", |ui| {
             ui.grid(|g| {
@@ -910,7 +939,7 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
 
         // Pull a workspace for blob reads before entering the section closure.
         let config_branches = state.config.config_branches.clone();
-        let mut ws = state.repo.as_mut().and_then(|repo| {
+        let mut ws = state.pile.repo_mut().and_then(|repo| {
             let branch_entries = list_branches(repo.storage_mut()).ok()?;
             let lookup = BranchLookup::new(&branch_entries);
             let refs = parse_branch_list(&config_branches);
@@ -943,7 +972,7 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
 
         // Pull workspace for blob reads.
         let exec_branches = state.config.exec_branches.clone();
-        let mut ws = state.repo.as_mut().and_then(|repo| {
+        let mut ws = state.pile.repo_mut().and_then(|repo| {
             let branch_entries = list_branches(repo.storage_mut()).ok()?;
             let lookup = BranchLookup::new(&branch_entries);
             let refs = parse_branch_list(&exec_branches);
@@ -984,7 +1013,7 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
 
         // Clone branch name before entering the section closure to avoid borrow conflicts.
         let compass_branches = state.config.compass_branches.clone();
-        let mut ws = state.repo.as_mut().and_then(|repo| {
+        let mut ws = state.pile.repo_mut().and_then(|repo| {
             let branch_entries = list_branches(repo.storage_mut()).ok()?;
             let lookup = BranchLookup::new(&branch_entries);
             let refs = parse_branch_list(&compass_branches);
@@ -1027,7 +1056,7 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
 
         // Pull workspace for relations blob reads (person labels).
         let relations_branches = state.config.relations_branches.clone();
-        let mut ws = state.repo.as_mut().and_then(|repo| {
+        let mut ws = state.pile.repo_mut().and_then(|repo| {
             let branch_entries = list_branches(repo.storage_mut()).ok()?;
             let lookup = BranchLookup::new(&branch_entries);
             let refs = parse_branch_list(&relations_branches);
@@ -1072,7 +1101,7 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
 
         // Pull a workspace for blob reads before entering the section closure.
         let relations_branches = state.config.relations_branches.clone();
-        let mut ws = state.repo.as_mut().and_then(|repo| {
+        let mut ws = state.pile.repo_mut().and_then(|repo| {
             let branch_entries = list_branches(repo.storage_mut()).ok()?;
             let lookup = BranchLookup::new(&branch_entries);
             let refs = parse_branch_list(&relations_branches);
@@ -1288,7 +1317,7 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
 
         // Pull workspace for blob reads.
         let teams_branches = state.config.teams_branches.clone();
-        let mut ws = state.repo.as_mut().and_then(|repo| {
+        let mut ws = state.pile.repo_mut().and_then(|repo| {
             let branch_entries = list_branches(repo.storage_mut()).ok()?;
             let lookup = BranchLookup::new(&branch_entries);
             let refs = parse_branch_list(&teams_branches);
@@ -1350,42 +1379,6 @@ pub fn run_diagnostics(
 }
 
 
-fn ensure_repo_open(state: &mut DashboardState) -> Result<(), String> {
-    let open_path = PathBuf::from(state.config.pile_path.trim());
-    let path_changed = state
-        .repo_open_path
-        .as_ref()
-        .map_or(true, |path| path != &open_path);
-    if path_changed || state.repo.is_none() {
-        if let Some(repo) = state.repo.take() {
-            let pile = repo.into_storage();
-            if let Err(err) = pile.close() {
-                eprintln!("warning: failed to close pile cleanly: {err:?}");
-            }
-        }
-        let mut pile = Pile::open(&open_path).map_err(|err| err.to_string())?;
-        if let Err(err) = pile.restore() {
-            if let Err(close_err) = pile.close() {
-                eprintln!("warning: failed to close pile cleanly: {close_err:?}");
-            }
-            return Err(err.to_string());
-        }
-        let repo = Repository::new(pile, state.signing_key.clone(), TribleSet::new())
-            .map_err(|err| format!("create repository: {err:?}"))?;
-        state.repo = Some(repo);
-        state.repo_open_path = Some(open_path);
-        // Reset per-branch cached state — old checkouts reference the previous pile.
-        state.config_co = None;
-        state.exec_co = None;
-        state.compass_co = None;
-        state.local_messages_co = None;
-        state.relations_co = None;
-        state.teams_co = None;
-        state.branches.clear();
-    }
-    Ok(())
-}
-
 fn should_refresh(state: &DashboardState) -> bool {
     if diagnostics_is_headless() {
         return true;
@@ -1429,7 +1422,7 @@ fn apply_branch_defaults(state: &mut DashboardState) {
 
     // Extract the branch name (ShortString, no blob read needed for lookup).
     // The branch field is a blob handle — pull a workspace for the read.
-    let branch = state.repo.as_mut().and_then(|repo| {
+    let branch = state.pile.repo_mut().and_then(|repo| {
         let branch_entries = list_branches(repo.storage_mut()).ok()?;
         let lookup = BranchLookup::new(&branch_entries);
         let refs = parse_branch_list(&state.config.config_branches);
@@ -1465,7 +1458,7 @@ fn catalog(co: &Option<Checkout>) -> &TribleSet {
 
 /// Refresh per-branch workspace + catalog state from the repository.
 fn refresh_catalogs(state: &mut DashboardState) {
-    let repo = match state.repo.as_mut() {
+    let repo = match state.pile.repo_mut() {
         Some(r) => r,
         None => return,
     };
@@ -3470,7 +3463,7 @@ fn send_local_message_from_ui(
     state.local_send_error = None;
     state.local_send_notice = None;
 
-    let Some(repo) = state.repo.as_mut() else {
+    let Some(repo) = state.pile.repo_mut() else {
         state.local_send_error = Some("Repository not open.".to_string());
         return;
     };
@@ -5225,93 +5218,54 @@ fn render_goal_card(ui: &mut egui::Ui, row: &CompassTaskRow, dep_indent: f32) ->
     let status_bg = status_color(&row.status);
     let card_bg = color_frame();
 
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 0.0;
-        if dep_indent > 0.0 {
-            ui.add_space(dep_indent);
-        }
+    if dep_indent > 0.0 {
+        ui.add_space(dep_indent);
+    }
 
-        egui::Frame::NONE
-            .fill(card_bg)
-            .corner_radius(egui::CornerRadius::same(4))
-            .inner_margin(egui::Margin {
-                left: 10,
-                right: 10,
-                top: 6,
-                bottom: 6,
-            })
-            .show(ui, |ui| {
-                let available_width = ui.available_width();
-                ui.set_min_width(available_width);
+    let w = ui.available_width() - dep_indent;
+    egui::Frame::NONE
+        .fill(card_bg)
+        .corner_radius(egui::CornerRadius::same(4))
+        .inner_margin(egui::Margin::symmetric(8, 4))
+        .show(ui, |ui| {
+            ui.set_min_width(w - 16.0);
 
-                // ── Row 1: status chip · title · [id] (and ^parent) ──
-                ui.horizontal(|ui| {
-                    render_goal_chip(ui, &row.status, status_bg);
-                    ui.add_space(6.0);
+            // Row 1: status chip · title · id
+            ui.horizontal(|ui| {
+                render_goal_chip(ui, &row.status, status_bg);
+                ui.label(egui::RichText::new(&row.title).monospace());
+                let id_text = if let Some(parent) = row.parent {
+                    format!("^{} {}", id_prefix(parent), row.id_prefix)
+                } else {
+                    row.id_prefix.clone()
+                };
+                ui.label(
+                    egui::RichText::new(id_text)
+                        .monospace()
+                        .small()
+                        .color(color_muted()),
+                );
+            });
 
-                    // Right-aligned id/parent label: measure width first.
-                    let id_text = if let Some(parent) = row.parent {
-                        format!("^{} [{}]", id_prefix(parent), row.id_prefix)
-                    } else {
-                        format!("[{}]", row.id_prefix)
-                    };
-                    let font_id = egui::TextStyle::Monospace.resolve(ui.style());
-                    let id_width = ui.fonts_mut(|fonts| {
-                        fonts
-                            .layout_no_wrap(id_text.clone(), font_id, egui::Color32::WHITE)
-                            .size()
-                            .x
-                    });
-                    let gap = 12.0;
-                    let title_width = (ui.available_width() - id_width - gap).max(40.0);
-
-                    ui.add_sized(
-                        [title_width, 0.0],
-                        egui::Label::new(egui::RichText::new(&row.title).monospace())
-                            .halign(egui::Align::LEFT)
-                            .wrap_mode(egui::TextWrapMode::Truncate),
-                    );
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(ui.available_width(), 0.0),
-                        egui::Layout::right_to_left(egui::Align::Center),
-                        |ui| {
-                            ui.label(
-                                egui::RichText::new(&id_text)
-                                    .monospace()
-                                    .color(color_muted()),
-                            );
-                        },
-                    );
+            // Row 2: tags + notes (compact, only if present)
+            let has_extras = !row.tags.is_empty() || row.note_count > 0;
+            if has_extras {
+                ui.horizontal_wrapped(|ui| {
+                    for tag in &row.tags {
+                        let tag_bg = colorhash::ral_categorical(tag.as_bytes());
+                        render_goal_chip(ui, &format!("#{tag}"), tag_bg);
+                    }
+                    if row.note_count > 0 {
+                        render_goal_chip(
+                            ui,
+                            &format!("{}n", row.note_count),
+                            color_muted(),
+                        );
+                    }
                 });
-
-                // ── Row 2: tag chips + note badge (only when there is something to show) ──
-                let has_tags = !row.tags.is_empty();
-                let has_notes = row.note_count > 0;
-                if has_tags || has_notes {
-                    ui.add_space(3.0);
-                    ui.horizontal_wrapped(|ui| {
-                        for tag in &row.tags {
-                            let tag_bg = colorhash::ral_categorical(tag.as_bytes());
-                            render_goal_chip(ui, &format!("#{tag}"), tag_bg);
-                        }
-                        if has_notes {
-                            let muted = color_muted();
-                            render_goal_chip(
-                                ui,
-                                &format!(
-                                    "{} note{}",
-                                    row.note_count,
-                                    if row.note_count == 1 { "" } else { "s" }
-                                ),
-                                muted,
-                            );
-                        }
-                    });
-                }
-            })
-    })
-    .inner
-    .response
+            }
+        })
+        .response
 }
 
 fn render_compass_swimlane_row(
@@ -5353,39 +5307,29 @@ fn render_compass_swimlane_row(
 
     if is_expanded {
         let task_notes = notes.get(&row.id).map(Vec::as_slice).unwrap_or(&[]);
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 0.0;
-            if dep_indent > 0.0 {
-                ui.add_space(dep_indent);
-            }
-            egui::Frame::NONE
-                .fill(egui::Color32::TRANSPARENT)
-                .stroke(outline)
-                .corner_radius(egui::CornerRadius::same(0))
-                .inner_margin(egui::Margin::symmetric(10, 6))
-                .show(ui, |ui| {
-                    let available_width = ui.available_width();
-                    ui.set_min_width(available_width);
-                    ui.set_max_width(available_width);
-
-                    // Frame::show inherits the current layout; force a vertical stack for notes.
-                    ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
-                        if task_notes.is_empty() {
-                            ui.small("(no notes)");
-                            return;
-                        }
-                        for note in task_notes {
-                            ui.small(&note.at);
-                            ui.add(
-                                egui::Label::new(egui::RichText::new(&note.body))
-                                    .wrap_mode(egui::TextWrapMode::Wrap),
-                            );
-                            ui.add_space(6.0);
-                        }
-                    });
-                });
-        });
-        ui.add_space(6.0);
+        if dep_indent > 0.0 {
+            ui.add_space(dep_indent);
+        }
+        egui::Frame::NONE
+            .stroke(outline)
+            .inner_margin(egui::Margin::symmetric(8, 4))
+            .show(ui, |ui| {
+                if task_notes.is_empty() {
+                    ui.small("(no notes)");
+                    return;
+                }
+                for note in task_notes {
+                    ui.label(
+                        egui::RichText::new(&note.at).small().color(color_muted()),
+                    );
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(&note.body))
+                            .wrap_mode(egui::TextWrapMode::Wrap),
+                    );
+                    ui.add_space(4.0);
+                }
+            });
+        ui.add_space(4.0);
     }
 
     // Draw a small "dependency gutter" to the left of the goal box.
@@ -5715,8 +5659,4 @@ fn format_id(labels: &HashMap<Id, String>, id: Id) -> String {
 fn repo_root() -> PathBuf {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     manifest.parent().map(PathBuf::from).unwrap_or(manifest)
-}
-
-fn random_signing_key() -> SigningKey {
-    SigningKey::generate(&mut OsRng)
 }
