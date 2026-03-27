@@ -744,7 +744,7 @@ fn cmd_list(
         } else {
             format!("  [{}]", tags.join(", "))
         };
-        println!("{}  {}  {}{}", &hash[..12], fname, mime, tag_str);
+        println!("{}  {}  {}{}", hash, fname, mime, tag_str);
     }
 
     Ok(())
@@ -1063,7 +1063,7 @@ fn cmd_search(
         } else {
             format!("  [{}]", tags.join(", "))
         };
-        println!("{}  {}  {}{}", &hash[..12], fname, mime, tag_str);
+        println!("{}  {}  {}{}", hash, fname, mime, tag_str);
     }
 
     Ok(())
