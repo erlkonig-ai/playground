@@ -1642,10 +1642,26 @@ fn cmd_list(
         // Backlink tag filter: check tags of latest versions that link TO this version.
         if has_backlink_filter {
             let mut backlink_tags: Vec<Id> = Vec::new();
-            for source_vid in find!(
+            // Check backlinks to both the version and the fragment ID,
+            // since existing data may reference either.
+            let mut all_backlinks: Vec<Id> = find!(
                 src: Id,
                 pattern!(&space, [{ ?src @ wiki::links_to: vid }])
-            ) {
+            ).collect();
+            all_backlinks.extend(find!(
+                src: Id,
+                pattern!(&space, [{ ?src @ wiki::links_to: frag_id }])
+            ));
+            all_backlinks.sort();
+            all_backlinks.dedup();
+            let latest_backlinks: Vec<&Id> = all_backlinks.iter().filter(|s| latest_vids.contains(*s)).collect();
+            if !all_backlinks.is_empty() || !latest_backlinks.is_empty() {
+                static DBG_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                if DBG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 3 {
+                    eprintln!("DEBUG: vid={vid:x} all_backlinks={} latest={}", all_backlinks.len(), latest_backlinks.len());
+                }
+            }
+            for &source_vid in &all_backlinks {
                 if latest_vids.contains(&source_vid) {
                     backlink_tags.extend(tags_of(&space, source_vid));
                 }
