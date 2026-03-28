@@ -15,7 +15,7 @@ base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 eframe = { version = "0.33", optional = true, features = ["persistence", "wgpu"] }
-GORBIE = { version = "0.9.6", optional = true, features = ["triblespace"] }
+GORBIE = { path = "../GORBIE", optional = true, features = ["triblespace"] }
 egui_plot = { version = "0.34", optional = true }
 hifitime = "4"
 libc = "0.2"

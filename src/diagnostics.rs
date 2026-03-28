@@ -104,10 +104,8 @@ mod reason_events {
 // ── Layout constants ────────────────────────────────────────────────
 const ACTIVITY_TIMELINE_HEIGHT: f32 = 980.0;
 const TURN_MEMORY_MAX_ROWS: usize = 160;
-const TIMELINE_DEFAULT_LIMIT: usize = 300;
-const TIMELINE_LIMIT_PRESETS: [usize; 4] = [100, 300, 1000, 3000];
-const TIMELINE_LIMIT_MIN: usize = 10;
-const TIMELINE_LIMIT_MAX: usize = 50_000;
+const TIMELINE_INITIAL_LIMIT: usize = 100;
+const TIMELINE_LOAD_MORE: usize = 100;
 const CONTEXT_TREE_HEIGHT: f32 = 720.0;
 const CONTEXT_ORIGIN_LIMIT: usize = 64;
 const LOCAL_COMPOSE_HEIGHT: f32 = 80.0;
@@ -246,30 +244,28 @@ mod relations {
 
 #[derive(Clone, Debug)]
 struct DashboardConfig {
-    config_branches: String,
-    exec_branches: String,
-    compass_branches: String,
-    local_message_branches: String,
-    relations_branches: String,
+    /// Exec branch name — set from agent config, defaults to "cognition".
+    exec_branch: String,
     local_me: String,
     local_peer: String,
-    teams_branches: String,
 }
 
 impl Default for DashboardConfig {
     fn default() -> Self {
         Self {
-            config_branches: "config".to_string(),
-            exec_branches: "main".to_string(),
-            compass_branches: "compass".to_string(),
-            local_message_branches: "local-messages".to_string(),
-            relations_branches: "relations".to_string(),
+            exec_branch: "cognition".to_string(),
             local_me: "jp".to_string(),
             local_peer: "agent".to_string(),
-            teams_branches: "teams".to_string(),
         }
     }
 }
+
+// Fixed branch names — no configuration needed.
+const BRANCH_CONFIG: &str = "config";
+const BRANCH_COMPASS: &str = "compass";
+const BRANCH_LOCAL_MESSAGES: &str = "local-messages";
+const BRANCH_RELATIONS: &str = "relations";
+const BRANCH_TEAMS: &str = "teams";
 
 fn default_pile_path() -> String {
     let default_pile = diagnostics_default_pile().unwrap_or_else(|| {
@@ -331,7 +327,7 @@ impl Default for DashboardState {
             context_selection_stack: Vec::new(),
             context_show_children: false,
             context_show_origins: false,
-            timeline_limit: TIMELINE_DEFAULT_LIMIT,
+            timeline_limit: TIMELINE_INITIAL_LIMIT,
             last_refresh_at: None,
         }
     }
@@ -622,21 +618,13 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
                 ui.ctx().request_repaint();
             }
 
-            let mut picker_branches = Vec::new();
-            if let Some(repo) = state.pile.repo_mut() {
-                picker_branches = list_branches(repo.storage_mut()).unwrap_or_default();
-                picker_branches
-                    .sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
-            }
-
-            ui.section("Config", |ui| {
+            ui.section("Overview", |ui| {
                 ui.grid(|g| {
-                    g.third(|ui| { ui.label(egui::RichText::new("Pile").color(color_muted())); });
-                    g.two_thirds(|ui| {
+                    // Editable pile path with loading indicator.
+                    g.full(|ui| {
                         let progress = if state.pile.is_opening() {
-                            // Bouncing segment animation while loading.
                             let t = ui.input(|i| i.time) as f32;
-                            let pos = (t * 1.5).sin() * 0.5 + 0.5; // 0..1 ping-pong
+                            let pos = (t * 1.5).sin() * 0.5 + 0.5;
                             let width = 0.2;
                             Some((pos - width * 0.5).max(0.0)..(pos + width * 0.5).min(1.0))
                         } else {
@@ -645,35 +633,81 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
                         ui.add(TextField::singleline(state.pile.pile_path_mut()).progress(progress));
                     });
 
-                    g.third(|ui| { ui.label(egui::RichText::new("Config").color(color_muted())); });
-                    g.two_thirds(|ui| {
-                        render_branch_picker(ui, "config_branch_picker", &picker_branches, &mut state.config.config_branches);
-                    });
+                    // Branch listing.
+                    let branches = &state.branches;
+                    if !branches.is_empty() {
+                        let mut primary: Vec<&BranchEntry> = Vec::new();
+                        let mut extra: Vec<&BranchEntry> = Vec::new();
+                        for branch in branches {
+                            let label = branch.name.as_deref().unwrap_or("<unnamed>");
+                            if label.contains("--orphan-") || label.starts_with('<') {
+                                extra.push(branch);
+                            } else {
+                                primary.push(branch);
+                            }
+                        }
 
-                    g.third(|ui| { ui.label(egui::RichText::new("Exec").color(color_muted())); });
-                    g.two_thirds(|ui| {
-                        render_branch_picker(ui, "exec_branch_picker", &picker_branches, &mut state.config.exec_branches);
-                    });
 
-                    g.third(|ui| { ui.label(egui::RichText::new("Compass").color(color_muted())); });
-                    g.two_thirds(|ui| {
-                        render_branch_picker(ui, "compass_branch_picker", &picker_branches, &mut state.config.compass_branches);
-                    });
+                        for branch in &primary {
+                            let name = branch.name.as_deref().unwrap_or("<unnamed>");
+                            let fill = colorhash::ral_categorical(name.as_bytes());
+                            let text_color = colorhash::text_color_on(fill);
+                            g.third(|ui| {
+                                egui::Frame::NONE
+                                    .fill(fill)
+                                    .corner_radius(egui::CornerRadius::same(5))
+                                    .inner_margin(egui::Margin::symmetric(8, 2))
+                                    .show(ui, |ui| {
+                                        ui.set_min_width(ui.available_width());
+                                        ui.horizontal(|ui| {
+                                            ui.spacing_mut().item_spacing.x = 4.0;
+                                            ui.label(egui::RichText::new(name).color(text_color).small());
+                                            ui.label(
+                                                egui::RichText::new(format!("{:x}", branch.id))
+                                                    .monospace()
+                                                    .color(text_color)
+                                                    .small(),
+                                            );
+                                        });
+                                    });
+                            });
+                        }
 
-                    g.third(|ui| { ui.label(egui::RichText::new("Local msgs").color(color_muted())); });
-                    g.two_thirds(|ui| {
-                        render_branch_picker(ui, "local_message_branch_picker", &picker_branches, &mut state.config.local_message_branches);
-                    });
-
-                    g.third(|ui| { ui.label(egui::RichText::new("Relations").color(color_muted())); });
-                    g.two_thirds(|ui| {
-                        render_branch_picker(ui, "relations_branch_picker", &picker_branches, &mut state.config.relations_branches);
-                    });
-
-                    g.third(|ui| { ui.label(egui::RichText::new("Teams").color(color_muted())); });
-                    g.two_thirds(|ui| {
-                        render_branch_picker(ui, "teams_branch_picker", &picker_branches, &mut state.config.teams_branches);
-                    });
+                        if !extra.is_empty() {
+                            g.full(|ui| {
+                                ui.section_collapsed(&format!("{} extra branches", extra.len()), |ui| {
+                                    ui.grid(|g| {
+                                        for branch in &extra {
+                                            let name = branch.name.as_deref().unwrap_or("<unnamed>");
+                                            let fill = colorhash::ral_categorical(name.as_bytes());
+                                            let text_color = colorhash::text_color_on(fill);
+                                            g.third(|ui| {
+                                                egui::Frame::NONE
+                                                    .fill(fill)
+                                                    .corner_radius(egui::CornerRadius::same(5))
+                                                    .inner_margin(egui::Margin::symmetric(8, 2))
+                                                    .show(ui, |ui| {
+                                                        ui.set_min_width(ui.available_width());
+                                                        ui.horizontal(|ui| {
+                                                            ui.spacing_mut().item_spacing.x = 4.0;
+                                                            ui.label(
+                                                                egui::RichText::new(name).color(text_color).small(),
+                                                            );
+                                                            ui.label(
+                                                                egui::RichText::new(id_prefix(branch.id))
+                                                                    .monospace()
+                                                                    .color(color_muted())
+                                                                    .small(),
+                                                            );
+                                                        });
+                                                    });
+                                            });
+                                        }
+                                    });
+                                });
+                            });
+                        }
+                    }
                 });
             });
 
@@ -711,11 +745,11 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
         let mut state = dashboard.read_mut(ui);
 
         // Pull workspace for blob reads.
-        let exec_branches = state.config.exec_branches.clone();
+        let exec_branch = state.config.exec_branch.clone();
         let mut ws = state.pile.repo_mut().and_then(|repo| {
             let branch_entries = list_branches(repo.storage_mut()).ok()?;
             let lookup = BranchLookup::new(&branch_entries);
-            let refs = parse_branch_list(&exec_branches);
+            let refs = parse_branch_list(&exec_branch);
             let ids = resolve_branch_ids(&lookup, &refs).ok()?;
             repo.pull(*ids.first()?).ok()
         });
@@ -730,9 +764,9 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
         let timeline_limit = state.timeline_limit;
 
         let exec_branch_err =
-            if state.exec_cat.co.is_none() && !state.config.exec_branches.trim().is_empty() {
+            if state.exec_cat.co.is_none() && !state.config.exec_branch.trim().is_empty() {
                 let branch_lookup = BranchLookup::new(&state.branches);
-                let refs = parse_branch_list(&state.config.exec_branches);
+                let refs = parse_branch_list(&state.config.exec_branch);
                 resolve_branch_ids(&branch_lookup, &refs).err()
             } else {
                 None
@@ -740,38 +774,6 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
 
         ui.section("Activity", |ui| {
             ui.grid(|g| g.full(|ui| {
-            let mut timeline_limit_changed = false;
-            ui.horizontal_wrapped(|ui| {
-                ui.small("Recent events:");
-                for preset in TIMELINE_LIMIT_PRESETS {
-                    let selected = state.timeline_limit == preset;
-                    let label = if selected {
-                        format!("[{preset}]")
-                    } else {
-                        preset.to_string()
-                    };
-                    if ui.add(Button::new(label)).clicked() && !selected {
-                        state.timeline_limit = preset;
-                        timeline_limit_changed = true;
-                    }
-                }
-                ui.small("custom");
-                let mut custom_limit = state.timeline_limit as u64;
-                if ui
-                    .add(
-                        egui::DragValue::new(&mut custom_limit)
-                            .range(TIMELINE_LIMIT_MIN as u64..=TIMELINE_LIMIT_MAX as u64),
-                    )
-                    .changed()
-                {
-                    state.timeline_limit = custom_limit as usize;
-                    timeline_limit_changed = true;
-                }
-            });
-            if timeline_limit_changed {
-                // Force catalog refresh on next frame.
-                state.last_refresh_at = None;
-            }
 
             if let Some(err) = &exec_branch_err {
                 ui.colored_label(egui::Color32::RED, format!("Exec branch: {err}"));
@@ -818,21 +820,16 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
 
             if timeline_rows.is_empty() {
                 ui.small("No activity yet.");
-            } else if timeline_rows.len() < timeline_total_rows {
-                ui.small(format!(
-                    "Showing latest {} of {} events.",
-                    timeline_rows.len(),
-                    timeline_total_rows
-                ));
-            } else {
-                ui.small(format!("{timeline_total_rows} events."));
-            }
-
-            if timeline_rows.is_empty() {
                 return;
             }
-            if let Some(request_id) = render_activity_timeline(ui, now_key, &timeline_rows) {
+
+            let has_more = timeline_rows.len() < timeline_total_rows;
+            let resp = render_activity_timeline(ui, now_key, &timeline_rows, has_more);
+            if let Some(request_id) = resp.context_clicked {
                 state.context_float_request_id = Some(request_id);
+            }
+            if resp.wants_more {
+                state.timeline_limit += TIMELINE_LOAD_MORE;
             }
 
             // Render context float if one is open.
@@ -878,126 +875,15 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
         });
     });
 
-    // ── Overview ─
-    nb.view(move |ui| {
-        let state = dashboard.read_mut(ui);
-        let pile_path = state.pile.pile_path().to_owned();
-        let branches = state.branches.clone();
-        ui.section("Overview", |ui| {
-            ui.grid(|g| {
-                // Pile path in a monospace frame (full width).
-                g.full(|ui| {
-                    let frame_bg = color_frame();
-                    let frame_text = colorhash::text_color_on(frame_bg);
-                    egui::Frame::NONE
-                        .fill(frame_bg)
-                        .corner_radius(egui::CornerRadius::same(4))
-                        .inner_margin(egui::Margin::symmetric(8, 4))
-                        .show(ui, |ui| {
-                            ui.set_min_width(ui.available_width());
-                            ui.label(egui::RichText::new(&pile_path).monospace().small().color(frame_text));
-                        });
-                });
-
-                if !branches.is_empty() {
-                    let mut primary: Vec<&BranchEntry> = Vec::new();
-                    let mut extra: Vec<&BranchEntry> = Vec::new();
-                    for branch in &branches {
-                        let label = branch.name.as_deref().unwrap_or("<unnamed>");
-                        if label.contains("--orphan-") || label.starts_with('<') {
-                            extra.push(branch);
-                        } else {
-                            primary.push(branch);
-                        }
-                    }
-
-                    g.full(|ui| {
-                        ui.small(format!(
-                            "{} branches ({} primary, {} extra)",
-                            branches.len(),
-                            primary.len(),
-                            extra.len(),
-                        ));
-                    });
-
-                    // Primary branches as colored chips (3 per row).
-                    for branch in &primary {
-                        let name = branch.name.as_deref().unwrap_or("<unnamed>");
-                        let fill = colorhash::ral_categorical(name.as_bytes());
-                        let text_color = colorhash::text_color_on(fill);
-                        g.third(|ui| {
-                            let w = ui.available_width();
-                            egui::Frame::NONE
-                                .fill(fill)
-                                .corner_radius(egui::CornerRadius::same(5))
-                                .inner_margin(egui::Margin::symmetric(8, 2))
-                                .show(ui, |ui| {
-                                    ui.set_min_width(w - 16.0);
-                                    ui.horizontal(|ui| {
-                                        ui.spacing_mut().item_spacing.x = 4.0;
-                                        ui.label(egui::RichText::new(name).color(text_color).small());
-                                        ui.label(
-                                            egui::RichText::new(id_prefix(branch.id))
-                                                .monospace()
-                                                .color(color_muted())
-                                                .small(),
-                                        );
-                                    });
-                                });
-                        });
-                    }
-
-                    // Extra branches in a collapsed section.
-                    if !extra.is_empty() {
-                        g.full(|ui| {
-                            ui.section_collapsed(&format!("{} extra branches", extra.len()), |ui| {
-                                ui.grid(|g| {
-                                    for branch in &extra {
-                                        let name = branch.name.as_deref().unwrap_or("<unnamed>");
-                                        let fill = colorhash::ral_categorical(name.as_bytes());
-                                        let text_color = colorhash::text_color_on(fill);
-                                        g.third(|ui| {
-                                            let w = ui.available_width();
-                                            egui::Frame::NONE
-                                                .fill(fill)
-                                                .corner_radius(egui::CornerRadius::same(5))
-                                                .inner_margin(egui::Margin::symmetric(8, 2))
-                                                .show(ui, |ui| {
-                                                    ui.set_min_width(w - 16.0);
-                                                    ui.horizontal(|ui| {
-                                                        ui.spacing_mut().item_spacing.x = 4.0;
-                                                        ui.label(
-                                                            egui::RichText::new(name).color(text_color).small(),
-                                                        );
-                                                        ui.label(
-                                                            egui::RichText::new(id_prefix(branch.id))
-                                                                .monospace()
-                                                                .color(color_muted())
-                                                                .small(),
-                                                        );
-                                                    });
-                                                });
-                                        });
-                                    }
-                                });
-                            });
-                        });
-                    }
-                }
-            });
-        });
-    });
-
     // ── Agent Config ─
     nb.view(move |ui| {
         let mut state = dashboard.read_mut(ui);
 
         // Pull a workspace for blob reads before entering the section closure.
-        let config_branches = state.config.config_branches.clone();
         let mut ws = state.pile.repo_mut().and_then(|repo| {
             let branch_entries = list_branches(repo.storage_mut()).ok()?;
             let lookup = BranchLookup::new(&branch_entries);
-            let refs = parse_branch_list(&config_branches);
+            let refs = parse_branch_list(BRANCH_CONFIG);
             let ids = resolve_branch_ids(&lookup, &refs).ok()?;
             repo.pull(*ids.first()?).ok()
         });
@@ -1005,9 +891,9 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
         ui.section("Agent Config", |ui| {
             ui.grid(|g| g.full(|ui| {
             // Show branch resolution error when the configured branch can't be found.
-            if state.config_cat.co.is_none() && !state.config.config_branches.trim().is_empty() {
+            if state.config_cat.co.is_none() {
                 let branch_lookup = BranchLookup::new(&state.branches);
-                let refs = parse_branch_list(&state.config.config_branches);
+                let refs = parse_branch_list(BRANCH_CONFIG);
                 if let Err(err) = resolve_branch_ids(&branch_lookup, &refs) {
                     ui.colored_label(egui::Color32::RED, err);
                     return;
@@ -1026,11 +912,11 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
         let mut state = dashboard.read_mut(ui);
 
         // Pull workspace for blob reads.
-        let exec_branches = state.config.exec_branches.clone();
+        let exec_branch = state.config.exec_branch.clone();
         let mut ws = state.pile.repo_mut().and_then(|repo| {
             let branch_entries = list_branches(repo.storage_mut()).ok()?;
             let lookup = BranchLookup::new(&branch_entries);
-            let refs = parse_branch_list(&exec_branches);
+            let refs = parse_branch_list(&exec_branch);
             let ids = resolve_branch_ids(&lookup, &refs).ok()?;
             repo.pull(*ids.first()?).ok()
         });
@@ -1066,12 +952,11 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
     nb.view(move |ui| {
         let mut state = dashboard.read_mut(ui);
 
-        // Clone branch name before entering the section closure to avoid borrow conflicts.
-        let compass_branches = state.config.compass_branches.clone();
+        // Pull workspace before entering the section closure to avoid borrow conflicts.
         let mut ws = state.pile.repo_mut().and_then(|repo| {
             let branch_entries = list_branches(repo.storage_mut()).ok()?;
             let lookup = BranchLookup::new(&branch_entries);
-            let refs = parse_branch_list(&compass_branches);
+            let refs = parse_branch_list(BRANCH_COMPASS);
             let ids = resolve_branch_ids(&lookup, &refs).ok()?;
             repo.pull(*ids.first()?).ok()
         });
@@ -1079,9 +964,9 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
         // Resolve branch error and clone the catalog before the section closure
         // so we don't hold an immutable borrow on state while also borrowing it mutably.
         let compass_branch_err =
-            if state.compass_cat.co.is_none() && !state.config.compass_branches.trim().is_empty() {
+            if state.compass_cat.co.is_none() {
                 let branch_lookup = BranchLookup::new(&state.branches);
-                let refs = parse_branch_list(&state.config.compass_branches);
+                let refs = parse_branch_list(BRANCH_COMPASS);
                 resolve_branch_ids(&branch_lookup, &refs).err()
             } else {
                 None
@@ -1110,11 +995,10 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
         let mut state = dashboard.read_mut(ui);
 
         // Pull workspace for relations blob reads (person labels).
-        let relations_branches = state.config.relations_branches.clone();
         let mut ws = state.pile.repo_mut().and_then(|repo| {
             let branch_entries = list_branches(repo.storage_mut()).ok()?;
             let lookup = BranchLookup::new(&branch_entries);
-            let refs = parse_branch_list(&relations_branches);
+            let refs = parse_branch_list(BRANCH_RELATIONS);
             let ids = resolve_branch_ids(&lookup, &refs).ok()?;
             repo.pull(*ids.first()?).ok()
         });
@@ -1132,9 +1016,9 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
         let branches = state.branches.clone();
 
         let local_message_err =
-            if state.local_messages_cat.co.is_none() && !state.config.local_message_branches.trim().is_empty() {
+            if state.local_messages_cat.co.is_none() {
                 let branch_lookup = BranchLookup::new(&state.branches);
-                let refs = parse_branch_list(&state.config.local_message_branches);
+                let refs = parse_branch_list(BRANCH_LOCAL_MESSAGES);
                 resolve_branch_ids(&branch_lookup, &refs).err()
             } else {
                 None
@@ -1155,20 +1039,19 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
         let mut state = dashboard.read_mut(ui);
 
         // Pull a workspace for blob reads before entering the section closure.
-        let relations_branches = state.config.relations_branches.clone();
         let mut ws = state.pile.repo_mut().and_then(|repo| {
             let branch_entries = list_branches(repo.storage_mut()).ok()?;
             let lookup = BranchLookup::new(&branch_entries);
-            let refs = parse_branch_list(&relations_branches);
+            let refs = parse_branch_list(BRANCH_RELATIONS);
             let ids = resolve_branch_ids(&lookup, &refs).ok()?;
             repo.pull(*ids.first()?).ok()
         });
 
         ui.section("Relations", |ui| {
             // Show branch resolution error when the configured branch can't be found.
-            if state.relations_cat.co.is_none() && !state.config.relations_branches.trim().is_empty() {
+            if state.relations_cat.co.is_none() {
                 let branch_lookup = BranchLookup::new(&state.branches);
-                let refs = parse_branch_list(&state.config.relations_branches);
+                let refs = parse_branch_list(BRANCH_RELATIONS);
                 if let Err(err) = resolve_branch_ids(&branch_lookup, &refs) {
                     ui.colored_label(egui::Color32::RED, err);
                     return;
@@ -1371,19 +1254,18 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
         let mut state = dashboard.read_mut(ui);
 
         // Pull workspace for blob reads.
-        let teams_branches = state.config.teams_branches.clone();
         let mut ws = state.pile.repo_mut().and_then(|repo| {
             let branch_entries = list_branches(repo.storage_mut()).ok()?;
             let lookup = BranchLookup::new(&branch_entries);
-            let refs = parse_branch_list(&teams_branches);
+            let refs = parse_branch_list(BRANCH_TEAMS);
             let ids = resolve_branch_ids(&lookup, &refs).ok()?;
             repo.pull(*ids.first()?).ok()
         });
 
         let teams_branch_err =
-            if state.teams_cat.co.is_none() && !state.config.teams_branches.trim().is_empty() {
+            if state.teams_cat.co.is_none() {
                 let branch_lookup = BranchLookup::new(&state.branches);
-                let refs = parse_branch_list(&state.config.teams_branches);
+                let refs = parse_branch_list(BRANCH_TEAMS);
                 resolve_branch_ids(&branch_lookup, &refs).err()
             } else {
                 None
@@ -1475,31 +1357,19 @@ fn apply_branch_defaults(state: &mut DashboardState) {
         return;
     }
 
-    // Extract the branch name (ShortString, no blob read needed for lookup).
+    // Extract the exec branch name from the agent config.
     // The branch field is a blob handle — pull a workspace for the read.
     let branch = state.pile.repo_mut().and_then(|repo| {
         let branch_entries = list_branches(repo.storage_mut()).ok()?;
         let lookup = BranchLookup::new(&branch_entries);
-        let refs = parse_branch_list(&state.config.config_branches);
+        let refs = parse_branch_list(BRANCH_CONFIG);
         let ids = resolve_branch_ids(&lookup, &refs).ok()?;
         let mut ws = repo.pull(*ids.first()?).ok()?;
         load_optional_string_attr(config_data, &mut ws, config_id, playground_config::branch)
     });
 
     if let Some(branch) = branch {
-        state.config.exec_branches = branch;
-    }
-    if state.config.compass_branches.is_empty() {
-        state.config.compass_branches = "compass".to_string();
-    }
-    if state.config.local_message_branches.is_empty() {
-        state.config.local_message_branches = "local-messages".to_string();
-    }
-    if state.config.relations_branches.is_empty() {
-        state.config.relations_branches = "relations".to_string();
-    }
-    if state.config.teams_branches.is_empty() {
-        state.config.teams_branches = "teams".to_string();
+        state.config.exec_branch = branch;
     }
 
     state.config_last_applied_id = Some(config_id);
@@ -1632,20 +1502,13 @@ fn refresh_catalogs(state: &mut DashboardState) {
         }
     }
 
-    let config_branches = state.config.config_branches.clone();
-    let exec_branches = state.config.exec_branches.clone();
-    let compass_branches = state.config.compass_branches.clone();
-    let local_message_branches = state.config.local_message_branches.clone();
-    let relations_branches = state.config.relations_branches.clone();
-    let teams_branches = state.config.teams_branches.clone();
-
     let chunk = HISTORY_CHUNK_SIZE;
-    refresh_role(repo, &branch_lookup, &config_branches, &mut state.config_cat, chunk);
-    refresh_role(repo, &branch_lookup, &exec_branches, &mut state.exec_cat, chunk);
-    refresh_role(repo, &branch_lookup, &compass_branches, &mut state.compass_cat, chunk);
-    refresh_role(repo, &branch_lookup, &local_message_branches, &mut state.local_messages_cat, chunk);
-    refresh_role(repo, &branch_lookup, &relations_branches, &mut state.relations_cat, chunk);
-    refresh_role(repo, &branch_lookup, &teams_branches, &mut state.teams_cat, chunk);
+    refresh_role(repo, &branch_lookup, BRANCH_CONFIG, &mut state.config_cat, chunk);
+    refresh_role(repo, &branch_lookup, &state.config.exec_branch, &mut state.exec_cat, chunk);
+    refresh_role(repo, &branch_lookup, BRANCH_COMPASS, &mut state.compass_cat, chunk);
+    refresh_role(repo, &branch_lookup, BRANCH_LOCAL_MESSAGES, &mut state.local_messages_cat, chunk);
+    refresh_role(repo, &branch_lookup, BRANCH_RELATIONS, &mut state.relations_cat, chunk);
+    refresh_role(repo, &branch_lookup, BRANCH_TEAMS, &mut state.teams_cat, chunk);
 
     state.now_key = epoch_key(now_epoch());
 }
@@ -3262,95 +3125,6 @@ fn render_person_picker(
         });
 }
 
-fn render_branch_picker(
-    ui: &mut egui::Ui,
-    id_salt: &'static str,
-    branches: &[BranchEntry],
-    raw: &mut String,
-) {
-    if branches.is_empty() {
-        return;
-    }
-
-    let mut name_counts: HashMap<String, usize> = HashMap::new();
-    for branch in branches {
-        if let Some(name) = branch.name.as_ref() {
-            *name_counts.entry(name.clone()).or_insert(0) += 1;
-        }
-    }
-
-    let refs = parse_branch_list(raw);
-    let lookup = BranchLookup::new(branches);
-    let selected_ids = resolve_branch_ids(&lookup, &refs).unwrap_or_default();
-
-    let selected_text = if selected_ids.is_empty() {
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            "Pick...".to_string()
-        } else {
-            trimmed.to_string()
-        }
-    } else if selected_ids.len() == 1 {
-        let id = selected_ids[0];
-        branches
-            .iter()
-            .find(|branch| branch.id == id)
-            .map(branch_display)
-            .unwrap_or_else(|| format!("{} ({})", "<branch>", id_prefix(id)))
-    } else {
-        format!("{} branches", selected_ids.len())
-    };
-
-    let mut selected: HashSet<Id> = selected_ids.iter().copied().collect();
-    let mut changed = false;
-    egui::ComboBox::from_id_salt(id_salt)
-        .selected_text(selected_text)
-        .width(ui.available_width())
-        .show_ui(ui, |ui| {
-            if ui.button("Clear").clicked() {
-                selected.clear();
-                changed = true;
-            }
-            ui.separator();
-            for branch in branches {
-                let display = branch_display(branch);
-                let mut is_selected = selected.contains(&branch.id);
-                if ui.checkbox(&mut is_selected, display).changed() {
-                    changed = true;
-                    if is_selected {
-                        selected.insert(branch.id);
-                    } else {
-                        selected.remove(&branch.id);
-                    }
-                }
-            }
-        });
-
-    if changed {
-        let mut parts = Vec::new();
-        for branch in branches {
-            if selected.contains(&branch.id) {
-                parts.push(branch_ref(branch, &name_counts));
-            }
-        }
-        *raw = parts.join(",");
-    }
-}
-
-fn branch_display(branch: &BranchEntry) -> String {
-    let name = branch.name.as_deref().unwrap_or("<unnamed>");
-    format!("{name} ({})", id_prefix(branch.id))
-}
-
-fn branch_ref(branch: &BranchEntry, name_counts: &HashMap<String, usize>) -> String {
-    if let Some(name) = branch.name.as_ref() {
-        if !name.starts_with('<') && name_counts.get(name).copied().unwrap_or(0) == 1 {
-            return name.clone();
-        }
-    }
-    format!("{:x}", branch.id)
-}
-
 fn render_teams_conversations(
     ui: &mut GORBIE::CardCtx<'_>,
     state: &mut DashboardState,
@@ -3563,7 +3337,7 @@ fn send_local_message_from_ui(
     }
 
     let branch_lookup = BranchLookup::new(branches);
-    let refs = parse_branch_list(&state.config.local_message_branches);
+    let refs = parse_branch_list(BRANCH_LOCAL_MESSAGES);
     let branch_id = match resolve_single_branch(&branch_lookup, &refs) {
         Ok(branch_id) => branch_id,
         Err(err) => {
@@ -4105,7 +3879,13 @@ fn mask_secret(secret: &str) -> String {
     format!("{prefix}…{suffix}")
 }
 
-fn render_activity_timeline(ui: &mut egui::Ui, now_key: i128, rows: &[TimelineRow]) -> Option<Id> {
+struct TimelineResponse {
+    context_clicked: Option<Id>,
+    /// The user scrolled near the bottom — load more events.
+    wants_more: bool,
+}
+
+fn render_activity_timeline(ui: &mut egui::Ui, now_key: i128, rows: &[TimelineRow], has_more: bool) -> TimelineResponse {
     let mut context_clicked = None;
     let max_height = if diagnostics_is_headless() {
         1800.0
@@ -4117,7 +3897,7 @@ fn render_activity_timeline(ui: &mut egui::Ui, now_key: i128, rows: &[TimelineRo
     } else {
         ACTIVITY_TIMELINE_HEIGHT
     };
-    egui::ScrollArea::vertical()
+    let output = egui::ScrollArea::vertical()
         .id_salt("activity_timeline_scroll")
         .auto_shrink([false, false])
         .min_scrolled_height(min_scrolled_height)
@@ -4129,8 +3909,20 @@ fn render_activity_timeline(ui: &mut egui::Ui, now_key: i128, rows: &[TimelineRo
                 }
                 ui.add_space(6.0);
             }
+            if has_more {
+                ui.label(egui::RichText::new("Scroll for more...").small().color(color_muted()));
+            }
         });
-    context_clicked
+
+    // Detect near-bottom: if the scroll offset + viewport >= content height - threshold
+    let wants_more = if has_more {
+        let viewport_bottom = output.state.offset.y + output.inner_rect.height();
+        let content_height = output.content_size.y;
+        viewport_bottom >= content_height - 200.0
+    } else {
+        false
+    };
+    TimelineResponse { context_clicked, wants_more }
 }
 
 fn turn_memory_role_style(role: ChatRole) -> (&'static str, egui::Color32) {
