@@ -263,75 +263,73 @@ enum TagCommand {
     },
 }
 
-/// Bidirectional tag name / id index.
-struct TagIndex {
-    by_name: HashMap<String, Id>,
-    by_id: HashMap<Id, String>,
+/// Resolve a tag ID to its name, or format as hex if unnamed.
+fn tag_name(space: &TribleSet, ws: &mut Workspace<Pile<valueschemas::Blake3>>, id: Id) -> String {
+    find!(h: TextHandle, pattern!(space, [{ id @ metadata::name: ?h }]))
+        .next()
+        .and_then(|h| ws.get::<View<str>, _>(h).ok())
+        .map(|v| v.as_ref().to_string())
+        .unwrap_or_else(|| format!("{:x}", id))
 }
 
-impl TagIndex {
-    fn load(ws: &mut Workspace<Pile<valueschemas::Blake3>>) -> Result<Self> {
-        let space = ws
-            .checkout(..)
-            .map_err(|e| anyhow::anyhow!("checkout for tag names: {e:?}"))?;
-        let mut by_name = HashMap::new();
-        let mut by_id = HashMap::new();
-        for (tag_id, handle) in find!(
-            (tag_id: Id, handle: TextHandle),
-            pattern!(&space, [{ ?tag_id @ metadata::name: ?handle }])
-        ) {
-            let view: View<str> = ws
-                .get(handle)
-                .map_err(|e| anyhow::anyhow!("read tag name: {e:?}"))?;
-            let name = view.as_ref().to_string();
-            by_name.insert(name.clone(), tag_id);
-            by_id.insert(tag_id, name);
-        }
-        Ok(Self { by_name, by_id })
-    }
+/// Format a list of tag IDs as a bracketed, comma-separated string of names.
+fn format_tags(space: &TribleSet, ws: &mut Workspace<Pile<valueschemas::Blake3>>, tags: &[Id]) -> String {
+    let names: Vec<String> = tags.iter().map(|t| tag_name(space, ws, *t)).collect();
+    if names.is_empty() { String::new() } else { format!(" [{}]", names.join(", ")) }
+}
 
-    fn name(&self, id: Id) -> String {
-        self.by_id
-            .get(&id)
-            .cloned()
-            .unwrap_or_else(|| format!("{:x}", id))
-    }
-
-    fn format_tags(&self, tags: &[Id]) -> String {
-        let names: Vec<String> = tags.iter().map(|t| self.name(*t)).collect();
-        if names.is_empty() {
-            String::new()
-        } else {
-            format!(" [{}]", names.join(", "))
-        }
-    }
-
-    fn resolve_or_mint(
-        &mut self,
-        names: &[String],
-        change: &mut TribleSet,
-        ws: &mut Workspace<Pile<valueschemas::Blake3>>,
-    ) -> Result<Vec<Id>> {
-        let mut ids = Vec::new();
-        for raw in names {
-            let name = raw.trim().to_lowercase();
-            if name.is_empty() {
-                continue;
-            }
-            if let Some(&id) = self.by_name.get(&name) {
-                ids.push(id);
-            } else {
-                let tag_id = genid();
-                let tag_ref = tag_id.id;
-                let name_handle = ws.put(name.clone());
-                *change += entity! { &tag_id @ metadata::name: name_handle };
-                self.by_name.insert(name.clone(), tag_ref);
-                self.by_id.insert(tag_ref, name);
-                ids.push(tag_ref);
+/// Find a tag ID by name, or mint a new one if it doesn't exist.
+fn resolve_tag(
+    space: &TribleSet,
+    ws: &mut Workspace<Pile<valueschemas::Blake3>>,
+    name: &str,
+    change: &mut TribleSet,
+) -> Id {
+    // Search all named entities for a matching name.
+    for (id, handle) in find!(
+        (id: Id, h: TextHandle),
+        pattern!(space, [{ ?id @ metadata::name: ?h }])
+    ) {
+        if let Ok(view) = ws.get::<View<str>, _>(handle) {
+            if view.as_ref().eq_ignore_ascii_case(name) {
+                return id;
             }
         }
-        Ok(ids)
     }
+    // Not found — mint a new tag.
+    let tag_id = genid();
+    let tag_ref = tag_id.id;
+    let name_handle = ws.put(name.to_lowercase());
+    *change += entity! { &tag_id @ metadata::name: name_handle };
+    tag_ref
+}
+
+/// Resolve a list of tag names to IDs, minting unknown ones.
+fn resolve_tags(
+    space: &TribleSet,
+    ws: &mut Workspace<Pile<valueschemas::Blake3>>,
+    names: &[String],
+    change: &mut TribleSet,
+) -> Vec<Id> {
+    names.iter()
+        .filter(|n| !n.trim().is_empty())
+        .map(|n| resolve_tag(space, ws, n.trim(), change))
+        .collect()
+}
+
+/// Find a tag ID by name (returns None if not found).
+fn find_tag_by_name(space: &TribleSet, ws: &mut Workspace<Pile<valueschemas::Blake3>>, name: &str) -> Option<Id> {
+    for (id, handle) in find!(
+        (id: Id, h: TextHandle),
+        pattern!(space, [{ ?id @ metadata::name: ?h }])
+    ) {
+        if let Ok(view) = ws.get::<View<str>, _>(handle) {
+            if view.as_ref().eq_ignore_ascii_case(name) {
+                return Some(id);
+            }
+        }
+    }
+    None
 }
 
 // ── triblespace query helpers ──────────────────────────────────────────────
@@ -966,7 +964,6 @@ fn cmd_check(repo: &mut Repo, bid: Id, try_compile: bool) -> Result<()> {
         pattern!(&space, [{ ?vid @ metadata::tag: &KIND_VERSION_ID }])
     ).collect();
 
-    let _tag_index = TagIndex::load(&mut ws)?;
     // All fragments are typst — no markdown path
 
     let mut issues = 0u32;
@@ -1265,8 +1262,7 @@ fn cmd_create(
     ensure_tag_vocabulary(repo, &mut ws)?;
     let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
     let mut change = TribleSet::new();
-    let mut tag_index = TagIndex::load(&mut ws)?;
-    let tag_ids = tag_index.resolve_or_mint(&tags, &mut change, &mut ws)?;
+    let tag_ids = resolve_tags(&space, &mut ws, &tags, &mut change);
 
     // Always validate typst compilation
     validate_typst(&content)?;
@@ -1305,11 +1301,10 @@ fn cmd_edit(
 
     ensure_tag_vocabulary(repo, &mut ws)?;
     let mut change = TribleSet::new();
-    let mut tag_index = TagIndex::load(&mut ws)?;
     let tag_ids = if tags.is_empty() {
         tags_of(&space, prev_vid)
     } else {
-        tag_index.resolve_or_mint(&tags, &mut change, &mut ws)?
+        resolve_tags(&space, &mut ws, &tags, &mut change)
     };
 
     let title = new_title.unwrap_or_else(|| {
@@ -1338,7 +1333,6 @@ fn cmd_show(repo: &mut Repo, bid: Id, id: String, follow_latest: bool) -> Result
     let parsed_id = parse_full_id(&id)?;
     let mut ws = repo.pull(bid).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
     let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-    let tag_index = TagIndex::load(&mut ws)?;
     let vid = resolve_to_show(&space, parsed_id, follow_latest)?;
     let fragment_id = version_fragment(&space, vid)
         .ok_or_else(|| anyhow::anyhow!("version has no fragment"))?;
@@ -1356,7 +1350,7 @@ fn cmd_show(repo: &mut Repo, bid: Id, id: String, follow_latest: bool) -> Result
         "fragment: {}  version: {}  date: {}",
         format!("{:x}", fragment_id), vid, format_date(created_at),
     );
-    let tag_str = tag_index.format_tags(&tags);
+    let tag_str = format_tags(&space, &mut ws, &tags);
     if !tag_str.is_empty() {
         println!("tags:{tag_str}");
     }
@@ -1405,7 +1399,6 @@ fn cmd_diff(
     let resolved = parse_full_id(&id)?;
     let mut ws = repo.pull(bid).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
     let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-    let tag_index = TagIndex::load(&mut ws)?;
     let fragment_id = to_fragment(&space, resolved)?;
     let history = version_history_of(&space, fragment_id);
     let n = history.len();
@@ -1436,8 +1429,8 @@ fn cmd_diff(
     println!("--- v{} {}  {}", from_idx + 1, old_vid, old_title);
     println!("+++ v{} {}  {}", to_idx + 1, new_vid, new_title);
 
-    let old_tags = tag_index.format_tags(&tags_of(&space, old_vid));
-    let new_tags = tag_index.format_tags(&tags_of(&space, new_vid));
+    let old_tags = format_tags(&space, &mut ws, &tags_of(&space, old_vid));
+    let new_tags = format_tags(&space, &mut ws, &tags_of(&space, new_vid));
     if old_tags != new_tags {
         println!("- tags:{old_tags}");
         println!("+ tags:{new_tags}");
@@ -1598,23 +1591,21 @@ fn cmd_list(
 ) -> Result<()> {
     let mut ws = repo.pull(bid).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
     let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-    let tag_index = TagIndex::load(&mut ws)?;
-
     let filter_ids: Vec<Id> = filter_tags
         .iter()
         .filter_map(|name| {
             let name = name.trim().to_lowercase();
-            tag_index.by_name.get(&name).copied()
+            find_tag_by_name(&space, &mut ws, &name)
         })
         .collect();
 
     let with_bl_ids: Vec<Id> = with_backlink_tag
         .iter()
-        .filter_map(|name| tag_index.by_name.get(&name.trim().to_lowercase()).copied())
+        .filter_map(|name| find_tag_by_name(&space, &mut ws, &name.trim().to_lowercase()))
         .collect();
     let without_bl_ids: Vec<Id> = without_backlink_tag
         .iter()
-        .filter_map(|name| tag_index.by_name.get(&name.trim().to_lowercase()).copied())
+        .filter_map(|name| find_tag_by_name(&space, &mut ws, &name.trim().to_lowercase()))
         .collect();
     // Derive attribute IDs for typed backlink filters.
     let with_bl_type_attrs: Vec<(String, triblespace::core::attribute::Attribute<valueschemas::GenId>)> =
@@ -1694,7 +1685,7 @@ fn cmd_list(
         }
 
         let title = read_title(&space, &mut ws, *vid).unwrap_or_default();
-        let tag_str = tag_index.format_tags(&tags);
+        let tag_str = format_tags(&space, &mut ws, &tags);
         let n_versions = version_history_of(&space, *frag_id).len();
         let ver_str = if n_versions > 1 {
             format!(" (v{})", n_versions)
@@ -1729,7 +1720,6 @@ fn cmd_history(repo: &mut Repo, bid: Id, id: String) -> Result<()> {
     let resolved = parse_full_id(&id)?;
     let mut ws = repo.pull(bid).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
     let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-    let tag_index = TagIndex::load(&mut ws)?;
     let fragment_id = to_fragment(&space, resolved)?;
     let history = version_history_of(&space, fragment_id);
 
@@ -1745,7 +1735,7 @@ fn cmd_history(repo: &mut Repo, bid: Id, id: String) -> Result<()> {
         let tags = tags_of(&space, *vid);
         println!(
             "  v{}  {}  {}  {}{}",
-            i + 1, vid, format_date(ts), title, tag_index.format_tags(&tags),
+            i + 1, vid, format_date(ts), title, format_tags(&space, &mut ws, &tags),
         );
     }
     Ok(())
@@ -1766,8 +1756,7 @@ fn cmd_tag_add(repo: &mut Repo, bid: Id, id: String, name: String) -> Result<()>
 
     ensure_tag_vocabulary(repo, &mut ws)?;
     let mut change = TribleSet::new();
-    let mut tag_index = TagIndex::load(&mut ws)?;
-    let new_tag = tag_index.resolve_or_mint(&[name.clone()], &mut change, &mut ws)?[0];
+    let new_tag = resolve_tags(&space, &mut ws, &[name.clone()], &mut change)[0];
 
     let prev_tags = tags_of(&space, prev_vid);
     if prev_tags.contains(&new_tag) {
@@ -1802,16 +1791,15 @@ fn cmd_tag_remove(repo: &mut Repo, bid: Id, id: String, name: String) -> Result<
     let prev_vid = latest_version_of(&space, fragment_id)
         .ok_or_else(|| anyhow::anyhow!("no versions for fragment {}", fragment_id))?;
 
-    let tag_index = TagIndex::load(&mut ws)?;
-    let tag_id = tag_index.by_name.get(&name)
+    let tag_id = find_tag_by_name(&space, &mut ws, &name)
         .ok_or_else(|| anyhow::anyhow!("unknown tag '{name}'"))?;
     let prev_tags = tags_of(&space, prev_vid);
-    if !prev_tags.contains(tag_id) {
+    if !prev_tags.contains(&tag_id) {
         println!("not tagged: #{name}");
         return Ok(());
     }
 
-    let tags: Vec<Id> = prev_tags.into_iter().filter(|t| t != tag_id).collect();
+    let tags: Vec<Id> = prev_tags.into_iter().filter(|t| *t != tag_id).collect();
     let prev_title = read_title(&space, &mut ws, prev_vid).unwrap_or_default();
     let prev_ch = content_handle_of(&space, prev_vid)
         .ok_or_else(|| anyhow::anyhow!("no content"))?;
@@ -1827,8 +1815,6 @@ fn cmd_tag_remove(repo: &mut Repo, bid: Id, id: String, name: String) -> Result<
 fn cmd_tag_list(repo: &mut Repo, bid: Id) -> Result<()> {
     let mut ws = repo.pull(bid).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
     let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-    let tag_index = TagIndex::load(&mut ws)?;
-
     let mut counts: HashMap<Id, usize> = HashMap::new();
     for (tag_id,) in find!(
         (tag_id: Id),
@@ -1839,11 +1825,19 @@ fn cmd_tag_list(repo: &mut Repo, bid: Id) -> Result<()> {
         }
     }
 
-    let mut entries: Vec<(String, Id, usize)> = tag_index
-        .by_name
-        .iter()
-        .map(|(name, &id)| (name.clone(), id, counts.get(&id).copied().unwrap_or(0)))
-        .collect();
+    // Build name→id map from all named entities.
+    let mut all_named: Vec<(String, Id, usize)> = Vec::new();
+    for (id, handle) in find!(
+        (id: Id, h: TextHandle),
+        pattern!(&space, [{ ?id @ metadata::name: ?h }])
+    ) {
+        if let Ok(view) = ws.get::<View<str>, _>(handle) {
+            let name = view.as_ref().to_string();
+            let count = counts.get(&id).copied().unwrap_or(0);
+            all_named.push((name, id, count));
+        }
+    }
+    let mut entries = all_named;
     entries.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)));
 
     for (name, id, count) in entries {
@@ -1859,8 +1853,8 @@ fn cmd_tag_mint(repo: &mut Repo, bid: Id, name: String) -> Result<()> {
     }
 
     let mut ws = repo.pull(bid).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
-    let tag_index = TagIndex::load(&mut ws)?;
-    if let Some(&existing) = tag_index.by_name.get(&name) {
+    let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+    if let Some(existing) = find_tag_by_name(&space, &mut ws, &name) {
         println!("tag '{}' already exists: {}", name, existing);
         return Ok(());
     }
@@ -1896,9 +1890,7 @@ fn cmd_import(repo: &mut Repo, bid: Id, path: PathBuf, tags: Vec<String>) -> Res
 
     let mut ws = repo.pull(bid).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
     ensure_tag_vocabulary(repo, &mut ws)?;
-    let mut tag_index = TagIndex::load(&mut ws)?;
     let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-
     for file in &files {
         let content = fs::read_to_string(file)
             .with_context(|| format!("read {}", file.display()))?;
@@ -1915,7 +1907,7 @@ fn cmd_import(repo: &mut Repo, bid: Id, path: PathBuf, tags: Vec<String>) -> Res
             });
 
         let mut change = TribleSet::new();
-        let tag_ids = tag_index.resolve_or_mint(&tags, &mut change, &mut ws)?;
+        let tag_ids = resolve_tags(&space, &mut ws, &tags, &mut change);
         let fragment_id = genid().id;
         let content_handle = ws.put(content);
         let vid = commit_version(
@@ -1952,8 +1944,6 @@ fn cmd_search(
 
     let mut ws = repo.pull(bid).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
     let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-    let tag_index = TagIndex::load(&mut ws)?;
-
     let latest = latest_versions(&space);
 
     let mut hits: Vec<(Id, Id, Lower, String, Vec<Id>, Vec<String>)> = Vec::new();
@@ -1999,7 +1989,7 @@ fn cmd_search(
     for (frag_id, _vid, created_at, title, tags, context_lines) in &hits {
         println!(
             "{}  {}  {}{}",
-            format!("{:x}", frag_id), format_date(*created_at), title, tag_index.format_tags(tags),
+            format!("{:x}", frag_id), format_date(*created_at), title, format_tags(&space, &mut ws, tags),
         );
         for line in context_lines {
             println!("    {}", line.trim());
