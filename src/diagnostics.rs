@@ -11,7 +11,9 @@ use triblespace::core::blob::schemas::simplearchive::SimpleArchive;
 use triblespace::core::id::{ExclusiveId, Id};
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::Pile;
-use triblespace::core::repo::{BlobStoreMeta, Checkout, Repository, Workspace};
+use triblespace::core::repo::{
+    BlobStoreMeta, Checkout, CommitSelector, CommitSet, Repository, Workspace, nth_ancestors,
+};
 use triblespace::core::trible::TribleSet;
 use triblespace::core::value::Value;
 use triblespace::core::value::schemas::hash::{Blake3, Handle};
@@ -111,6 +113,44 @@ const CONTEXT_ORIGIN_LIMIT: usize = 64;
 const LOCAL_COMPOSE_HEIGHT: f32 = 80.0;
 const TEAMS_SCROLL_HEIGHT: f32 = 520.0;
 const CATALOG_REFRESH_MS: u64 = 1000;
+const HISTORY_CHUNK_SIZE: usize = 64;
+
+/// Per-branch catalog state with progressive history loading.
+///
+/// On first load, only the most recent `HISTORY_CHUNK_SIZE` commits are
+/// checked out. Each subsequent frame extends backwards by another chunk
+/// until the full history is loaded, then switches to incremental mode.
+struct BranchCatalog {
+    co: Option<Checkout>,
+    /// The frontier: commits just beyond our loaded range.
+    /// `nth_ancestors(frontier, chunk)` gives the next boundary.
+    /// Empty = fully loaded (reached root).
+    frontier: CommitSet,
+    fully_loaded: bool,
+}
+
+impl Default for BranchCatalog {
+    fn default() -> Self {
+        Self {
+            co: None,
+            frontier: CommitSet::new(),
+            fully_loaded: false,
+        }
+    }
+}
+
+impl BranchCatalog {
+    fn catalog(&self) -> &TribleSet {
+        static EMPTY: std::sync::LazyLock<TribleSet> = std::sync::LazyLock::new(TribleSet::new);
+        self.co.as_ref().map(|c| c.facts()).unwrap_or(&EMPTY)
+    }
+
+    fn reset(&mut self) {
+        self.co = None;
+        self.frontier = CommitSet::new();
+        self.fully_loaded = false;
+    }
+}
 
 // ── RAL color palette ──────────────────────────────────────────────
 // All colors drawn from the industrial RAL palette for visual consistency.
@@ -242,16 +282,12 @@ fn default_pile_path() -> String {
 struct DashboardState {
     config: DashboardConfig,
     pile: PileRepoState,
-    // Per-branch state — Checkout pattern (triblespace 0.26).
-    // Checkout = TribleSet (facts) + CommitSet (continuation token).
-    // .facts() for queries, .commits() for next delta, += for merge.
-    // None = not yet loaded (first refresh does full checkout).
-    config_co: Option<Checkout>,
-    exec_co: Option<Checkout>,
-    compass_co: Option<Checkout>,
-    local_messages_co: Option<Checkout>,
-    relations_co: Option<Checkout>,
-    teams_co: Option<Checkout>,
+    config_cat: BranchCatalog,
+    exec_cat: BranchCatalog,
+    compass_cat: BranchCatalog,
+    local_messages_cat: BranchCatalog,
+    relations_cat: BranchCatalog,
+    teams_cat: BranchCatalog,
     branches: Vec<BranchEntry>,
     now_key: i128,
     local_draft: String,
@@ -275,13 +311,12 @@ impl Default for DashboardState {
         Self {
             config: DashboardConfig::default(),
             pile: PileRepoState::new(default_pile_path()),
-            // Per-branch cached state
-            config_co: None,
-            exec_co: None,
-            compass_co: None,
-            local_messages_co: None,
-            relations_co: None,
-            teams_co: None,
+            config_cat: BranchCatalog::default(),
+            exec_cat: BranchCatalog::default(),
+            compass_cat: BranchCatalog::default(),
+            local_messages_cat: BranchCatalog::default(),
+            relations_cat: BranchCatalog::default(),
+            teams_cat: BranchCatalog::default(),
             branches: Vec::new(),
             now_key: 0,
             local_draft: String::new(),
@@ -551,12 +586,12 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
             let was_opening = state.pile.is_opening();
             state.pile.poll();
             if was_opening && !state.pile.is_opening() && state.pile.is_open() {
-                state.config_co = None;
-                state.exec_co = None;
-                state.compass_co = None;
-                state.local_messages_co = None;
-                state.relations_co = None;
-                state.teams_co = None;
+                state.config_cat.reset();
+                state.exec_cat.reset();
+                state.compass_cat.reset();
+                state.local_messages_cat.reset();
+                state.relations_cat.reset();
+                state.teams_cat.reset();
                 state.branches.clear();
             }
 
@@ -565,18 +600,22 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
             let path_changed = state.pile.open_path().map_or(false, |p| p != edited_path);
             if path_changed {
                 state.pile.close();
-                state.config_co = None;
-                state.exec_co = None;
-                state.compass_co = None;
-                state.local_messages_co = None;
-                state.relations_co = None;
-                state.teams_co = None;
+                state.config_cat.reset();
+                state.exec_cat.reset();
+                state.compass_cat.reset();
+                state.local_messages_cat.reset();
+                state.relations_cat.reset();
+                state.teams_cat.reset();
                 state.branches.clear();
             }
 
-            // Auto-open: if the pile is not open and not opening and no error, start opening.
+            // Auto-open: if the pile is not open and not opening and no error,
+            // and the path looks like it exists, start opening.
             if !state.pile.is_open() && !state.pile.is_opening() && state.pile.last_error().is_none() {
-                state.pile.open();
+                let path = PathBuf::from(state.pile.pile_path().trim());
+                if path.exists() {
+                    state.pile.open();
+                }
             }
 
             if state.pile.is_opening() {
@@ -638,13 +677,29 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
                 });
             });
 
-            if state.pile.is_open() && should_refresh(&state) {
-                refresh_catalogs(state);
-                apply_branch_defaults(state);
-                state.last_refresh_at = Some(Instant::now());
-            }
+            if state.pile.is_open() {
+                let all_loaded = state.config_cat.fully_loaded
+                    && state.exec_cat.fully_loaded
+                    && state.compass_cat.fully_loaded
+                    && state.local_messages_cat.fully_loaded
+                    && state.relations_cat.fully_loaded
+                    && state.teams_cat.fully_loaded;
 
-            if !diagnostics_is_headless() {
+                // While history is still loading, refresh every frame.
+                // Once fully loaded, switch to timer-based incremental refresh.
+                if !all_loaded || should_refresh(&state) {
+                    refresh_catalogs(state);
+                    apply_branch_defaults(state);
+                    state.last_refresh_at = Some(Instant::now());
+                }
+
+                if !all_loaded {
+                    ui.ctx().request_repaint();
+                } else if !diagnostics_is_headless() {
+                    ui.ctx()
+                        .request_repaint_after(Duration::from_millis(CATALOG_REFRESH_MS));
+                }
+            } else if !diagnostics_is_headless() {
                 ui.ctx()
                     .request_repaint_after(Duration::from_millis(CATALOG_REFRESH_MS));
             }
@@ -666,16 +721,16 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
         });
 
         // Clone all catalogs needed for the timeline.
-        let exec_data = catalog(&state.exec_co).clone();
-        let local_data = catalog(&state.local_messages_co).clone();
-        let teams_data = catalog(&state.teams_co).clone();
-        let compass_data = catalog(&state.compass_co).clone();
-        let relations_data = catalog(&state.relations_co).clone();
+        let exec_data = state.exec_cat.catalog().clone();
+        let local_data = state.local_messages_cat.catalog().clone();
+        let teams_data = state.teams_cat.catalog().clone();
+        let compass_data = state.compass_cat.catalog().clone();
+        let relations_data = state.relations_cat.catalog().clone();
         let now_key = state.now_key;
         let timeline_limit = state.timeline_limit;
 
         let exec_branch_err =
-            if state.exec_co.is_none() && !state.config.exec_branches.trim().is_empty() {
+            if state.exec_cat.co.is_none() && !state.config.exec_branches.trim().is_empty() {
                 let branch_lookup = BranchLookup::new(&state.branches);
                 let refs = parse_branch_list(&state.config.exec_branches);
                 resolve_branch_ids(&branch_lookup, &refs).err()
@@ -950,7 +1005,7 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
         ui.section("Agent Config", |ui| {
             ui.grid(|g| g.full(|ui| {
             // Show branch resolution error when the configured branch can't be found.
-            if state.config_co.is_none() && !state.config.config_branches.trim().is_empty() {
+            if state.config_cat.co.is_none() && !state.config.config_branches.trim().is_empty() {
                 let branch_lookup = BranchLookup::new(&state.branches);
                 let refs = parse_branch_list(&state.config.config_branches);
                 if let Err(err) = resolve_branch_ids(&branch_lookup, &refs) {
@@ -959,7 +1014,7 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
                 }
             }
 
-            let data = catalog(&state.config_co).clone();
+            let data = state.config_cat.catalog().clone();
             let now_key = state.now_key;
             render_agent_config(ui, &mut state.config_reveal_secrets, now_key, &data, &mut ws);
             }));
@@ -980,7 +1035,7 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
             repo.pull(*ids.first()?).ok()
         });
 
-        let exec_data = catalog(&state.exec_co).clone();
+        let exec_data = state.exec_cat.catalog().clone();
         let now_key = state.now_key;
         let context_selected_chunk = state.context_selected_chunk;
         let context_show_children = state.context_show_children;
@@ -1024,14 +1079,14 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
         // Resolve branch error and clone the catalog before the section closure
         // so we don't hold an immutable borrow on state while also borrowing it mutably.
         let compass_branch_err =
-            if state.compass_co.is_none() && !state.config.compass_branches.trim().is_empty() {
+            if state.compass_cat.co.is_none() && !state.config.compass_branches.trim().is_empty() {
                 let branch_lookup = BranchLookup::new(&state.branches);
                 let refs = parse_branch_list(&state.config.compass_branches);
                 resolve_branch_ids(&branch_lookup, &refs).err()
             } else {
                 None
             };
-        let compass_data = catalog(&state.compass_co).clone();
+        let compass_data = state.compass_cat.catalog().clone();
 
         ui.section("Compass", |ui| {
             ui.grid(|g| g.full(|ui| {
@@ -1065,7 +1120,7 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
         });
 
         // Collect relations for person picker.
-        let relations_data = catalog(&state.relations_co).clone();
+        let relations_data = state.relations_cat.catalog().clone();
         let people = if let Some(ref mut ws) = ws {
             collect_relations_people(&relations_data, ws)
         } else {
@@ -1077,7 +1132,7 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
         let branches = state.branches.clone();
 
         let local_message_err =
-            if state.local_messages_co.is_none() && !state.config.local_message_branches.trim().is_empty() {
+            if state.local_messages_cat.co.is_none() && !state.config.local_message_branches.trim().is_empty() {
                 let branch_lookup = BranchLookup::new(&state.branches);
                 let refs = parse_branch_list(&state.config.local_message_branches);
                 resolve_branch_ids(&branch_lookup, &refs).err()
@@ -1111,7 +1166,7 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
 
         ui.section("Relations", |ui| {
             // Show branch resolution error when the configured branch can't be found.
-            if state.relations_co.is_none() && !state.config.relations_branches.trim().is_empty() {
+            if state.relations_cat.co.is_none() && !state.config.relations_branches.trim().is_empty() {
                 let branch_lookup = BranchLookup::new(&state.branches);
                 let refs = parse_branch_list(&state.config.relations_branches);
                 if let Err(err) = resolve_branch_ids(&branch_lookup, &refs) {
@@ -1120,7 +1175,7 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
                 }
             }
 
-            let data = catalog(&state.relations_co);
+            let data = state.relations_cat.catalog();
             if data.is_empty() {
                 ui.label("No relations.");
                 return;
@@ -1326,14 +1381,14 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
         });
 
         let teams_branch_err =
-            if state.teams_co.is_none() && !state.config.teams_branches.trim().is_empty() {
+            if state.teams_cat.co.is_none() && !state.config.teams_branches.trim().is_empty() {
                 let branch_lookup = BranchLookup::new(&state.branches);
                 let refs = parse_branch_list(&state.config.teams_branches);
                 resolve_branch_ids(&branch_lookup, &refs).err()
             } else {
                 None
             };
-        let teams_data = catalog(&state.teams_co).clone();
+        let teams_data = state.teams_cat.catalog().clone();
         let now_key = state.now_key;
 
         ui.section("Teams", |ui| {
@@ -1391,7 +1446,7 @@ fn should_refresh(state: &DashboardState) -> bool {
 
 /// Apply branch name defaults from the latest agent config in the config catalog.
 fn apply_branch_defaults(state: &mut DashboardState) {
-    let config_data = catalog(&state.config_co);
+    let config_data = state.config_cat.catalog();
     if config_data.is_empty() {
         return;
     }
@@ -1450,12 +1505,6 @@ fn apply_branch_defaults(state: &mut DashboardState) {
     state.config_last_applied_id = Some(config_id);
 }
 
-/// Extract the facts TribleSet from an `Option<Checkout>`, returning an empty set if None.
-fn catalog(co: &Option<Checkout>) -> &TribleSet {
-    static EMPTY: std::sync::LazyLock<TribleSet> = std::sync::LazyLock::new(TribleSet::new);
-    co.as_ref().map(|c| c.facts()).unwrap_or(&EMPTY)
-}
-
 /// Refresh per-branch workspace + catalog state from the repository.
 fn refresh_catalogs(state: &mut DashboardState) {
     let repo = match state.pile.repo_mut() {
@@ -1483,15 +1532,20 @@ fn refresh_catalogs(state: &mut DashboardState) {
     let branch_lookup = BranchLookup::new(&state.branches);
 
     /// Resolve branch names, pull workspace, and update the checkout in place.
-    /// - If `co` is None (first load): full checkout via `ws.checkout(..)`.
-    /// - If `co` is Some (incremental): delta checkout via `ws.checkout(co.commits()..)`,
-    ///   then merge with `co += &delta`.
-    /// Multi-branch configs union the checkouts from all branches.
+    /// Progressive history loading for a single branch.
+    ///
+    /// - First call: initialize frontier to HEAD, then checkout the first
+    ///   chunk (nth_ancestors(head, chunk)..head).
+    /// - Subsequent calls while `!fully_loaded`: compute new_frontier =
+    ///   nth_ancestors(frontier, chunk), checkout new_frontier..frontier,
+    ///   merge into existing checkout, advance frontier.
+    /// - Once fully loaded: incremental delta from HEAD (new commits only).
     fn refresh_role(
         repo: &mut Repository<Pile>,
         branch_lookup: &BranchLookup,
         branch_names: &str,
-        co: &mut Option<Checkout>,
+        cat: &mut BranchCatalog,
+        chunk_size: usize,
     ) {
         let refs = parse_branch_list(branch_names);
         let ids = match resolve_branch_ids(branch_lookup, &refs) {
@@ -1500,32 +1554,64 @@ fn refresh_catalogs(state: &mut DashboardState) {
         };
 
         if ids.len() == 1 {
-            // Single-branch path: incremental checkout when possible.
             let mut ws = match repo.pull(ids[0]) {
                 Ok(ws) => ws,
                 Err(_) => return,
             };
-            if ws.head().is_none() {
-                // Branch has no commits — clear checkout.
-                *co = None;
+            let Some(head) = ws.head() else {
+                cat.reset();
+                return;
+            };
+
+            if cat.fully_loaded {
+                // Incremental: pick up new commits at HEAD.
+                if let Some(ref mut existing) = cat.co {
+                    if let Ok(delta) = ws.checkout(existing.commits()..) {
+                        if !delta.facts().is_empty() {
+                            *existing += &delta;
+                        }
+                    }
+                }
                 return;
             }
-            match co {
-                Some(existing) => {
-                    // Incremental: checkout only new commits since last time.
-                    if let Ok(delta) = ws.checkout(existing.commits()..) {
-                        *existing += &delta;
+
+            if cat.frontier.is_empty() && cat.co.is_none() {
+                // First call: set frontier to HEAD.
+                let mut f = CommitSet::new();
+                f.insert(&triblespace::core::patch::Entry::new(&head.raw));
+                cat.frontier = f;
+            }
+
+            // Compute new frontier by walking back chunk_size steps.
+            let new_frontier = match nth_ancestors(cat.frontier.clone(), chunk_size).select(&mut ws) {
+                Ok(f) => f,
+                Err(_) => {
+                    cat.fully_loaded = true;
+                    return;
+                }
+            };
+
+            // Checkout the chunk between new_frontier (exclusive) and frontier (inclusive).
+            match ws.checkout(new_frontier.clone()..cat.frontier.clone()) {
+                Ok(chunk) => {
+                    match &mut cat.co {
+                        Some(existing) => *existing += &chunk,
+                        None => cat.co = Some(chunk),
                     }
                 }
-                None => {
-                    // First load: full checkout.
-                    if let Ok(full) = ws.checkout(..) {
-                        *co = Some(full);
-                    }
+                Err(_) => {
+                    cat.fully_loaded = true;
+                    return;
                 }
             }
+
+            if new_frontier.is_empty() {
+                cat.fully_loaded = true;
+            } else {
+                cat.frontier = new_frontier;
+            }
         } else {
-            // Multi-branch: always do full checkout and union all branches.
+            // Multi-branch: full checkout (progressive loading not yet supported).
             let mut merged: Option<Checkout> = None;
             for branch_id in &ids {
                 let mut ws = match repo.pull(*branch_id) {
@@ -1541,7 +1627,8 @@ fn refresh_catalogs(state: &mut DashboardState) {
                     }
                 }
             }
-            *co = merged;
+            cat.co = merged;
+            cat.fully_loaded = true;
         }
     }
 
@@ -1552,12 +1639,13 @@ fn refresh_catalogs(state: &mut DashboardState) {
     let relations_branches = state.config.relations_branches.clone();
     let teams_branches = state.config.teams_branches.clone();
 
-    refresh_role(repo, &branch_lookup, &config_branches, &mut state.config_co);
-    refresh_role(repo, &branch_lookup, &exec_branches, &mut state.exec_co);
-    refresh_role(repo, &branch_lookup, &compass_branches, &mut state.compass_co);
-    refresh_role(repo, &branch_lookup, &local_message_branches, &mut state.local_messages_co);
-    refresh_role(repo, &branch_lookup, &relations_branches, &mut state.relations_co);
-    refresh_role(repo, &branch_lookup, &teams_branches, &mut state.teams_co);
+    let chunk = HISTORY_CHUNK_SIZE;
+    refresh_role(repo, &branch_lookup, &config_branches, &mut state.config_cat, chunk);
+    refresh_role(repo, &branch_lookup, &exec_branches, &mut state.exec_cat, chunk);
+    refresh_role(repo, &branch_lookup, &compass_branches, &mut state.compass_cat, chunk);
+    refresh_role(repo, &branch_lookup, &local_message_branches, &mut state.local_messages_cat, chunk);
+    refresh_role(repo, &branch_lookup, &relations_branches, &mut state.relations_cat, chunk);
+    refresh_role(repo, &branch_lookup, &teams_branches, &mut state.teams_cat, chunk);
 
     state.now_key = epoch_key(now_epoch());
 }
