@@ -299,6 +299,8 @@ struct DashboardState {
     context_show_children: bool,
     context_show_origins: bool,
     timeline_limit: usize,
+    /// Timeline zoom: pixels per minute of wall time.
+    timeline_scale: f32,
     last_refresh_at: Option<Instant>,
 }
 
@@ -328,6 +330,7 @@ impl Default for DashboardState {
             context_show_children: false,
             context_show_origins: false,
             timeline_limit: TIMELINE_INITIAL_LIMIT,
+            timeline_scale: TIMELINE_DEFAULT_SCALE,
             last_refresh_at: None,
         }
     }
@@ -823,8 +826,21 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
                 return;
             }
 
+            // Zoom control.
+            ui.horizontal(|ui| {
+                ui.small(egui::RichText::new("zoom").color(color_muted()));
+                if ui.add(Button::new("−")).clicked() {
+                    state.timeline_scale = (state.timeline_scale * 0.5).max(0.1);
+                }
+                ui.small(format!("{:.1} px/min", state.timeline_scale));
+                if ui.add(Button::new("+")).clicked() {
+                    state.timeline_scale = (state.timeline_scale * 2.0).min(100.0);
+                }
+            });
+
             let has_more = timeline_rows.len() < timeline_total_rows;
-            let resp = render_activity_timeline(ui, now_key, &timeline_rows, has_more);
+            let scale = state.timeline_scale;
+            let resp = render_activity_timeline(ui, now_key, &timeline_rows, has_more, scale);
             if let Some(request_id) = resp.context_clicked {
                 state.context_float_request_id = Some(request_id);
             }
@@ -3885,7 +3901,73 @@ struct TimelineResponse {
     wants_more: bool,
 }
 
-fn render_activity_timeline(ui: &mut egui::Ui, now_key: i128, rows: &[TimelineRow], has_more: bool) -> TimelineResponse {
+/// Format a TAI nanosecond key as a human-readable time marker.
+fn format_time_marker(key: i128) -> String {
+    let ns = hifitime::Duration::from_total_nanoseconds(key);
+    let epoch = Epoch::from_tai_duration(ns);
+    let (y, m, d, h, min, s, _) = epoch.to_gregorian_utc();
+    format!("{y:04}-{m:02}-{d:02} {h:02}:{min:02}:{s:02}")
+}
+
+/// Format a TAI nanosecond key as a short time (just hours:minutes).
+fn format_time_short(key: i128) -> String {
+    let ns = hifitime::Duration::from_total_nanoseconds(key);
+    let epoch = Epoch::from_tai_duration(ns);
+    let (_, _, _, h, min, _, _) = epoch.to_gregorian_utc();
+    format!("{h:02}:{min:02}")
+}
+
+/// Format a TAI nanosecond key as a date.
+fn format_date(key: i128) -> String {
+    let ns = hifitime::Duration::from_total_nanoseconds(key);
+    let epoch = Epoch::from_tai_duration(ns);
+    let (y, m, d, _, _, _, _) = epoch.to_gregorian_utc();
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// Render a time ruler marker between timeline events.
+fn render_time_marker(ui: &mut egui::Ui, key: i128, show_date: bool) {
+    let label = if show_date {
+        format_time_marker(key)
+    } else {
+        format_time_short(key)
+    };
+    ui.horizontal(|ui| {
+        let muted = color_muted();
+        // Ruler line
+        ui.separator();
+        ui.label(egui::RichText::new(label).small().monospace().color(muted));
+    });
+}
+
+/// Decide how many nanoseconds of gap warrants a time marker between events.
+/// Returns (should_show_marker, should_show_date).
+fn should_show_time_marker(prev_key: i128, cur_key: i128) -> (bool, bool) {
+    let gap_ns = prev_key.saturating_sub(cur_key).max(0);
+    let gap_minutes = gap_ns / 60_000_000_000;
+    let gap_hours = gap_minutes / 60;
+
+    if gap_hours >= 24 {
+        (true, true) // date + time for day-level gaps
+    } else if gap_minutes >= 5 {
+        (true, false) // time only for multi-minute gaps
+    } else {
+        (false, false) // no marker for short gaps
+    }
+}
+
+/// Default scale: pixels per minute of wall time.
+const TIMELINE_DEFAULT_SCALE: f32 = 2.0;
+/// Minimum event-to-event gap in pixels (so events never overlap).
+const TIMELINE_MIN_EVENT_GAP: f32 = 2.0;
+
+fn render_activity_timeline(
+    ui: &mut egui::Ui,
+    now_key: i128,
+    rows: &[TimelineRow],
+    has_more: bool,
+    px_per_minute: f32,
+) -> TimelineResponse {
     let mut context_clicked = None;
     let max_height = if diagnostics_is_headless() {
         1800.0
@@ -3903,18 +3985,39 @@ fn render_activity_timeline(ui: &mut egui::Ui, now_key: i128, rows: &[TimelineRo
         .min_scrolled_height(min_scrolled_height)
         .max_height(max_height)
         .show(ui, |ui| {
+            let mut prev_key: Option<i128> = None;
+
             for row in rows {
+                // Proportional spacing: gap = time_delta * scale.
+                if let (Some(prev), Some(cur)) = (prev_key, row.at) {
+                    let gap_ns = prev.saturating_sub(cur).max(0);
+                    let gap_minutes = gap_ns as f64 / 60_000_000_000.0;
+                    let gap_px = (gap_minutes as f32 * px_per_minute)
+                        .max(TIMELINE_MIN_EVENT_GAP);
+                    ui.add_space(gap_px);
+
+                    // Time markers at significant gaps.
+                    let (show, show_date) = should_show_time_marker(prev, cur);
+                    if show {
+                        render_time_marker(ui, cur, show_date);
+                    }
+                } else if prev_key.is_none() {
+                    if let Some(cur) = row.at {
+                        render_time_marker(ui, cur, true);
+                    }
+                }
+                prev_key = row.at.or(prev_key);
+
                 if let Some(id) = render_timeline_row(ui, now_key, row) {
                     context_clicked = Some(id);
                 }
-                ui.add_space(6.0);
             }
             if has_more {
+                ui.add_space(6.0);
                 ui.label(egui::RichText::new("Scroll for more...").small().color(color_muted()));
             }
         });
 
-    // Detect near-bottom: if the scroll offset + viewport >= content height - threshold
     let wants_more = if has_more {
         let viewport_bottom = output.state.offset.y + output.inner_rect.height();
         let content_height = output.content_size.y;
@@ -4544,14 +4647,88 @@ fn render_timeline_ctx_chip(ui: &mut egui::Ui, fill: egui::Color32) -> egui::Res
         .inner
 }
 
+/// One-line summary for each event type (shown in the compact chip).
+fn timeline_event_summary(event: &TimelineEvent) -> String {
+    match event {
+        TimelineEvent::Shell { command, status, exit_code, .. } => {
+            let code = exit_code.map(|c| format!(" → {c}")).unwrap_or_default();
+            format!("{}: {}{code}", exec_status_text(*status), truncate_single_line(command, 80))
+        }
+        TimelineEvent::Cognition { summary, input_tokens, output_tokens, .. } => {
+            let tokens = match (input_tokens, output_tokens) {
+                (Some(i), Some(o)) => format!(" ({}→{})", format_tokens_compact(*i), format_tokens_compact(*o)),
+                _ => String::new(),
+            };
+            format!("{}{tokens}", truncate_single_line(summary, 80))
+        }
+        TimelineEvent::Reason { text, .. } => {
+            truncate_single_line(text, 80).to_string()
+        }
+        TimelineEvent::Teams { author, chat_label, content, .. } => {
+            format!("{author} in {chat_label}: {}", truncate_single_line(content, 60))
+        }
+        TimelineEvent::LocalMessage { from_label, to_label, body, .. } => {
+            format!("{from_label} → {to_label}: {}", truncate_single_line(body, 60))
+        }
+        TimelineEvent::GoalCreated { goal } => {
+            format!("created: {}", goal.title)
+        }
+        TimelineEvent::GoalStatus { goal, to_status } => {
+            format!("{} → {to_status}", goal.title)
+        }
+        TimelineEvent::GoalNote { goal, note } => {
+            format!("{}: {}", goal.title, truncate_single_line(note, 60))
+        }
+    }
+}
+
 fn render_timeline_row(ui: &mut egui::Ui, now_key: i128, row: &TimelineRow) -> Option<Id> {
     let mut context_clicked = None;
     let (source_label, source_color) = timeline_source_style(row.source);
-    ui.horizontal_wrapped(|ui| {
-        ui.small(format_age(now_key, row.at));
-        render_timeline_source_chip(ui, source_label, source_color);
-    });
+    let summary = timeline_event_summary(&row.event);
 
+    // Compact chip: [source] summary [age]
+    let resp = egui::Frame::NONE
+        .fill(color_frame())
+        .corner_radius(egui::CornerRadius::same(4))
+        .inner_margin(egui::Margin::symmetric(8, 3))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                render_timeline_source_chip(ui, source_label, source_color);
+                ui.label(egui::RichText::new(&summary).small());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(egui::RichText::new(format_age(now_key, row.at)).small().color(color_muted()));
+                });
+            });
+        })
+        .response;
+
+    // Click to expand details.
+    let expand_id = ui.make_persistent_id(("timeline_expand", row.at, source_label));
+    let expanded = ui.ctx().data_mut(|d| *d.get_persisted_mut_or(expand_id, false));
+
+    if resp.interact(egui::Sense::click()).clicked() {
+        ui.ctx().data_mut(|d| d.insert_persisted(expand_id, !expanded));
+    }
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+
+    if expanded {
+        // Show full details below the chip.
+        egui::Frame::NONE
+            .inner_margin(egui::Margin { left: 16, right: 0, top: 2, bottom: 2 })
+            .show(ui, |ui| {
+                render_timeline_row_details(ui, now_key, row, &mut context_clicked);
+            });
+    }
+
+    context_clicked
+}
+
+/// Expanded details for a timeline event (shown when the chip is clicked).
+fn render_timeline_row_details(ui: &mut egui::Ui, now_key: i128, row: &TimelineRow, context_clicked: &mut Option<Id>) {
+    let (_, source_color) = timeline_source_style(row.source);
     match &row.event {
         TimelineEvent::Shell {
             request_id,
@@ -4567,7 +4744,7 @@ fn render_timeline_row(ui: &mut egui::Ui, now_key: i128, row: &TimelineRow) -> O
                 ui.label(format!("{}: {}", exec_status_text(*status), command));
                 let chip_resp = render_timeline_ctx_chip(ui, source_color);
                 if chip_resp.on_hover_text("Show model context for this turn").clicked() {
-                    context_clicked = Some(*request_id);
+                    *context_clicked = Some(*request_id);
                 }
             });
             let mut details = Vec::new();
@@ -4748,7 +4925,6 @@ fn render_timeline_row(ui: &mut egui::Ui, now_key: i128, row: &TimelineRow) -> O
             render_timeline_goal_event(ui, goal, Some(format!("note: {note}")));
         }
     }
-    context_clicked
 }
 
 fn timeline_source_style(source: TimelineSource) -> (&'static str, egui::Color32) {
