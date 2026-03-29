@@ -1,5 +1,5 @@
 use hifitime::Epoch;
-use triblespace::prelude::valueschemas::NsTAIInterval;
+use triblespace::prelude::valueschemas::{NsTAIInterval, OrderedNsTAIInterval};
 use triblespace::prelude::{TryToValue, Value};
 
 pub(crate) fn now_epoch() -> Epoch {
@@ -7,6 +7,10 @@ pub(crate) fn now_epoch() -> Epoch {
 }
 
 pub(crate) fn epoch_interval(epoch: Epoch) -> Value<NsTAIInterval> {
+    (epoch, epoch).try_to_value().unwrap()
+}
+
+pub(crate) fn ordered_epoch_interval(epoch: Epoch) -> Value<OrderedNsTAIInterval> {
     (epoch, epoch).try_to_value().unwrap()
 }
 

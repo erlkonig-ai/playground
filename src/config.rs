@@ -13,7 +13,7 @@ use triblespace::prelude::*;
 
 use crate::repo_ops::push_workspace;
 use crate::schema::playground_config;
-use crate::time_util::{epoch_interval, interval_key, now_epoch};
+use crate::time_util::{epoch_interval, interval_key, now_epoch, ordered_epoch_interval};
 
 const DEFAULT_MODEL: &str = "gpt-oss:120b";
 const DEFAULT_BASE_URL: &str = "http://localhost:11434/v1";
@@ -463,7 +463,9 @@ fn load_latest_model_profile(
 }
 
 fn store_config(ws: &mut Workspace<Pile>, config: &Config) -> Result<()> {
-    let now = epoch_interval(now_epoch());
+    let now_e = now_epoch();
+    let now = epoch_interval(now_e);
+    let now_ordered = ordered_epoch_interval(now_e);
     let config_id = ufoid();
     let profile_id = config
         .model_profile_id
@@ -479,6 +481,7 @@ fn store_config(ws: &mut Workspace<Pile>, config: &Config) -> Result<()> {
     change += entity! { &config_id @
         metadata::tag: playground_config::kind_config,
         playground_config::updated_at: now,
+        playground_config::ordered_updated_at: now_ordered,
         playground_config::system_prompt: system_prompt,
         playground_config::branch: branch,
         playground_config::author: author,
@@ -522,6 +525,7 @@ fn store_config(ws: &mut Workspace<Pile>, config: &Config) -> Result<()> {
     change += entity! { &profile_entry_id @
         metadata::tag: playground_config::kind_model_profile,
         playground_config::updated_at: now,
+        playground_config::ordered_updated_at: now_ordered,
         playground_config::model_profile_id: profile_id,
         metadata::name: profile_name,
         playground_config::model_name: model_name,

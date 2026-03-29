@@ -17,9 +17,8 @@ use triblespace::core::repo::{
 use triblespace::core::trible::TribleSet;
 use triblespace::core::value::Value;
 use triblespace::core::value::schemas::hash::{Blake3, Handle};
-use triblespace::core::value::schemas::time::NsTAIInterval;
 use triblespace::macros::{entity, find, id_hex, pattern};
-use triblespace::prelude::valueschemas::{GenId, U256BE};
+use triblespace::prelude::valueschemas::{GenId, OrderedNsTAIInterval, U256BE};
 use triblespace::prelude::{
     Attribute, BlobStore, BlobStoreGet, BranchStore, ToBlob, TryFromValue, TryToValue,
     View,
@@ -541,22 +540,22 @@ struct CompassTaskRow {
     id_prefix: String,
     title: String,
     tags: Vec<String>,
-    created_at: String,
+    created_at: Option<i128>,
     status: String,
-    status_at: Option<String>,
+    status_at: Option<i128>,
     note_count: usize,
     parent: Option<Id>,
 }
 
 impl CompassTaskRow {
-    fn sort_key(&self) -> &str {
-        self.status_at.as_deref().unwrap_or(&self.created_at)
+    fn sort_key(&self) -> i128 {
+        self.status_at.unwrap_or(self.created_at.unwrap_or(i128::MIN))
     }
 }
 
 #[derive(Debug, Clone)]
 struct CompassNoteRow {
-    at: String,
+    at: Option<i128>,
     body: String,
 }
 
@@ -564,7 +563,7 @@ struct CompassNoteRow {
 struct CompassStatusRow {
     task: Id,
     status: String,
-    at: String,
+    at: Option<i128>,
 }
 
 #[derive(Debug, Clone)]
@@ -1355,14 +1354,14 @@ fn apply_branch_defaults(state: &mut DashboardState) {
         return;
     }
 
-    // Find the latest config entity by updated_at.
+    // Find the latest config entity by ordered_updated_at.
     let mut latest: Option<(Id, i128)> = None;
     for (config_id, updated_at) in find!(
-        (config_id: Id, updated_at: Value<NsTAIInterval>),
+        (config_id: Id, updated_at: Value<OrderedNsTAIInterval>),
         pattern!(config_data, [{
             ?config_id @
             metadata::tag: playground_config::kind_config,
-            playground_config::updated_at: ?updated_at,
+            playground_config::ordered_updated_at: ?updated_at,
         }])
     ) {
         let key = interval_key(updated_at);
@@ -1688,11 +1687,11 @@ fn resolve_branch_ids(lookup: &BranchLookup, refs: &[String]) -> Result<Vec<Id>,
 fn latest_model_profile_entry_id(data: &TribleSet, profile_id: Id) -> Option<Id> {
     let mut latest: Option<(Id, i128)> = None;
     for (entry_id, updated_at) in find!(
-        (entry_id: Id, updated_at: Value<NsTAIInterval>),
+        (entry_id: Id, updated_at: Value<OrderedNsTAIInterval>),
         pattern!(data, [{
             ?entry_id @
             metadata::tag: playground_config::kind_model_profile,
-            playground_config::updated_at: ?updated_at,
+            playground_config::ordered_updated_at: ?updated_at,
             playground_config::model_profile_id: profile_id,
         }])
     ) {
@@ -1758,8 +1757,8 @@ fn collect_exec_rows(data: &TribleSet, ws: &mut Workspace<Pile>) -> Vec<ExecRow>
     }
 
     for (request_id, requested_at) in find!(
-        (request_id: Id, requested_at: Value<NsTAIInterval>),
-        pattern!(data, [{ ?request_id @ playground_exec::requested_at: ?requested_at }])
+        (request_id: Id, requested_at: Value<OrderedNsTAIInterval>),
+        pattern!(data, [{ ?request_id @ playground_exec::ordered_requested_at: ?requested_at }])
     ) {
         if let Some(row) = rows.get_mut(&request_id) {
             row.requested_at = Some(interval_key(requested_at));
@@ -1884,7 +1883,7 @@ fn collect_local_messages(data: &TribleSet, ws: &mut Workspace<Pile>) -> Vec<Loc
             from: Id,
             to: Id,
             body_handle: Value<Handle<Blake3, LongString>>,
-            created_at: Value<NsTAIInterval>
+            created_at: Value<OrderedNsTAIInterval>
         ),
         pattern!(&data, [{
             ?message_id @
@@ -1892,7 +1891,7 @@ fn collect_local_messages(data: &TribleSet, ws: &mut Workspace<Pile>) -> Vec<Loc
             local_messages::from: ?from,
             local_messages::to: ?to,
             local_messages::body: ?body_handle,
-            local_messages::created_at: ?created_at,
+            local_messages::ordered_created_at: ?created_at,
         }])
     ) {
         let body = load_text(ws, body_handle).unwrap_or_else(|| "<missing>".to_string());
@@ -1912,14 +1911,14 @@ fn collect_local_messages(data: &TribleSet, ws: &mut Workspace<Pile>) -> Vec<Loc
             read_id: Id,
             message_id: Id,
             reader_id: Id,
-            read_at: Value<NsTAIInterval>
+            read_at: Value<OrderedNsTAIInterval>
         ),
         pattern!(&data, [{
             ?read_id @
             metadata::tag: &LOCAL_KIND_READ_ID,
             local_messages::about_message: ?message_id,
             local_messages::reader: ?reader_id,
-            local_messages::read_at: ?read_at,
+            local_messages::ordered_read_at: ?read_at,
         }])
     ) {
         let _ = read_at;
@@ -2167,7 +2166,7 @@ fn collect_teams_messages(
             chat_id: Id,
             author_id: Id,
             content_handle: Value<Handle<Blake3, LongString>>,
-            created_at: Value<NsTAIInterval>
+            created_at: Value<OrderedNsTAIInterval>
         ),
         pattern!(data, [{
             ?message_id @
@@ -2175,7 +2174,7 @@ fn collect_teams_messages(
             teams::chat: ?chat_id,
             archive::author: ?author_id,
             archive::content: ?content_handle,
-            archive::created_at: ?created_at,
+            archive::ordered_created_at: ?created_at,
         }])
     ) {
         let content = load_text(ws, content_handle).unwrap_or_else(|| "<missing>".to_string());
@@ -2288,11 +2287,11 @@ fn collect_reasoning_summaries(
     }
 
     for (result_id, finished_at) in find!(
-        (result_id: Id, finished_at: Value<NsTAIInterval>),
+        (result_id: Id, finished_at: Value<OrderedNsTAIInterval>),
         pattern!(data, [{
             ?result_id @
             metadata::tag: model_chat::kind_result,
-            model_chat::finished_at: ?finished_at,
+            model_chat::ordered_finished_at: ?finished_at,
         }])
     ) {
         let summary = if let Some(handle) = reasoning_by_result.get(&result_id).copied() {
@@ -2374,13 +2373,13 @@ fn collect_reason_rows(data: &TribleSet, ws: &mut Workspace<Pile>) -> Vec<Reason
         (
             reason_id: Id,
             text_handle: Value<Handle<Blake3, LongString>>,
-            created_at: Value<NsTAIInterval>
+            created_at: Value<OrderedNsTAIInterval>
         ),
         pattern!(data, [{
             ?reason_id @
             metadata::tag: &REASON_KIND_EVENT_ID,
             reason_events::text: ?text_handle,
-            reason_events::created_at: ?created_at,
+            reason_events::ordered_created_at: ?created_at,
         }])
     ) {
         let Some(text) = load_text(ws, text_handle) else {
@@ -2406,15 +2405,15 @@ fn collect_context_chunks(data: &TribleSet) -> Vec<ContextChunkRow> {
         (
             chunk_id: Id,
             summary: Value<Handle<Blake3, LongString>>,
-            start_at: Value<NsTAIInterval>,
-            end_at: Value<NsTAIInterval>
+            start_at: Value<OrderedNsTAIInterval>,
+            end_at: Value<OrderedNsTAIInterval>
         ),
         pattern!(data, [{
             ?chunk_id @
             metadata::tag: playground_context::kind_chunk,
             playground_context::summary: ?summary,
-            playground_context::start_at: ?start_at,
-            playground_context::end_at: ?end_at,
+            playground_context::ordered_start_at: ?start_at,
+            playground_context::ordered_end_at: ?end_at,
         }])
     ) {
         rows.insert(
@@ -2685,7 +2684,7 @@ fn build_activity_timeline(
     for (goal, _depth) in compass_rows {
         goal_rows.insert(goal.id, goal.clone());
         rows.push(TimelineRow {
-            at: parse_compass_stamp(&goal.created_at),
+            at: goal.created_at,
             source: TimelineSource::Goals,
             event: TimelineEvent::GoalCreated { goal: goal.clone() },
         });
@@ -2696,7 +2695,7 @@ fn build_activity_timeline(
         id_prefix: id_prefix(task_id),
         title: format!("[{}]", id_prefix(task_id)),
         tags: Vec::new(),
-        created_at: String::new(),
+        created_at: None,
         status: "todo".to_string(),
         status_at: None,
         note_count: 0,
@@ -2709,9 +2708,9 @@ fn build_activity_timeline(
             .cloned()
             .unwrap_or_else(|| fallback_goal(status.task));
         goal.status = status.status.clone();
-        goal.status_at = Some(status.at.clone());
+        goal.status_at = status.at;
         rows.push(TimelineRow {
-            at: parse_compass_stamp(&status.at),
+            at: status.at,
             source: TimelineSource::Goals,
             event: TimelineEvent::GoalStatus {
                 goal,
@@ -2727,7 +2726,7 @@ fn build_activity_timeline(
             .unwrap_or_else(|| fallback_goal(*task_id));
         for note in notes {
             rows.push(TimelineRow {
-                at: parse_compass_stamp(&note.at),
+                at: note.at,
                 source: TimelineSource::Goals,
                 event: TimelineEvent::GoalNote {
                     goal: goal.clone(),
@@ -2746,10 +2745,6 @@ fn build_activity_timeline(
     (rows, total_rows)
 }
 
-fn parse_compass_stamp(stamp: &str) -> Option<i128> {
-    Epoch::from_gregorian_str(stamp).ok().map(epoch_key)
-}
-
 fn collect_compass_rows(
     data: &TribleSet,
     ws: &mut Workspace<Pile>,
@@ -2760,13 +2755,13 @@ fn collect_compass_rows(
         (
             task_id: Id,
             title_handle: Value<Handle<Blake3, LongString>>,
-            created_at: String
+            created_at: Value<OrderedNsTAIInterval>
         ),
         pattern!(&data, [{
             ?task_id @
             metadata::tag: &COMPASS_KIND_GOAL_ID,
             compass::title: ?title_handle,
-            compass::created_at: ?created_at,
+            compass::ordered_created_at: ?created_at,
         }])
     ) {
         if tasks.contains_key(&task_id) {
@@ -2780,7 +2775,7 @@ fn collect_compass_rows(
                 id_prefix: id_prefix(task_id),
                 title,
                 tags: Vec::new(),
-                created_at,
+                created_at: Some(interval_key(created_at)),
                 status: "todo".to_string(),
                 status_at: None,
                 note_count: 0,
@@ -2811,25 +2806,26 @@ fn collect_compass_rows(
         }
     }
 
-    let mut status_map: HashMap<Id, (String, String)> = HashMap::new();
+    let mut status_map: HashMap<Id, (String, i128)> = HashMap::new();
     for (task_id, status, at) in find!(
-        (task_id: Id, status: String, at: String),
+        (task_id: Id, status: String, at: Value<OrderedNsTAIInterval>),
         pattern!(&data, [{
             _?event @
             metadata::tag: &COMPASS_KIND_STATUS_ID,
             compass::task: ?task_id,
             compass::status: ?status,
-            compass::at: ?at,
+            compass::ordered_at: ?at,
         }])
     ) {
+        let at_key = interval_key(at);
         status_map
             .entry(task_id)
             .and_modify(|current| {
-                if at > current.1 {
-                    *current = (status.clone(), at.clone());
+                if at_key > current.1 {
+                    *current = (status.clone(), at_key);
                 }
             })
-            .or_insert_with(|| (status, at));
+            .or_insert_with(|| (status, at_key));
     }
 
     let mut note_counts: HashMap<Id, usize> = HashMap::new();
@@ -2845,9 +2841,9 @@ fn collect_compass_rows(
     }
 
     for task in tasks.values_mut() {
-        if let Some((status, at)) = status_map.get(&task.id) {
+        if let Some((status, at_key)) = status_map.get(&task.id) {
             task.status = status.clone();
-            task.status_at = Some(at.clone());
+            task.status_at = Some(*at_key);
         }
         if let Some(count) = note_counts.get(&task.id) {
             task.note_count = *count;
@@ -2862,19 +2858,19 @@ fn collect_compass_rows(
 fn collect_compass_status_rows(data: &TribleSet) -> Vec<CompassStatusRow> {
     let mut rows = Vec::new();
     for (task_id, status, at) in find!(
-        (task_id: Id, status: String, at: String),
+        (task_id: Id, status: String, at: Value<OrderedNsTAIInterval>),
         pattern!(&data, [{
             _?event @
             metadata::tag: &COMPASS_KIND_STATUS_ID,
             compass::task: ?task_id,
             compass::status: ?status,
-            compass::at: ?at,
+            compass::ordered_at: ?at,
         }])
     ) {
         rows.push(CompassStatusRow {
             task: task_id,
             status,
-            at,
+            at: Some(interval_key(at)),
         });
     }
     rows.sort_by(|a, b| b.at.cmp(&a.at));
@@ -2888,23 +2884,22 @@ fn collect_compass_notes(
     let mut map: HashMap<Id, Vec<CompassNoteRow>> = HashMap::new();
 
     for (task_id, note_handle, at) in find!(
-        (task_id: Id, note_handle: Value<Handle<Blake3, LongString>>, at: String),
+        (task_id: Id, note_handle: Value<Handle<Blake3, LongString>>, at: Value<OrderedNsTAIInterval>),
         pattern!(&data, [{
             _?event @
             metadata::tag: &COMPASS_KIND_NOTE_ID,
             compass::task: ?task_id,
             compass::note: ?note_handle,
-            compass::at: ?at,
+            compass::ordered_at: ?at,
         }])
     ) {
         let body = load_text(ws, note_handle).unwrap_or_else(|| "<missing>".to_string());
         map.entry(task_id)
             .or_default()
-            .push(CompassNoteRow { at, body });
+            .push(CompassNoteRow { at: Some(interval_key(at)), body });
     }
 
     for notes in map.values_mut() {
-        // ISO-like timestamps sort lexicographically.
         notes.sort_by(|a, b| b.at.cmp(&a.at));
     }
 
@@ -2937,10 +2932,10 @@ fn order_compass_rows(rows: Vec<CompassTaskRow>) -> Vec<(CompassTaskRow, usize)>
         items.sort_by(|a, b| {
             let a_row = by_id.get(a);
             let b_row = by_id.get(b);
-            let a_key = a_row.map(|row| row.sort_key()).unwrap_or("");
-            let b_key = b_row.map(|row| row.sort_key()).unwrap_or("");
+            let a_key = a_row.map(|row| row.sort_key()).unwrap_or(i128::MIN);
+            let b_key = b_row.map(|row| row.sort_key()).unwrap_or(i128::MIN);
             b_key
-                .cmp(a_key)
+                .cmp(&a_key)
                 .then_with(|| {
                     let a_title = a_row.map(|row| row.title.as_str()).unwrap_or("");
                     let b_title = b_row.map(|row| row.title.as_str()).unwrap_or("");
@@ -3418,7 +3413,7 @@ fn send_local_message(
     let mut change = ensure_local_metadata(&mut ws)?;
 
     let now = now_epoch();
-    let now_interval: Value<NsTAIInterval> = (now, now).try_to_value().unwrap();
+    let now_interval: Value<OrderedNsTAIInterval> = (now, now).try_to_value().unwrap();
     let message_id = triblespace::prelude::ufoid();
     let body_handle = ws.put(body.to_string());
     change += entity! { &message_id @
@@ -3426,7 +3421,7 @@ fn send_local_message(
         local_messages::from: from,
         local_messages::to: to,
         local_messages::body: body_handle,
-        local_messages::created_at: now_interval,
+        local_messages::ordered_created_at: now_interval,
     };
 
     ws.commit(change, "local message");
@@ -3493,8 +3488,8 @@ fn load_attempts(data: &TribleSet) -> HashMap<Id, u64> {
 fn load_started_at(data: &TribleSet) -> HashMap<Id, i128> {
     let mut intervals = HashMap::new();
     for (event_id, interval) in find!(
-        (event_id: Id, interval: Value<NsTAIInterval>),
-        pattern!(data, [{ ?event_id @ playground_exec::started_at: ?interval }])
+        (event_id: Id, interval: Value<OrderedNsTAIInterval>),
+        pattern!(data, [{ ?event_id @ playground_exec::ordered_started_at: ?interval }])
     ) {
         intervals.insert(event_id, interval_key(interval));
     }
@@ -3504,8 +3499,8 @@ fn load_started_at(data: &TribleSet) -> HashMap<Id, i128> {
 fn load_finished_at(data: &TribleSet) -> HashMap<Id, i128> {
     let mut intervals = HashMap::new();
     for (event_id, interval) in find!(
-        (event_id: Id, interval: Value<NsTAIInterval>),
-        pattern!(data, [{ ?event_id @ playground_exec::finished_at: ?interval }])
+        (event_id: Id, interval: Value<OrderedNsTAIInterval>),
+        pattern!(data, [{ ?event_id @ playground_exec::ordered_finished_at: ?interval }])
     ) {
         intervals.insert(event_id, interval_key(interval));
     }
@@ -3668,11 +3663,11 @@ fn render_agent_config(
     // Find the latest config entity.
     let mut latest: Option<(Id, i128)> = None;
     for (config_id, updated_at) in find!(
-        (config_id: Id, updated_at: Value<NsTAIInterval>),
+        (config_id: Id, updated_at: Value<OrderedNsTAIInterval>),
         pattern!(data, [{
             ?config_id @
             metadata::tag: playground_config::kind_config,
-            playground_config::updated_at: ?updated_at,
+            playground_config::ordered_updated_at: ?updated_at,
         }])
     ) {
         let key = interval_key(updated_at);
@@ -5059,13 +5054,13 @@ fn render_compass_swimlanes_live(
         (
             task_id: Id,
             title_handle: Value<Handle<Blake3, LongString>>,
-            created_at: String
+            created_at: Value<OrderedNsTAIInterval>
         ),
         pattern!(data, [{
             ?task_id @
             metadata::tag: &COMPASS_KIND_GOAL_ID,
             compass::title: ?title_handle,
-            compass::created_at: ?created_at,
+            compass::ordered_created_at: ?created_at,
         }])
     ) {
         if tasks.contains_key(&task_id) {
@@ -5082,7 +5077,7 @@ fn render_compass_swimlanes_live(
                 id_prefix: id_prefix(task_id),
                 title,
                 tags: Vec::new(),
-                created_at,
+                created_at: Some(interval_key(created_at)),
                 status: "todo".to_string(),
                 status_at: None,
                 note_count: 0,
@@ -5121,25 +5116,26 @@ fn render_compass_swimlanes_live(
     }
 
     // ── Latest status per goal ──
-    let mut status_map: HashMap<Id, (String, String)> = HashMap::new();
+    let mut status_map: HashMap<Id, (String, i128)> = HashMap::new();
     for (task_id, status, at) in find!(
-        (task_id: Id, status: String, at: String),
+        (task_id: Id, status: String, at: Value<OrderedNsTAIInterval>),
         pattern!(data, [{
             _?event @
             metadata::tag: &COMPASS_KIND_STATUS_ID,
             compass::task: ?task_id,
             compass::status: ?status,
-            compass::at: ?at,
+            compass::ordered_at: ?at,
         }])
     ) {
+        let at_key = interval_key(at);
         status_map
             .entry(task_id)
             .and_modify(|current| {
-                if at > current.1 {
-                    *current = (status.clone(), at.clone());
+                if at_key > current.1 {
+                    *current = (status.clone(), at_key);
                 }
             })
-            .or_insert_with(|| (status, at));
+            .or_insert_with(|| (status, at_key));
     }
 
     // ── Note counts ──
@@ -5157,9 +5153,9 @@ fn render_compass_swimlanes_live(
 
     // ── Apply status & note counts to tasks ──
     for task in tasks.values_mut() {
-        if let Some((status, at)) = status_map.get(&task.id) {
+        if let Some((status, at_key)) = status_map.get(&task.id) {
             task.status = status.clone();
-            task.status_at = Some(at.clone());
+            task.status_at = Some(*at_key);
         }
         if let Some(count) = note_counts.get(&task.id) {
             task.note_count = *count;
@@ -5174,20 +5170,20 @@ fn render_compass_swimlanes_live(
     let notes: HashMap<Id, Vec<CompassNoteRow>> = if let Some(goal_id) = *expanded_goal {
         let mut map: HashMap<Id, Vec<CompassNoteRow>> = HashMap::new();
         for (note_handle, at) in find!(
-            (note_handle: Value<Handle<Blake3, LongString>>, at: String),
+            (note_handle: Value<Handle<Blake3, LongString>>, at: Value<OrderedNsTAIInterval>),
             pattern!(data, [{
                 _?event @
                 metadata::tag: &COMPASS_KIND_NOTE_ID,
                 compass::task: &goal_id,
                 compass::note: ?note_handle,
-                compass::at: ?at,
+                compass::ordered_at: ?at,
             }])
         ) {
             let body = ws
                 .as_mut()
                 .and_then(|w| load_text(w, note_handle))
                 .unwrap_or_else(|| "<missing>".to_string());
-            map.entry(goal_id).or_default().push(CompassNoteRow { at, body });
+            map.entry(goal_id).or_default().push(CompassNoteRow { at: Some(interval_key(at)), body });
         }
         for notes in map.values_mut() {
             notes.sort_by(|a, b| b.at.cmp(&a.at));
@@ -5388,9 +5384,10 @@ fn render_compass_swimlane_row(
                     ui.small("(no notes)");
                     return;
                 }
+                let now_key = epoch_key(now_epoch());
                 for note in task_notes {
                     ui.label(
-                        egui::RichText::new(&note.at).small().color(color_muted()),
+                        egui::RichText::new(format_age(now_key, note.at)).small().color(color_muted()),
                     );
                     ui.add(
                         egui::Label::new(egui::RichText::new(&note.body))
@@ -5681,7 +5678,7 @@ fn epoch_key(epoch: Epoch) -> i128 {
     epoch.to_tai_duration().total_nanoseconds()
 }
 
-fn interval_key(interval: Value<NsTAIInterval>) -> i128 {
+fn interval_key(interval: Value<OrderedNsTAIInterval>) -> i128 {
     let (lower_ns, _): (i128, i128) = interval.try_from_value().unwrap();
     lower_ns
 }

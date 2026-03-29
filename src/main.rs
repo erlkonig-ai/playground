@@ -40,7 +40,7 @@ use repo_util::{
     refresh_cached_checkout,
 };
 use schema::{model_chat, playground_cog, playground_context, playground_exec};
-use time_util::{epoch_interval, format_tai_interval_timestamp, format_time_range, interval_key, interval_width, now_epoch};
+use time_util::{epoch_interval, format_tai_interval_timestamp, format_time_range, interval_key, interval_width, now_epoch, ordered_epoch_interval};
 
 const MEMORY_BRANCH_NAME: &str = "memory";
 
@@ -821,7 +821,9 @@ fn create_thought_and_request(
         }
     }
 
-    let now = epoch_interval(now_epoch());
+    let now_e = now_epoch();
+    let now = epoch_interval(now_e);
+    let now_ordered = ordered_epoch_interval(now_e);
     let memory_catalog = match repo.ensure_branch(MEMORY_BRANCH_NAME, None) {
         Ok(memory_branch_id) => {
             let mut memory_ws = pull_workspace(repo, memory_branch_id, "pull memory branch")?;
@@ -874,6 +876,7 @@ fn create_thought_and_request(
         metadata::tag: playground_cog::kind_thought,
         playground_cog::context: context_handle,
         playground_cog::created_at: now,
+        playground_cog::ordered_created_at: now_ordered,
     };
     if let Some(exec_result_id) = about_exec_result {
         change += entity! { &thought_id @ playground_cog::about_exec_result: exec_result_id };
@@ -885,6 +888,7 @@ fn create_thought_and_request(
         model_chat::about_thought: *thought_id,
         model_chat::context: context_handle,
         model_chat::requested_at: now,
+        model_chat::ordered_requested_at: now_ordered,
         model_chat::model: config.model.model.as_str(),
     };
 
@@ -912,7 +916,9 @@ fn create_request_for_thought_from_catalog(
         return Err(anyhow!("thought {thought_id:x} missing context"));
     };
 
-    let now = epoch_interval(now_epoch());
+    let now_e = now_epoch();
+    let now = epoch_interval(now_e);
+    let now_ordered = ordered_epoch_interval(now_e);
     let request_id = ufoid();
     let mut change = TribleSet::new();
     change += entity! { &request_id @
@@ -920,6 +926,7 @@ fn create_request_for_thought_from_catalog(
         model_chat::about_thought: thought_id,
         model_chat::context: context_handle,
         model_chat::requested_at: now,
+        model_chat::ordered_requested_at: now_ordered,
         model_chat::model: config.model.model.as_str(),
     };
     ws.commit(change, "create model request");
@@ -943,7 +950,9 @@ fn retry_model_request(
             return Err(anyhow!("thought {thought_id:x} missing context for retry"));
         };
 
-        let now = epoch_interval(now_epoch());
+        let now_e = now_epoch();
+        let now = epoch_interval(now_e);
+        let now_ordered = ordered_epoch_interval(now_e);
         let request_id = ufoid();
         let mut change = TribleSet::new();
         change += entity! { &request_id @
@@ -951,6 +960,7 @@ fn retry_model_request(
             model_chat::about_thought: thought_id,
             model_chat::context: context_handle,
             model_chat::requested_at: now,
+            model_chat::ordered_requested_at: now_ordered,
             model_chat::model: config.model.model.as_str(),
         };
         ws.commit(change, "retry model request");
@@ -1509,13 +1519,16 @@ fn ensure_command_request(
     }
 
     let request_id = ufoid();
-    let now = epoch_interval(now_epoch());
+    let now_e = now_epoch();
+    let now = epoch_interval(now_e);
+    let now_ordered = ordered_epoch_interval(now_e);
     let command_handle = ws.put(command.to_owned());
     let mut change = TribleSet::new();
     change += entity! { &request_id @
         metadata::tag: playground_exec::kind_command_request,
         playground_exec::command_text: command_handle,
         playground_exec::requested_at: now,
+        playground_exec::ordered_requested_at: now_ordered,
     };
     if let Some(thought_id) = thought_id {
         change += entity! { &request_id @ playground_exec::about_thought: thought_id };

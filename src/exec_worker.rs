@@ -24,7 +24,7 @@ use crate::repo_util::{
     push_workspace, refresh_cached_checkout,
 };
 use crate::schema::playground_exec;
-use crate::time_util::{epoch_interval, interval_key, now_epoch};
+use crate::time_util::{epoch_interval, interval_key, now_epoch, ordered_epoch_interval};
 
 const DEFAULT_EXEC_TIMEOUT_MS: u64 = 300_000;
 const EXEC_CONTROL_POLL_MS: u64 = 100;
@@ -113,7 +113,9 @@ pub(crate) fn run_exec_loop(
                 extra: Vec::new(),
             };
 
-            let started_at = epoch_interval(now_epoch());
+            let started_e = now_epoch();
+            let started_at = epoch_interval(started_e);
+            let ordered_started_at = ordered_epoch_interval(started_e);
             let in_progress_id = ufoid();
             let mut change = TribleSet::new();
             change += entity! { &in_progress_id @
@@ -121,6 +123,7 @@ pub(crate) fn run_exec_loop(
                 playground_exec::about_request: request.id,
                 playground_exec::worker: worker_id,
                 playground_exec::started_at: started_at,
+                playground_exec::ordered_started_at: ordered_started_at,
                 playground_exec::attempt: attempt,
             };
             ws.commit(change, "playground_exec in_progress");
@@ -170,7 +173,9 @@ pub(crate) fn run_exec_loop(
                 error,
             } = output;
             let duration_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
-            let finished_at = epoch_interval(now_epoch());
+            let finished_e = now_epoch();
+            let finished_at = epoch_interval(finished_e);
+            let ordered_finished_at = ordered_epoch_interval(finished_e);
 
             let result_id = ufoid();
             let mut change = TribleSet::new();
@@ -178,6 +183,7 @@ pub(crate) fn run_exec_loop(
                 metadata::tag: playground_exec::kind_command_result,
                 playground_exec::about_request: request.id,
                 playground_exec::finished_at: finished_at,
+                playground_exec::ordered_finished_at: ordered_finished_at,
                 playground_exec::attempt: attempt,
                 playground_exec::duration_ms: duration_ms,
             };
