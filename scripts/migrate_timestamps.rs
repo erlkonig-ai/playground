@@ -6,7 +6,7 @@
 //! ed25519-dalek = "2"
 //! rand_core = "0.6"
 //! triblespace = { version = "0.28", default-features = false }
-//! hifitime = "4"
+//! hifitime = "4.2"
 //! ```
 
 //! Migrate LE timestamps (NsTAIInterval) to OBE (OrderedNsTAIInterval).
@@ -24,7 +24,6 @@ use triblespace::core::id::Id;
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::Repository;
 use triblespace::core::trible::{Trible, TribleSet};
-use triblespace::core::value::schemas::hash::Blake3;
 use triblespace::macros::id_hex;
 use triblespace::prelude::*;
 
@@ -113,17 +112,9 @@ fn main() -> Result<()> {
     println!("Found {} branches", branch_ids.len());
 
     // Build lookup: old attribute ID → new attribute ID (as raw bytes).
-    let old_attr_ids: std::collections::HashSet<[u8; 16]> = MIGRATIONS
-        .iter()
-        .map(|(old, _)| old.raw())
-        .collect();
     let migration_map: std::collections::HashMap<[u8; 16], [u8; 16]> = MIGRATIONS
         .iter()
         .map(|(old, new)| (old.raw(), new.raw()))
-        .collect();
-    let compass_old_ids: std::collections::HashSet<[u8; 16]> = COMPASS_MIGRATIONS
-        .iter()
-        .map(|(old, _)| old.raw())
         .collect();
     let compass_map: std::collections::HashMap<[u8; 16], [u8; 16]> = COMPASS_MIGRATIONS
         .iter()
@@ -180,18 +171,26 @@ fn main() -> Result<()> {
             if let Some(new_a) = compass_map.get(&a_raw) {
                 // Extract ShortString value: it's a fixed 32-byte field, read as UTF-8.
                 let s = std::str::from_utf8(v).unwrap_or("").trim_end_matches('\0');
-                if let Some(obe_v) = iso_to_obe(s) {
-                    let mut new_trible_data = [0u8; 64];
-                    new_trible_data[0..16].copy_from_slice(e);
-                    new_trible_data[16..32].copy_from_slice(new_a);
-                    new_trible_data[32..64].copy_from_slice(&obe_v);
+                if s.is_empty() {
+                    continue;
+                }
+                match iso_to_obe(s) {
+                    Some(obe_v) => {
+                        let mut new_trible_data = [0u8; 64];
+                        new_trible_data[0..16].copy_from_slice(e);
+                        new_trible_data[16..32].copy_from_slice(new_a);
+                        new_trible_data[32..64].copy_from_slice(&obe_v);
 
-                    let new_trible = Trible::as_transmute_raw_unchecked(&new_trible_data);
-                    if data.contains(new_trible) {
-                        already_present += 1;
-                    } else {
-                        change.insert(new_trible);
-                        migrated_compass += 1;
+                        let new_trible = Trible::as_transmute_raw_unchecked(&new_trible_data);
+                        if data.contains(new_trible) {
+                            already_present += 1;
+                        } else {
+                            change.insert(new_trible);
+                            migrated_compass += 1;
+                        }
+                    }
+                    None => {
+                        eprintln!("    warning: failed to parse compass timestamp: {s:?}");
                     }
                 }
             }
