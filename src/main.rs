@@ -40,7 +40,7 @@ use repo_util::{
     refresh_cached_checkout,
 };
 use schema::{model_chat, playground_cog, playground_context, playground_exec};
-use time_util::{epoch_interval, format_tai_interval_timestamp, format_time_range, interval_key, interval_width, now_epoch, ordered_epoch_interval};
+use time_util::{epoch_interval, format_tai_interval_timestamp, format_time_range, interval_key, interval_width, now_epoch};
 
 const MEMORY_BRANCH_NAME: &str = "memory";
 
@@ -51,8 +51,7 @@ mod reason_events {
 
     attributes! {
         "B10329D5D1087D15A3DAFF7A7CC50696" as text: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
-        "FBA9BC32A457C7BFFDB7E0181D3E82A4" as created_at: valueschemas::NsTAIInterval;
-        "79C9CB4C48864D28B215D4264E1037BF" as ordered_created_at: valueschemas::OrderedNsTAIInterval;
+        "79C9CB4C48864D28B215D4264E1037BF" as ordered_created_at: valueschemas::NsTAIInterval;
         "E6B1C728F1AE9F46CAB4DBB60D1A9528" as about_turn: valueschemas::GenId;
         "721DED6DA776F2CF4FB91C54D9F82358" as worker: valueschemas::GenId;
         "514F4FE9F560FB155450462C8CF50749" as command_text: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
@@ -822,8 +821,7 @@ fn create_thought_and_request(
     }
 
     let now_e = now_epoch();
-    let now = epoch_interval(now_e);
-    let now_ordered = ordered_epoch_interval(now_e);
+    let now_ordered = epoch_interval(now_e);
     let memory_catalog = match repo.ensure_branch(MEMORY_BRANCH_NAME, None) {
         Ok(memory_branch_id) => {
             let mut memory_ws = pull_workspace(repo, memory_branch_id, "pull memory branch")?;
@@ -875,7 +873,6 @@ fn create_thought_and_request(
     change += entity! { &thought_id @
         metadata::tag: playground_cog::kind_thought,
         playground_cog::context: context_handle,
-        playground_cog::created_at: now,
         playground_cog::ordered_created_at: now_ordered,
     };
     if let Some(exec_result_id) = about_exec_result {
@@ -887,7 +884,6 @@ fn create_thought_and_request(
         metadata::tag: model_chat::kind_request,
         model_chat::about_thought: *thought_id,
         model_chat::context: context_handle,
-        model_chat::requested_at: now,
         model_chat::ordered_requested_at: now_ordered,
         model_chat::model: config.model.model.as_str(),
     };
@@ -917,15 +913,13 @@ fn create_request_for_thought_from_catalog(
     };
 
     let now_e = now_epoch();
-    let now = epoch_interval(now_e);
-    let now_ordered = ordered_epoch_interval(now_e);
+    let now_ordered = epoch_interval(now_e);
     let request_id = ufoid();
     let mut change = TribleSet::new();
     change += entity! { &request_id @
         metadata::tag: model_chat::kind_request,
         model_chat::about_thought: thought_id,
         model_chat::context: context_handle,
-        model_chat::requested_at: now,
         model_chat::ordered_requested_at: now_ordered,
         model_chat::model: config.model.model.as_str(),
     };
@@ -951,15 +945,13 @@ fn retry_model_request(
         };
 
         let now_e = now_epoch();
-        let now = epoch_interval(now_e);
-        let now_ordered = ordered_epoch_interval(now_e);
+        let now_ordered = epoch_interval(now_e);
         let request_id = ufoid();
         let mut change = TribleSet::new();
         change += entity! { &request_id @
             metadata::tag: model_chat::kind_request,
             model_chat::about_thought: thought_id,
             model_chat::context: context_handle,
-            model_chat::requested_at: now,
             model_chat::ordered_requested_at: now_ordered,
             model_chat::model: config.model.model.as_str(),
         };
@@ -1142,7 +1134,7 @@ fn latest_pending_model_request(catalog: &TribleSet) -> Option<ModelRequestInfo>
     .map(|request_id| {
         let requested_at = find!(
             ts: Value<NsTAIInterval>,
-            pattern!(catalog, [{ request_id @ model_chat::requested_at: ?ts }])
+            pattern!(catalog, [{ request_id @ model_chat::ordered_requested_at: ?ts }])
         )
         .next()
         .map(|ts| interval_key(ts))
@@ -1187,7 +1179,7 @@ fn latest_unrequested_thought(catalog: &TribleSet) -> Option<Id> {
     .map(|thought_id| {
         let created_at = find!(
             ts: Value<NsTAIInterval>,
-            pattern!(catalog, [{ thought_id @ playground_cog::created_at: ?ts }])
+            pattern!(catalog, [{ thought_id @ playground_cog::ordered_created_at: ?ts }])
         )
         .next()
         .map(|ts| interval_key(ts))
@@ -1247,7 +1239,7 @@ fn latest_model_result(catalog: &TribleSet, request_id: Id) -> Option<ModelResul
     .map(|result_id| {
             let finished_at = find!(
                 ts: Value<NsTAIInterval>,
-                pattern!(catalog, [{ result_id @ model_chat::finished_at: ?ts }])
+                pattern!(catalog, [{ result_id @ model_chat::ordered_finished_at: ?ts }])
             )
             .next();
 
@@ -1297,7 +1289,7 @@ fn reason_events_for_turn(catalog: &TribleSet, turn_id: Id) -> Vec<ReasonEventIn
     .map(|reason_id| {
         let created_at = find!(
             ts: Value<NsTAIInterval>,
-            pattern!(catalog, [{ reason_id @ reason_events::created_at: ?ts }])
+            pattern!(catalog, [{ reason_id @ reason_events::ordered_created_at: ?ts }])
         )
         .next()
         .map(|ts| interval_key(ts))
@@ -1388,7 +1380,7 @@ fn latest_moment_boundary_turn_id(catalog: &TribleSet) -> Option<Id> {
     .filter_map(|(boundary_id, turn_id)| {
         let created = find!(
             ts: Value<NsTAIInterval>,
-            pattern!(catalog, [{ boundary_id @ playground_cog::created_at: ?ts }])
+            pattern!(catalog, [{ boundary_id @ playground_cog::ordered_created_at: ?ts }])
         )
         .next()
         .map(|ts| interval_key(ts))?;
@@ -1435,7 +1427,7 @@ fn fill_command_result_fields(catalog: &TribleSet, info: &mut CommandResultInfo)
 
     info.finished_at = find!(
         ts: Value<NsTAIInterval>,
-        pattern!(catalog, [{ result_id @ playground_exec::finished_at: ?ts }])
+        pattern!(catalog, [{ result_id @ playground_exec::ordered_finished_at: ?ts }])
     )
     .next();
 
@@ -1520,14 +1512,12 @@ fn ensure_command_request(
 
     let request_id = ufoid();
     let now_e = now_epoch();
-    let now = epoch_interval(now_e);
-    let now_ordered = ordered_epoch_interval(now_e);
+    let now_ordered = epoch_interval(now_e);
     let command_handle = ws.put(command.to_owned());
     let mut change = TribleSet::new();
     change += entity! { &request_id @
         metadata::tag: playground_exec::kind_command_request,
         playground_exec::command_text: command_handle,
-        playground_exec::requested_at: now,
         playground_exec::ordered_requested_at: now_ordered,
     };
     if let Some(thought_id) = thought_id {
@@ -2163,8 +2153,8 @@ fn load_context_chunks(catalog: &TribleSet) -> ContextChunkIndex {
             ?chunk_id @
             metadata::tag: playground_context::kind_chunk,
             playground_context::summary: ?summary,
-            playground_context::start_at: ?start_at,
-            playground_context::end_at: ?end_at,
+            playground_context::ordered_start_at: ?start_at,
+            playground_context::ordered_end_at: ?end_at,
         }])
     ) {
         index.chunks.insert(

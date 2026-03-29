@@ -26,7 +26,7 @@ use crate::repo_util::{
     push_workspace, refresh_cached_checkout,
 };
 use crate::schema::model_chat;
-use crate::time_util::{epoch_interval, interval_key, now_epoch, ordered_epoch_interval};
+use crate::time_util::{epoch_interval, interval_key, now_epoch};
 
 #[derive(Debug, Clone)]
 struct ModelRequest {
@@ -308,15 +308,13 @@ pub(crate) fn run_model_loop(
                 Ok(messages) => messages,
                 Err(err) => {
                     let finished_e = now_epoch();
-                    let finished_at = epoch_interval(finished_e);
-                    let ordered_finished_at = ordered_epoch_interval(finished_e);
+                    let ordered_finished_at = epoch_interval(finished_e);
                     let result_id = ufoid();
                     let handle = ws.put(format!("parse chat context: {err}"));
                     let mut change = TribleSet::new();
                     change += entity! { &result_id @
                         metadata::tag: model_chat::kind_result,
                         model_chat::about_request: request.id,
-                        model_chat::finished_at: finished_at,
                         model_chat::ordered_finished_at: ordered_finished_at,
                         model_chat::attempt: attempt,
                         model_chat::error: handle,
@@ -332,8 +330,7 @@ pub(crate) fn run_model_loop(
                 serde_json::to_string(&payload).context("serialize request payload")?;
 
             let started_e = now_epoch();
-            let started_at = epoch_interval(started_e);
-            let ordered_started_at = ordered_epoch_interval(started_e);
+            let ordered_started_at = epoch_interval(started_e);
             let in_progress_id = ufoid();
             let request_raw_handle = ws.put(request_raw);
 
@@ -344,7 +341,6 @@ pub(crate) fn run_model_loop(
             change += entity! { &in_progress_id @
                 metadata::tag: model_chat::kind_in_progress,
                 model_chat::about_request: request.id,
-                model_chat::started_at: started_at,
                 model_chat::ordered_started_at: ordered_started_at,
                 model_chat::worker: worker_id,
                 model_chat::attempt: attempt,
@@ -355,14 +351,12 @@ pub(crate) fn run_model_loop(
             let result = client.send_payload(&payload);
 
             let finished_e = now_epoch();
-            let finished_at = epoch_interval(finished_e);
-            let ordered_finished_at = ordered_epoch_interval(finished_e);
+            let ordered_finished_at = epoch_interval(finished_e);
             let result_id = ufoid();
             let mut change = TribleSet::new();
             change += entity! { &result_id @
                 metadata::tag: model_chat::kind_result,
                 model_chat::about_request: request.id,
-                model_chat::finished_at: finished_at,
                 model_chat::ordered_finished_at: ordered_finished_at,
                 model_chat::attempt: attempt,
             };
@@ -501,7 +495,7 @@ fn next_pending_model_request(catalog: &TribleSet, worker_id: Id) -> Option<Mode
     candidates.sort_by_key(|(id, _)| {
         find!(
             (ts: Value<NsTAIInterval>),
-            pattern!(catalog, [{ *id @ model_chat::requested_at: ?ts }])
+            pattern!(catalog, [{ *id @ model_chat::ordered_requested_at: ?ts }])
         )
         .next()
         .map(|(ts,)| interval_key(ts))

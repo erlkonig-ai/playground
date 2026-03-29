@@ -9,7 +9,7 @@
 //! hifitime = "4.2"
 //! ```
 
-//! Migrate LE timestamps (NsTAIInterval) to OBE (OrderedNsTAIInterval).
+//! Migrate LE timestamps (NsTAIInterval) to OBE (NsTAIInterval).
 //!
 //! For each branch, reads all tribles with old LE timestamp attributes,
 //! re-encodes the values as order-preserving big-endian, and writes them
@@ -28,7 +28,7 @@ use triblespace::macros::id_hex;
 use triblespace::prelude::*;
 
 #[derive(Parser)]
-#[command(about = "Migrate NsTAIInterval (LE) → OrderedNsTAIInterval (OBE)")]
+#[command(about = "Migrate NsTAIInterval (LE) → NsTAIInterval (OBE)")]
 struct Cli {
     #[arg(long, env = "PILE")]
     pile: PathBuf,
@@ -63,7 +63,7 @@ const MIGRATIONS: &[(Id, Id)] = &[
     (id_hex!("FBA9BC32A457C7BFFDB7E0181D3E82A4"), id_hex!("79C9CB4C48864D28B215D4264E1037BF")), // created_at
 ];
 
-/// Compass attributes: ShortString ISO timestamps → OrderedNsTAIInterval.
+/// Compass attributes: ShortString ISO timestamps → NsTAIInterval.
 const COMPASS_MIGRATIONS: &[(Id, Id)] = &[
     (id_hex!("F9B56611861316B31A6C510B081C30B3"), id_hex!("E915C4D678D0F484B89B4E85E55DB442")), // created_at
     (id_hex!("8200ADEDC8D4D3D6D01CDC7396DF9AEC"), id_hex!("4FB34DB057497FB845B3816521A9A05E")), // at
@@ -71,7 +71,7 @@ const COMPASS_MIGRATIONS: &[(Id, Id)] = &[
 
 const SIGN_BIT: u128 = 1u128 << 127;
 
-/// Convert LE NsTAIInterval value bytes to OBE OrderedNsTAIInterval bytes.
+/// Convert LE NsTAIInterval value bytes to OBE NsTAIInterval bytes.
 fn le_to_obe(le_value: &[u8; 32]) -> [u8; 32] {
     let lower = i128::from_le_bytes(le_value[0..16].try_into().unwrap());
     let upper = i128::from_le_bytes(le_value[16..32].try_into().unwrap());
@@ -81,7 +81,7 @@ fn le_to_obe(le_value: &[u8; 32]) -> [u8; 32] {
     obe
 }
 
-/// Convert ISO timestamp string to OrderedNsTAIInterval value bytes.
+/// Convert ISO timestamp string to NsTAIInterval value bytes.
 fn iso_to_obe(iso: &str) -> Option<[u8; 32]> {
     let epoch = hifitime::Epoch::from_gregorian_str(iso).ok()?;
     let ns = epoch.to_tai_duration().total_nanoseconds();
@@ -142,7 +142,7 @@ fn main() -> Result<()> {
         let mut migrated_compass = 0usize;
         let mut already_present = 0usize;
 
-        // Migrate NsTAIInterval (LE) → OrderedNsTAIInterval (OBE).
+        // Migrate NsTAIInterval (LE) → NsTAIInterval (OBE).
         for trible in data.iter() {
             let e = &trible.data[0..16];
             let a = &trible.data[16..32];
@@ -167,7 +167,7 @@ fn main() -> Result<()> {
                 }
             }
 
-            // Compass: ShortString → OrderedNsTAIInterval.
+            // Compass: ShortString → NsTAIInterval.
             if let Some(new_a) = compass_map.get(&a_raw) {
                 // Extract ShortString value: it's a fixed 32-byte field, read as UTF-8.
                 let s = std::str::from_utf8(v).unwrap_or("").trim_end_matches('\0');
@@ -202,7 +202,7 @@ fn main() -> Result<()> {
         );
 
         if total > 0 && !cli.dry_run {
-            ws.commit(change, "migrate timestamps to OrderedNsTAIInterval");
+            ws.commit(change, "migrate timestamps to NsTAIInterval");
             repo.push(&mut ws)
                 .map_err(|e| anyhow::anyhow!("push branch {branch_name}: {e:?}"))?;
             println!("    committed.");

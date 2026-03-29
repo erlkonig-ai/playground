@@ -1,15 +1,14 @@
 use triblespace::core::metadata;
 use triblespace::macros::id_hex;
 use triblespace::prelude::blobschemas::LongString;
-use triblespace::prelude::valueschemas::{Blake3, GenId, Handle, NsTAIInterval, OrderedNsTAIInterval, U256BE};
+use triblespace::prelude::valueschemas::{Blake3, GenId, Handle, NsTAIInterval, U256BE};
 use triblespace::prelude::*;
 
 pub mod playground_config {
     use super::*;
 
     attributes! {
-        "DDF83FEC915816ACAE7F3FEBB57E5137" as pub updated_at: NsTAIInterval;
-        "5E32E36AD28B0B1E035D2DFCC20A3DC5" as pub ordered_updated_at: OrderedNsTAIInterval;
+        "5E32E36AD28B0B1E035D2DFCC20A3DC5" as pub ordered_updated_at: NsTAIInterval;
         "950B556A74F71AC7CB008AB23FBB6544" as pub system_prompt: Handle<Blake3, LongString>;
         "35E36AE7B60AD946661BD63B3CD64672" as pub branch: Handle<Blake3, LongString>;
         "F0F90572249284CD57E48580369DEB6D" as pub author: Handle<Blake3, LongString>;

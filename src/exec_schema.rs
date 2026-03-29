@@ -2,7 +2,7 @@ use triblespace::core::blob::schemas::UnknownBlob;
 use triblespace::core::metadata;
 use triblespace::macros::id_hex;
 use triblespace::prelude::blobschemas::LongString;
-use triblespace::prelude::valueschemas::{Blake3, GenId, Handle, NsTAIInterval, OrderedNsTAIInterval, U256BE};
+use triblespace::prelude::valueschemas::{Blake3, GenId, Handle, NsTAIInterval, U256BE};
 use triblespace::prelude::*;
 
 pub mod playground_exec {
@@ -15,17 +15,14 @@ pub mod playground_exec {
         "FC48EA2441A1EECAC29C6A2032C09C1E" as pub stdin_text: Handle<Blake3, LongString>;
         "7FFF32386EBB2AE92094B7D88DE2743D" as pub timeout_ms: U256BE;
         "6A968C3FA5667F591D7C41B497CE4559" as pub sandbox_profile: GenId;
-        "AAD2627FB70DC16F6ADF8869AE1B203F" as pub requested_at: NsTAIInterval;
-        "D8910A14B31096DF94DE9E807B87645F" as pub ordered_requested_at: OrderedNsTAIInterval;
+        "D8910A14B31096DF94DE9E807B87645F" as pub ordered_requested_at: NsTAIInterval;
         "C4C3870642CAB5F55E7E575B1A62E640" as pub about_request: GenId;
         "28D60463309BCEE8C855A9921CA70669" as pub about_message: GenId;
         "90307D583A8F085828E1007AE432BF86" as pub about_thought: GenId;
         "442A275ABC6834231FC65A4B89773ECD" as pub worker: GenId;
-        "B878792F16C0C27C776992FA053A2218" as pub started_at: NsTAIInterval;
-        "CCFAE38E0C70AFBBF7223D2DA28A93C7" as pub ordered_started_at: OrderedNsTAIInterval;
+        "CCFAE38E0C70AFBBF7223D2DA28A93C7" as pub ordered_started_at: NsTAIInterval;
         "79474B948670C7D0322C309EB65219F8" as pub attempt: U256BE;
-        "B4B81B90EFB4D1F5EE62DDE9CB48025D" as pub finished_at: NsTAIInterval;
-        "3BB7917C5E41E494FECE36FFE79FEF23" as pub ordered_finished_at: OrderedNsTAIInterval;
+        "3BB7917C5E41E494FECE36FFE79FEF23" as pub ordered_finished_at: NsTAIInterval;
         "B68F9025545C7E616EB90C6440220348" as pub exit_code: U256BE;
         "579EA2A82FB6A4D5B1E409D4F7747E2F" as pub stdout: Handle<Blake3, UnknownBlob>;
         "6F1CB839CAE28A34C5107F36EB7939C3" as pub stderr: Handle<Blake3, UnknownBlob>;
