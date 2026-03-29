@@ -2,7 +2,7 @@
 //! ```cargo
 //! [dependencies]
 //! anyhow = "1"
-//! clap = { version = "4", features = ["derive"] }
+//! clap = { version = "4", features = ["derive", "env"] }
 //! ed25519-dalek = "2"
 //! rand_core = "0.6"
 //! triblespace = { version = "0.28", default-features = false }
@@ -25,8 +25,7 @@ use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::Repository;
 use triblespace::core::trible::{Trible, TribleSet};
 use triblespace::core::value::schemas::hash::Blake3;
-use triblespace::core::value::schemas::time::{NsTAIInterval, OrderedNsTAIInterval};
-use triblespace::core::value::Value;
+use triblespace::macros::id_hex;
 use triblespace::prelude::*;
 
 #[derive(Parser)]
@@ -116,19 +115,19 @@ fn main() -> Result<()> {
     // Build lookup: old attribute ID → new attribute ID (as raw bytes).
     let old_attr_ids: std::collections::HashSet<[u8; 16]> = MIGRATIONS
         .iter()
-        .map(|(old, _)| old.raw)
+        .map(|(old, _)| old.raw())
         .collect();
     let migration_map: std::collections::HashMap<[u8; 16], [u8; 16]> = MIGRATIONS
         .iter()
-        .map(|(old, new)| (old.raw, new.raw))
+        .map(|(old, new)| (old.raw(), new.raw()))
         .collect();
     let compass_old_ids: std::collections::HashSet<[u8; 16]> = COMPASS_MIGRATIONS
         .iter()
-        .map(|(old, _)| old.raw)
+        .map(|(old, _)| old.raw())
         .collect();
     let compass_map: std::collections::HashMap<[u8; 16], [u8; 16]> = COMPASS_MIGRATIONS
         .iter()
-        .map(|(old, new)| (old.raw, new.raw))
+        .map(|(old, new)| (old.raw(), new.raw()))
         .collect();
 
     for branch_id in &branch_ids {
@@ -145,23 +144,7 @@ fn main() -> Result<()> {
             .map_err(|e| anyhow::anyhow!("checkout branch {branch_id:x}: {e:?}"))?;
         let data = checkout.facts();
 
-        let branch_name = {
-            let reader = repo.storage_mut().reader().map_err(|e| anyhow::anyhow!("{e:?}"))?;
-            if let Some(meta_handle) = repo.storage_mut().head(*branch_id).map_err(|e| anyhow::anyhow!("{e:?}"))? {
-                reader.get::<TribleSet, _>(meta_handle)
-                    .ok()
-                    .and_then(|meta| {
-                        find!(h: Value<Handle<Blake3, triblespace::core::blob::schemas::longstring::LongString>>,
-                            pattern!(&meta, [{ triblespace::core::metadata::name: ?h }])
-                        ).next()
-                    })
-                    .and_then(|h| reader.get::<View<str>, _>(h).ok())
-                    .map(|v| v.as_ref().to_string())
-                    .unwrap_or_else(|| format!("{branch_id:x}"))
-            } else {
-                format!("{branch_id:x}")
-            }
-        };
+        let branch_name = format!("{branch_id:x}");
 
         let mut change = TribleSet::new();
         let mut migrated_le = 0usize;
