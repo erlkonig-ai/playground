@@ -4,7 +4,9 @@ version = 4
 
 [[package]]
 name = "GORBIE"
-version = "0.9.6"
+version = "0.9.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d4f6e370f56423b727ed5b25c39b44ceaa3da3b07c72e4e27142a1e607e6dbe2"
 dependencies = [
  "ctrlc",
  "dark-light",
@@ -2242,6 +2244,8 @@ dependencies = [
 [[package]]
 name = "gorbie-commonmark"
 version = "0.23.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "14f995e9aa723d3caa1ac3be9d562492f18afe50490d639a90a568b9ea03b1a4"
 dependencies = [
  "egui",
  "egui_extras",
@@ -2252,6 +2256,8 @@ dependencies = [
 [[package]]
 name = "gorbie-commonmark-backend"
 version = "0.23.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "80f720de764711677e79f217dde4e8616b77f2a34e02628127559ac4dc67621f"
 dependencies = [
  "egui",
  "egui_extras",
@@ -2262,6 +2268,8 @@ dependencies = [
 [[package]]
 name = "gorbie-macros"
 version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1ebbe4f5d2f0430c5ff3c93069cbd3c55aeffc77b2dfaf822d3f14344ba575b3"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -4972,9 +4980,9 @@ dependencies = [
 
 [[package]]
 name = "triblespace"
-version = "0.27.1"
+version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c4ef954ff5d5e45cab9b8a6c1bd53dc6cfebe18d8389b9ec84f60afc283f1730"
+checksum = "2bb8745fd4032cd92014546467bab1b207b93a28eb70536b2fa4be5b337d1cbb"
 dependencies = [
  "triblespace-core",
  "triblespace-macros",
@@ -4982,9 +4990,9 @@ dependencies = [
 
 [[package]]
 name = "triblespace-core"
-version = "0.27.1"
+version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "23d4eeee24dd3e0310e92c3d846d5bf51cb1bc5f0950831a92a1257553be1dea"
+checksum = "785465319674af0b92c0e3f7b5961526428b7ce9c12bc63ff10eb5020205a029"
 dependencies = [
  "anybytes",
  "arbitrary",
@@ -5046,9 +5054,9 @@ dependencies = [
 
 [[package]]
 name = "triblespace-macros"
-version = "0.27.1"
+version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "64023941ed2c17ea8faa3b8af494ed8abd31bc515a3f810ef3497a01e2b6aaf5"
+checksum = "96018a7efb7a986004df83313adb655e999472462b7c4a10ecbcdc9916615667"
 dependencies = [
  "ed25519-dalek",
  "hex",
