@@ -2,7 +2,7 @@ use triblespace::core::metadata;
 use triblespace::macros::id_hex;
 use triblespace::prelude::blobschemas::LongString;
 use triblespace::prelude::valueschemas::{
-    Blake3, GenId, Handle, NsTAIInterval, ShortString, U256BE,
+    Blake3, GenId, Handle, NsTAIInterval, OrderedNsTAIInterval, ShortString, U256BE,
 };
 use triblespace::prelude::*;
 
@@ -15,11 +15,14 @@ pub mod model_chat {
         "C1FFE9D4FEC549C09C96639665561DFE" as pub model: ShortString;
         "B6BF5BEE9961D6C0F4F825088DD2C3F2" as pub context: Handle<Blake3, LongString>;
         "0DA5DD275AA34F86B0297CC35F1B7395" as pub requested_at: NsTAIInterval;
+        "59FA7C04A43B96F31414D1B4544FAEC2" as pub ordered_requested_at: OrderedNsTAIInterval;
         "430B9CD43A3BC414E730B29BCFD6349B" as pub request_raw: Handle<Blake3, LongString>;
         "4FC561A8EC8E9D750445AE8A0BE5E094" as pub worker: GenId;
         "1DE7C6BCE0223199368070A82EA23A7E" as pub started_at: NsTAIInterval;
+        "D1384E835F1C325249A603D93CA2701D" as pub ordered_started_at: OrderedNsTAIInterval;
         "8CAEF4617646F8C9E90BC9A3ED3D0496" as pub attempt: U256BE;
         "238CF718317A94DB46B8D75E7CB6D609" as pub finished_at: NsTAIInterval;
+        "2A98AB108752C0C0C6355B84871932DA" as pub ordered_finished_at: OrderedNsTAIInterval;
         "B1B904590F0FA70AD1BA247F3D23A6CC" as pub output_text: Handle<Blake3, LongString>;
         "9CD6494CB9825D01A2E86C7E2A56CA96" as pub response_id: Handle<Blake3, LongString>;
         "E41A91D2C68640AA86AB31A2CAB2858F" as pub response_raw: Handle<Blake3, LongString>;

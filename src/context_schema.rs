@@ -2,7 +2,7 @@ use triblespace::core::metadata;
 use triblespace::macros::id_hex;
 use triblespace::prelude::blobschemas::LongString;
 use triblespace::prelude::valueschemas::{
-    Blake3, GenId, Handle, NsTAIInterval,
+    Blake3, GenId, Handle, NsTAIInterval, OrderedNsTAIInterval,
 };
 use triblespace::prelude::*;
 
@@ -12,8 +12,11 @@ pub mod playground_context {
     attributes! {
         "3292CF0B3B6077991D8ECE6E2973D4B6" as pub summary: Handle<Blake3, LongString>;
         "3D5865566AF5118471DA1FF7F87CB791" as pub created_at: NsTAIInterval;
+        "4036F38AB05D26764A1E5E456337F399" as pub ordered_created_at: OrderedNsTAIInterval;
         "4EAF7FE3122A0AE2D8309B79DCCB8D75" as pub start_at: NsTAIInterval;
+        "502F7D33822A90366F0F0ADA0556177F" as pub ordered_start_at: OrderedNsTAIInterval;
         "95D629052C40FA09B378DDC507BEA0D3" as pub end_at: NsTAIInterval;
+        "DF84E872EB68FBFCA63D760F27FD8A6F" as pub ordered_end_at: OrderedNsTAIInterval;
         "CB97C36A32DEC70E0D1149E7C5D88588" as pub left: GenId;
         "087D07E3D9D94F0C4E96813C7BC5E74C" as pub right: GenId;
         "9B83D68AECD6888AA9CE95E754494768" as pub child: GenId;

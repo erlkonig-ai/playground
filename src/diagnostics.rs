@@ -43,7 +43,7 @@ use crate::schema::playground_exec;
 mod archive {
     use triblespace::macros::id_hex;
     use triblespace::prelude::blobschemas::LongString;
-    use triblespace::prelude::valueschemas::{Blake3, GenId, Handle, NsTAIInterval};
+    use triblespace::prelude::valueschemas::{Blake3, GenId, Handle, NsTAIInterval, OrderedNsTAIInterval};
     use triblespace::prelude::*;
 
     attributes! {
@@ -52,6 +52,7 @@ mod archive {
         "E63EE961ABDB1D1BEC0789FDAFFB9501" as pub author_name: Handle<Blake3, LongString>;
         "ACF09FF3D62B73983A222313FF0C52D2" as pub content: Handle<Blake3, LongString>;
         "0DA5DD275AA34F86B0297CC35F1B7395" as pub created_at: NsTAIInterval;
+        "59FA7C04A43B96F31414D1B4544FAEC2" as pub ordered_created_at: OrderedNsTAIInterval;
     }
 
     #[allow(non_upper_case_globals)]
@@ -71,18 +72,20 @@ mod teams {
 
 mod compass {
     use triblespace::prelude::blobschemas::LongString;
-    use triblespace::prelude::valueschemas::{Blake3, GenId, Handle, ShortString};
+    use triblespace::prelude::valueschemas::{Blake3, GenId, Handle, OrderedNsTAIInterval, ShortString};
     use triblespace::prelude::*;
 
     attributes! {
         "EE18CEC15C18438A2FAB670E2E46E00C" as pub title: Handle<Blake3, LongString>;
         "F9B56611861316B31A6C510B081C30B3" as pub created_at: ShortString;
+        "E915C4D678D0F484B89B4E85E55DB442" as pub ordered_created_at: OrderedNsTAIInterval;
         "5FF4941DCC3F6C35E9B3FD57216F69ED" as pub tag: ShortString;
         "9D2B6EBDA67E9BB6BE6215959D182041" as pub parent: GenId;
 
         "C1EAAA039DA7F486E4A54CC87D42E72C" as pub task: GenId;
         "61C44E0F8A73443ED592A713151E99A4" as pub status: ShortString;
         "8200ADEDC8D4D3D6D01CDC7396DF9AEC" as pub at: ShortString;
+        "4FB34DB057497FB845B3816521A9A05E" as pub ordered_at: OrderedNsTAIInterval;
         "47351DF00B3DDA96CB305157CD53D781" as pub note: Handle<Blake3, LongString>;
     }
 }
@@ -95,6 +98,7 @@ mod reason_events {
     attributes! {
         "B10329D5D1087D15A3DAFF7A7CC50696" as text: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
         "FBA9BC32A457C7BFFDB7E0181D3E82A4" as created_at: valueschemas::NsTAIInterval;
+        "79C9CB4C48864D28B215D4264E1037BF" as ordered_created_at: valueschemas::OrderedNsTAIInterval;
         "E6B1C728F1AE9F46CAB4DBB60D1A9528" as about_turn: valueschemas::GenId;
         "721DED6DA776F2CF4FB91C54D9F82358" as worker: valueschemas::GenId;
         "514F4FE9F560FB155450462C8CF50749" as command_text: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
@@ -219,10 +223,12 @@ mod local_messages {
         "95D58D3E68A43979F8AA51415541414C" as to: valueschemas::GenId;
         "23075866B369B5F393D43B30649469F6" as body: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
         "53ECCC7489AF8D30EF385ED12073F4A3" as created_at: valueschemas::NsTAIInterval;
+        "5FA453867880877B613B7632A233419B" as ordered_created_at: valueschemas::OrderedNsTAIInterval;
 
         "2213B191326E9B99605FA094E516E50E" as about_message: valueschemas::GenId;
         "99E92F483731FA6D59115A8D6D187A37" as reader: valueschemas::GenId;
         "934C5AD3DA8F7A2EB467460E50D17A4F" as read_at: valueschemas::NsTAIInterval;
+        "CFEF2E96BC66FF3BE0A39C34E70A5032" as ordered_read_at: valueschemas::OrderedNsTAIInterval;
     }
 }
 

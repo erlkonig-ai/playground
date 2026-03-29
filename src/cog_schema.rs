@@ -1,7 +1,7 @@
 use triblespace::core::metadata;
 use triblespace::macros::id_hex;
 use triblespace::prelude::blobschemas::LongString;
-use triblespace::prelude::valueschemas::{Blake3, GenId, Handle, NsTAIInterval};
+use triblespace::prelude::valueschemas::{Blake3, GenId, Handle, NsTAIInterval, OrderedNsTAIInterval};
 use triblespace::prelude::*;
 
 pub mod playground_cog {
@@ -10,6 +10,7 @@ pub mod playground_cog {
     attributes! {
         "FA6090FB00EEE2F5EF1E51F1F68EA5B8" as pub context: Handle<Blake3, LongString>;
         "99F834C6A6A050DECBE42D639288B559" as pub created_at: NsTAIInterval;
+        "1AE17985F2AE74631CE16FD84DC97FB4" as pub ordered_created_at: OrderedNsTAIInterval;
         "D986EF113EFA588E6247420A06DA87BA" as pub about_exec_result: GenId;
         "CC8828B7462BFDA45A296C0A12C6333C" as pub moment_boundary_turn_id: GenId;
     }
