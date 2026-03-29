@@ -1,87 +1,53 @@
-# Playground Event Model (Shell Physics + Mistral Adapter)
+# Event Model
 
-## Why
+## Shell-First Causality
 
-Playground treats the shell as the model's physical reality:
+Playground treats the shell as the model's physical reality. Every action the
+model takes is a shell command; every observation is the command's output. This
+grounds the model's experience in concrete, reproducible cause-and-effect
+rather than abstract API calls.
 
-- the model emits one command string,
-- the runtime executes it,
-- the model observes concrete command output.
+The core invariant: **one side-effecting command per turn**. The model emits a
+command, the shell executes it, and the output becomes the next observation.
+This sequential discipline keeps the interaction log deterministic and
+replayable.
 
-To keep reasoning/memory grounded, reified cognition must follow the same
-causal interface (shell actions and shell observations), not a hidden side
-channel.
+## Turn Structure
 
-## Core Invariants
+Each turn in the cognition branch is recorded as a chain of entities:
 
-1. **Shell-first causality**: model-visible state advances through command/result
-   transitions.
-2. **One side-effecting command per turn**: the command/result pair is the lived
-   primitive.
-3. **Reason/memory are reified**: they are modeled as shell-native operations.
-4. **Provider artifacts are preserved**: rich transport data is retained, but
-   projected through shell-causal views for context construction.
+1. **Thought** (`kind_thought`) — the context snapshot that prompted the model
+2. **Model Request** (`kind_request`) — links thought to model + context
+3. **Model Result** (`kind_result`) — output text, reasoning, response metadata
+4. **Command Request** (`kind_command_request`) — the shell command extracted
+5. **Command Result** (`kind_command_result`) — stdout, stderr, exit code,
+   `finished_at` timestamp
 
-## Canonical Model
+Each entity links back to its predecessor via `about_thought` or
+`about_exec_result`, forming a provenance chain.
 
-Use two peer record streams (linked, not subordinate):
+## Provider Artifacts
 
-- **Turns**: command/result records in shell causality.
-- **Artifacts**: provider/faculty artifacts (reasoning chunks, memory chunks,
-  ids, encrypted reasoning payloads, provenance metadata).
+The raw provider response is stored alongside the canonical turn structure.
+This preserves provider-specific data (usage metadata, model identifiers,
+reasoning traces) without polluting the canonical format.
 
-Artifacts link to turns (for ownership/provenance), but are not flattened into
-ad-hoc monolithic text blobs by default.
+## Memory / Moment Boundary
 
-## Provider Mapping
+The context window is split into two regions separated by the **breath**
+boundary (see `playground_memory_architecture.md`):
 
-### Chat-Completions -> Canonical
+- **Memory**: curated summaries from the memory branch, stable across turns
+- **Moment**: recent shell interactions from the cognition branch, changing
+  each turn
 
-- Preserve provider response JSON (`response_raw`) losslessly.
-- Project model output command into a turn.
-- Capture provider thinking/reasoning text as reasoning artifacts attached to the turn.
-- Capture explicit `reason` faculty outputs as reason artifacts with the same
-  shape class as provider reasoning (different provenance).
+The breath markers (`"breath"` / `"present moment begins."`) are static
+strings that anchor the Anthropic prompt prefix cache. Everything before the
+breath is cacheable; everything after is the dynamic tail.
 
-### Canonical -> Chat-Completions
+## Context Fill
 
-- Build prompt messages from canonical turns/artifacts.
-- Reify reasoning as shell-native synthetic turns (e.g. `reason "..."` + ack
-  output) where needed.
-
-## Prompt Construction Rules
-
-- `moment`: recent raw command/result turns (+ compatible reasoning artifacts).
-- `memory`: compacted recalled history via `memory` faculty projections.
-- Do not rely on a generic `reasoning:` text side channel as the primary model.
-- Reasoning should be visible as provider reasoning artifacts or shell-reified
-  `reason` turns.
-
-## Concrete Migration Steps
-
-1. **Projection contract**
-   - Define one canonical projection shape for turn + reasoning artifact links.
-   - Keep existing `llm_chat::reasoning_text` as compatibility fallback during
-     migration.
-2. **Context builder**
-   - Stop using `reasoning:` inline section as primary source for turn context.
-   - Build context from turn records + artifact projection (moment then memory).
-3. **Reason faculty alignment**
-   - Remove mixed-mode reason text echo duplication in stderr; keep id/ack.
-   - Keep reason content available once in causal stream.
-4. **Reason artifact continuity**
-   - Keep provider reasoning artifacts attached to turns.
-   - Keep shell-reified `reason` turns as the provider-agnostic path.
-5. **Diagnostics**
-   - Show artifact provenance (`provider` vs `reason` faculty) in timeline rows.
-   - Keep raw-response inspection available for debugging.
-6. **Cleanup**
-   - After parity validation, remove redundant fallback paths and dead
-     `reasoning:`-centric joins.
-
-## Notes
-
-- This model keeps the shell-causal worldview coherent for the agent while still
-  preserving richer provider artifacts for replay, migration, and debugging.
-- It intentionally separates **storage fidelity** from **model-facing causal
-  projection**.
+The last user message in each turn is annotated with the current context fill
+percentage, giving the model awareness of how much of its context window is
+in use. This allows the model to decide when to consolidate memory (freeing
+moment space) or when to be more concise.

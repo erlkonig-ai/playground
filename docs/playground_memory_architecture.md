@@ -1,348 +1,132 @@
-# Playground Memory Architecture
+# Memory Architecture
 
-## Overview
+This document describes the memory system as currently implemented. The system
+provides manually curated, hierarchical summaries of past interactions that the
+model uses as long-term context.
 
-This document describes the target architecture for how Playground constructs,
-stores, and recalls memory. It supersedes the ad-hoc leaf/merge compaction
-system and aligns memory creation with the shell-causal physics described in
-`playground_event_model.md`.
+## Three-Branch Model
 
-The central idea: **memory creation is a physical act within the loop, not a
-hidden side-channel.** The model observes a turn, decides what to remember, and
-emits that memory through a faculty call — the same way it does everything else.
+The playground maintains three independent branches on the pile:
 
-## Two Strata of Context
+| Branch | Purpose | Written by |
+|--------|---------|------------|
+| **memory** | User-created summary chunks | Memory faculty (`memory create`) |
+| **cognition** | Active execution state (thoughts, model requests/results, commands) | Model worker loop |
+| **archive** | Imported historical messages (prior sessions, external sources) | Import tools |
 
-The model's context has two strata:
+Memory chunks can reference cognition results via `about_exec_result` and
+archive messages via `about_archive_message` for provenance tracking. The
+three branches are independent — memory consolidation happens at the user's
+discretion, not automatically.
 
-- **Memory**: compacted history. Rendered as synthetic `memory <id>` → summary
-  turn pairs. This is the stable, prefix-cached segment of the context.
-- **Moment**: recent raw turns. The live causal frontier. This is the varying
-  suffix that changes every turn.
+## Chunk Data Model
 
-Between them sits a deterministic boundary turn, `breath`, that separates the
-two segments and breaks the autoregressive pattern of `memory` calls.
+A chunk is an entity tagged with `kind_chunk` carrying these attributes:
 
-## The `breath` Boundary
+| Attribute | Schema | Description |
+|-----------|--------|-------------|
+| `summary` | `Handle<Blake3, LongString>` | Text summary stored as a blob |
+| `created_at` | `NsTAIInterval` | When the chunk was created |
+| `start_at` | `NsTAIInterval` | Temporal scope start (inclusive) |
+| `end_at` | `NsTAIInterval` | Temporal scope end (inclusive) |
+| `child` | `GenId` (repeated) | Arbitrary n-ary tree children |
+| `about_exec_result` | `GenId` (optional) | Provenance link to cognition branch |
+| `about_archive_message` | `GenId` (optional) | Provenance link to archive branch |
 
-`breath` is a deterministic, zero-cost faculty call inserted by the runtime at
-the memory→moment boundary. It:
+Time ranges use `NsTAIInterval` (TAI nanosecond intervals), allowing chunks
+to represent non-instant events. Queries use overlap logic, not equality.
 
-1. **Breaks the memory pattern.** A long sequence of `memory <id>` → summary
-   pairs can cause weaker models to hallucinate further `memory` calls. `breath`
-   provides a distributional shift that terminates the pattern.
+### Hierarchical Structure
 
-2. **Surfaces context metadata.** The output is something like:
-   ```
-   breath → context filled to 63%. present moment begins.
-   ```
-   This gives the model a sense of how much budget remains for the moment.
+Chunks form an arbitrary n-ary tree via `child` edges. A root chunk has no
+parent. Splitting a root into finer-grained children is how the model adds
+detail: the parent provides a coarse summary while children cover sub-ranges
+at higher resolution.
 
-3. **Is causally clean.** `breath` only references backward-settled state
-   (memory content, context size). It has no side effects, reads no external
-   state, and produces no temporal leakage. Consecutive calls are idempotent
-   and non-contradictory.
+The context assembly algorithm exploits this hierarchy for adaptive budget
+allocation (see below).
 
-4. **Marks the prefix cache boundary.** Everything before and including `breath`
-   (system prompt + memories + breath) is the stable prefix. Everything after
-   (moment turns) is the varying suffix. When memories change, `breath` changes,
-   which correctly invalidates the cache.
+## Memory Creation
 
-### Future: affect-driven `breath`
-
-The emotional memory lens produces valence signals through the merge hierarchy.
-A future extension could surface the dominant affect signal in `breath`:
+Memory is created explicitly via the memory faculty:
 
 ```
-breath → context filled to 63%. recent pattern: sustained focus, low friction.
+memory create [<from>..<to>] <summary>
 ```
 
-This affect signal could also influence memory segment composition — high
-emotional valence shifts the mix toward emotional lens memories, neutral/focused
-valence toward factual/technical. The model never explicitly chooses its
-emotional state; the state emerges from its history and subtly shapes what it
-recalls. This is intentionally subconscious.
+The faculty:
+1. Stores the summary text as a `LongString` blob
+2. Sets `start_at`/`end_at` from the range (defaults to now)
+3. Parses the summary for `(memory:<range>)` or `[text](memory:<hex>)` links
+   and creates `child` edges to referenced chunks
+4. If no children are specified, scans the cognition and archive branches for
+   events in the time range and creates `about_exec_result` /
+   `about_archive_message` provenance links
 
-For now, `breath` is a simple context-fill percentage. Affect integration is a
-separate design step.
+All queries use `pattern!` directly on the `TribleSet` — no pre-materialization
+into Rust structs. Chunk metadata is loaded on demand.
 
-## Archive Branch vs Cognition Branch
+## The Breath Mechanism
 
-- **Archive branch**: durable source of truth. Raw structured records from
-  imports (ChatGPT, Codex, Copilot, Gemini, Claude, or any future format).
-  Provider-shaped schema. Stays forever, re-ingestable when lenses change.
-
-- **Cognition branch**: derived memory view. Context chunks at all levels of the
-  LSM merge tree. Every chunk is a summary — there is no level at which raw turn
-  data is directly exposed. The `memory` faculty navigates this tree; drill-down
-  always terminates at the finest-grained summary, never at raw turn data.
-
-When a lens is added or its prompt changes, the runtime re-ingests from the
-archive branch. The existing `missing_lenses` check already supports this: it
-skips messages that have chunks for a given lens and creates new ones for lenses
-that don't.
-
-## Reification: Archive → Synthetic Moment
-
-Archived events were never lived in this shell. They enter memory exclusively
-through the memory door, never through the moment door. But during memory
-*creation*, they are presented to the model as synthetic moment turns so that
-the model's embodied understanding applies.
-
-The reification mapping:
-
-| Archive content | Synthetic turn (assistant → user) |
-|---|---|
-| User message | `local_message read <person-id>` → message content |
-| Assistant response | `local_message send <person-id> <content>` → `[ok]` |
-| Tool call / function call | `<tool-name> <args>` → tool result |
-| Reasoning / thinking | `reason "..."` → `[ok]` |
-| System message | `archive show <id>` → content |
-| Anything without a clean mapping | `archive show <id>` → content |
-
-`archive show <id>` is the graceful fallback — it still looks like a shell
-interaction rather than breaking the metaphor.
-
-This reification achieves **phenomenological parity** between lived turns and
-archived turns at the point of memory creation. The model uses the same
-perceptual apparatus regardless of provenance.
-
-## Memory Creation as a Physical Act
-
-### The `memory summarise` faculty
-
-When the runtime wants to create memories from turns (whether lived exec turns
-transitioning out of the moment, or archived turns being ingested), it:
-
-1. **Forks the current context.** The fork shares the cached prefix (system
-   prompt + existing memories + `breath`).
-
-2. **Injects synthetic moment turns.** For archive, these are reified per the
-   mapping above. For exec turns transitioning from moment to memory, they are
-   the actual raw turns.
-
-3. **Appends a `memory summarise <lens>` call.** The faculty returns:
-   - The IDs of the turns to be summarised (since the model cannot otherwise
-     distinguish which turns in its context are the summarisation targets vs
-     existing history).
-   - The lens-specific instructions (factual, technical, emotional).
-   - A directive to call `memory create <lens> <content>` for each turn worth
-     preserving.
-
-4. **The model responds.** It reads the turns in context, applies the lens, and
-   emits zero or more `memory create` calls. This is a real action with real
-   causal consequences — the memory is created because the model decided to
-   create it.
-
-5. **The fork terminates.** The runtime collects the `memory create` outputs
-   and stores them as level-0 chunks on the cognition branch.
-
-### The `memory create` faculty
+The breath is a static boundary between memory and the present moment in the
+model's context window. It consists of two fixed messages:
 
 ```
-memory create <lens> <content>
+assistant: "breath"
+user:      "present moment begins."
 ```
 
-Creates a level-0 context chunk for the given lens with the provided content.
-Returns the chunk ID. This is both the mechanism for runtime-driven
-summarisation (via the fork described above) and a faculty the model can call
-spontaneously during normal execution to note something worth remembering.
+These markers serve as an anchor for Anthropic's prompt prefix caching. Because
+they never change, the cache can seed the prefix (system prompt + memory cover +
+breath) and only recompute the moment (recent shell interactions) on each turn.
 
-### Prefix caching during batch ingestion
+### One-Turn Delay
 
-When processing a batch of archive messages, the context structure is:
+When the memory cover changes (e.g., new chunks were created), the OLD cover
+is used for the current turn and the NEW cover is recorded for the next turn.
+This one-turn delay ensures the cache sees a stable prefix before it shifts.
 
-```
-system prompt                          ← cached across ALL calls
-memory 3a... → summary                 ← cached, grows as memories accumulate
-memory 7f... → summary                 ←
-...                                    ←
-breath → context filled to N%.         ← cache boundary
-archive show <id> → content            ← varies per message
-memory summarise factual → instructions ← varies per lens
-```
+## Context Assembly
 
-The system prompt + memory prefix is shared across all leaf summarisation calls
-in a batch. Each call only pays for the synthetic turn + lens instruction.
+The model's prompt is assembled as:
 
-As memories accumulate auto-regressively (each new memory becomes part of the
-prefix for the next summarisation call), the prefix grows but remains cacheable.
+1. **System prompt** (static, from config)
+2. **Memory cover** (chronologically sorted chunk summaries, budget-aware)
+3. **Breath boundary** (assistant "breath" + user "present moment begins.")
+4. **Moment turns** (recent shell interactions, most recent that fit budget)
 
-## Lens Architecture
-
-Three default lenses: **factual**, **technical**, **emotional**.
-
-Each lens has:
-- `prompt`: leaf-level summarisation instructions (used via `memory summarise`).
-- `compaction_prompt`: merge-level instructions (used when the LSM tree merges
-  N children into one parent summary).
-- `max_output_tokens`: budget for merge output.
-
-### Leaf level (level 0)
-
-LLM-generated, lens-differentiated. The model sees the same embodied context
-but applies different lens instructions, producing genuinely different summaries
-per lens. This replaces the current approach where the leaf is identical raw
-text across all lenses.
-
-### Merge level (level 1+)
-
-When `merge_arity` chunks accumulate at a given level, they are merged via the
-`compaction_prompt`. This is the existing LSM carry mechanism and remains
-unchanged — except that its inputs are now richer (lens-specific leaf summaries
-rather than duplicated raw text).
-
-### Selective memory creation
-
-Because memory creation is a model action (`memory create`), the model can
-choose not to create a memory for a given lens. The emotional lens prompt
-already says "if no grounded affective signal, output nothing." With this
-architecture, that instruction actually works — the model simply doesn't call
-`memory create emotional` for that turn. No empty chunks, no wasted storage.
-
-## Memory Drill-Down
-
-The `memory` faculty navigates the chunk tree:
+### Budget Model
 
 ```
-level N  →  merged summary of children
-level 1  →  merged summary of children
-level 0  →  leaf summary (LLM-generated, lens-specific)
-         ✗  no path to raw turn/reasoning data
+input_budget = context_window - max_output - safety_margin
+body_budget  = input_budget * chars_per_token - system_prompt_chars
 ```
 
-`memory <id>` shows the chunk summary and lists child IDs. `memory turn <id>`
-finds all chunks linked to a given turn. Drill-down always terminates at a
-summary. Raw turn data lives on the archive/exec branches and is only accessed
-during memory creation, not during recall.
+Memory cover takes priority; moment turns fill the remainder.
 
-This is intentional. Memory is not a recording — it is a lossy, lens-shaped
-compression of experience. The raw data is preserved on the archive branch for
-re-ingestion, but the model's relationship to its past is always mediated
-through summaries.
+### Adaptive Splitting
 
-## Context Construction (Full Picture)
+The memory cover algorithm greedily selects chunks:
 
-The runtime prompt for a given exec turn looks like:
+1. Start with all root chunks, sorted chronologically
+2. Drop oldest roots if total summary text exceeds budget
+3. Iteratively split the widest (coarsest) parent that has children, if the
+   children's combined cost fits within the freed budget
+4. Stop when no more splits fit or budget is exhausted
+5. Track contiguous coverage — stop at the first temporal gap
 
-```
-┌─────────────────────────────────────┐
-│ system prompt                       │  ← stable
-├─────────────────────────────────────┤
-│ memory <id> → summary               │  ← stable (prefix-cached)
-│ memory <id> → summary               │
-│ ...                                  │
-├─────────────────────────────────────┤
-│ breath → context filled to N%.       │  ← cache boundary
-├─────────────────────────────────────┤
-│ reason "rationale"                   │  ← moment (varying suffix)
-│ [ok]                                 │
-│ command arg1 arg2                    │
-│ stdout: ...                          │
-│ ...                                  │
-│ reason "next rationale"              │
-│ [ok]                                 │
-│ next_command                         │
-│ stdout: ...                          │
-└─────────────────────────────────────┘
-```
+This maximizes detail where the time range is broadest while respecting the
+token budget. Isolated future chunks don't advance the coverage boundary,
+preventing unsummarized events from being skipped.
 
-For memory creation forks:
+## Provenance
 
-```
-┌─────────────────────────────────────┐
-│ system prompt                       │  ← shared with main loop
-├─────────────────────────────────────┤
-│ memory <id> → summary               │  ← shared, prefix-cached
-│ ...                                  │
-├─────────────────────────────────────┤
-│ breath → context filled to N%.       │  ← cache boundary
-├─────────────────────────────────────┤
-│ archive show <id> → content          │  ← turn(s) to summarise
-│ memory summarise factual → instr.    │  ← lens instructions + turn IDs
-├─────────────────────────────────────┤
-│ memory create factual <summary>      │  ← model's response
-│ [ok: chunk <new-id>]                 │
-└─────────────────────────────────────┘
-```
+Chunks can optionally link to the raw events they summarize:
 
-## Relationship to Event Model
+- `about_exec_result` points to a cognition-branch execution result entity
+  (carries `finished_at` timestamp)
+- `about_archive_message` points to an archive-branch message entity
+  (carries `created_at`, `author`, content)
 
-This architecture is consistent with the event model's core invariants:
-
-1. **Shell-first causality**: memory creation happens through shell commands
-   (`memory summarise`, `memory create`), not through a hidden compaction
-   side-channel.
-
-2. **One command per turn**: the fork follows the same bicameral loop structure.
-
-3. **Reason/memory are reified**: reasoning appears as `reason "..."` turns in
-   both live and synthetic contexts. Memory appears as `memory <id>` recalls
-   and `memory create` actions.
-
-4. **Provider artifacts are preserved**: raw archive data and provider response
-   JSON remain on their respective branches. The memory tree is a derived view.
-
-## Migration Path
-
-### From current state
-
-1. **Wire the `prompt` field.** `MemoryLensConfig.prompt` exists but is unused.
-   Connect it to the `memory summarise` faculty output.
-
-2. **Build `memory summarise` faculty.** Returns lens instructions + turn IDs to
-   summarise. Stateless, deterministic.
-
-3. **Build `memory create` faculty.** Stores a level-0 chunk on the cognition
-   branch. Returns chunk ID.
-
-4. **Build `breath` faculty.** Deterministic context-fill output. Inserted by
-   runtime at memory→moment boundary.
-
-5. **Build the fork mechanism.** The runtime forks the current context, injects
-   synthetic turns, appends `memory summarise`, runs the model, collects
-   `memory create` outputs. This replaces `SemanticCompactor` for leaf creation.
-
-6. **Implement archive reification.** Map archive records to synthetic shell
-   turns per the reification table.
-
-7. **Keep `SemanticCompactor.merge()` for now.** The LSM merge pass can remain
-   as a separate LLM call (it operates on summaries, not raw turns, so the
-   embodiment context is less critical). It can be migrated to the fork
-   mechanism later if desired.
-
-8. **Build Claude importer.** Add to the archive importer family. Map Claude's
-   `thinking` blocks to reasoning, `tool_use`/`tool_result` blocks to
-   tool calls, text blocks to message content.
-
-### What can be removed after migration
-
-- `SemanticCompactor` leaf creation path (replaced by fork + `memory create`).
-- `format_archive_output()` (replaced by archive reification).
-- `format_exec_outputs_by_lens()` (replaced by fork with actual moment turns).
-- The pattern of duplicating identical leaf text across lenses.
-
-## Open Questions
-
-- **Merge compaction**: should the LSM merge also go through the fork mechanism?
-  Pro: full embodiment context for merging. Con: merging N summaries into one
-  is less about embodied perception and more about compression, so the current
-  standalone `SemanticCompactor.merge()` may be adequate.
-
-- **Affect propagation**: how does the emotional lens hierarchy produce a
-  usable valence signal for `breath`? What's the representation — a discrete
-  label, a vector, a scalar? How does it merge through the LSM tree?
-
-- **Batch size for summarisation forks**: one turn per fork (fine-grained, more
-  LLM calls, better prefix caching) vs small batches (fewer calls, model sees
-  sequence context, but less cache reuse per call)?
-
-- **Spontaneous memory creation**: when the model calls `memory create` during
-  normal execution (not in a summarisation fork), how does that interact with
-  the automatic moment→memory transition? Does the runtime skip turns that
-  already have a memory?
-
-- **`memory create` during archive ingestion ordering**: if we process archive
-  messages auto-regressively and each new memory enters the prefix for the next
-  call, the order matters. Should archive messages always be processed in
-  chronological order? What about cross-conversation interleaving?
+These links allow the model to trace a summary back to the specific shell
+interactions or imported messages it was derived from.
