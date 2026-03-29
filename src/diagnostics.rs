@@ -3917,14 +3917,6 @@ fn format_time_short(key: i128) -> String {
     format!("{h:02}:{min:02}")
 }
 
-/// Format a TAI nanosecond key as a date.
-fn format_date(key: i128) -> String {
-    let ns = hifitime::Duration::from_total_nanoseconds(key);
-    let epoch = Epoch::from_tai_duration(ns);
-    let (y, m, d, _, _, _, _) = epoch.to_gregorian_utc();
-    format!("{y:04}-{m:02}-{d:02}")
-}
-
 /// Render a time ruler marker between timeline events.
 fn render_time_marker(ui: &mut egui::Ui, key: i128, show_date: bool) {
     let label = if show_date {
@@ -3932,10 +3924,27 @@ fn render_time_marker(ui: &mut egui::Ui, key: i128, show_date: bool) {
     } else {
         format_time_short(key)
     };
+    let muted = color_muted();
     ui.horizontal(|ui| {
-        let muted = color_muted();
-        // Ruler line
-        ui.separator();
+        let available = ui.available_width();
+        let label_galley = ui.painter().layout_no_wrap(
+            label.clone(),
+            egui::FontId::monospace(10.0),
+            muted,
+        );
+        let label_w = label_galley.size().x;
+        // Horizontal line fills space up to the label, then the label sits right-aligned.
+        let line_w = (available - label_w - 8.0).max(0.0);
+        let (line_rect, _) = ui.allocate_exact_size(
+            egui::vec2(line_w, 1.0),
+            egui::Sense::hover(),
+        );
+        let y = line_rect.center().y;
+        ui.painter().line_segment(
+            [egui::pos2(line_rect.left(), y), egui::pos2(line_rect.right(), y)],
+            egui::Stroke::new(1.0, muted),
+        );
+        ui.add_space(4.0);
         ui.label(egui::RichText::new(label).small().monospace().color(muted));
     });
 }
@@ -4715,10 +4724,21 @@ fn render_timeline_row(ui: &mut egui::Ui, now_key: i128, row: &TimelineRow) -> O
     }
 
     if expanded {
-        // Show full details below the chip.
+        // Show full details below the chip, indented with a left accent border.
+        let (_, source_color) = timeline_source_style(row.source);
         egui::Frame::NONE
-            .inner_margin(egui::Margin { left: 16, right: 0, top: 2, bottom: 2 })
+            .stroke(egui::Stroke::NONE)
+            .inner_margin(egui::Margin { left: 16, right: 0, top: 4, bottom: 4 })
             .show(ui, |ui| {
+                // Accent bar on the left edge
+                let rect = ui.max_rect();
+                ui.painter().line_segment(
+                    [
+                        egui::pos2(rect.left() - 10.0, rect.top()),
+                        egui::pos2(rect.left() - 10.0, rect.bottom()),
+                    ],
+                    egui::Stroke::new(2.0, source_color.gamma_multiply(0.5)),
+                );
                 render_timeline_row_details(ui, now_key, row, &mut context_clicked);
             });
     }
@@ -5274,18 +5294,12 @@ fn render_goal_card(ui: &mut egui::Ui, row: &CompassTaskRow, dep_indent: f32) ->
     let status_bg = status_color(&row.status);
     let card_bg = color_frame();
 
-    if dep_indent > 0.0 {
-        ui.add_space(dep_indent);
-    }
-
-    let w = ui.available_width() - dep_indent;
     egui::Frame::NONE
         .fill(card_bg)
         .corner_radius(egui::CornerRadius::same(4))
         .inner_margin(egui::Margin::symmetric(8, 4))
+        .outer_margin(egui::Margin { left: dep_indent as i8, right: 0, top: 0, bottom: 0 })
         .show(ui, |ui| {
-            ui.set_min_width(w - 16.0);
-
             // Row 1: status chip · title · id
             ui.horizontal(|ui| {
                 render_goal_chip(ui, &row.status, status_bg);
@@ -5357,17 +5371,11 @@ fn render_compass_swimlane_row(
         }
     }
 
-    if depth == 0 {
-        // still allow expansion
-    }
-
     if is_expanded {
         let task_notes = notes.get(&row.id).map(Vec::as_slice).unwrap_or(&[]);
-        if dep_indent > 0.0 {
-            ui.add_space(dep_indent);
-        }
         egui::Frame::NONE
             .stroke(outline)
+            .outer_margin(egui::Margin { left: dep_indent as i8, right: 0, top: 0, bottom: 0 })
             .inner_margin(egui::Margin::symmetric(8, 4))
             .show(ui, |ui| {
                 if task_notes.is_empty() {
