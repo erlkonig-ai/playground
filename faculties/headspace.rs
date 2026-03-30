@@ -6,7 +6,7 @@
 //! ed25519-dalek = "2.1.1"
 //! hifitime = "4.2.3"
 //! rand_core = "0.6.4"
-//! triblespace = "0.22"
+//! triblespace = "0.29"
 //! ```
 
 use std::collections::HashMap;
@@ -47,7 +47,7 @@ const KIND_MODEL_PROFILE_ID: Id = id_hex!("B08E356C4B08F44AB7EC177D47129447");
 mod playground_config {
     use super::*;
     attributes! {
-        "DDF83FEC915816ACAE7F3FEBB57E5137" as updated_at: NsTAIInterval;
+        "5E32E36AD28B0B1E035D2DFCC20A3DC5" as updated_at: NsTAIInterval;
         "950B556A74F71AC7CB008AB23FBB6544" as system_prompt: Handle<Blake3, LongString>;
         "35E36AE7B60AD946661BD63B3CD64672" as branch: Handle<Blake3, LongString>;
         "F0F90572249284CD57E48580369DEB6D" as author: Handle<Blake3, LongString>;

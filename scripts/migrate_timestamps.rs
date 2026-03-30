@@ -5,7 +5,7 @@
 //! clap = { version = "4", features = ["derive", "env"] }
 //! ed25519-dalek = "2"
 //! rand_core = "0.6"
-//! triblespace = { version = "0.28", default-features = false }
+//! triblespace = { version = "0.29", default-features = false }
 //! hifitime = "4.2"
 //! ```
 

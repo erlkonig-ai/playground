@@ -11,7 +11,7 @@
 //! serde_json = "1"
 //! tracing = "0.1"
 //! tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-//! triblespace = "0.22"
+//! triblespace = "0.29"
 //! ```
 
 use std::collections::HashSet;
@@ -88,7 +88,7 @@ mod common {
                 "4FE6A8A43658BC2F61FEDF5CFB29EEFC" as pub author_model: Handle<Blake3, LongString>;
                 "1F127324384335D12ECFE0CB84840925" as pub author_provider: Handle<Blake3, LongString>;
                 "ACF09FF3D62B73983A222313FF0C52D2" as pub content: Handle<Blake3, LongString>;
-                "0DA5DD275AA34F86B0297CC35F1B7395" as pub created_at: NsTAIInterval;
+                "59FA7C04A43B96F31414D1B4544FAEC2" as pub created_at: NsTAIInterval;
 
                 "D8A469EAC2518D1A85692E0BEBF20D6C" as pub content_type: ShortString;
                 "8334E282F24A4C7779C8899191B29E00" as pub attachment: GenId;

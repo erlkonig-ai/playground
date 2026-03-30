@@ -8,7 +8,7 @@
 //! rand_core = "0.6.4"
 //! serde = { version = "1.0", features = ["derive"] }
 //! serde_json = "1.0"
-//! triblespace = "0.22"
+//! triblespace = "0.29"
 //! ```
 
 use anyhow::{Result, anyhow, bail};
@@ -47,7 +47,7 @@ type TextHandle = Value<valueschemas::Handle<valueschemas::Blake3, blobschemas::
 mod config {
     use super::*;
     attributes! {
-        "DDF83FEC915816ACAE7F3FEBB57E5137" as updated_at: valueschemas::NsTAIInterval;
+        "5E32E36AD28B0B1E035D2DFCC20A3DC5" as updated_at: valueschemas::NsTAIInterval;
         "D1DC11B303725409AB8A30C6B59DB2D7" as persona_id: valueschemas::GenId;
         "950B556A74F71AC7CB008AB23FBB6544" as system_prompt: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
         "79E1B50756FB64A30916E9353225E179" as active_model_profile_id: valueschemas::GenId;
@@ -63,7 +63,7 @@ mod local {
     use super::*;
     attributes! {
         "95D58D3E68A43979F8AA51415541414C" as to: valueschemas::GenId;
-        "53ECCC7489AF8D30EF385ED12073F4A3" as created_at: valueschemas::NsTAIInterval;
+        "5FA453867880877B613B7632A233419B" as created_at: valueschemas::NsTAIInterval;
         "2213B191326E9B99605FA094E516E50E" as about_message: valueschemas::GenId;
         "99E92F483731FA6D59115A8D6D187A37" as reader: valueschemas::GenId;
     }
@@ -81,10 +81,10 @@ mod exec {
     attributes! {
         "AA2F34973589295FA70B538D92CD30F8" as kind: valueschemas::GenId;
         "79DD6A1A02E598033EDCE5C667E8E3E6" as command_text: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
-        "AAD2627FB70DC16F6ADF8869AE1B203F" as requested_at: valueschemas::NsTAIInterval;
+        "D8910A14B31096DF94DE9E807B87645F" as requested_at: valueschemas::NsTAIInterval;
         "C4C3870642CAB5F55E7E575B1A62E640" as about_request: valueschemas::GenId;
-        "B878792F16C0C27C776992FA053A2218" as started_at: valueschemas::NsTAIInterval;
-        "B4B81B90EFB4D1F5EE62DDE9CB48025D" as finished_at: valueschemas::NsTAIInterval;
+        "CCFAE38E0C70AFBBF7223D2DA28A93C7" as started_at: valueschemas::NsTAIInterval;
+        "3BB7917C5E41E494FECE36FFE79FEF23" as finished_at: valueschemas::NsTAIInterval;
         "B68F9025545C7E616EB90C6440220348" as exit_code: valueschemas::U256BE;
         "CA7AF66AAF5105EC15625ED14E1A2AC0" as stdout_text: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
         "BE4D1876B22EAF93AAD1175DB76D1C72" as stderr_text: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
@@ -99,9 +99,9 @@ mod model_chat {
         "5F10520477A04E5FB322C85CC78C6762" as kind: valueschemas::GenId;
         "5A14A02113CE43A59881D0717726F465" as about_request: valueschemas::GenId;
         "DA8E31E47919337B3E00724EBE32D14E" as about_thought: valueschemas::GenId;
-        "0DA5DD275AA34F86B0297CC35F1B7395" as requested_at: valueschemas::NsTAIInterval;
-        "1DE7C6BCE0223199368070A82EA23A7E" as started_at: valueschemas::NsTAIInterval;
-        "238CF718317A94DB46B8D75E7CB6D609" as finished_at: valueschemas::NsTAIInterval;
+        "59FA7C04A43B96F31414D1B4544FAEC2" as requested_at: valueschemas::NsTAIInterval;
+        "D1384E835F1C325249A603D93CA2701D" as started_at: valueschemas::NsTAIInterval;
+        "2A98AB108752C0C0C6355B84871932DA" as finished_at: valueschemas::NsTAIInterval;
         "B1B904590F0FA70AD1BA247F3D23A6CC" as output_text: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
         "567E35DACDB00C799E75AEED0B6EFDF7" as reasoning_text: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
         "9E9B829C473E416E9150D4B94A6A2DC4" as error: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
@@ -116,7 +116,7 @@ mod reason {
     use super::*;
     attributes! {
         "B10329D5D1087D15A3DAFF7A7CC50696" as text: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
-        "FBA9BC32A457C7BFFDB7E0181D3E82A4" as created_at: valueschemas::NsTAIInterval;
+        "79C9CB4C48864D28B215D4264E1037BF" as created_at: valueschemas::NsTAIInterval;
         "E6B1C728F1AE9F46CAB4DBB60D1A9528" as about_turn: valueschemas::GenId;
         "514F4FE9F560FB155450462C8CF50749" as command_text: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
     }
@@ -127,9 +127,9 @@ mod context {
     attributes! {
         "81E520987033BE71EB0AFFA8297DE613" as kind: valueschemas::GenId;
         "3292CF0B3B6077991D8ECE6E2973D4B6" as summary: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
-        "3D5865566AF5118471DA1FF7F87CB791" as created_at: valueschemas::NsTAIInterval;
-        "4EAF7FE3122A0AE2D8309B79DCCB8D75" as start_at: valueschemas::NsTAIInterval;
-        "95D629052C40FA09B378DDC507BEA0D3" as end_at: valueschemas::NsTAIInterval;
+        "4036F38AB05D26764A1E5E456337F399" as created_at: valueschemas::NsTAIInterval;
+        "502F7D33822A90366F0F0ADA0556177F" as start_at: valueschemas::NsTAIInterval;
+        "DF84E872EB68FBFCA63D760F27FD8A6F" as end_at: valueschemas::NsTAIInterval;
         "CB97C36A32DEC70E0D1149E7C5D88588" as left: valueschemas::GenId;
         "087D07E3D9D94F0C4E96813C7BC5E74C" as right: valueschemas::GenId;
         "9B83D68AECD6888AA9CE95E754494768" as child: valueschemas::GenId;
@@ -142,7 +142,7 @@ mod cog {
     attributes! {
         "07F063ECF1DC9FB3C1984BDB10B98BFA" as kind: valueschemas::GenId;
         "FA6090FB00EEE2F5EF1E51F1F68EA5B8" as context: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
-        "99F834C6A6A050DECBE42D639288B559" as created_at: valueschemas::NsTAIInterval;
+        "1AE17985F2AE74631CE16FD84DC97FB4" as created_at: valueschemas::NsTAIInterval;
     }
 }
 

@@ -9,7 +9,7 @@
 //! reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }
 //! serde = { version = "1", features = ["derive"] }
 //! serde_json = "1"
-//! triblespace = "0.22"
+//! triblespace = "0.29"
 //! ```
 
 use std::fs;
@@ -90,7 +90,7 @@ mod config_schema {
     use super::*;
 
     attributes! {
-        "DDF83FEC915816ACAE7F3FEBB57E5137" as updated_at: NsTAIInterval;
+        "5E32E36AD28B0B1E035D2DFCC20A3DC5" as updated_at: NsTAIInterval;
         "328B29CE81665EE719C5A6E91695D4D4" as tavily_api_key: Handle<Blake3, LongString>;
         "AB0DF9F03F28A27A6DB95B693CC0EC53" as exa_api_key: Handle<Blake3, LongString>;
     }

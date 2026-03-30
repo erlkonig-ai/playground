@@ -6,7 +6,7 @@
 //! ed25519-dalek = "2.1.1"
 //! hifitime = "4.2.3"
 //! rand_core = "0.6.4"
-//! triblespace = "0.22"
+//! triblespace = "0.29"
 //! ```
 
 use anyhow::{Context, Result, bail};
@@ -48,11 +48,11 @@ mod local {
         "42C4DB210F7EAFAF38F179ADCB4A9D5B" as from: valueschemas::GenId;
         "95D58D3E68A43979F8AA51415541414C" as to: valueschemas::GenId;
         "23075866B369B5F393D43B30649469F6" as body: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
-        "53ECCC7489AF8D30EF385ED12073F4A3" as created_at: valueschemas::NsTAIInterval;
+        "5FA453867880877B613B7632A233419B" as created_at: valueschemas::NsTAIInterval;
 
         "2213B191326E9B99605FA094E516E50E" as about_message: valueschemas::GenId;
         "99E92F483731FA6D59115A8D6D187A37" as reader: valueschemas::GenId;
-        "934C5AD3DA8F7A2EB467460E50D17A4F" as read_at: valueschemas::NsTAIInterval;
+        "CFEF2E96BC66FF3BE0A39C34E70A5032" as read_at: valueschemas::NsTAIInterval;
     }
 }
 

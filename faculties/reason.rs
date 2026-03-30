@@ -6,7 +6,7 @@
 //! ed25519-dalek = "2.1.1"
 //! hifitime = "4.2.3"
 //! rand_core = "0.6.4"
-//! triblespace = "0.22"
+//! triblespace = "0.29"
 //! ```
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -31,7 +31,7 @@ mod reason_schema {
 
     attributes! {
         "B10329D5D1087D15A3DAFF7A7CC50696" as text: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
-        "FBA9BC32A457C7BFFDB7E0181D3E82A4" as created_at: valueschemas::NsTAIInterval;
+        "79C9CB4C48864D28B215D4264E1037BF" as created_at: valueschemas::NsTAIInterval;
         "E6B1C728F1AE9F46CAB4DBB60D1A9528" as about_turn: valueschemas::GenId;
         "721DED6DA776F2CF4FB91C54D9F82358" as worker: valueschemas::GenId;
         "514F4FE9F560FB155450462C8CF50749" as command_text: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;

@@ -4,21 +4,20 @@
 //! anyhow = "1.0"
 //! clap = { version = "4.5.4", features = ["derive", "env"] }
 //! ed25519-dalek = "2.1.1"
+//! hifitime = "4.2.3"
 //! rand_core = "0.6.4"
-//! time = { version = "0.3.36", features = ["formatting", "macros"] }
-//! triblespace = "0.22"
+//! triblespace = "0.29"
 //! ```
 
 use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, Parser, Subcommand};
 use ed25519_dalek::SigningKey;
+use hifitime::Epoch;
 use rand_core::OsRng;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use time::macros::format_description;
-use time::OffsetDateTime;
 use triblespace::core::metadata;
 use triblespace::core::repo::{Repository, Workspace};
 use triblespace::macros::id_hex;
@@ -53,7 +52,7 @@ mod board {
 
     attributes! {
         "EE18CEC15C18438A2FAB670E2E46E00C" as title: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
-        "F9B56611861316B31A6C510B081C30B3" as created_at: valueschemas::ShortString;
+        "E915C4D678D0F484B89B4E85E55DB442" as created_at: valueschemas::NsTAIInterval;
         // TODO: migrate to metadata::tag (GenId) — tags should be entities with
         // their own ID + metadata::name, not inline strings. See wiki.rs TagIndex
         // for the correct pattern. This ShortString tag is a legacy design mistake.
@@ -62,7 +61,7 @@ mod board {
 
         "C1EAAA039DA7F486E4A54CC87D42E72C" as task: valueschemas::GenId;
         "61C44E0F8A73443ED592A713151E99A4" as status: valueschemas::ShortString;
-        "8200ADEDC8D4D3D6D01CDC7396DF9AEC" as at: valueschemas::ShortString;
+        "4FB34DB057497FB845B3816521A9A05E" as at: valueschemas::NsTAIInterval;
         "47351DF00B3DDA96CB305157CD53D781" as note: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
         "B88842D9D00361A0F2728C478C79D75C" as higher: valueschemas::GenId;
         "18F3446C9E9281A248D370A56395A3F0" as lower: valueschemas::GenId;
@@ -159,11 +158,24 @@ enum Command {
 
 /// Query helpers that operate directly on the checked-out TribleSet + workspace.
 
-fn now_stamp() -> String {
-    let format = format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]Z");
-    OffsetDateTime::now_utc()
-        .format(&format)
-        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
+type IntervalValue = Value<valueschemas::NsTAIInterval>;
+
+fn now_epoch() -> Epoch {
+    Epoch::now().unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0))
+}
+
+fn epoch_interval(epoch: Epoch) -> IntervalValue {
+    (epoch, epoch).to_value()
+}
+
+fn interval_key(interval: IntervalValue) -> i128 {
+    let (lower, _): (Epoch, Epoch) = interval.from_value();
+    lower.to_tai_duration().total_nanoseconds()
+}
+
+fn format_interval(interval: IntervalValue) -> String {
+    let (lower, _): (Epoch, Epoch) = interval.from_value();
+    format!("{}", lower)
 }
 
 fn validate_short(label: &str, value: &str) -> Result<()> {
@@ -285,16 +297,15 @@ fn task_parent(space: &TribleSet, task_id: Id) -> Option<Id> {
     find!(p: Id, pattern!(space, [{ task_id @ board::parent: ?p }])).next()
 }
 
-fn task_created_at(space: &TribleSet, task_id: Id) -> String {
-    find!(s: String, pattern!(space, [{ task_id @ board::created_at: ?s }]))
+fn task_created_at(space: &TribleSet, task_id: Id) -> Option<IntervalValue> {
+    find!(s: IntervalValue, pattern!(space, [{ task_id @ board::created_at: ?s }]))
         .next()
-        .unwrap_or_default()
 }
 
 /// Latest status for a task.
-fn task_latest_status(space: &TribleSet, task_id: Id) -> Option<(String, String)> {
+fn task_latest_status(space: &TribleSet, task_id: Id) -> Option<(String, IntervalValue)> {
     find!(
-        (status: String, at: String),
+        (status: String, at: IntervalValue),
         pattern!(space, [{
             _?evt @
             metadata::tag: &KIND_STATUS_ID,
@@ -303,7 +314,7 @@ fn task_latest_status(space: &TribleSet, task_id: Id) -> Option<(String, String)
             board::at: ?at,
         }])
     )
-    .max_by(|a, b| a.1.cmp(&b.1))
+    .max_by(|a, b| interval_key(a.1).cmp(&interval_key(b.1)))
 }
 
 /// All goal IDs.
@@ -355,9 +366,9 @@ fn resolve_task_id(input: &str, space: &TribleSet) -> Result<Id> {
 
 /// Compute active priority edges from the space.
 fn active_priority_edges(space: &TribleSet) -> HashSet<(Id, Id)> {
-    let mut latest: HashMap<(Id, Id), (String, bool)> = HashMap::new();
+    let mut latest: HashMap<(Id, Id), (i128, bool)> = HashMap::new();
     for (higher, lower, at) in find!(
-        (higher: Id, lower: Id, at: String),
+        (higher: Id, lower: Id, at: IntervalValue),
         pattern!(space, [{
             _?evt @
             metadata::tag: &KIND_PRIORITIZE_ID,
@@ -366,12 +377,13 @@ fn active_priority_edges(space: &TribleSet) -> HashSet<(Id, Id)> {
             board::at: ?at,
         }])
     ) {
+        let key = interval_key(at);
         latest.entry((higher, lower))
-            .and_modify(|(cur_at, cur_active)| { if at > *cur_at { *cur_at = at.clone(); *cur_active = true; } })
-            .or_insert((at, true));
+            .and_modify(|(cur_key, cur_active)| { if key > *cur_key { *cur_key = key; *cur_active = true; } })
+            .or_insert((key, true));
     }
     for (higher, lower, at) in find!(
-        (higher: Id, lower: Id, at: String),
+        (higher: Id, lower: Id, at: IntervalValue),
         pattern!(space, [{
             _?evt @
             metadata::tag: &KIND_DEPRIORITIZE_ID,
@@ -380,9 +392,10 @@ fn active_priority_edges(space: &TribleSet) -> HashSet<(Id, Id)> {
             board::at: ?at,
         }])
     ) {
+        let key = interval_key(at);
         latest.entry((higher, lower))
-            .and_modify(|(cur_at, cur_active)| { if at > *cur_at { *cur_at = at.clone(); *cur_active = false; } })
-            .or_insert((at, false));
+            .and_modify(|(cur_key, cur_active)| { if key > *cur_key { *cur_key = key; *cur_active = false; } })
+            .or_insert((key, false));
     }
     latest.into_iter().filter(|(_, (_, active))| *active).map(|(k, _)| k).collect()
 }
@@ -513,10 +526,11 @@ fn render_board(
         let notes = note_count(space, task_id);
         let parent = task_parent(space, task_id);
 
+        let sort_key = status_at.map(interval_key).or(created_at.map(interval_key)).unwrap_or(0);
         columns
             .entry(status)
             .or_default()
-            .push(TaskRow { id: task_id, id_hex: fmt_id(task_id), title, tags, created_at, status_at, note_count: notes, parent });
+            .push(TaskRow { id: task_id, id_hex: fmt_id(task_id), title, tags, sort_key, note_count: notes, parent });
     }
 
     let mut ordered_statuses = Vec::new();
@@ -564,18 +578,12 @@ struct TaskRow {
     id_hex: String,
     title: String,
     tags: Vec<String>,
-    created_at: String,
-    status_at: Option<String>,
+    sort_key: i128,
     note_count: usize,
     parent: Option<Id>,
 }
 
 impl TaskRow {
-    fn sort_key(&self) -> &str {
-        self.status_at
-            .as_deref()
-            .unwrap_or(&self.created_at)
-    }
 
     fn tag_suffix(&self) -> String {
         if self.tags.is_empty() {
@@ -625,9 +633,9 @@ fn order_rows(rows: Vec<TaskRow>, priority_edges: &HashSet<(Id, Id)>) -> Vec<(Ta
             match a_rank.cmp(&b_rank) {
                 std::cmp::Ordering::Equal => {
                     // Fall back to timestamp (most recent first)
-                    let a_key = by_id.get(a).map(|row| row.sort_key()).unwrap_or("");
-                    let b_key = by_id.get(b).map(|row| row.sort_key()).unwrap_or("");
-                    b_key.cmp(a_key)
+                    let a_key = by_id.get(a).map(|row| row.sort_key).unwrap_or(0);
+                    let b_key = by_id.get(b).map(|row| row.sort_key).unwrap_or(0);
+                    b_key.cmp(&a_key)
                 }
                 other => other,
             }
@@ -727,7 +735,7 @@ fn cmd_add(
             .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
         let task_id = ufoid();
         let task_ref = task_id.id;
-        let now = now_stamp();
+        let now = epoch_interval(now_epoch());
         let title_handle = ws.put(title);
 
         let mut change = TribleSet::new();
@@ -735,7 +743,7 @@ fn cmd_add(
         change += entity! { &task_id @
             metadata::tag: &KIND_GOAL_ID,
             board::title: title_handle,
-            board::created_at: now.as_str(),
+            board::created_at: now,
             board::parent?: parent_id.as_ref(),
             board::tag*: tags.iter().map(|tag| tag.as_str()),
         };
@@ -745,7 +753,7 @@ fn cmd_add(
             metadata::tag: &KIND_STATUS_ID,
             board::task: &task_ref,
             board::status: status.as_str(),
-            board::at: now.as_str(),
+            board::at: now,
         };
 
         if let Some(note) = note {
@@ -754,7 +762,7 @@ fn cmd_add(
                 metadata::tag: &KIND_NOTE_ID,
                 board::task: &task_ref,
                 board::note: ws.put(note),
-                board::at: now.as_str(),
+                board::at: now,
             };
         }
 
@@ -805,7 +813,7 @@ fn cmd_move(
         let mut ws = repo
             .pull(branch_id)
             .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
-        let now = now_stamp();
+        let now = epoch_interval(now_epoch());
 
         let status_id = ufoid();
         let mut change = TribleSet::new();
@@ -814,7 +822,7 @@ fn cmd_move(
             metadata::tag: &KIND_STATUS_ID,
             board::task: &task_id,
             board::status: status.as_str(),
-            board::at: now.as_str(),
+            board::at: now,
         };
 
         ws.commit(change, "move goal");
@@ -833,7 +841,7 @@ fn cmd_note(pile: &Path, _branch_name: &str, branch_id: Id, id: String, note: St
         let mut ws = repo
             .pull(branch_id)
             .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
-        let now = now_stamp();
+        let now = epoch_interval(now_epoch());
 
         let note_id = ufoid();
         let mut change = TribleSet::new();
@@ -842,7 +850,7 @@ fn cmd_note(pile: &Path, _branch_name: &str, branch_id: Id, id: String, note: St
             metadata::tag: &KIND_NOTE_ID,
             board::task: &task_id,
             board::note: ws.put(note),
-            board::at: now.as_str(),
+            board::at: now,
         };
 
         ws.commit(change, "add goal note");
@@ -870,10 +878,12 @@ fn cmd_show(pile: &Path, _branch_name: &str, branch_id: Id, id: String) -> Resul
 
         println!("Goal {:x}", task_id);
         println!("Title: {}", title);
-        println!("Created: {}", task_created_at(&space, task_id));
+        if let Some(created) = task_created_at(&space, task_id) {
+            println!("Created: {}", format_interval(created));
+        }
 
         if let Some((status, at)) = task_latest_status(&space, task_id) {
-            println!("Status: {} (since {})", status, at);
+            println!("Status: {} (since {})", status, format_interval(at));
         }
 
         let tags = task_tags(&space, task_id);
@@ -892,8 +902,8 @@ fn cmd_show(pile: &Path, _branch_name: &str, branch_id: Id, id: String) -> Resul
         }
 
         // Status history for this task.
-        let mut history: Vec<(String, String)> = find!(
-            (status: String, at: String),
+        let mut history: Vec<(String, i128, String)> = find!(
+            (status: String, at: IntervalValue),
             pattern!(&space, [{
                 _?evt @
                 metadata::tag: &KIND_STATUS_ID,
@@ -901,19 +911,19 @@ fn cmd_show(pile: &Path, _branch_name: &str, branch_id: Id, id: String) -> Resul
                 board::status: ?status,
                 board::at: ?at,
             }])
-        ).collect();
+        ).map(|(status, at)| (status, interval_key(at), format_interval(at))).collect();
         if !history.is_empty() {
             history.sort_by(|a, b| a.1.cmp(&b.1));
             println!();
             println!("Status history:");
-            for (status, at) in &history {
-                println!("- {at} {status}");
+            for (status, _, at_str) in &history {
+                println!("- {at_str} {status}");
             }
         }
 
         // Notes for this task.
-        let mut notes: Vec<(String, String)> = find!(
-            (note_handle: TextHandle, at: String),
+        let mut notes: Vec<(String, i128, String)> = find!(
+            (note_handle: TextHandle, at: IntervalValue),
             pattern!(&space, [{
                 _?evt @
                 metadata::tag: &KIND_NOTE_ID,
@@ -922,18 +932,18 @@ fn cmd_show(pile: &Path, _branch_name: &str, branch_id: Id, id: String) -> Resul
                 board::at: ?at,
             }])
         )
-        .filter_map(|(h, at)| read_text(&mut ws, h).ok().map(|text| (text, at)))
+        .filter_map(|(h, at)| read_text(&mut ws, h).ok().map(|text| (text, interval_key(at), format_interval(at))))
         .collect();
         if !notes.is_empty() {
             notes.sort_by(|a, b| a.1.cmp(&b.1));
             println!();
             println!("Notes:");
-            for (text, at) in &notes {
-                println!("- {at} {text}");
+            for (text, _, at_str) in &notes {
+                println!("- {at_str} {text}");
             }
 
             let mut all_refs = Vec::new();
-            for (text, _) in &notes {
+            for (text, _, _) in &notes {
                 all_refs.extend(extract_references(text));
             }
             all_refs.sort();
@@ -987,7 +997,7 @@ fn cmd_prioritize(
             bail!("would create a priority cycle");
         }
 
-        let now = now_stamp();
+        let now = epoch_interval(now_epoch());
         let evt_id = ufoid();
         let mut change = TribleSet::new();
         change += ensure_kind_entities(&mut ws)?;
@@ -995,7 +1005,7 @@ fn cmd_prioritize(
             metadata::tag: &KIND_PRIORITIZE_ID,
             board::higher: &higher_id,
             board::lower: &lower_id,
-            board::at: now.as_str(),
+            board::at: now,
         };
 
         ws.commit(change, "prioritize goal");
@@ -1030,7 +1040,7 @@ fn cmd_deprioritize(
             bail!("no active priority relationship between these goals");
         }
 
-        let now = now_stamp();
+        let now = epoch_interval(now_epoch());
         let evt_id = ufoid();
         let mut change = TribleSet::new();
         change += ensure_kind_entities(&mut ws)?;
@@ -1038,7 +1048,7 @@ fn cmd_deprioritize(
             metadata::tag: &KIND_DEPRIORITIZE_ID,
             board::higher: &higher_id,
             board::lower: &lower_id,
-            board::at: now.as_str(),
+            board::at: now,
         };
 
         ws.commit(change, "deprioritize goal");

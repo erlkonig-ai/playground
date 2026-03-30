@@ -8,7 +8,7 @@
 //! hifitime = "4.2.3"
 //! humantime = "2.1.0"
 //! rand_core = "0.6.4"
-//! triblespace = "0.22"
+//! triblespace = "0.29"
 //! ```
 
 use anyhow::{Result, anyhow, bail};
@@ -38,6 +38,12 @@ const KIND_ORIENT_CHECKPOINT_ID: Id = id_hex!("163114E5F2272D15F21E1994EF418A31"
 
 type TextHandle = Value<valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>>;
 type CommitHandle = Value<valueschemas::Handle<valueschemas::Blake3, SimpleArchive>>;
+type IntervalValue = Value<valueschemas::NsTAIInterval>;
+
+fn interval_key(interval: IntervalValue) -> i128 {
+    let (lower, _): (Epoch, Epoch) = interval.from_value();
+    lower.to_tai_duration().total_nanoseconds()
+}
 
 mod local {
     use super::*;
@@ -45,11 +51,11 @@ mod local {
         "42C4DB210F7EAFAF38F179ADCB4A9D5B" as from: valueschemas::GenId;
         "95D58D3E68A43979F8AA51415541414C" as to: valueschemas::GenId;
         "23075866B369B5F393D43B30649469F6" as body: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
-        "53ECCC7489AF8D30EF385ED12073F4A3" as created_at: valueschemas::NsTAIInterval;
+        "5FA453867880877B613B7632A233419B" as created_at: valueschemas::NsTAIInterval;
 
         "2213B191326E9B99605FA094E516E50E" as about_message: valueschemas::GenId;
         "99E92F483731FA6D59115A8D6D187A37" as reader: valueschemas::GenId;
-        "934C5AD3DA8F7A2EB467460E50D17A4F" as read_at: valueschemas::NsTAIInterval;
+        "CFEF2E96BC66FF3BE0A39C34E70A5032" as read_at: valueschemas::NsTAIInterval;
     }
 }
 
@@ -58,7 +64,7 @@ mod config_schema {
 
     attributes! {
         "79F990573A9DCC91EF08A5F8CBA7AA25" as kind: valueschemas::GenId;
-        "DDF83FEC915816ACAE7F3FEBB57E5137" as updated_at: valueschemas::NsTAIInterval;
+        "5E32E36AD28B0B1E035D2DFCC20A3DC5" as updated_at: valueschemas::NsTAIInterval;
         "D1DC11B303725409AB8A30C6B59DB2D7" as persona_id: valueschemas::GenId;
     }
 }
@@ -69,13 +75,13 @@ mod board {
     use super::*;
     attributes! {
         "EE18CEC15C18438A2FAB670E2E46E00C" as title: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
-        "F9B56611861316B31A6C510B081C30B3" as created_at: valueschemas::ShortString;
+        "E915C4D678D0F484B89B4E85E55DB442" as created_at: valueschemas::NsTAIInterval;
         "5FF4941DCC3F6C35E9B3FD57216F69ED" as tag: valueschemas::ShortString;
         "9D2B6EBDA67E9BB6BE6215959D182041" as parent: valueschemas::GenId;
 
         "C1EAAA039DA7F486E4A54CC87D42E72C" as task: valueschemas::GenId;
         "61C44E0F8A73443ED592A713151E99A4" as status: valueschemas::ShortString;
-        "8200ADEDC8D4D3D6D01CDC7396DF9AEC" as at: valueschemas::ShortString;
+        "4FB34DB057497FB845B3816521A9A05E" as at: valueschemas::NsTAIInterval;
     }
 }
 
@@ -296,9 +302,9 @@ fn task_tags(space: &TribleSet, task_id: Id) -> Vec<String> {
     tags
 }
 
-fn task_latest_status(space: &TribleSet, task_id: Id) -> Option<(String, String)> {
+fn task_latest_status(space: &TribleSet, task_id: Id) -> Option<(String, IntervalValue)> {
     find!(
-        (status: String, at: String),
+        (status: String, at: IntervalValue),
         pattern!(space, [{
             _?evt @
             metadata::tag: &KIND_STATUS_ID,
@@ -307,7 +313,7 @@ fn task_latest_status(space: &TribleSet, task_id: Id) -> Option<(String, String)
             board::at: ?at,
         }])
     )
-    .max_by(|a, b| a.1.cmp(&b.1))
+    .max_by(|a, b| interval_key(a.1).cmp(&interval_key(b.1)))
 }
 
 fn load_config_identity(
@@ -448,15 +454,15 @@ fn cmd_show(pile: &Path, message_limit: usize, doing_limit: usize, todo_limit: u
             .map_err(|e| anyhow!("pull compass workspace: {e:?}"))?;
         let compass_space = compass_ws.checkout(..).map_err(|e| anyhow!("checkout compass: {e:?}"))?;
 
-        let mut doing: Vec<(String, Id)> = Vec::new();
-        let mut todo: Vec<(String, Id)> = Vec::new();
+        let mut doing: Vec<(i128, Id)> = Vec::new();
+        let mut todo: Vec<(i128, Id)> = Vec::new();
         for task_id in find!(id: Id, pattern!(&compass_space, [{ ?id @ metadata::tag: &KIND_GOAL_ID }])) {
             let (status, status_at) = task_latest_status(&compass_space, task_id)
-                .map(|(s, at)| (s.to_lowercase(), Some(at)))
+                .map(|(s, at)| (s.to_lowercase(), Some(interval_key(at))))
                 .unwrap_or_else(|| ("todo".to_string(), None));
-            let created_at: String = find!(s: String, pattern!(&compass_space, [{ task_id @ board::created_at: ?s }]))
-                .next().unwrap_or_default();
-            let sort_key = status_at.as_deref().unwrap_or(&created_at).to_string();
+            let created_key: i128 = find!(s: IntervalValue, pattern!(&compass_space, [{ task_id @ board::created_at: ?s }]))
+                .next().map(interval_key).unwrap_or(0);
+            let sort_key = status_at.unwrap_or(created_key);
             if status == "doing" {
                 doing.push((sort_key, task_id));
             } else if status == "todo" {
