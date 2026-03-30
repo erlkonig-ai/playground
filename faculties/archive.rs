@@ -11,7 +11,7 @@
 //! serde_json = "1"
 //! tracing = "0.1"
 //! tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-//! triblespace = "0.29"
+//! triblespace = "0.31"
 //! ```
 
 use std::collections::HashSet;

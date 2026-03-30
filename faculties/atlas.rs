@@ -5,7 +5,7 @@
 //! clap = { version = "4.5.4", features = ["derive", "env"] }
 //! ed25519-dalek = "2.1.1"
 //! rand_core = "0.6.4"
-//! triblespace = "0.29"
+//! triblespace = "0.31"
 //! ```
 
 use std::cmp::Ordering;

@@ -8,7 +8,7 @@
 //! rand_core = "0.6.4"
 //! serde = { version = "1.0", features = ["derive"] }
 //! serde_json = "1.0"
-//! triblespace = "0.29"
+//! triblespace = "0.31"
 //! ```
 
 use anyhow::{Result, anyhow, bail};

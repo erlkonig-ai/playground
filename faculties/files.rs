@@ -8,7 +8,7 @@
 //! rand_core = "0.6.4"
 //! reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 //! anybytes = "0.20"
-//! triblespace = "0.29"
+//! triblespace = "0.31"
 //! ```
 
 use anyhow::{Context, Result, bail};

@@ -6,7 +6,7 @@
 //! ed25519-dalek = "2.1.1"
 //! hifitime = "4.2.3"
 //! rand_core = "0.6.4"
-//! triblespace = "0.29"
+//! triblespace = "0.31"
 //! ```
 
 use std::collections::HashMap;

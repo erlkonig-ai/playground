@@ -1,7 +1,7 @@
 #!/usr/bin/env -S rust-script
 //! ```cargo
 //! [dependencies]
-//! triblespace = { version = "0.29", features = ["telemetry"] }
+//! triblespace = { version = "0.31", features = ["telemetry"] }
 //! hifitime = "4.2"
 //! ed25519-dalek = "2"
 //! rand_core = "0.6"

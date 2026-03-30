@@ -9,7 +9,7 @@
 //! reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }
 //! serde = { version = "1", features = ["derive"] }
 //! serde_json = "1"
-//! triblespace = "0.29"
+//! triblespace = "0.31"
 //! ```
 
 use std::fs;
