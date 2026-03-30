@@ -21,7 +21,7 @@ use triblespace::macros::{entity, find, id_hex, pattern};
 use triblespace::prelude::valueschemas::{GenId, NsTAIInterval, U256BE};
 use triblespace::prelude::{
     Attribute, BlobStore, BlobStoreGet, BranchStore, ToBlob, TryFromValue, TryToValue,
-    View, and, IntersectionConstraint,
+    View, and,
 };
 
 use GORBIE::NotebookConfig;
@@ -763,7 +763,6 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
         let local_data = state.local_messages_cat.catalog().clone();
         let teams_data = state.teams_cat.catalog().clone();
         let compass_data = state.compass_cat.catalog().clone();
-        let relations_data = state.relations_cat.catalog().clone();
         let now_key = state.now_key;
 
         // Initialize timeline_start to "now" if not yet set.
@@ -788,75 +787,70 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
 
             // The timeline viewport: full-width painted region as a time axis.
             let viewport_height = ACTIVITY_TIMELINE_HEIGHT;
-            let scale = state.timeline_scale;
-            let ns_per_px = 60_000_000_000.0 / scale as f64; // nanoseconds per pixel
-            let scroll_speed = 3.0; // multiplier for faster scrolling
+            let scroll_speed = 3.0;
 
-            // Allocate the viewport rect (full width, no grid margin).
+            // Allocate the viewport rect.
             let viewport_width = ui.available_width();
             let (viewport_rect, viewport_response) = ui.allocate_exact_size(
                 egui::vec2(viewport_width, viewport_height),
                 egui::Sense::click_and_drag(),
             );
 
-            // Input handling — only when pointer is over the viewport.
-            if viewport_response.hovered() {
-                let (scroll_y, scroll_x, ctrl, pointer_pos) = ui.input(|i| {
-                    (i.smooth_scroll_delta.y, i.smooth_scroll_delta.x,
-                     i.modifiers.command || i.modifiers.ctrl,
-                     i.pointer.hover_pos())
-                });
+            // Input handling — compute ns_per_px from CURRENT scale for input.
+            {
+                let ns_per_px = 60_000_000_000.0 / state.timeline_scale as f64;
 
-                // Cursor Y relative to viewport top — used for zoom-at-cursor.
-                let cursor_rel_y = pointer_pos
-                    .map(|p| (p.y - viewport_rect.top()).max(0.0))
-                    .unwrap_or(viewport_height * 0.5);
+                if viewport_response.hovered() {
+                    let (scroll_y, scroll_x, ctrl, pointer_pos) = ui.input(|i| {
+                        (i.smooth_scroll_delta.y, i.smooth_scroll_delta.x,
+                         i.modifiers.command || i.modifiers.ctrl,
+                         i.pointer.hover_pos())
+                    });
 
-                // Timestamp under the cursor (before zoom).
-                let cursor_time = state.timeline_start - (cursor_rel_y as f64 * ns_per_px) as i128;
+                    let cursor_rel_y = pointer_pos
+                        .map(|p| (p.y - viewport_rect.top()).max(0.0))
+                        .unwrap_or(viewport_height * 0.5);
 
-                // Vertical scroll: pan through time.
-                if !ctrl && scroll_y != 0.0 {
-                    let pan_ns = (scroll_y as f64 * scroll_speed * ns_per_px) as i128;
+                    let cursor_time = state.timeline_start - (cursor_rel_y as f64 * ns_per_px) as i128;
+
+                    if !ctrl && scroll_y != 0.0 {
+                        let pan_ns = (scroll_y as f64 * scroll_speed * ns_per_px) as i128;
+                        state.timeline_start += pan_ns;
+                    }
+
+                    let zoom_factor = if ctrl && scroll_y != 0.0 {
+                        if scroll_y > 0.0 { 1.15 } else { 1.0 / 1.15 }
+                    } else if scroll_x != 0.0 {
+                        if scroll_x > 0.0 { 1.08 } else { 1.0 / 1.08 }
+                    } else {
+                        1.0
+                    };
+
+                    if zoom_factor != 1.0 {
+                        let new_scale = (state.timeline_scale * zoom_factor).clamp(0.01, 1000.0);
+                        let new_ns_per_px = 60_000_000_000.0 / new_scale as f64;
+                        state.timeline_start = cursor_time + (cursor_rel_y as f64 * new_ns_per_px) as i128;
+                        state.timeline_scale = new_scale;
+                    }
+
+                    ui.ctx().input_mut(|i| {
+                        i.smooth_scroll_delta = egui::Vec2::ZERO;
+                    });
+                }
+
+                if viewport_response.dragged() {
+                    let drag_delta = viewport_response.drag_delta().y;
+                    let pan_ns = (drag_delta as f64 * ns_per_px) as i128;
                     state.timeline_start += pan_ns;
                 }
 
-                // Zoom (ctrl+scroll or horizontal scroll): scale around cursor.
-                let zoom_factor = if ctrl && scroll_y != 0.0 {
-                    if scroll_y > 0.0 { 1.15 } else { 1.0 / 1.15 }
-                } else if scroll_x != 0.0 {
-                    if scroll_x > 0.0 { 1.08 } else { 1.0 / 1.08 }
-                } else {
-                    1.0
-                };
-
-                if zoom_factor != 1.0 {
-                    let new_scale = (state.timeline_scale * zoom_factor).clamp(0.01, 1000.0);
-                    let new_ns_per_px = 60_000_000_000.0 / new_scale as f64;
-
-                    // Adjust start so cursor_time stays at cursor_rel_y.
-                    state.timeline_start = cursor_time + (cursor_rel_y as f64 * new_ns_per_px) as i128;
-                    state.timeline_scale = new_scale;
+                if viewport_response.double_clicked() {
+                    state.timeline_start = now_key;
                 }
-
-                // Consume scroll so GORBIE notebook doesn't scroll too.
-                ui.ctx().input_mut(|i| {
-                    i.smooth_scroll_delta = egui::Vec2::ZERO;
-                });
             }
 
-            // Drag: pan through time.
-            if viewport_response.dragged() {
-                let drag_delta = viewport_response.drag_delta().y;
-                let pan_ns = (drag_delta as f64 * scroll_speed * ns_per_px) as i128;
-                state.timeline_start += pan_ns;
-            }
-
-            // Double-click: jump to now.
-            if viewport_response.double_clicked() {
-                state.timeline_start = now_key;
-            }
-
+            // Recompute viewport bounds AFTER all input with final scale.
+            let ns_per_px = 60_000_000_000.0 / state.timeline_scale as f64;
             let viewport_ns = (viewport_height as f64 * ns_per_px) as i128;
             let view_start = state.timeline_start;
             let view_end = view_start - viewport_ns;
@@ -902,267 +896,143 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
                 return;
             };
 
-            let t0 = Instant::now();
-
             // Build range bounds as NsTAIInterval values.
             let ts_min = Epoch::from_tai_duration(hifitime::Duration::from_total_nanoseconds(view_end));
             let ts_max = Epoch::from_tai_duration(hifitime::Duration::from_total_nanoseconds(view_start));
             let min_ts: Value<NsTAIInterval> = (ts_min, ts_min).try_to_value().unwrap();
             let max_ts: Value<NsTAIInterval> = (ts_max, ts_max).try_to_value().unwrap();
 
-            // Query events directly into visible list — no intermediate structs.
+            // Direct rendering: each event painted at its exact timestamp position.
             struct VisibleEvent {
                 y: f32,
-                at: i128,
                 source: TimelineSource,
                 summary: String,
             }
-            let mut visible: Vec<VisibleEvent> = Vec::new();
+            let mut events: Vec<VisibleEvent> = Vec::new();
 
-            let ts_to_y = |ts: Value<NsTAIInterval>| -> f32 {
+            let push_event = |events: &mut Vec<VisibleEvent>, ts: Value<NsTAIInterval>, source: TimelineSource, summary: String| {
                 let key = interval_key(ts);
-                viewport_rect.top() + ((view_start - key) as f64 / ns_per_px) as f32
+                let y = viewport_rect.top() + ((view_start - key) as f64 / ns_per_px) as f32;
+                events.push(VisibleEvent { y, source, summary });
             };
 
-            // Shell exec events.
+            // Shell exec events — manual range filter (testing).
             for (ts, command) in find!(
                 (ts: Value<NsTAIInterval>, command: Value<Handle<Blake3, LongString>>),
-                and!(
-                    pattern!(&exec_data, [{ playground_exec::ordered_requested_at: ?ts, playground_exec::command_text: ?command }]),
-                    exec_data.value_in_range(ts, min_ts, max_ts),
-                )
+                pattern!(&exec_data, [{ playground_exec::ordered_requested_at: ?ts, playground_exec::command_text: ?command }])
             ) {
+                let key = interval_key(ts);
+                if key < view_end || key > view_start { continue; }
                 if let Some(text) = load_text(ws, command) {
-                    visible.push(VisibleEvent { y: ts_to_y(ts), at: interval_key(ts), source: TimelineSource::Shell, summary: truncate_single_line(&text, 80).to_string() });
+                    push_event(&mut events, ts, TimelineSource::Shell, truncate_single_line(&text, 80).to_string());
                 }
             }
 
-            // Cognition (model chat results with reasoning text).
+            // Cognition.
             for (ts, reasoning) in find!(
                 (ts: Value<NsTAIInterval>, reasoning: Value<Handle<Blake3, LongString>>),
-                and!(
-                    pattern!(&exec_data, [{ model_chat::ordered_finished_at: ?ts, model_chat::reasoning_text: ?reasoning }]),
-                    exec_data.value_in_range(ts, min_ts, max_ts),
-                )
+                pattern!(&exec_data, [{ model_chat::ordered_finished_at: ?ts, model_chat::reasoning_text: ?reasoning }])
             ) {
+                let key = interval_key(ts);
+                if key < view_end || key > view_start { continue; }
                 if let Some(text) = load_text(ws, reasoning) {
-                    visible.push(VisibleEvent { y: ts_to_y(ts), at: interval_key(ts), source: TimelineSource::Cognition, summary: truncate_single_line(&text, 80).to_string() });
+                    push_event(&mut events, ts, TimelineSource::Cognition, truncate_single_line(&text, 80).to_string());
                 }
             }
 
             // Local messages.
             for (ts, body) in find!(
                 (ts: Value<NsTAIInterval>, body: Value<Handle<Blake3, LongString>>),
-                and!(
-                    pattern!(&local_data, [{ local_messages::ordered_created_at: ?ts, local_messages::body: ?body }]),
-                    local_data.value_in_range(ts, min_ts, max_ts),
-                )
+                pattern!(&local_data, [{ local_messages::ordered_created_at: ?ts, local_messages::body: ?body }])
             ) {
+                let key = interval_key(ts);
+                if key < view_end || key > view_start { continue; }
                 if let Some(text) = load_text(ws, body) {
-                    visible.push(VisibleEvent { y: ts_to_y(ts), at: interval_key(ts), source: TimelineSource::LocalMessages, summary: truncate_single_line(&text, 80).to_string() });
+                    push_event(&mut events, ts, TimelineSource::LocalMessages, truncate_single_line(&text, 80).to_string());
                 }
             }
 
             // Teams messages.
             for (ts, content) in find!(
                 (ts: Value<NsTAIInterval>, content: Value<Handle<Blake3, LongString>>),
-                and!(
-                    pattern!(&teams_data, [{ archive::ordered_created_at: ?ts, archive::content: ?content }]),
-                    teams_data.value_in_range(ts, min_ts, max_ts),
-                )
+                pattern!(&teams_data, [{ archive::ordered_created_at: ?ts, archive::content: ?content }])
             ) {
+                let key = interval_key(ts);
+                if key < view_end || key > view_start { continue; }
                 if let Some(text) = load_text(ws, content) {
-                    visible.push(VisibleEvent { y: ts_to_y(ts), at: interval_key(ts), source: TimelineSource::Teams, summary: truncate_single_line(&text, 80).to_string() });
+                    push_event(&mut events, ts, TimelineSource::Teams, truncate_single_line(&text, 80).to_string());
                 }
             }
 
             // Compass goals.
             for (ts, title) in find!(
                 (ts: Value<NsTAIInterval>, title: Value<Handle<Blake3, LongString>>),
-                and!(
-                    pattern!(&compass_data, [{ compass::ordered_created_at: ?ts, compass::title: ?title }]),
-                    compass_data.value_in_range(ts, min_ts, max_ts),
-                )
+                pattern!(&compass_data, [{ compass::ordered_created_at: ?ts, compass::title: ?title }])
             ) {
+                let key = interval_key(ts);
+                if key < view_end || key > view_start { continue; }
                 if let Some(text) = load_text(ws, title) {
-                    visible.push(VisibleEvent { y: ts_to_y(ts), at: interval_key(ts), source: TimelineSource::Goals, summary: truncate_single_line(&text, 80).to_string() });
+                    push_event(&mut events, ts, TimelineSource::Goals, truncate_single_line(&text, 80).to_string());
                 }
             }
 
             // Compass status/note events.
             for ts in find!(
                 ts: Value<NsTAIInterval>,
-                and!(
-                    pattern!(&compass_data, [{ compass::ordered_at: ?ts }]),
-                    compass_data.value_in_range(ts, min_ts, max_ts),
-                )
+                pattern!(&compass_data, [{ compass::ordered_at: ?ts }])
             ) {
-                visible.push(VisibleEvent { y: ts_to_y(ts), at: interval_key(ts), source: TimelineSource::Goals, summary: "status/note".to_string() });
+                let key = interval_key(ts);
+                if key < view_end || key > view_start { continue; }
+                push_event(&mut events, ts, TimelineSource::Goals, "status/note".to_string());
             }
 
-            // Sort by y position (newest = top).
-            visible.sort_by(|a, b| a.y.partial_cmp(&b.y).unwrap_or(std::cmp::Ordering::Equal));
-
-            let t1 = Instant::now();
-            let query_ms = (t1 - t0).as_secs_f64() * 1000.0;
-
-            painter.text(
-                egui::pos2(viewport_rect.right() - 8.0, viewport_rect.bottom() - 12.0),
-                egui::Align2::RIGHT_CENTER,
-                &format!("query:{:.1}ms {} events", query_ms, visible.len()),
-                egui::FontId::monospace(8.0),
-                color_muted(),
-            );
 
 
-            // Render events with density-aware clustering.
-            const EVENT_ROW_HEIGHT: f32 = 18.0;
+            // Render each event at its exact timestamp position.
             let event_left = viewport_rect.left() + 120.0;
             let event_width = viewport_rect.width() - 130.0;
             let text_color = colorhash::text_color_on(color_frame());
 
-            // Cluster events that are too close together.
-            // Clusters are clickable — clicking expands them into a vertical list.
-            // The expanded cluster ID is tracked in egui's persisted data.
-            let expanded_cluster_id: Option<i128> = ui.ctx().data_mut(|d| {
-                *d.get_persisted_mut_or(egui::Id::new("timeline_expanded_cluster"), None)
-            });
+            for ev in &events {
+                let (source_label, source_color) = timeline_source_style(ev.source);
 
-            let mut new_expanded: Option<i128> = expanded_cluster_id;
-            let mut i = 0;
-            while i < visible.len() {
-                let ev = &visible[i];
-                let y = ev.y;
-                let cluster_key = ev.at; // use first event's timestamp as cluster ID
+                // Source dot on the left margin.
+                painter.circle_filled(
+                    egui::pos2(viewport_rect.left() + 10.0, ev.y),
+                    4.0,
+                    source_color,
+                );
 
-                // Count how many events cluster at this y position.
-                let mut cluster_end = i + 1;
-                while cluster_end < visible.len()
-                    && (visible[cluster_end].y - y).abs() < EVENT_ROW_HEIGHT
-                {
-                    cluster_end += 1;
-                }
+                // Full chip.
+                let chip_rect = egui::Rect::from_min_size(
+                    egui::pos2(event_left, ev.y - 8.0),
+                    egui::vec2(event_width, 16.0),
+                );
+                painter.rect_filled(chip_rect, 3.0, color_frame());
 
-                let cluster_size = cluster_end - i;
-                let is_expanded = expanded_cluster_id == Some(cluster_key) && cluster_size > 1;
+                let tag_text = colorhash::text_color_on(source_color);
+                let tag_rect = egui::Rect::from_min_size(
+                    egui::pos2(event_left + 2.0, ev.y - 7.0),
+                    egui::vec2(36.0, 14.0),
+                );
+                painter.rect_filled(tag_rect, 3.0, source_color);
+                painter.text(
+                    tag_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    source_label,
+                    egui::FontId::proportional(9.0),
+                    tag_text,
+                );
 
-                if cluster_size == 1 || is_expanded {
-                    // Render individual events (single or expanded cluster).
-                    let count = if is_expanded { cluster_size } else { 1 };
-                    for j in 0..count {
-                        let ev = &visible[i + j];
-                        let row_y = if is_expanded {
-                            y + j as f32 * EVENT_ROW_HEIGHT
-                        } else {
-                            y
-                        };
-
-                        let (source_label, source_color) = timeline_source_style(ev.source);
-
-                        let chip_rect = egui::Rect::from_min_size(
-                            egui::pos2(event_left, row_y - 8.0),
-                            egui::vec2(event_width, 16.0),
-                        );
-                        painter.rect_filled(chip_rect, 3.0, color_frame());
-
-                        let tag_text = colorhash::text_color_on(source_color);
-                        let tag_rect = egui::Rect::from_min_size(
-                            egui::pos2(event_left + 2.0, row_y - 7.0),
-                            egui::vec2(36.0, 14.0),
-                        );
-                        painter.rect_filled(tag_rect, 3.0, source_color);
-                        painter.text(
-                            tag_rect.center(),
-                            egui::Align2::CENTER_CENTER,
-                            source_label,
-                            egui::FontId::proportional(9.0),
-                            tag_text,
-                        );
-
-                        painter.text(
-                            egui::pos2(event_left + 42.0, row_y),
-                            egui::Align2::LEFT_CENTER,
-                            &ev.summary,
-                            egui::FontId::monospace(10.0),
-                            text_color,
-                        );
-                    }
-
-                    // If expanded, make clickable to collapse.
-                    if is_expanded {
-                        let expanded_rect = egui::Rect::from_min_size(
-                            egui::pos2(event_left, y - 8.0),
-                            egui::vec2(event_width, count as f32 * EVENT_ROW_HEIGHT),
-                        );
-                        let click_id = ui.id().with(("cluster_collapse", cluster_key));
-                        let resp = ui.interact(expanded_rect, click_id, egui::Sense::click());
-                        if resp.clicked() {
-                            new_expanded = None;
-                        }
-                    }
-                } else {
-                    // Collapsed cluster: show source-colored chips side by side.
-                    let cluster_y = y;
-                    let chip_w = 10.0;
-                    let chip_h = 14.0;
-                    let max_chips = ((event_width - 60.0) / (chip_w + 2.0)) as usize;
-                    let chips_to_show = cluster_size.min(max_chips);
-
-                    let bar_width = (chips_to_show as f32 * (chip_w + 2.0)) + 50.0;
-                    let bar_rect = egui::Rect::from_min_size(
-                        egui::pos2(event_left, cluster_y - 8.0),
-                        egui::vec2(bar_width, 16.0),
-                    );
-                    painter.rect_filled(bar_rect, 3.0, color_frame());
-
-                    for j in 0..chips_to_show {
-                        let (_, source_color) = timeline_source_style(visible[i + j].source);
-                        let cx = event_left + 2.0 + j as f32 * (chip_w + 2.0);
-                        let chip_rect = egui::Rect::from_min_size(
-                            egui::pos2(cx, cluster_y - 7.0),
-                            egui::vec2(chip_w, chip_h),
-                        );
-                        painter.rect_filled(chip_rect, 2.0, source_color);
-                    }
-
-                    let count_x = event_left + 4.0 + chips_to_show as f32 * (chip_w + 2.0);
-                    painter.text(
-                        egui::pos2(count_x, cluster_y),
-                        egui::Align2::LEFT_CENTER,
-                        &format!("{cluster_size} events"),
-                        egui::FontId::monospace(9.0),
-                        color_muted(),
-                    );
-
-                    // Click to expand.
-                    let click_id = ui.id().with(("cluster_expand", cluster_key));
-                    let resp = ui.interact(bar_rect, click_id, egui::Sense::click());
-                    if resp.clicked() {
-                        new_expanded = Some(cluster_key);
-                    }
-                    if resp.hovered() {
-                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                    }
-                }
-
-                i = cluster_end;
+                painter.text(
+                    egui::pos2(event_left + 42.0, ev.y),
+                    egui::Align2::LEFT_CENTER,
+                    &ev.summary,
+                    egui::FontId::monospace(10.0),
+                    text_color,
+                );
             }
 
-            // Persist expanded cluster state.
-            if new_expanded != expanded_cluster_id {
-                ui.ctx().data_mut(|d| {
-                    d.insert_persisted(egui::Id::new("timeline_expanded_cluster"), new_expanded);
-                });
-            }
-
-            // Event count in top-right corner.
-            painter.text(
-                egui::pos2(viewport_rect.right() - 8.0, viewport_rect.top() + 12.0),
-                egui::Align2::RIGHT_CENTER,
-                &format!("{} visible", visible.len()),
-                egui::FontId::monospace(9.0),
-                color_muted(),
-            );
 
             // TODO: Render context float — needs refactoring to not use exec_rows.
             if false && state.context_float_request_id.is_some() {
