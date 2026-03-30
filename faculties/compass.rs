@@ -165,16 +165,16 @@ fn now_epoch() -> Epoch {
 }
 
 fn epoch_interval(epoch: Epoch) -> IntervalValue {
-    (epoch, epoch).to_value()
+    (epoch, epoch).try_to_value().unwrap()
 }
 
 fn interval_key(interval: IntervalValue) -> i128 {
-    let (lower, _): (Epoch, Epoch) = interval.from_value();
-    lower.to_tai_duration().total_nanoseconds()
+    let (lower, _): (i128, i128) = interval.try_from_value().unwrap();
+    lower
 }
 
 fn format_interval(interval: IntervalValue) -> String {
-    let (lower, _): (Epoch, Epoch) = interval.from_value();
+    let (lower, _): (Epoch, Epoch) = interval.try_from_value().unwrap();
     format!("{}", lower)
 }
 
