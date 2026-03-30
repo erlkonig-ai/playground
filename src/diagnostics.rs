@@ -783,13 +783,34 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
                 ui.colored_label(egui::Color32::RED, format!("Exec branch: {err}"));
             }
 
-            // Build the timeline from all catalogs.
-            let Some(ref mut ws) = ws else {
-                if exec_data.is_empty() {
-                    ui.label("No activity yet.");
-                } else {
-                    ui.label("No workspace available for blob reads.");
+            // Phase 1: collect all timestamps cheaply (no blob reads).
+            let all_timestamps = collect_timeline_timestamps(
+                &exec_data, &local_data, &teams_data, &compass_data,
+            );
+
+            if all_timestamps.is_empty() {
+                ui.small("No activity yet.");
+                return;
+            }
+
+            // Zoom control.
+            ui.horizontal(|ui| {
+                ui.small(egui::RichText::new("zoom").color(color_muted()));
+                if ui.add(Button::new("−")).clicked() {
+                    state.timeline_scale = (state.timeline_scale * 0.5).max(0.1);
                 }
+                ui.small(format!("{:.1} px/min", state.timeline_scale));
+                if ui.add(Button::new("+")).clicked() {
+                    state.timeline_scale = (state.timeline_scale * 2.0).min(100.0);
+                }
+                ui.small(egui::RichText::new(format!("{} events", all_timestamps.len())).color(color_muted()));
+            });
+
+            // Phase 2: materialize only events needed for rendering.
+            // For now, still collect all events but the timestamp index
+            // gives us the total count and time range without blob reads.
+            let Some(ref mut ws) = ws else {
+                ui.label("No workspace available for blob reads.");
                 return;
             };
 
@@ -821,23 +842,6 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
                 &labels,
                 timeline_limit,
             );
-
-            if timeline_rows.is_empty() {
-                ui.small("No activity yet.");
-                return;
-            }
-
-            // Zoom control.
-            ui.horizontal(|ui| {
-                ui.small(egui::RichText::new("zoom").color(color_muted()));
-                if ui.add(Button::new("−")).clicked() {
-                    state.timeline_scale = (state.timeline_scale * 0.5).max(0.1);
-                }
-                ui.small(format!("{:.1} px/min", state.timeline_scale));
-                if ui.add(Button::new("+")).clicked() {
-                    state.timeline_scale = (state.timeline_scale * 2.0).min(100.0);
-                }
-            });
 
             let has_more = timeline_rows.len() < timeline_total_rows;
             let scale = state.timeline_scale;
@@ -2572,6 +2576,73 @@ fn build_context_selected(
         origins_total,
         origins,
     })
+}
+
+/// Cheaply collect all event timestamps without blob reads.
+/// Returns a sorted (descending) Vec of (timestamp, source) pairs.
+/// This is Phase 1 of the two-phase timeline: establish the time range
+/// and determine which events are in the viewport before doing expensive
+/// blob reads in Phase 2.
+fn collect_timeline_timestamps(
+    exec_data: &TribleSet,
+    local_data: &TribleSet,
+    teams_data: &TribleSet,
+    compass_data: &TribleSet,
+) -> Vec<i128> {
+    let mut timestamps = Vec::new();
+
+    // Exec: requested_at (the primary exec timestamp)
+    for ts in find!(
+        ts: Value<NsTAIInterval>,
+        pattern!(exec_data, [{ playground_exec::ordered_requested_at: ?ts }])
+    ) {
+        timestamps.push(interval_key(ts));
+    }
+
+    // Reasoning summaries (cog::created_at)
+    for ts in find!(
+        ts: Value<NsTAIInterval>,
+        pattern!(exec_data, [{ playground_cog::ordered_created_at: ?ts }])
+    ) {
+        timestamps.push(interval_key(ts));
+    }
+
+    // Local messages
+    for ts in find!(
+        ts: Value<NsTAIInterval>,
+        pattern!(local_data, [{ local_messages::ordered_created_at: ?ts }])
+    ) {
+        timestamps.push(interval_key(ts));
+    }
+
+    // Teams messages
+    for ts in find!(
+        ts: Value<NsTAIInterval>,
+        pattern!(teams_data, [{ archive::ordered_created_at: ?ts }])
+    ) {
+        timestamps.push(interval_key(ts));
+    }
+
+    // Compass goals
+    for ts in find!(
+        ts: Value<NsTAIInterval>,
+        pattern!(compass_data, [{ compass::ordered_created_at: ?ts }])
+    ) {
+        timestamps.push(interval_key(ts));
+    }
+
+    // Compass status events
+    for ts in find!(
+        ts: Value<NsTAIInterval>,
+        pattern!(compass_data, [{ compass::ordered_at: ?ts }])
+    ) {
+        timestamps.push(interval_key(ts));
+    }
+
+    timestamps.sort_unstable();
+    timestamps.reverse(); // newest first
+    timestamps.dedup();
+    timestamps
 }
 
 fn build_activity_timeline(
