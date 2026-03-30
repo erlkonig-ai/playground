@@ -916,13 +916,14 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
                 events.push(VisibleEvent { y, source, summary });
             };
 
-            // Shell exec events — manual range filter (testing).
+            // Shell exec events.
             for (ts, command) in find!(
                 (ts: Value<NsTAIInterval>, command: Value<Handle<Blake3, LongString>>),
-                pattern!(&exec_data, [{ playground_exec::ordered_requested_at: ?ts, playground_exec::command_text: ?command }])
+                and!(
+                    pattern!(&exec_data, [{ playground_exec::ordered_requested_at: ?ts, playground_exec::command_text: ?command }]),
+                    exec_data.value_in_range(ts, min_ts, max_ts),
+                )
             ) {
-                let key = interval_key(ts);
-                if key < view_end || key > view_start { continue; }
                 if let Some(text) = load_text(ws, command) {
                     push_event(&mut events, ts, TimelineSource::Shell, truncate_single_line(&text, 80).to_string());
                 }
@@ -931,10 +932,11 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
             // Cognition.
             for (ts, reasoning) in find!(
                 (ts: Value<NsTAIInterval>, reasoning: Value<Handle<Blake3, LongString>>),
-                pattern!(&exec_data, [{ model_chat::ordered_finished_at: ?ts, model_chat::reasoning_text: ?reasoning }])
+                and!(
+                    pattern!(&exec_data, [{ model_chat::ordered_finished_at: ?ts, model_chat::reasoning_text: ?reasoning }]),
+                    exec_data.value_in_range(ts, min_ts, max_ts),
+                )
             ) {
-                let key = interval_key(ts);
-                if key < view_end || key > view_start { continue; }
                 if let Some(text) = load_text(ws, reasoning) {
                     push_event(&mut events, ts, TimelineSource::Cognition, truncate_single_line(&text, 80).to_string());
                 }
@@ -943,10 +945,11 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
             // Local messages.
             for (ts, body) in find!(
                 (ts: Value<NsTAIInterval>, body: Value<Handle<Blake3, LongString>>),
-                pattern!(&local_data, [{ local_messages::ordered_created_at: ?ts, local_messages::body: ?body }])
+                and!(
+                    pattern!(&local_data, [{ local_messages::ordered_created_at: ?ts, local_messages::body: ?body }]),
+                    local_data.value_in_range(ts, min_ts, max_ts),
+                )
             ) {
-                let key = interval_key(ts);
-                if key < view_end || key > view_start { continue; }
                 if let Some(text) = load_text(ws, body) {
                     push_event(&mut events, ts, TimelineSource::LocalMessages, truncate_single_line(&text, 80).to_string());
                 }
@@ -955,22 +958,24 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
             // Teams messages.
             for (ts, content) in find!(
                 (ts: Value<NsTAIInterval>, content: Value<Handle<Blake3, LongString>>),
-                pattern!(&teams_data, [{ archive::ordered_created_at: ?ts, archive::content: ?content }])
+                and!(
+                    pattern!(&teams_data, [{ archive::ordered_created_at: ?ts, archive::content: ?content }]),
+                    teams_data.value_in_range(ts, min_ts, max_ts),
+                )
             ) {
-                let key = interval_key(ts);
-                if key < view_end || key > view_start { continue; }
                 if let Some(text) = load_text(ws, content) {
                     push_event(&mut events, ts, TimelineSource::Teams, truncate_single_line(&text, 80).to_string());
                 }
             }
 
-            // Compass goals.
+            // Compass goals — using value_in_range (testing fix).
             for (ts, title) in find!(
                 (ts: Value<NsTAIInterval>, title: Value<Handle<Blake3, LongString>>),
-                pattern!(&compass_data, [{ compass::ordered_created_at: ?ts, compass::title: ?title }])
+                and!(
+                    pattern!(&compass_data, [{ compass::ordered_created_at: ?ts, compass::title: ?title }]),
+                    compass_data.value_in_range(ts, min_ts, max_ts),
+                )
             ) {
-                let key = interval_key(ts);
-                if key < view_end || key > view_start { continue; }
                 if let Some(text) = load_text(ws, title) {
                     push_event(&mut events, ts, TimelineSource::Goals, truncate_single_line(&text, 80).to_string());
                 }
@@ -979,10 +984,11 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
             // Compass status/note events.
             for ts in find!(
                 ts: Value<NsTAIInterval>,
-                pattern!(&compass_data, [{ compass::ordered_at: ?ts }])
+                and!(
+                    pattern!(&compass_data, [{ compass::ordered_at: ?ts }]),
+                    compass_data.value_in_range(ts, min_ts, max_ts),
+                )
             ) {
-                let key = interval_key(ts);
-                if key < view_end || key > view_start { continue; }
                 push_event(&mut events, ts, TimelineSource::Goals, "status/note".to_string());
             }
 
