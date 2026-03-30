@@ -21,7 +21,7 @@ use triblespace::macros::{entity, find, id_hex, pattern};
 use triblespace::prelude::valueschemas::{GenId, NsTAIInterval, U256BE};
 use triblespace::prelude::{
     Attribute, BlobStore, BlobStoreGet, BranchStore, ToBlob, TryFromValue, TryToValue,
-    View,
+    View, and, IntersectionConstraint,
 };
 
 use GORBIE::NotebookConfig;
@@ -896,49 +896,21 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
                 }
             }
 
-            // Phase 2: collect and render events in the visible range.
+            // Query events directly from catalogs for the visible time range.
+            // No shadow datamodel — just find! queries with value_in_range.
             let Some(ref mut ws) = ws else {
                 return;
             };
 
-            let exec_rows = collect_exec_rows(&exec_data, ws);
-            let reasoning_summaries = collect_reasoning_summaries(&exec_data, ws);
-            let reason_rows = collect_reason_rows(&exec_data, ws);
-            let local_message_rows = collect_local_messages(&local_data, ws);
-            let (teams_messages, teams_chats) = collect_teams_messages(&teams_data, ws);
-            let compass_rows = collect_compass_rows(&compass_data, ws);
-            let compass_status_rows = collect_compass_status_rows(&compass_data);
-            let compass_notes = collect_compass_notes(&compass_data, ws);
-            let labels = collect_labels(&exec_data, ws);
-            let relations_people = collect_relations_people(&relations_data, ws);
-            let relations_labels = collect_relations_labels(&relations_people);
-            let local_me_id = resolve_person_ref(&relations_people, &state.config.local_me);
+            let t0 = Instant::now();
 
-            let (all_rows, _) = build_activity_timeline(
-                &exec_rows,
-                &reasoning_summaries,
-                &reason_rows,
-                &local_message_rows,
-                local_me_id,
-                &relations_labels,
-                &teams_messages,
-                &teams_chats,
-                &compass_rows,
-                &compass_status_rows,
-                &compass_notes,
-                &labels,
-                usize::MAX, // no limit — we filter by viewport
-            );
+            // Build range bounds as NsTAIInterval values.
+            let ts_min = Epoch::from_tai_duration(hifitime::Duration::from_total_nanoseconds(view_end));
+            let ts_max = Epoch::from_tai_duration(hifitime::Duration::from_total_nanoseconds(view_start));
+            let min_ts: Value<NsTAIInterval> = (ts_min, ts_min).try_to_value().unwrap();
+            let max_ts: Value<NsTAIInterval> = (ts_max, ts_max).try_to_value().unwrap();
 
-            // Render events with density-aware clustering.
-            // Events closer than EVENT_ROW_HEIGHT apart get merged into
-            // summary chips showing just the source colors.
-            const EVENT_ROW_HEIGHT: f32 = 18.0;
-            let event_left = viewport_rect.left() + 120.0;
-            let event_width = viewport_rect.width() - 130.0;
-            let text_color = colorhash::text_color_on(color_frame());
-
-            // Collect visible events with their y positions.
+            // Query events directly into visible list — no intermediate structs.
             struct VisibleEvent {
                 y: f32,
                 at: i128,
@@ -946,25 +918,110 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
                 summary: String,
             }
             let mut visible: Vec<VisibleEvent> = Vec::new();
-            for row in &all_rows {
-                let Some(at) = row.at else { continue };
-                if at > view_start || at < view_end { continue }
 
-                let y = viewport_rect.top()
-                    + ((view_start - at) as f64 / ns_per_px) as f32;
+            let ts_to_y = |ts: Value<NsTAIInterval>| -> f32 {
+                let key = interval_key(ts);
+                viewport_rect.top() + ((view_start - key) as f64 / ns_per_px) as f32
+            };
 
-                visible.push(VisibleEvent {
-                    y,
-                    at,
-                    source: row.source,
-                    summary: timeline_event_summary(&row.event),
-                });
+            // Shell exec events.
+            for (ts, command) in find!(
+                (ts: Value<NsTAIInterval>, command: Value<Handle<Blake3, LongString>>),
+                and!(
+                    pattern!(&exec_data, [{ playground_exec::ordered_requested_at: ?ts, playground_exec::command_text: ?command }]),
+                    exec_data.value_in_range(ts, min_ts, max_ts),
+                )
+            ) {
+                if let Some(text) = load_text(ws, command) {
+                    visible.push(VisibleEvent { y: ts_to_y(ts), at: interval_key(ts), source: TimelineSource::Shell, summary: truncate_single_line(&text, 80).to_string() });
+                }
             }
 
-            // Clip to viewport.
-            visible.retain(|ev| ev.y >= viewport_rect.top() - 20.0 && ev.y <= viewport_rect.bottom() + 20.0);
+            // Cognition (model chat results with reasoning text).
+            for (ts, reasoning) in find!(
+                (ts: Value<NsTAIInterval>, reasoning: Value<Handle<Blake3, LongString>>),
+                and!(
+                    pattern!(&exec_data, [{ model_chat::ordered_finished_at: ?ts, model_chat::reasoning_text: ?reasoning }]),
+                    exec_data.value_in_range(ts, min_ts, max_ts),
+                )
+            ) {
+                if let Some(text) = load_text(ws, reasoning) {
+                    visible.push(VisibleEvent { y: ts_to_y(ts), at: interval_key(ts), source: TimelineSource::Cognition, summary: truncate_single_line(&text, 80).to_string() });
+                }
+            }
 
-            // Render: cluster events that are too close together.
+            // Local messages.
+            for (ts, body) in find!(
+                (ts: Value<NsTAIInterval>, body: Value<Handle<Blake3, LongString>>),
+                and!(
+                    pattern!(&local_data, [{ local_messages::ordered_created_at: ?ts, local_messages::body: ?body }]),
+                    local_data.value_in_range(ts, min_ts, max_ts),
+                )
+            ) {
+                if let Some(text) = load_text(ws, body) {
+                    visible.push(VisibleEvent { y: ts_to_y(ts), at: interval_key(ts), source: TimelineSource::LocalMessages, summary: truncate_single_line(&text, 80).to_string() });
+                }
+            }
+
+            // Teams messages.
+            for (ts, content) in find!(
+                (ts: Value<NsTAIInterval>, content: Value<Handle<Blake3, LongString>>),
+                and!(
+                    pattern!(&teams_data, [{ archive::ordered_created_at: ?ts, archive::content: ?content }]),
+                    teams_data.value_in_range(ts, min_ts, max_ts),
+                )
+            ) {
+                if let Some(text) = load_text(ws, content) {
+                    visible.push(VisibleEvent { y: ts_to_y(ts), at: interval_key(ts), source: TimelineSource::Teams, summary: truncate_single_line(&text, 80).to_string() });
+                }
+            }
+
+            // Compass goals.
+            for (ts, title) in find!(
+                (ts: Value<NsTAIInterval>, title: Value<Handle<Blake3, LongString>>),
+                and!(
+                    pattern!(&compass_data, [{ compass::ordered_created_at: ?ts, compass::title: ?title }]),
+                    compass_data.value_in_range(ts, min_ts, max_ts),
+                )
+            ) {
+                if let Some(text) = load_text(ws, title) {
+                    visible.push(VisibleEvent { y: ts_to_y(ts), at: interval_key(ts), source: TimelineSource::Goals, summary: truncate_single_line(&text, 80).to_string() });
+                }
+            }
+
+            // Compass status/note events.
+            for ts in find!(
+                ts: Value<NsTAIInterval>,
+                and!(
+                    pattern!(&compass_data, [{ compass::ordered_at: ?ts }]),
+                    compass_data.value_in_range(ts, min_ts, max_ts),
+                )
+            ) {
+                visible.push(VisibleEvent { y: ts_to_y(ts), at: interval_key(ts), source: TimelineSource::Goals, summary: "status/note".to_string() });
+            }
+
+            // Sort by y position (newest = top).
+            visible.sort_by(|a, b| a.y.partial_cmp(&b.y).unwrap_or(std::cmp::Ordering::Equal));
+
+            let t1 = Instant::now();
+            let query_ms = (t1 - t0).as_secs_f64() * 1000.0;
+
+            painter.text(
+                egui::pos2(viewport_rect.right() - 8.0, viewport_rect.bottom() - 12.0),
+                egui::Align2::RIGHT_CENTER,
+                &format!("query:{:.1}ms {} events", query_ms, visible.len()),
+                egui::FontId::monospace(8.0),
+                color_muted(),
+            );
+
+
+            // Render events with density-aware clustering.
+            const EVENT_ROW_HEIGHT: f32 = 18.0;
+            let event_left = viewport_rect.left() + 120.0;
+            let event_width = viewport_rect.width() - 130.0;
+            let text_color = colorhash::text_color_on(color_frame());
+
+            // Cluster events that are too close together.
             // Clusters are clickable — clicking expands them into a vertical list.
             // The expanded cluster ID is tracked in egui's persisted data.
             let expanded_cluster_id: Option<i128> = ui.ctx().data_mut(|d| {
@@ -1102,13 +1159,15 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
             painter.text(
                 egui::pos2(viewport_rect.right() - 8.0, viewport_rect.top() + 12.0),
                 egui::Align2::RIGHT_CENTER,
-                &format!("{}/{} visible", visible.len(), all_rows.len()),
+                &format!("{} visible", visible.len()),
                 egui::FontId::monospace(9.0),
                 color_muted(),
             );
 
-            // Render context float if one is open.
-            if let Some(request_id) = state.context_float_request_id {
+            // TODO: Render context float — needs refactoring to not use exec_rows.
+            if false && state.context_float_request_id.is_some() {
+                let request_id = state.context_float_request_id.unwrap();
+                let exec_rows = collect_exec_rows(&exec_data, ws);
                 let turn_memory_rows = collect_turn_memory_rows(&exec_data, &exec_rows, ws);
                 if let Some(row) = turn_memory_rows.iter().find(|r| r.request_id == request_id) {
                     let row = row.clone();
