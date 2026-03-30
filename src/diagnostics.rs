@@ -105,8 +105,6 @@ mod reason_events {
 // ── Layout constants ────────────────────────────────────────────────
 const ACTIVITY_TIMELINE_HEIGHT: f32 = 980.0;
 const TURN_MEMORY_MAX_ROWS: usize = 160;
-const TIMELINE_INITIAL_LIMIT: usize = 100;
-const TIMELINE_LOAD_MORE: usize = 100;
 const CONTEXT_TREE_HEIGHT: f32 = 720.0;
 const CONTEXT_ORIGIN_LIMIT: usize = 64;
 const LOCAL_COMPOSE_HEIGHT: f32 = 80.0;
@@ -299,7 +297,9 @@ struct DashboardState {
     context_selection_stack: Vec<Id>,
     context_show_children: bool,
     context_show_origins: bool,
-    timeline_limit: usize,
+    /// Timeline viewport: top edge = this timestamp (newest visible).
+    /// Scrolling pans this value. Initialized to now_key.
+    timeline_start: i128,
     /// Timeline zoom: pixels per minute of wall time.
     timeline_scale: f32,
     last_refresh_at: Option<Instant>,
@@ -330,7 +330,7 @@ impl Default for DashboardState {
             context_selection_stack: Vec::new(),
             context_show_children: false,
             context_show_origins: false,
-            timeline_limit: TIMELINE_INITIAL_LIMIT,
+            timeline_start: 0, // initialized to now_key on first refresh
             timeline_scale: TIMELINE_DEFAULT_SCALE,
             last_refresh_at: None,
         }
@@ -765,7 +765,11 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
         let compass_data = state.compass_cat.catalog().clone();
         let relations_data = state.relations_cat.catalog().clone();
         let now_key = state.now_key;
-        let timeline_limit = state.timeline_limit;
+
+        // Initialize timeline_start to "now" if not yet set.
+        if state.timeline_start == 0 {
+            state.timeline_start = now_key;
+        }
 
         let exec_branch_err =
             if state.exec_cat.co.is_none() && !state.config.exec_branch.trim().is_empty() {
@@ -777,40 +781,123 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
             };
 
         ui.section("Activity", |ui| {
-            ui.grid(|g| g.full(|ui| {
 
             if let Some(err) = &exec_branch_err {
                 ui.colored_label(egui::Color32::RED, format!("Exec branch: {err}"));
             }
 
-            // Phase 1: collect all timestamps cheaply (no blob reads).
-            let all_timestamps = collect_timeline_timestamps(
-                &exec_data, &local_data, &teams_data, &compass_data,
+            // The timeline viewport: full-width painted region as a time axis.
+            let viewport_height = ACTIVITY_TIMELINE_HEIGHT;
+            let scale = state.timeline_scale;
+            let ns_per_px = 60_000_000_000.0 / scale as f64; // nanoseconds per pixel
+            let scroll_speed = 3.0; // multiplier for faster scrolling
+
+            // Allocate the viewport rect (full width, no grid margin).
+            let viewport_width = ui.available_width();
+            let (viewport_rect, viewport_response) = ui.allocate_exact_size(
+                egui::vec2(viewport_width, viewport_height),
+                egui::Sense::click_and_drag(),
             );
 
-            if all_timestamps.is_empty() {
-                ui.small("No activity yet.");
-                return;
+            // Input handling — only when pointer is over the viewport.
+            if viewport_response.hovered() {
+                let (scroll_y, scroll_x, ctrl, pointer_pos) = ui.input(|i| {
+                    (i.smooth_scroll_delta.y, i.smooth_scroll_delta.x,
+                     i.modifiers.command || i.modifiers.ctrl,
+                     i.pointer.hover_pos())
+                });
+
+                // Cursor Y relative to viewport top — used for zoom-at-cursor.
+                let cursor_rel_y = pointer_pos
+                    .map(|p| (p.y - viewport_rect.top()).max(0.0))
+                    .unwrap_or(viewport_height * 0.5);
+
+                // Timestamp under the cursor (before zoom).
+                let cursor_time = state.timeline_start - (cursor_rel_y as f64 * ns_per_px) as i128;
+
+                // Vertical scroll: pan through time.
+                if !ctrl && scroll_y != 0.0 {
+                    let pan_ns = (scroll_y as f64 * scroll_speed * ns_per_px) as i128;
+                    state.timeline_start += pan_ns;
+                }
+
+                // Zoom (ctrl+scroll or horizontal scroll): scale around cursor.
+                let zoom_factor = if ctrl && scroll_y != 0.0 {
+                    if scroll_y > 0.0 { 1.15 } else { 1.0 / 1.15 }
+                } else if scroll_x != 0.0 {
+                    if scroll_x > 0.0 { 1.08 } else { 1.0 / 1.08 }
+                } else {
+                    1.0
+                };
+
+                if zoom_factor != 1.0 {
+                    let new_scale = (state.timeline_scale * zoom_factor).clamp(0.01, 1000.0);
+                    let new_ns_per_px = 60_000_000_000.0 / new_scale as f64;
+
+                    // Adjust start so cursor_time stays at cursor_rel_y.
+                    state.timeline_start = cursor_time + (cursor_rel_y as f64 * new_ns_per_px) as i128;
+                    state.timeline_scale = new_scale;
+                }
+
+                // Consume scroll so GORBIE notebook doesn't scroll too.
+                ui.ctx().input_mut(|i| {
+                    i.smooth_scroll_delta = egui::Vec2::ZERO;
+                });
             }
 
-            // Zoom control.
-            ui.horizontal(|ui| {
-                ui.small(egui::RichText::new("zoom").color(color_muted()));
-                if ui.add(Button::new("−")).clicked() {
-                    state.timeline_scale = (state.timeline_scale * 0.5).max(0.1);
-                }
-                ui.small(format!("{:.1} px/min", state.timeline_scale));
-                if ui.add(Button::new("+")).clicked() {
-                    state.timeline_scale = (state.timeline_scale * 2.0).min(100.0);
-                }
-                ui.small(egui::RichText::new(format!("{} events", all_timestamps.len())).color(color_muted()));
-            });
+            // Drag: pan through time.
+            if viewport_response.dragged() {
+                let drag_delta = viewport_response.drag_delta().y;
+                let pan_ns = (drag_delta as f64 * scroll_speed * ns_per_px) as i128;
+                state.timeline_start += pan_ns;
+            }
 
-            // Phase 2: materialize only events needed for rendering.
-            // For now, still collect all events but the timestamp index
-            // gives us the total count and time range without blob reads.
+            // Double-click: jump to now.
+            if viewport_response.double_clicked() {
+                state.timeline_start = now_key;
+            }
+
+            let viewport_ns = (viewport_height as f64 * ns_per_px) as i128;
+            let view_start = state.timeline_start;
+            let view_end = view_start - viewport_ns;
+
+            // Clip painting to viewport.
+            let painter = ui.painter_at(viewport_rect);
+
+            // Background.
+            painter.rect_filled(viewport_rect, 0.0, color_frame());
+
+            // Draw tick marks along the left edge.
+            let tick_interval_ns = auto_tick_interval(viewport_ns);
+            if tick_interval_ns > 0 {
+                // Align first tick to a multiple of tick_interval.
+                let first_tick = (view_start / tick_interval_ns) * tick_interval_ns;
+                let mut tick = first_tick;
+                while tick > view_end {
+                    let y = viewport_rect.top()
+                        + ((view_start - tick) as f64 / ns_per_px) as f32;
+                    if y >= viewport_rect.top() && y <= viewport_rect.bottom() {
+                        // Tick line.
+                        painter.line_segment(
+                            [egui::pos2(viewport_rect.left(), y), egui::pos2(viewport_rect.left() + 40.0, y)],
+                            egui::Stroke::new(1.0, color_muted()),
+                        );
+                        // Time label.
+                        let label = format_time_marker(tick);
+                        painter.text(
+                            egui::pos2(viewport_rect.left() + 44.0, y),
+                            egui::Align2::LEFT_CENTER,
+                            &label,
+                            egui::FontId::monospace(9.0),
+                            color_muted(),
+                        );
+                    }
+                    tick -= tick_interval_ns;
+                }
+            }
+
+            // Phase 2: collect and render events in the visible range.
             let Some(ref mut ws) = ws else {
-                ui.label("No workspace available for blob reads.");
                 return;
             };
 
@@ -827,7 +914,7 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
             let relations_labels = collect_relations_labels(&relations_people);
             let local_me_id = resolve_person_ref(&relations_people, &state.config.local_me);
 
-            let (timeline_rows, timeline_total_rows) = build_activity_timeline(
+            let (all_rows, _) = build_activity_timeline(
                 &exec_rows,
                 &reasoning_summaries,
                 &reason_rows,
@@ -840,18 +927,185 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
                 &compass_status_rows,
                 &compass_notes,
                 &labels,
-                timeline_limit,
+                usize::MAX, // no limit — we filter by viewport
             );
 
-            let has_more = timeline_rows.len() < timeline_total_rows;
-            let scale = state.timeline_scale;
-            let resp = render_activity_timeline(ui, now_key, &timeline_rows, has_more, scale);
-            if let Some(request_id) = resp.context_clicked {
-                state.context_float_request_id = Some(request_id);
+            // Render events with density-aware clustering.
+            // Events closer than EVENT_ROW_HEIGHT apart get merged into
+            // summary chips showing just the source colors.
+            const EVENT_ROW_HEIGHT: f32 = 18.0;
+            let event_left = viewport_rect.left() + 120.0;
+            let event_width = viewport_rect.width() - 130.0;
+            let text_color = colorhash::text_color_on(color_frame());
+
+            // Collect visible events with their y positions.
+            struct VisibleEvent {
+                y: f32,
+                at: i128,
+                source: TimelineSource,
+                summary: String,
             }
-            if resp.wants_more {
-                state.timeline_limit += TIMELINE_LOAD_MORE;
+            let mut visible: Vec<VisibleEvent> = Vec::new();
+            for row in &all_rows {
+                let Some(at) = row.at else { continue };
+                if at > view_start || at < view_end { continue }
+
+                let y = viewport_rect.top()
+                    + ((view_start - at) as f64 / ns_per_px) as f32;
+
+                visible.push(VisibleEvent {
+                    y,
+                    at,
+                    source: row.source,
+                    summary: timeline_event_summary(&row.event),
+                });
             }
+
+            // Clip to viewport.
+            visible.retain(|ev| ev.y >= viewport_rect.top() - 20.0 && ev.y <= viewport_rect.bottom() + 20.0);
+
+            // Render: cluster events that are too close together.
+            // Clusters are clickable — clicking expands them into a vertical list.
+            // The expanded cluster ID is tracked in egui's persisted data.
+            let expanded_cluster_id: Option<i128> = ui.ctx().data_mut(|d| {
+                *d.get_persisted_mut_or(egui::Id::new("timeline_expanded_cluster"), None)
+            });
+
+            let mut new_expanded: Option<i128> = expanded_cluster_id;
+            let mut i = 0;
+            while i < visible.len() {
+                let ev = &visible[i];
+                let y = ev.y;
+                let cluster_key = ev.at; // use first event's timestamp as cluster ID
+
+                // Count how many events cluster at this y position.
+                let mut cluster_end = i + 1;
+                while cluster_end < visible.len()
+                    && (visible[cluster_end].y - y).abs() < EVENT_ROW_HEIGHT
+                {
+                    cluster_end += 1;
+                }
+
+                let cluster_size = cluster_end - i;
+                let is_expanded = expanded_cluster_id == Some(cluster_key) && cluster_size > 1;
+
+                if cluster_size == 1 || is_expanded {
+                    // Render individual events (single or expanded cluster).
+                    let count = if is_expanded { cluster_size } else { 1 };
+                    for j in 0..count {
+                        let ev = &visible[i + j];
+                        let row_y = if is_expanded {
+                            y + j as f32 * EVENT_ROW_HEIGHT
+                        } else {
+                            y
+                        };
+
+                        let (source_label, source_color) = timeline_source_style(ev.source);
+
+                        let chip_rect = egui::Rect::from_min_size(
+                            egui::pos2(event_left, row_y - 8.0),
+                            egui::vec2(event_width, 16.0),
+                        );
+                        painter.rect_filled(chip_rect, 3.0, color_frame());
+
+                        let tag_text = colorhash::text_color_on(source_color);
+                        let tag_rect = egui::Rect::from_min_size(
+                            egui::pos2(event_left + 2.0, row_y - 7.0),
+                            egui::vec2(36.0, 14.0),
+                        );
+                        painter.rect_filled(tag_rect, 3.0, source_color);
+                        painter.text(
+                            tag_rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            source_label,
+                            egui::FontId::proportional(9.0),
+                            tag_text,
+                        );
+
+                        painter.text(
+                            egui::pos2(event_left + 42.0, row_y),
+                            egui::Align2::LEFT_CENTER,
+                            &ev.summary,
+                            egui::FontId::monospace(10.0),
+                            text_color,
+                        );
+                    }
+
+                    // If expanded, make clickable to collapse.
+                    if is_expanded {
+                        let expanded_rect = egui::Rect::from_min_size(
+                            egui::pos2(event_left, y - 8.0),
+                            egui::vec2(event_width, count as f32 * EVENT_ROW_HEIGHT),
+                        );
+                        let click_id = ui.id().with(("cluster_collapse", cluster_key));
+                        let resp = ui.interact(expanded_rect, click_id, egui::Sense::click());
+                        if resp.clicked() {
+                            new_expanded = None;
+                        }
+                    }
+                } else {
+                    // Collapsed cluster: show source-colored chips side by side.
+                    let cluster_y = y;
+                    let chip_w = 10.0;
+                    let chip_h = 14.0;
+                    let max_chips = ((event_width - 60.0) / (chip_w + 2.0)) as usize;
+                    let chips_to_show = cluster_size.min(max_chips);
+
+                    let bar_width = (chips_to_show as f32 * (chip_w + 2.0)) + 50.0;
+                    let bar_rect = egui::Rect::from_min_size(
+                        egui::pos2(event_left, cluster_y - 8.0),
+                        egui::vec2(bar_width, 16.0),
+                    );
+                    painter.rect_filled(bar_rect, 3.0, color_frame());
+
+                    for j in 0..chips_to_show {
+                        let (_, source_color) = timeline_source_style(visible[i + j].source);
+                        let cx = event_left + 2.0 + j as f32 * (chip_w + 2.0);
+                        let chip_rect = egui::Rect::from_min_size(
+                            egui::pos2(cx, cluster_y - 7.0),
+                            egui::vec2(chip_w, chip_h),
+                        );
+                        painter.rect_filled(chip_rect, 2.0, source_color);
+                    }
+
+                    let count_x = event_left + 4.0 + chips_to_show as f32 * (chip_w + 2.0);
+                    painter.text(
+                        egui::pos2(count_x, cluster_y),
+                        egui::Align2::LEFT_CENTER,
+                        &format!("{cluster_size} events"),
+                        egui::FontId::monospace(9.0),
+                        color_muted(),
+                    );
+
+                    // Click to expand.
+                    let click_id = ui.id().with(("cluster_expand", cluster_key));
+                    let resp = ui.interact(bar_rect, click_id, egui::Sense::click());
+                    if resp.clicked() {
+                        new_expanded = Some(cluster_key);
+                    }
+                    if resp.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                }
+
+                i = cluster_end;
+            }
+
+            // Persist expanded cluster state.
+            if new_expanded != expanded_cluster_id {
+                ui.ctx().data_mut(|d| {
+                    d.insert_persisted(egui::Id::new("timeline_expanded_cluster"), new_expanded);
+                });
+            }
+
+            // Event count in top-right corner.
+            painter.text(
+                egui::pos2(viewport_rect.right() - 8.0, viewport_rect.top() + 12.0),
+                egui::Align2::RIGHT_CENTER,
+                &format!("{}/{} visible", visible.len(), all_rows.len()),
+                egui::FontId::monospace(9.0),
+                color_muted(),
+            );
 
             // Render context float if one is open.
             if let Some(request_id) = state.context_float_request_id {
@@ -892,7 +1146,6 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
                     });
                 }
             }
-            }));
         });
     });
 
@@ -3967,6 +4220,37 @@ struct TimelineResponse {
     context_clicked: Option<Id>,
     /// The user scrolled near the bottom — load more events.
     wants_more: bool,
+}
+
+/// Choose a tick interval (in nanoseconds) that gives ~5-10 ticks
+/// for the given viewport time span.
+fn auto_tick_interval(viewport_ns: i128) -> i128 {
+    let target_ticks = 8;
+    let raw = viewport_ns / target_ticks;
+    // Snap to nice intervals: 1s, 5s, 10s, 30s, 1m, 5m, 10m, 30m, 1h, 3h, 6h, 12h, 1d
+    let ns = 1_000_000_000i128;
+    let intervals = [
+        ns,           // 1 second
+        5 * ns,       // 5 seconds
+        10 * ns,      // 10 seconds
+        30 * ns,      // 30 seconds
+        60 * ns,      // 1 minute
+        5 * 60 * ns,  // 5 minutes
+        10 * 60 * ns, // 10 minutes
+        30 * 60 * ns, // 30 minutes
+        3600 * ns,    // 1 hour
+        3 * 3600 * ns, // 3 hours
+        6 * 3600 * ns, // 6 hours
+        12 * 3600 * ns, // 12 hours
+        86400 * ns,   // 1 day
+        7 * 86400 * ns, // 1 week
+    ];
+    for &interval in &intervals {
+        if interval >= raw {
+            return interval;
+        }
+    }
+    *intervals.last().unwrap()
 }
 
 /// Format a TAI nanosecond key as a human-readable time marker.
