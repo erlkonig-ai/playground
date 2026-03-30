@@ -4,7 +4,9 @@ version = 4
 
 [[package]]
 name = "GORBIE"
-version = "0.9.8"
+version = "0.9.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "48dc7c38d8120e2e9e8215ec14a91931d3744194f5d8cda470912bdc14722eac"
 dependencies = [
  "ctrlc",
  "dark-light",
@@ -243,7 +245,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -254,7 +256,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1022,6 +1024,8 @@ checksum = "c2459377285ad874054d797f3ccebf984978aa39129f6eafde5cdc8315b612f8"
 [[package]]
 name = "const_blake3"
 version = "0.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "73669b833cef325e02d23313debfb6fc18651590af0812036cc42239286a712d"
 dependencies = [
  "blake3",
 ]
@@ -1740,7 +1744,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2240,6 +2244,8 @@ dependencies = [
 [[package]]
 name = "gorbie-commonmark"
 version = "0.23.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "14f995e9aa723d3caa1ac3be9d562492f18afe50490d639a90a568b9ea03b1a4"
 dependencies = [
  "egui",
  "egui_extras",
@@ -2250,6 +2256,8 @@ dependencies = [
 [[package]]
 name = "gorbie-commonmark-backend"
 version = "0.23.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "80f720de764711677e79f217dde4e8616b77f2a34e02628127559ac4dc67621f"
 dependencies = [
  "egui",
  "egui_extras",
@@ -2260,6 +2268,8 @@ dependencies = [
 [[package]]
 name = "gorbie-macros"
 version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1ebbe4f5d2f0430c5ff3c93069cbd3c55aeffc77b2dfaf822d3f14344ba575b3"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -3082,7 +3092,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4203,7 +4213,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.11.0",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4679,7 +4689,7 @@ dependencies = [
  "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.2",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4971,6 +4981,8 @@ dependencies = [
 [[package]]
 name = "triblespace"
 version = "0.30.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ff368a98b136565963e2d76cd415e372d2db3cd56ca02095ea94ae88a3f20f74"
 dependencies = [
  "ed25519-dalek",
  "log",
@@ -4985,6 +4997,8 @@ dependencies = [
 [[package]]
 name = "triblespace-core"
 version = "0.30.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "87e5c7a29ae8c1d4bc2338c186ae1c3cd8b37ce32d3a0c352cbd4280103e11ce"
 dependencies = [
  "anybytes",
  "arbitrary",
@@ -5035,6 +5049,8 @@ dependencies = [
 [[package]]
 name = "triblespace-core-macros"
 version = "0.23.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4b362d0aea90dee0686c88a22e16340ca81ea221ed144baf6e950ccd4c82a0d4"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5045,6 +5061,8 @@ dependencies = [
 [[package]]
 name = "triblespace-macros"
 version = "0.30.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "04b182786aad71fd57cccd022992a38d3a23877bf9193ad46ab3d19b1b19c564"
 dependencies = [
  "ed25519-dalek",
  "hex",
@@ -5059,6 +5077,8 @@ dependencies = [
 [[package]]
 name = "triblespace-macros-common"
 version = "0.23.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fbbe3adcffad19c42c39debbdfe47295a839fe352b292f78903cfe031d7be8ac"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5783,7 +5803,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
