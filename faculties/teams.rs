@@ -778,7 +778,7 @@ fn log_event(config: &TeamsBridgeConfig, level: &str, message: &str) -> Result<(
     let (repo, branch_id) = open_repo_for_branch_id(&config.pile_path, config.log_branch_id, "logs")?;
     with_repo_close(repo, |repo| {
         let mut ws = map_err_debug(repo.pull(branch_id), "pull workspace")?;
-        let catalog = map_err_debug(ws.checkout(..), "checkout workspace")?;
+        let catalog = map_err_debug(ws.checkout(..), "checkout workspace")?.into_facts();
 
         let mut change = TribleSet::new();
         let author_id = stable_id("teams-log-author", &[]);
@@ -820,7 +820,7 @@ fn pull_once_with_cache(
         open_repo_for_branch_id(&config.pile_path, config.branch_id, &config.branch)?;
     with_repo_close(repo, |repo| {
         let mut ws = map_err_debug(repo.pull(branch_id), "pull workspace")?;
-        let catalog = map_err_debug(ws.checkout(..), "checkout workspace")?;
+        let catalog = map_err_debug(ws.checkout(..), "checkout workspace")?.into_facts();
         let cursor_state = load_cursor_from_space(&mut ws, &catalog)?;
         let start_url = match cursor_state.as_ref() {
             Some(cursor) if cursor.url.contains("/me/") => {
@@ -1060,7 +1060,7 @@ fn load_cached_token_from_pile(config: &TeamsBridgeConfig) -> Result<Option<Stri
         open_repo_for_branch_id(&config.pile_path, config.branch_id, &config.branch)?;
     with_repo_close(repo, |repo| {
         let mut ws = map_err_debug(repo.pull(branch_id), "pull workspace")?;
-        let catalog = map_err_debug(ws.checkout(..), "checkout workspace")?;
+        let catalog = map_err_debug(ws.checkout(..), "checkout workspace")?.into_facts();
         let Some(state) = latest_token_state(&catalog) else {
             return Ok(None);
         };
@@ -1113,7 +1113,7 @@ fn load_config_from_pile(config: &TeamsBridgeConfig) -> Result<Option<TeamsConfi
         open_repo_for_branch_id(&config.pile_path, config.branch_id, &config.branch)?;
     with_repo_close(repo, |repo| {
         let mut ws = map_err_debug(repo.pull(branch_id), "pull workspace")?;
-        let catalog = map_err_debug(ws.checkout(..), "checkout workspace")?;
+        let catalog = map_err_debug(ws.checkout(..), "checkout workspace")?.into_facts();
         let Some(state) = latest_config_state(&catalog) else {
             return Ok(None);
         };
@@ -1303,7 +1303,7 @@ fn store_token_in_repo(
     token: &TokenData,
 ) -> Result<()> {
     let mut ws = map_err_debug(repo.pull(branch_id), "pull workspace")?;
-    let catalog = map_err_debug(ws.checkout(..), "checkout workspace")?;
+    let catalog = map_err_debug(ws.checkout(..), "checkout workspace")?.into_facts();
     let change = build_token_change(&mut ws, &catalog, token)?;
     if change.is_empty() {
         return Ok(());
@@ -1371,7 +1371,7 @@ fn store_config_in_repo(
     data: &TeamsConfigData,
 ) -> Result<()> {
     let mut ws = map_err_debug(repo.pull(branch_id), "pull workspace")?;
-    let catalog = map_err_debug(ws.checkout(..), "checkout workspace")?;
+    let catalog = map_err_debug(ws.checkout(..), "checkout workspace")?.into_facts();
     let change = build_config_change(&mut ws, &catalog, data)?;
     if change.is_empty() {
         return Ok(());
@@ -2077,7 +2077,7 @@ fn read_messages(config: TeamsBridgeConfig, options: ReadOptions) -> Result<()> 
         open_repo_for_branch_id(&config.pile_path, config.branch_id, &config.branch)?;
     with_repo_close(repo, |repo| {
         let mut ws = map_err_debug(repo.pull(branch_id), "pull workspace")?;
-        let catalog = map_err_debug(ws.checkout(..), "checkout workspace")?;
+        let catalog = map_err_debug(ws.checkout(..), "checkout workspace")?.into_facts();
 
         let chat_map = load_chat_map(&mut ws, &catalog)?;
         let author_map = load_author_map(&mut ws, &catalog)?;
@@ -2216,7 +2216,7 @@ fn list_attachments(config: TeamsBridgeConfig, options: AttachmentListOptions) -
         open_repo_for_branch_id(&config.pile_path, config.branch_id, &config.branch)?;
     with_repo_close(repo, |repo| {
         let mut ws = map_err_debug(repo.pull(branch_id), "pull workspace")?;
-        let catalog = map_err_debug(ws.checkout(..), "checkout workspace")?;
+        let catalog = map_err_debug(ws.checkout(..), "checkout workspace")?.into_facts();
 
         let chat_map = load_chat_map(&mut ws, &catalog)?;
         let message_map = load_message_external_map(&mut ws, &catalog)?;
@@ -2335,7 +2335,7 @@ fn list_attachments(config: TeamsBridgeConfig, options: AttachmentListOptions) -
                 .name
                 .map(|handle| load_longstring(&mut ws, handle))
                 .transpose()?;
-            let mime = row.mime.map(|value| String::from_value(&value));
+            let mime = row.mime.map(|value| String::try_from_value(&value).unwrap());
             let size = row.size.and_then(u256_to_u128).map(|value| value.to_string());
             let timestamp = format_interval(row.created_at);
 
@@ -2369,11 +2369,12 @@ fn backfill_attachments(config: TeamsBridgeConfig, options: AttachmentBackfillOp
         open_repo_for_branch_id(&config.pile_path, config.branch_id, &config.branch)?;
     with_repo_close(repo, |repo| {
         let mut ws = map_err_debug(repo.pull(branch_id), "pull workspace")?;
-        let catalog = map_err_debug(ws.checkout(..), "checkout workspace")?;
+        let catalog = map_err_debug(ws.checkout(..), "checkout workspace")?.into_facts();
         let index = CatalogIndex::build(&catalog);
 
         let chat_map = load_chat_map(&mut ws, &catalog)?;
         let message_map = load_message_external_map(&mut ws, &catalog)?;
+        let mut files_change = TribleSet::new();
 
         let chat_filter_ids = match options.chat_id.as_ref().map(|value| value.trim()) {
             Some(value) if !value.is_empty() => {
@@ -2538,6 +2539,7 @@ fn backfill_attachments(config: TeamsBridgeConfig, options: AttachmentBackfillOp
             ensure_attachments(
                 &mut ws,
                 &mut change,
+                &mut files_change,
                 &index,
                 &message_stub,
                 &token,
@@ -2570,7 +2572,7 @@ fn export_attachment(config: TeamsBridgeConfig, options: AttachmentExportOptions
         open_repo_for_branch_id(&config.pile_path, config.branch_id, &config.branch)?;
     with_repo_close(repo, |repo| {
         let mut ws = map_err_debug(repo.pull(branch_id), "pull workspace")?;
-        let catalog = map_err_debug(ws.checkout(..), "checkout workspace")?;
+        let catalog = map_err_debug(ws.checkout(..), "checkout workspace")?.into_facts();
 
         let chat_map = load_chat_map(&mut ws, &catalog)?;
         let message_map = load_message_external_map(&mut ws, &catalog)?;
@@ -3495,7 +3497,7 @@ fn sanitize_filename(value: &str) -> String {
 }
 
 fn infer_extension(mime: Option<&Value<ShortString>>) -> Option<&'static str> {
-    let mut mime = String::from_value(mime?);
+    let mut mime = String::try_from_value(mime?).ok()?;
     mime.make_ascii_lowercase();
     let mime = mime.split(';').next().unwrap_or("").trim();
     match mime {
