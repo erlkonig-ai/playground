@@ -225,7 +225,8 @@ fn load_relations(
         .map_err(|e| anyhow::anyhow!("pull relations workspace: {e:?}"))?;
     let space = ws
         .checkout(..)
-        .map_err(|e| anyhow::anyhow!("checkout relations: {e:?}"))?;
+        .map_err(|e| anyhow::anyhow!("checkout relations: {e:?}"))?
+        .into_facts();
     Ok((space, ws))
 }
 
@@ -321,7 +322,8 @@ fn with_repo<T>(
 fn ensure_metadata(ws: &mut Workspace<Pile<valueschemas::Blake3>>) -> Result<TribleSet> {
     let space = ws
         .checkout(..)
-        .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?
+        .into_facts();
     let mut change = TribleSet::new();
 
     let mut existing_kinds: HashSet<Id> = find!(
@@ -442,7 +444,8 @@ fn cmd_ack(
 
         let space = ws
             .checkout(..)
-            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?
+            .into_facts();
         let message_id = resolve_message_id(&space, &id)?;
 
         let now = epoch_interval(now_epoch());
@@ -478,7 +481,8 @@ fn cmd_list(
             .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
         let space = ws
             .checkout(..)
-            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?
+            .into_facts();
 
         let mut messages = Vec::new();
         for (message_id, from, to, body, created_at) in find!(
