@@ -861,32 +861,77 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
             // Background.
             painter.rect_filled(viewport_rect, 0.0, color_frame());
 
-            // Draw tick marks along the left edge.
-            let tick_interval_ns = auto_tick_interval(viewport_ns);
-            if tick_interval_ns > 0 {
-                // Align first tick to a multiple of tick_interval.
-                let first_tick = (view_start / tick_interval_ns) * tick_interval_ns;
-                let mut tick = first_tick;
+            // Four-sine ruler: one sine per natural time unit.
+            // Constructive interference at "nice" times → tall peaks.
+            // Scroll = phase shift, zoom = wavelength rescaling.
+            let muted = color_muted();
+            let max_len = 80.0;
+            let tick_spacing_px = 6.0;
+            let tau = std::f64::consts::TAU;
+
+            // The four natural time periods.
+            let ns = 1_000_000_000.0f64;
+            let periods = [ns, 60.0 * ns, 3600.0 * ns, 86400.0 * ns];
+
+            // Significance: sum of cosines, equal weight per visible period.
+            // Periods whose wavelength is < 2 tick spacings fade out smoothly.
+            let significance = |t: f64| -> f32 {
+                let mut sig = 0.0f32;
+                let mut n = 0.0f32;
+                for &period in &periods {
+                    let px_wave = period / ns_per_px;
+                    // Smooth fade: fully in at 4× tick spacing, gone at 1×.
+                    let vis = ((px_wave as f32 / tick_spacing_px - 1.0) / 3.0).clamp(0.0, 1.0);
+                    if vis < 0.001 { continue; }
+                    sig += vis * (0.5 + 0.5 * (tau * t / period).cos() as f32);
+                    n += vis;
+                }
+                if n > 0.0 { sig / n } else { 0.0 }
+            };
+
+            // Draw the sine ruler.
+            let n_samples = (viewport_height / tick_spacing_px) as usize + 1;
+            for i in 0..=n_samples {
+                let y = viewport_rect.top() + i as f32 * tick_spacing_px;
+                if y > viewport_rect.bottom() { break; }
+
+                let t = view_start as f64 - (i as f64 * tick_spacing_px as f64 * ns_per_px);
+                let sig = significance(t);
+                let tick_len = 2.0 + (max_len - 2.0) * sig;
+
+                painter.line_segment(
+                    [egui::pos2(viewport_rect.left(), y),
+                     egui::pos2(viewport_rect.left() + tick_len, y)],
+                    egui::Stroke::new(0.5, muted),
+                );
+            }
+
+            // Labels: independent of sine, placed at the coarsest time
+            // interval that gives ~6-10 labels in the viewport.
+            let label_min_spacing_px = 100.0;
+            let label_min_ns = (label_min_spacing_px as f64 * ns_per_px) as i128;
+            let label_interval = TICK_INTERVALS.iter()
+                .copied()
+                .find(|&iv| iv >= label_min_ns)
+                .unwrap_or(*TICK_INTERVALS.last().unwrap());
+
+            if label_interval > 0 {
+                let first = (view_start / label_interval) * label_interval;
+                let mut tick = first;
                 while tick > view_end {
                     let y = viewport_rect.top()
                         + ((view_start - tick) as f64 / ns_per_px) as f32;
                     if y >= viewport_rect.top() && y <= viewport_rect.bottom() {
-                        // Tick line.
-                        painter.line_segment(
-                            [egui::pos2(viewport_rect.left(), y), egui::pos2(viewport_rect.left() + 40.0, y)],
-                            egui::Stroke::new(1.0, color_muted()),
-                        );
-                        // Time label.
                         let label = format_time_marker(tick);
                         painter.text(
-                            egui::pos2(viewport_rect.left() + 44.0, y),
+                            egui::pos2(viewport_rect.left() + max_len + 4.0, y),
                             egui::Align2::LEFT_CENTER,
                             &label,
                             egui::FontId::monospace(9.0),
-                            color_muted(),
+                            muted,
                         );
                     }
-                    tick -= tick_interval_ns;
+                    tick -= label_interval;
                 }
             }
 
@@ -4159,33 +4204,49 @@ struct TimelineResponse {
 
 /// Choose a tick interval (in nanoseconds) that gives ~5-10 ticks
 /// for the given viewport time span.
-fn auto_tick_interval(viewport_ns: i128) -> i128 {
-    let target_ticks = 8;
-    let raw = viewport_ns / target_ticks;
-    // Snap to nice intervals: 1s, 5s, 10s, 30s, 1m, 5m, 10m, 30m, 1h, 3h, 6h, 12h, 1d
-    let ns = 1_000_000_000i128;
-    let intervals = [
-        ns,           // 1 second
-        5 * ns,       // 5 seconds
-        10 * ns,      // 10 seconds
-        30 * ns,      // 30 seconds
-        60 * ns,      // 1 minute
-        5 * 60 * ns,  // 5 minutes
-        10 * 60 * ns, // 10 minutes
-        30 * 60 * ns, // 30 minutes
-        3600 * ns,    // 1 hour
-        3 * 3600 * ns, // 3 hours
-        6 * 3600 * ns, // 6 hours
-        12 * 3600 * ns, // 12 hours
-        86400 * ns,   // 1 day
-        7 * 86400 * ns, // 1 week
-    ];
-    for &interval in &intervals {
+const TICK_INTERVALS: &[i128] = {
+    const NS: i128 = 1_000_000_000;
+    &[
+        NS,              // 1 second
+        5 * NS,          // 5 seconds
+        10 * NS,         // 10 seconds
+        30 * NS,         // 30 seconds
+        60 * NS,         // 1 minute
+        5 * 60 * NS,     // 5 minutes
+        10 * 60 * NS,    // 10 minutes
+        30 * 60 * NS,    // 30 minutes
+        3600 * NS,       // 1 hour
+        3 * 3600 * NS,   // 3 hours
+        6 * 3600 * NS,   // 6 hours
+        12 * 3600 * NS,  // 12 hours
+        86400 * NS,      // 1 day
+        7 * 86400 * NS,  // 1 week
+    ]
+};
+
+/// Returns (major_interval, minor_interval, promotion_t).
+/// Major is picked from TICK_INTERVALS. Minor = major / 5 for uniform density.
+/// `promotion_t` is 0.0..1.0 — how far minor ticks are toward becoming major.
+fn ruler_levels(viewport_ns: i128) -> (i128, i128, f32) {
+    let target_major = 6;
+    let raw = viewport_ns / target_major;
+
+    let mut major_idx = 0;
+    for (i, &interval) in TICK_INTERVALS.iter().enumerate() {
         if interval >= raw {
-            return interval;
+            major_idx = i;
+            break;
         }
+        major_idx = i;
     }
-    *intervals.last().unwrap()
+
+    let major = TICK_INTERVALS[major_idx];
+    let minor = major / 5; // uniform: always 5 minor ticks per major
+
+    let major_count = viewport_ns as f64 / major as f64;
+    let t = 1.0 - ((major_count - 3.0) / (target_major as f64 - 3.0)).clamp(0.0, 1.0) as f32;
+
+    (major, minor, t)
 }
 
 /// Format a TAI nanosecond key as a human-readable time marker.
