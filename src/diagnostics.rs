@@ -866,12 +866,12 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
             // Scroll = phase shift, zoom = wavelength rescaling.
             let muted = color_muted();
             let max_len = 80.0;
-            let tick_spacing_px = 6.0;
+            let tick_spacing_px = GORBIE::card_ctx::GRID_ROW_MODULE;
             let tau = std::f64::consts::TAU;
 
             // The four natural time periods.
             let ns = 1_000_000_000.0f64;
-            let periods = [ns, 60.0 * ns, 3600.0 * ns, 86400.0 * ns];
+            let periods = [60.0 * ns, 3600.0 * ns, 86400.0 * ns];
 
             // Significance: sum of cosines, equal weight per visible period.
             // Periods whose wavelength is < 2 tick spacings fade out smoothly.
