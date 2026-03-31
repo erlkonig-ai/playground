@@ -11,7 +11,7 @@
 //! serde_json = "1"
 //! tracing = "0.1"
 //! tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-//! triblespace = "0.31"
+//! triblespace = "0.32"
 //! ```
 
 use std::collections::HashSet;
@@ -465,7 +465,7 @@ mod common {
     }
 
     pub fn epoch_interval(epoch: Epoch) -> Value<NsTAIInterval> {
-        (epoch, epoch).to_value()
+        (epoch, epoch).try_to_value().unwrap()
     }
 
     pub fn ensure_author(
@@ -830,7 +830,7 @@ fn init_tracing(enabled: bool, filter: Option<&str>) {
 }
 
 fn interval_key(interval: Value<NsTAIInterval>) -> i128 {
-    let (lower, _upper): (Epoch, Epoch) = interval.from_value();
+    let (lower, _upper): (Epoch, Epoch) = interval.try_from_value().unwrap();
     lower.to_tai_duration().total_nanoseconds()
 }
 
@@ -1175,7 +1175,7 @@ fn main() -> Result<()> {
                     let name = author_name(&mut ws, &catalog, author_id)?;
                     let role = author_role(&mut ws, &catalog, author_id)?;
                     let content = load_longstring(&mut ws, content_handle)?;
-                    let (lower, _upper): (Epoch, Epoch) = created_at.from_value();
+                    let (lower, _upper): (Epoch, Epoch) = created_at.try_from_value().unwrap();
                     let role = role.as_deref().unwrap_or("");
                     println!(
                         "{} {} {} {}",
@@ -1195,7 +1195,7 @@ fn main() -> Result<()> {
                 let (message_id, name, role, created_at, content_handle, reply_to) =
                     message_record(&mut ws, &catalog, message_id)?;
                 let content = load_longstring(&mut ws, content_handle)?;
-                let (lower, _upper): (Epoch, Epoch) = created_at.from_value();
+                let (lower, _upper): (Epoch, Epoch) = created_at.try_from_value().unwrap();
                 let content_type = message_content_type(&catalog, message_id);
                 let attachments = message_attachments(&mut ws, &catalog, message_id)?;
 
@@ -1277,7 +1277,7 @@ fn main() -> Result<()> {
                     let (message_id, name, role, created_at, content_handle, _reply_to) =
                         message_record(&mut ws, &catalog, message_id)?;
                     let content = load_longstring(&mut ws, content_handle)?;
-                    let (lower, _upper): (Epoch, Epoch) = created_at.from_value();
+                    let (lower, _upper): (Epoch, Epoch) = created_at.try_from_value().unwrap();
                     let role = role.as_deref().unwrap_or("");
                     println!(
                         "{} {} {} {}",
@@ -1342,7 +1342,7 @@ fn main() -> Result<()> {
                 {
                     let name = author_name(&mut ws, &catalog, author_id)?;
                     let role = author_role(&mut ws, &catalog, author_id)?;
-                    let (lower, _upper): (Epoch, Epoch) = created_at.from_value();
+                    let (lower, _upper): (Epoch, Epoch) = created_at.try_from_value().unwrap();
                     let role = role.as_deref().unwrap_or("");
                     println!(
                         "{} {} {} {}",

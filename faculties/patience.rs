@@ -7,7 +7,7 @@
 //! hifitime = "4.2.3"
 //! humantime = "2.3.0"
 //! rand_core = "0.6.4"
-//! triblespace = "0.31"
+//! triblespace = "0.32"
 //! ```
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -78,7 +78,7 @@ fn now_epoch() -> Epoch {
 }
 
 fn epoch_interval(epoch: Epoch) -> Value<valueschemas::NsTAIInterval> {
-    (epoch, epoch).to_value()
+    (epoch, epoch).try_to_value().unwrap()
 }
 
 fn fmt_id(id: Id) -> String {

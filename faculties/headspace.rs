@@ -6,7 +6,7 @@
 //! ed25519-dalek = "2.1.1"
 //! hifitime = "4.2.3"
 //! rand_core = "0.6.4"
-//! triblespace = "0.31"
+//! triblespace = "0.32"
 //! ```
 
 use std::collections::HashMap;
@@ -423,11 +423,11 @@ fn now_epoch() -> Epoch {
 }
 
 fn epoch_interval(epoch: Epoch) -> Value<NsTAIInterval> {
-    (epoch, epoch).to_value()
+    (epoch, epoch).try_to_value().unwrap()
 }
 
 fn interval_key(interval: Value<NsTAIInterval>) -> i128 {
-    let (lower, _): (Epoch, Epoch) = interval.from_value();
+    let (lower, _): (Epoch, Epoch) = interval.try_from_value().unwrap();
     lower.to_tai_duration().total_nanoseconds()
 }
 

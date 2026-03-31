@@ -8,7 +8,7 @@
 //! rand_core = "0.6.4"
 //! reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 //! anybytes = "0.20"
-//! triblespace = "0.31"
+//! triblespace = "0.32"
 //! ```
 
 use anyhow::{Context, Result, bail};
@@ -172,11 +172,11 @@ enum Command {
 
 fn now_tai() -> Value<valueschemas::NsTAIInterval> {
     let now = Epoch::now().unwrap_or(Epoch::from_unix_seconds(0.0));
-    (now, now).to_value()
+    (now, now).try_to_value().expect("valid TAI interval")
 }
 
 fn interval_key(interval: Value<valueschemas::NsTAIInterval>) -> i128 {
-    let (lower, _): (Epoch, Epoch) = interval.from_value();
+    let (lower, _): (Epoch, Epoch) = interval.try_from_value().expect("valid TAI interval");
     lower.to_tai_duration().total_nanoseconds()
 }
 

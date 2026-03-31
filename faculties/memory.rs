@@ -6,7 +6,7 @@
 //! ed25519-dalek = "2.1.1"
 //! hifitime = "4.2.3"
 //! rand_core = "0.6.4"
-//! triblespace = "0.31"
+//! triblespace = "0.32"
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -180,12 +180,12 @@ fn parse_time_range(s: &str) -> Result<(Epoch, Epoch)> {
 }
 
 fn epoch_from_interval(interval: Value<NsTAIInterval>) -> Epoch {
-    let (lower, _): (Epoch, Epoch) = interval.from_value();
+    let (lower, _): (Epoch, Epoch) = interval.try_from_value().unwrap();
     lower
 }
 
 fn epoch_end_from_interval(interval: Value<NsTAIInterval>) -> Epoch {
-    let (_, upper): (Epoch, Epoch) = interval.from_value();
+    let (_, upper): (Epoch, Epoch) = interval.try_from_value().unwrap();
     upper
 }
 
@@ -414,8 +414,8 @@ fn cmd_create(pile_path: &Path, args: &[String]) -> Result<()> {
         let (start_at, end_at) = if let (Some(s), Some(e)) = (children_start, children_end) {
             (s, e)
         } else if let Some((range_start, range_end)) = explicit_range {
-            let start_val: Value<NsTAIInterval> = (range_start, range_start).to_value();
-            let end_val: Value<NsTAIInterval> = (range_end, range_end).to_value();
+            let start_val: Value<NsTAIInterval> = (range_start, range_start).try_to_value().unwrap();
+            let end_val: Value<NsTAIInterval> = (range_end, range_end).try_to_value().unwrap();
             (start_val, end_val)
         } else if let Some((_, time)) = about_exec {
             (time, time)
@@ -424,7 +424,7 @@ fn cmd_create(pile_path: &Path, args: &[String]) -> Result<()> {
         } else {
             let now = Epoch::now()
                 .unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0));
-            let t: Value<NsTAIInterval> = (now, now).to_value();
+            let t: Value<NsTAIInterval> = (now, now).try_to_value().unwrap();
             (t, t)
         };
 
@@ -437,7 +437,7 @@ fn cmd_create(pile_path: &Path, args: &[String]) -> Result<()> {
         let chunk_id = ufoid();
         let now = Epoch::now()
             .unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0));
-        let created_at: Value<NsTAIInterval> = (now, now).to_value();
+        let created_at: Value<NsTAIInterval> = (now, now).try_to_value().unwrap();
 
         let mut change = TribleSet::new();
         change += entity! { &chunk_id @
@@ -880,7 +880,7 @@ fn parse_optional_hex_id(raw: Option<&str>) -> Result<Option<Id>> {
 }
 
 fn interval_key(interval: Value<NsTAIInterval>) -> i128 {
-    let (lower, _): (Epoch, Epoch) = interval.from_value();
+    let (lower, _): (Epoch, Epoch) = interval.try_from_value().unwrap();
     lower.to_tai_duration().total_nanoseconds()
 }
 

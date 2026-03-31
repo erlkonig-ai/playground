@@ -8,7 +8,7 @@
 //! rand_core = "0.6.4"
 //! serde = { version = "1.0", features = ["derive"] }
 //! serde_json = "1.0"
-//! triblespace = "0.31"
+//! triblespace = "0.32"
 //! ```
 
 use anyhow::{Result, anyhow, bail};
@@ -411,7 +411,7 @@ fn now_epoch() -> Epoch {
 }
 
 fn interval_key(interval: Value<valueschemas::NsTAIInterval>) -> i128 {
-    let (lower, _): (Epoch, Epoch) = interval.from_value();
+    let (lower, _): (Epoch, Epoch) = interval.try_from_value().unwrap();
     lower.to_tai_duration().total_nanoseconds()
 }
 

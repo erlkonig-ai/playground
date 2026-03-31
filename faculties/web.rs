@@ -9,7 +9,7 @@
 //! reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }
 //! serde = { version = "1", features = ["derive"] }
 //! serde_json = "1"
-//! triblespace = "0.31"
+//! triblespace = "0.32"
 //! ```
 
 use std::fs;
@@ -353,7 +353,7 @@ fn latest_config_id(space: &TribleSet) -> Result<Option<Id>> {
 }
 
 fn interval_key(value: Value<NsTAIInterval>) -> i128 {
-    let (lower, _): (Epoch, Epoch) = value.from_value();
+    let (lower, _): (Epoch, Epoch) = value.try_from_value().unwrap();
     lower.to_tai_duration().total_nanoseconds()
 }
 
@@ -516,7 +516,7 @@ fn now_epoch() -> Epoch {
 }
 
 fn epoch_interval(epoch: Epoch) -> Value<NsTAIInterval> {
-    (epoch, epoch).to_value()
+    (epoch, epoch).try_to_value().unwrap()
 }
 
 // --- Tavily ---

@@ -11,7 +11,7 @@
 //! reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }
 //! serde = { version = "1", features = ["derive"] }
 //! serde_json = "1"
-//! triblespace = "0.31"
+//! triblespace = "0.32"
 //! ```
 
 use std::collections::{HashMap, HashSet};
@@ -3551,16 +3551,16 @@ fn now_epoch() -> Epoch {
 }
 
 fn epoch_interval(epoch: Epoch) -> Value<NsTAIInterval> {
-    (epoch, epoch).to_value()
+    (epoch, epoch).try_to_value().unwrap()
 }
 
 fn interval_key(interval: Value<NsTAIInterval>) -> i128 {
-    let (lower, _): (Epoch, Epoch) = interval.from_value();
+    let (lower, _): (Epoch, Epoch) = interval.try_from_value().unwrap();
     lower.to_tai_duration().total_nanoseconds()
 }
 
 fn format_interval(interval: Value<NsTAIInterval>) -> String {
-    let (lower, _): (Epoch, Epoch) = interval.from_value();
+    let (lower, _): (Epoch, Epoch) = interval.try_from_value().unwrap();
     lower.to_gregorian_str(TimeScale::UTC)
 }
 

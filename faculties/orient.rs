@@ -8,7 +8,7 @@
 //! hifitime = "4.2.3"
 //! humantime = "2.1.0"
 //! rand_core = "0.6.4"
-//! triblespace = "0.31"
+//! triblespace = "0.32"
 //! ```
 
 use anyhow::{Result, anyhow, bail};
@@ -41,8 +41,8 @@ type CommitHandle = Value<valueschemas::Handle<valueschemas::Blake3, SimpleArchi
 type IntervalValue = Value<valueschemas::NsTAIInterval>;
 
 fn interval_key(interval: IntervalValue) -> i128 {
-    let (lower, _): (Epoch, Epoch) = interval.from_value();
-    lower.to_tai_duration().total_nanoseconds()
+    let (lower, _): (i128, i128) = interval.try_from_value().unwrap();
+    lower
 }
 
 mod local {
@@ -183,13 +183,9 @@ fn now_epoch() -> Epoch {
 }
 
 fn epoch_interval(epoch: Epoch) -> Value<valueschemas::NsTAIInterval> {
-    (epoch, epoch).to_value()
+    (epoch, epoch).try_to_value().unwrap()
 }
 
-fn interval_key(interval: Value<valueschemas::NsTAIInterval>) -> i128 {
-    let (lower, _): (Epoch, Epoch) = interval.from_value();
-    lower.to_tai_duration().total_nanoseconds()
-}
 
 fn format_age(now_key: i128, past_key: i128) -> String {
     let delta_ns = now_key.saturating_sub(past_key);
