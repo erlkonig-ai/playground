@@ -4,9 +4,9 @@ version = 4
 
 [[package]]
 name = "GORBIE"
-version = "0.9.11"
+version = "0.9.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "02c665c46af89d7c2401fedbdbcf1e82a8880fdd36a5f5df2e9437ea58def3de"
+checksum = "b3126a3c656ebd0bbd7a0f947b6057f9a855d91dd7ec1e621e856860725d70d1"
 dependencies = [
  "ctrlc",
  "dark-light",
@@ -259,9 +259,9 @@ dependencies = [
 
 [[package]]
 name = "anybytes"
-version = "0.20.1"
+version = "0.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9df2807934c3c1d613c20ac7d0120d4067c036fa2f7fedd2cd9f2b959b42e774"
+checksum = "cada9ef8ee94f698de87e120c8574581f3bba30310c50f408744575d3af4dfe9"
 dependencies = [
  "bytes",
  "memmap2",
@@ -2505,7 +2505,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.62.2",
+ "windows-core 0.61.2",
 ]
 
 [[package]]
@@ -5134,9 +5134,9 @@ dependencies = [
 
 [[package]]
 name = "triblespace"
-version = "0.32.0"
+version = "0.33.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "555ca6d08526ca4bfd59771fcf2deaf587ed6624eb610fa2ca57f4a420aa11d2"
+checksum = "01d290e615cc8e7200402ecea1cc09214ca42f128c6501be78e4a776e2a5d0d1"
 dependencies = [
  "ed25519-dalek",
  "log",
@@ -5150,9 +5150,9 @@ dependencies = [
 
 [[package]]
 name = "triblespace-core"
-version = "0.32.0"
+version = "0.33.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "853a6b3a9913570fe1bc0fa83dff489e837e810a4c59b7bcc458723aa6b9719f"
+checksum = "13149323d956d2d0d251d4fd6ff0badd2bade4a9b09100af09cc55d0182dcec4"
 dependencies = [
  "anybytes",
  "arbitrary",
@@ -5213,9 +5213,9 @@ dependencies = [
 
 [[package]]
 name = "triblespace-macros"
-version = "0.32.0"
+version = "0.33.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0788e2741a991ee4c462405cf1a8a4a68aca5626274f2c57e8daee368582470e"
+checksum = "1c571fe62e7ba28c708ffe625e7441ba1f5e712d7b256e4fbdbfbb521411d00e"
 dependencies = [
  "ed25519-dalek",
  "hex",
@@ -6080,19 +6080,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "windows-core"
-version = "0.62.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b8e83a14d34d0623b51dce9581199302a221863196a1dde71a7663a4c2be9deb"
-dependencies = [
- "windows-implement 0.60.2",
- "windows-interface 0.59.3",
- "windows-link 0.2.1",
- "windows-result 0.4.1",
- "windows-strings 0.5.1",
-]
-
-[[package]]
 name = "windows-future"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6188,15 +6175,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "windows-result"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7781fa89eaf60850ac3d2da7af8e5242a5ea78d1a11c49bf2910bb5a73853eb5"
-dependencies = [
- "windows-link 0.2.1",
-]
-
-[[package]]
 name = "windows-strings"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6213,15 +6191,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "56e6c93f3a0c3b36176cb1327a4958a0353d5d166c2a35cb268ace15e91d3b57"
 dependencies = [
  "windows-link 0.1.3",
-]
-
-[[package]]
-name = "windows-strings"
-version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7837d08f69c77cf6b07689544538e017c1bfcf57e34b4c0ff58e6c2cd3b37091"
-dependencies = [
- "windows-link 0.2.1",
 ]
 
 [[package]]

@@ -8,7 +8,7 @@
 //! rand_core = "0.6.4"
 //! serde = { version = "1.0", features = ["derive"] }
 //! serde_json = "1.0"
-//! triblespace = "0.32"
+//! triblespace = "0.33"
 //! ```
 
 use anyhow::{Result, anyhow, bail};
@@ -47,7 +47,6 @@ type TextHandle = Value<valueschemas::Handle<valueschemas::Blake3, blobschemas::
 mod config {
     use super::*;
     attributes! {
-        "5E32E36AD28B0B1E035D2DFCC20A3DC5" as updated_at: valueschemas::NsTAIInterval;
         "D1DC11B303725409AB8A30C6B59DB2D7" as persona_id: valueschemas::GenId;
         "950B556A74F71AC7CB008AB23FBB6544" as system_prompt: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
         "79E1B50756FB64A30916E9353225E179" as active_model_profile_id: valueschemas::GenId;
@@ -63,7 +62,6 @@ mod local {
     use super::*;
     attributes! {
         "95D58D3E68A43979F8AA51415541414C" as to: valueschemas::GenId;
-        "5FA453867880877B613B7632A233419B" as created_at: valueschemas::NsTAIInterval;
         "2213B191326E9B99605FA094E516E50E" as about_message: valueschemas::GenId;
         "99E92F483731FA6D59115A8D6D187A37" as reader: valueschemas::GenId;
     }
@@ -83,8 +81,6 @@ mod exec {
         "79DD6A1A02E598033EDCE5C667E8E3E6" as command_text: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
         "D8910A14B31096DF94DE9E807B87645F" as requested_at: valueschemas::NsTAIInterval;
         "C4C3870642CAB5F55E7E575B1A62E640" as about_request: valueschemas::GenId;
-        "CCFAE38E0C70AFBBF7223D2DA28A93C7" as started_at: valueschemas::NsTAIInterval;
-        "3BB7917C5E41E494FECE36FFE79FEF23" as finished_at: valueschemas::NsTAIInterval;
         "B68F9025545C7E616EB90C6440220348" as exit_code: valueschemas::U256BE;
         "CA7AF66AAF5105EC15625ED14E1A2AC0" as stdout_text: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
         "BE4D1876B22EAF93AAD1175DB76D1C72" as stderr_text: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
@@ -99,9 +95,6 @@ mod model_chat {
         "5F10520477A04E5FB322C85CC78C6762" as kind: valueschemas::GenId;
         "5A14A02113CE43A59881D0717726F465" as about_request: valueschemas::GenId;
         "DA8E31E47919337B3E00724EBE32D14E" as about_thought: valueschemas::GenId;
-        "59FA7C04A43B96F31414D1B4544FAEC2" as requested_at: valueschemas::NsTAIInterval;
-        "D1384E835F1C325249A603D93CA2701D" as started_at: valueschemas::NsTAIInterval;
-        "2A98AB108752C0C0C6355B84871932DA" as finished_at: valueschemas::NsTAIInterval;
         "B1B904590F0FA70AD1BA247F3D23A6CC" as output_text: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
         "567E35DACDB00C799E75AEED0B6EFDF7" as reasoning_text: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
         "9E9B829C473E416E9150D4B94A6A2DC4" as error: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
@@ -127,7 +120,6 @@ mod context {
     attributes! {
         "81E520987033BE71EB0AFFA8297DE613" as kind: valueschemas::GenId;
         "3292CF0B3B6077991D8ECE6E2973D4B6" as summary: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
-        "4036F38AB05D26764A1E5E456337F399" as created_at: valueschemas::NsTAIInterval;
         "502F7D33822A90366F0F0ADA0556177F" as start_at: valueschemas::NsTAIInterval;
         "DF84E872EB68FBFCA63D760F27FD8A6F" as end_at: valueschemas::NsTAIInterval;
         "CB97C36A32DEC70E0D1149E7C5D88588" as left: valueschemas::GenId;
@@ -142,7 +134,6 @@ mod cog {
     attributes! {
         "07F063ECF1DC9FB3C1984BDB10B98BFA" as kind: valueschemas::GenId;
         "FA6090FB00EEE2F5EF1E51F1F68EA5B8" as context: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
-        "1AE17985F2AE74631CE16FD84DC97FB4" as created_at: valueschemas::NsTAIInterval;
     }
 }
 
@@ -643,7 +634,7 @@ fn load_latest_config(
         (config_id: Id, updated_at: Value<valueschemas::NsTAIInterval>),
         pattern!(&space, [{
             ?config_id @
-            config::updated_at: ?updated_at,
+            metadata::updated_at: ?updated_at,
         }])
     ) {
         let key = interval_key(updated_at);
@@ -703,7 +694,7 @@ fn collect_exec_state(
             _?event_id @
             metadata::tag: &KIND_EXEC_IN_PROGRESS_ID,
             exec::about_request: ?about_request,
-            exec::started_at: ?started_at,
+            metadata::started_at: ?started_at,
         }])
     ) {
         state.in_progress.push(ExecInProgressRow {
@@ -719,7 +710,7 @@ fn collect_exec_state(
             ?result_id @
             metadata::tag: &KIND_EXEC_RESULT_ID,
             exec::about_request: ?about_request,
-            exec::finished_at: ?finished_at,
+            metadata::finished_at: ?finished_at,
         }])
     ) {
         result_map.insert(
@@ -777,7 +768,7 @@ fn collect_model_chat_state(
         pattern!(&space, [{
             ?request_id @
             metadata::tag: &KIND_MODEL_REQUEST_ID,
-            model_chat::requested_at: ?requested_at,
+            metadata::created_at: ?requested_at,
         }])
     ) {
         state
@@ -791,7 +782,7 @@ fn collect_model_chat_state(
             _?event_id @
             metadata::tag: &KIND_MODEL_IN_PROGRESS_ID,
             model_chat::about_request: ?about_request,
-            model_chat::started_at: ?started_at,
+            metadata::started_at: ?started_at,
         }])
     ) {
         state.in_progress.push(ModelInProgressRow {
@@ -807,7 +798,7 @@ fn collect_model_chat_state(
             ?result_id @
             metadata::tag: &KIND_MODEL_RESULT_ID,
             model_chat::about_request: ?about_request,
-            model_chat::finished_at: ?finished_at,
+            metadata::finished_at: ?finished_at,
         }])
     ) {
         result_map.insert(
@@ -2015,7 +2006,7 @@ fn collect_context_chunks(
 
     for (chunk_id, value) in find!(
         (chunk_id: Id, value: Value<valueschemas::NsTAIInterval>),
-        pattern!(&space, [{ ?chunk_id @ context::created_at: ?value }])
+        pattern!(&space, [{ ?chunk_id @ metadata::created_at: ?value }])
     ) {
         if let Some(row) = chunks.get_mut(&chunk_id) {
             row.created_at = Some(interval_key(value));
@@ -2085,7 +2076,7 @@ fn load_budget_from_config(
         (config_id: Id, updated_at: Value<valueschemas::NsTAIInterval>),
         pattern!(&space, [{
             ?config_id @
-            config::updated_at: ?updated_at,
+            metadata::updated_at: ?updated_at,
         }])
     ) {
         let key = interval_key(updated_at);
@@ -2594,7 +2585,7 @@ fn cmd_turn(
         }
         if let Some(value) = find!(
             value: Value<valueschemas::NsTAIInterval>,
-            pattern!(&space, [{ rid @ exec::finished_at: ?value }])
+            pattern!(&space, [{ rid @ metadata::finished_at: ?value }])
         ).next() {
             finished_at = Some(interval_key(value));
         }
@@ -2690,7 +2681,7 @@ fn cmd_turn(
 
             let model_finished: Option<i128> = find!(
                 value: Value<valueschemas::NsTAIInterval>,
-                pattern!(&space, [{ &mid @ model_chat::finished_at: ?value }])
+                pattern!(&space, [{ &mid @ metadata::finished_at: ?value }])
             ).next().map(interval_key);
 
             let input_tokens: Option<u64> = find!(

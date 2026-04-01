@@ -6,7 +6,7 @@
 //! ed25519-dalek = "2.1.1"
 //! hifitime = "4.2.3"
 //! rand_core = "0.6.4"
-//! triblespace = "0.32"
+//! triblespace = "0.33"
 //! ```
 
 use std::collections::HashMap;
@@ -47,7 +47,6 @@ const KIND_MODEL_PROFILE_ID: Id = id_hex!("B08E356C4B08F44AB7EC177D47129447");
 mod playground_config {
     use super::*;
     attributes! {
-        "5E32E36AD28B0B1E035D2DFCC20A3DC5" as updated_at: NsTAIInterval;
         "950B556A74F71AC7CB008AB23FBB6544" as system_prompt: Handle<Blake3, LongString>;
         "35E36AE7B60AD946661BD63B3CD64672" as branch: Handle<Blake3, LongString>;
         "F0F90572249284CD57E48580369DEB6D" as author: Handle<Blake3, LongString>;
@@ -531,7 +530,7 @@ fn list_model_profiles(pile_path: &Path) -> Result<Vec<ModelProfileSummary>> {
             pattern!(&catalog, [{
                 ?entry_id @
                 metadata::tag: KIND_MODEL_PROFILE_ID,
-                playground_config::updated_at: ?updated_at,
+                metadata::updated_at: ?updated_at,
                 playground_config::model_profile_id: ?profile_id,
             }])
         ) {
@@ -601,7 +600,7 @@ fn load_latest_config(
         pattern!(catalog, [{
             ?config_id @
             metadata::tag: KIND_CONFIG_ID,
-            playground_config::updated_at: ?updated_at,
+            metadata::updated_at: ?updated_at,
         }])
     ) {
         let key = interval_key(updated_at);
@@ -736,7 +735,7 @@ fn load_latest_model_profile(
         pattern!(catalog, [{
             ?entry_id @
             metadata::tag: KIND_MODEL_PROFILE_ID,
-            playground_config::updated_at: ?updated_at,
+            metadata::updated_at: ?updated_at,
             playground_config::model_profile_id: profile_id,
         }])
     ) {
@@ -829,7 +828,7 @@ fn store_config(ws: &mut Workspace<Pile<Blake3>>, config: &Config) -> Result<()>
     let mut change = TribleSet::new();
     change += entity! { &config_id @
         metadata::tag: KIND_CONFIG_ID,
-        playground_config::updated_at: now,
+        metadata::updated_at: now,
         playground_config::system_prompt: system_prompt,
         playground_config::branch: branch,
         playground_config::author: author,
@@ -870,7 +869,7 @@ fn store_config(ws: &mut Workspace<Pile<Blake3>>, config: &Config) -> Result<()>
 
     change += entity! { &profile_entry_id @
         metadata::tag: KIND_MODEL_PROFILE_ID,
-        playground_config::updated_at: now,
+        metadata::updated_at: now,
         playground_config::model_profile_id: profile_id,
         metadata::name: profile_name,
         playground_config::model_name: model_name_handle,

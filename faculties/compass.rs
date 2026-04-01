@@ -6,7 +6,7 @@
 //! ed25519-dalek = "2.1.1"
 //! hifitime = "4.2.3"
 //! rand_core = "0.6.4"
-//! triblespace = { path = "/path/to/workspace/triblespace-rs" }
+//! triblespace = "0.33"
 //! ```
 
 use anyhow::{Context, Result, bail};
@@ -52,7 +52,6 @@ mod board {
 
     attributes! {
         "EE18CEC15C18438A2FAB670E2E46E00C" as title: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
-        "E915C4D678D0F484B89B4E85E55DB442" as created_at: valueschemas::NsTAIInterval;
         // TODO: migrate to metadata::tag (GenId) — tags should be entities with
         // their own ID + metadata::name, not inline strings. See wiki.rs TagIndex
         // for the correct pattern. This ShortString tag is a legacy design mistake.
@@ -298,7 +297,7 @@ fn task_parent(space: &TribleSet, task_id: Id) -> Option<Id> {
 }
 
 fn task_created_at(space: &TribleSet, task_id: Id) -> Option<IntervalValue> {
-    find!(s: IntervalValue, pattern!(space, [{ task_id @ board::created_at: ?s }]))
+    find!(s: IntervalValue, pattern!(space, [{ task_id @ metadata::created_at: ?s }]))
         .next()
 }
 
@@ -743,7 +742,7 @@ fn cmd_add(
         change += entity! { &task_id @
             metadata::tag: &KIND_GOAL_ID,
             board::title: title_handle,
-            board::created_at: now,
+            metadata::created_at: now,
             board::parent?: parent_id.as_ref(),
             board::tag*: tags.iter().map(|tag| tag.as_str()),
         };

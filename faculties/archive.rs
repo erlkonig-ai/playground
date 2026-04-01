@@ -11,7 +11,7 @@
 //! serde_json = "1"
 //! tracing = "0.1"
 //! tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-//! triblespace = "0.32"
+//! triblespace = "0.33"
 //! ```
 
 use std::collections::HashSet;
@@ -88,8 +88,6 @@ mod common {
                 "4FE6A8A43658BC2F61FEDF5CFB29EEFC" as pub author_model: Handle<Blake3, LongString>;
                 "1F127324384335D12ECFE0CB84840925" as pub author_provider: Handle<Blake3, LongString>;
                 "ACF09FF3D62B73983A222313FF0C52D2" as pub content: Handle<Blake3, LongString>;
-                "59FA7C04A43B96F31414D1B4544FAEC2" as pub created_at: NsTAIInterval;
-
                 "D8A469EAC2518D1A85692E0BEBF20D6C" as pub content_type: ShortString;
                 "8334E282F24A4C7779C8899191B29E00" as pub attachment: GenId;
 
@@ -165,8 +163,6 @@ mod common {
             metadata += metadata::Describe::describe(&archive::author_model, blobs)?;
             metadata += metadata::Describe::describe(&archive::author_provider, blobs)?;
             metadata += metadata::Describe::describe(&archive::content, blobs)?;
-            metadata += metadata::Describe::describe(&archive::created_at, blobs)?;
-
             metadata += metadata::Describe::describe(&archive::content_type, blobs)?;
             metadata += metadata::Describe::describe(&archive::attachment, blobs)?;
             metadata += metadata::Describe::describe(&archive::attachment_source_id, blobs)?;
@@ -200,7 +196,7 @@ mod common {
             "AA3CF220F15CCF724276F1251AFE053B" as pub source_author: Handle<Blake3, LongString>;
             "B4C084B61FB46A932BFCA75B8BC621FA" as pub source_role: Handle<Blake3, LongString>;
             "220DA5084D6261B5420922EADC064A5A" as pub source_parent_id: Handle<Blake3, LongString>;
-            "F672605621E56674127FD210CFFDFF2A" as pub source_created_at: NsTAIInterval;
+            "D59247F3AADD3DE8E23B01E8B7406020" as pub source_created_at: NsTAIInterval;
             /// Conversation → message edge (repeated).
             "06DB96427C8EA6FC982D44E018AB0831" as pub message: GenId;
         }
@@ -1053,7 +1049,7 @@ fn message_record(
             message_id @
                 common::archive::author: ?author,
                 common::archive::content: ?content,
-                common::archive::created_at: ?created_at,
+                common::metadata::created_at: ?created_at,
         }])
     )
     .into_iter()
@@ -1156,7 +1152,7 @@ fn main() -> Result<()> {
                             common::metadata::tag: common::archive::kind_message,
                             common::archive::author: ?author,
                             common::archive::content: ?content,
-                            common::archive::created_at: ?created_at,
+                            common::metadata::created_at: ?created_at,
                     }])
                 ) {
                     records.push((
@@ -1317,7 +1313,7 @@ fn main() -> Result<()> {
                             common::metadata::tag: common::archive::kind_message,
                             common::archive::author: ?author,
                             common::archive::content: ?content,
-                            common::archive::created_at: ?created_at,
+                            common::metadata::created_at: ?created_at,
                     }])
                 ) {
                     let content = load_longstring(&mut ws, content_handle)?;

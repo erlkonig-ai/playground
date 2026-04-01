@@ -49,6 +49,8 @@ mod archive {
         "5F10520477A04E5FB322C85CC78C6762" as pub kind: GenId;
         "838CC157FFDD37C6AC7CC5A472E43ADB" as pub author: GenId;
         "E63EE961ABDB1D1BEC0789FDAFFB9501" as pub author_name: Handle<Blake3, LongString>;
+        "2D15150501ACCD9DFD96CB4BF19D1883" as pub author_role: Handle<Blake3, LongString>;
+        "4FE6A8A43658BC2F61FEDF5CFB29EEFC" as pub author_model: Handle<Blake3, LongString>;
         "ACF09FF3D62B73983A222313FF0C52D2" as pub content: Handle<Blake3, LongString>;
         "59FA7C04A43B96F31414D1B4544FAEC2" as pub ordered_created_at: NsTAIInterval;
     }
@@ -293,7 +295,7 @@ struct DashboardState {
     compass_expanded_goal: Option<Id>,
     teams_selected_chat: Option<Id>,
     context_selected_chunk: Option<Id>,
-    context_float_request_id: Option<Id>,
+    context_float_request_id: Option<(Id, TimelineSource)>,
     context_selection_stack: Vec<Id>,
     context_show_children: bool,
     context_show_origins: bool,
@@ -326,7 +328,7 @@ impl Default for DashboardState {
             compass_expanded_goal: None,
             teams_selected_chat: None,
             context_selected_chunk: None,
-            context_float_request_id: None,
+            context_float_request_id: None, // (Id, TimelineSource)
             context_selection_stack: Vec::new(),
             context_show_children: false,
             context_show_origins: false,
@@ -763,6 +765,7 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
         let local_data = state.local_messages_cat.catalog().clone();
         let teams_data = state.teams_cat.catalog().clone();
         let compass_data = state.compass_cat.catalog().clone();
+        let relations_data = state.relations_cat.catalog().clone();
         let now_key = state.now_key;
 
         // Initialize timeline_start to "now" if not yet set.
@@ -950,96 +953,112 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
             // Direct rendering: each event painted at its exact timestamp position.
             struct VisibleEvent {
                 y: f32,
+                id: Id,
                 source: TimelineSource,
                 summary: String,
             }
             let mut events: Vec<VisibleEvent> = Vec::new();
 
-            let push_event = |events: &mut Vec<VisibleEvent>, ts: Value<NsTAIInterval>, source: TimelineSource, summary: String| {
+            let push_event = |events: &mut Vec<VisibleEvent>, id: Id, ts: Value<NsTAIInterval>, source: TimelineSource, summary: String| {
                 let key = interval_key(ts);
                 let y = viewport_rect.top() + ((view_start - key) as f64 / ns_per_px) as f32;
-                events.push(VisibleEvent { y, source, summary });
+                events.push(VisibleEvent { y, id, source, summary });
             };
 
             // Shell exec events.
-            for (ts, command) in find!(
-                (ts: Value<NsTAIInterval>, command: Value<Handle<Blake3, LongString>>),
+            for (id, ts, command) in find!(
+                (id: Id, ts: Value<NsTAIInterval>, command: Value<Handle<Blake3, LongString>>),
                 and!(
-                    pattern!(&exec_data, [{ playground_exec::ordered_requested_at: ?ts, playground_exec::command_text: ?command }]),
+                    pattern!(&exec_data, [{ ?id @ playground_exec::ordered_requested_at: ?ts, playground_exec::command_text: ?command }]),
                     exec_data.value_in_range(ts, min_ts, max_ts),
                 )
             ) {
                 if let Some(text) = load_text(ws, command) {
-                    push_event(&mut events, ts, TimelineSource::Shell, truncate_single_line(&text, 80).to_string());
+                    push_event(&mut events, id, ts, TimelineSource::Shell, truncate_single_line(&text, 80).to_string());
                 }
             }
 
             // Cognition.
-            for (ts, reasoning) in find!(
-                (ts: Value<NsTAIInterval>, reasoning: Value<Handle<Blake3, LongString>>),
+            for (id, ts, reasoning) in find!(
+                (id: Id, ts: Value<NsTAIInterval>, reasoning: Value<Handle<Blake3, LongString>>),
                 and!(
-                    pattern!(&exec_data, [{ model_chat::ordered_finished_at: ?ts, model_chat::reasoning_text: ?reasoning }]),
+                    pattern!(&exec_data, [{ ?id @ model_chat::ordered_finished_at: ?ts, model_chat::reasoning_text: ?reasoning }]),
                     exec_data.value_in_range(ts, min_ts, max_ts),
                 )
             ) {
                 if let Some(text) = load_text(ws, reasoning) {
-                    push_event(&mut events, ts, TimelineSource::Cognition, truncate_single_line(&text, 80).to_string());
+                    push_event(&mut events, id, ts, TimelineSource::Cognition, truncate_single_line(&text, 80).to_string());
                 }
             }
 
             // Local messages.
-            for (ts, body) in find!(
-                (ts: Value<NsTAIInterval>, body: Value<Handle<Blake3, LongString>>),
+            for (id, ts, body) in find!(
+                (id: Id, ts: Value<NsTAIInterval>, body: Value<Handle<Blake3, LongString>>),
                 and!(
-                    pattern!(&local_data, [{ local_messages::ordered_created_at: ?ts, local_messages::body: ?body }]),
+                    pattern!(&local_data, [{ ?id @ local_messages::ordered_created_at: ?ts, local_messages::body: ?body }]),
                     local_data.value_in_range(ts, min_ts, max_ts),
                 )
             ) {
                 if let Some(text) = load_text(ws, body) {
-                    push_event(&mut events, ts, TimelineSource::LocalMessages, truncate_single_line(&text, 80).to_string());
+                    push_event(&mut events, id, ts, TimelineSource::LocalMessages, truncate_single_line(&text, 80).to_string());
                 }
             }
 
             // Teams messages.
-            for (ts, content) in find!(
-                (ts: Value<NsTAIInterval>, content: Value<Handle<Blake3, LongString>>),
+            for (id, ts, content) in find!(
+                (id: Id, ts: Value<NsTAIInterval>, content: Value<Handle<Blake3, LongString>>),
                 and!(
-                    pattern!(&teams_data, [{ archive::ordered_created_at: ?ts, archive::content: ?content }]),
+                    pattern!(&teams_data, [{ ?id @ archive::ordered_created_at: ?ts, archive::content: ?content }]),
                     teams_data.value_in_range(ts, min_ts, max_ts),
                 )
             ) {
                 if let Some(text) = load_text(ws, content) {
-                    push_event(&mut events, ts, TimelineSource::Teams, truncate_single_line(&text, 80).to_string());
+                    push_event(&mut events, id, ts, TimelineSource::Teams, truncate_single_line(&text, 80).to_string());
                 }
             }
 
-            // Compass goals — using value_in_range (testing fix).
-            for (ts, title) in find!(
-                (ts: Value<NsTAIInterval>, title: Value<Handle<Blake3, LongString>>),
+            // Compass goals.
+            for (id, ts, title) in find!(
+                (id: Id, ts: Value<NsTAIInterval>, title: Value<Handle<Blake3, LongString>>),
                 and!(
-                    pattern!(&compass_data, [{ compass::ordered_created_at: ?ts, compass::title: ?title }]),
+                    pattern!(&compass_data, [{ ?id @ compass::ordered_created_at: ?ts, compass::title: ?title }]),
                     compass_data.value_in_range(ts, min_ts, max_ts),
                 )
             ) {
                 if let Some(text) = load_text(ws, title) {
-                    push_event(&mut events, ts, TimelineSource::Goals, truncate_single_line(&text, 80).to_string());
+                    push_event(&mut events, id, ts, TimelineSource::Goals, truncate_single_line(&text, 80).to_string());
                 }
             }
 
             // Compass status/note events.
-            for ts in find!(
-                ts: Value<NsTAIInterval>,
+            for (id, ts) in find!(
+                (id: Id, ts: Value<NsTAIInterval>),
                 and!(
-                    pattern!(&compass_data, [{ compass::ordered_at: ?ts }]),
+                    pattern!(&compass_data, [{ ?id @ compass::ordered_at: ?ts }]),
                     compass_data.value_in_range(ts, min_ts, max_ts),
                 )
             ) {
-                push_event(&mut events, ts, TimelineSource::Goals, "status/note".to_string());
+                // Build a more descriptive summary.
+                let status: Option<String> = find!(
+                    v: String,
+                    pattern!(&compass_data, [{ &id @ compass::status: ?v }])
+                ).next();
+                let note_preview: Option<String> = find!(
+                    handle: Value<Handle<Blake3, LongString>>,
+                    pattern!(&compass_data, [{ &id @ compass::note: ?handle }])
+                ).next().and_then(|h| load_text(ws, h)).map(|t| truncate_single_line(&t, 60).to_string());
+                let summary = match (status, note_preview) {
+                    (Some(s), Some(n)) => format!("[{s}] {n}"),
+                    (Some(s), None) => format!("[{s}]"),
+                    (None, Some(n)) => n,
+                    (None, None) => "event".to_string(),
+                };
+                push_event(&mut events, id, ts, TimelineSource::Goals, summary);
             }
 
 
 
-            // Render each event at its exact timestamp position.
+            // Render each event as a clickable chip.
             let event_left = viewport_rect.left() + 120.0;
             let event_width = viewport_rect.width() - 130.0;
             let text_color = colorhash::text_color_on(color_frame());
@@ -1047,20 +1066,14 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
             for ev in &events {
                 let (source_label, source_color) = timeline_source_style(ev.source);
 
-                // Source dot on the left margin.
-                painter.circle_filled(
-                    egui::pos2(viewport_rect.left() + 10.0, ev.y),
-                    4.0,
-                    source_color,
-                );
-
-                // Full chip.
+                // Chip background.
                 let chip_rect = egui::Rect::from_min_size(
                     egui::pos2(event_left, ev.y - 8.0),
                     egui::vec2(event_width, 16.0),
                 );
                 painter.rect_filled(chip_rect, 3.0, color_frame());
 
+                // Source tag.
                 let tag_text = colorhash::text_color_on(source_color);
                 let tag_rect = egui::Rect::from_min_size(
                     egui::pos2(event_left + 2.0, ev.y - 7.0),
@@ -1075,6 +1088,7 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
                     tag_text,
                 );
 
+                // Summary text.
                 painter.text(
                     egui::pos2(event_left + 42.0, ev.y),
                     egui::Align2::LEFT_CENTER,
@@ -1082,49 +1096,349 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
                     egui::FontId::monospace(10.0),
                     text_color,
                 );
+
+                // Click to open details float.
+                let click_id = ui.id().with(("timeline_event", ev.id));
+                let resp = ui.interact(chip_rect, click_id, egui::Sense::click());
+                if resp.clicked() {
+                    state.context_float_request_id = Some((ev.id, ev.source));
+                }
+                if resp.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    // Highlight on hover.
+                    painter.rect_stroke(chip_rect, 3.0, egui::Stroke::new(1.0, source_color), egui::StrokeKind::Outside);
+                }
             }
 
+            // Details float: bespoke rendering per event type.
+            if let Some((selected_id, selected_source)) = state.context_float_request_id {
+                let (source_label, source_color) = timeline_source_style(selected_source);
 
-            // TODO: Render context float — needs refactoring to not use exec_rows.
-            if false && state.context_float_request_id.is_some() {
-                let request_id = state.context_float_request_id.unwrap();
-                let exec_rows = collect_exec_rows(&exec_data, ws);
-                let turn_memory_rows = collect_turn_memory_rows(&exec_data, &exec_rows, ws);
-                if let Some(row) = turn_memory_rows.iter().find(|r| r.request_id == request_id) {
-                    let row = row.clone();
-                    ui.push_id(request_id, |ui| {
-                        let resp = ui.float(|ui| {
-                            ui.heading(&format!("Context · turn {}", id_prefix(request_id)));
-                            if row.context_messages.is_empty() {
-                                if let Some(err) = row.context_error.as_deref() {
-                                    ui.colored_label(egui::Color32::LIGHT_RED, err);
-                                } else {
-                                    ui.label("No context messages.");
-                                }
-                            } else {
-                                ui.label(&format!("{} messages", row.context_messages.len()));
-                                for (idx, message) in row.context_messages.iter().enumerate() {
-                                    let (label, fill) = turn_memory_role_style(message.role);
-                                    let chars = message.content.chars().count();
-                                    ui.horizontal_wrapped(|ui| {
-                                        render_timeline_source_chip(ui, label, fill);
-                                        ui.small(format!("msg {idx} · {chars}c"));
+                let mut load_blob_of = |data: &TribleSet, eid: &Id, attr: Attribute<Handle<Blake3, LongString>>| -> Option<String> {
+                    find!(
+                        handle: Value<Handle<Blake3, LongString>>,
+                        pattern!(data, [{ eid @ attr: ?handle }])
+                    ).next().and_then(|h| load_text(ws, h))
+                };
+                // Convenience: default to selected_id.
+                // (macro because closures can't reborrow)
+                macro_rules! load_blob {
+                    ($data:expr, $attr:expr) => { load_blob_of($data, &selected_id, $attr) }
+                }
+                let load_u256 = |data: &TribleSet, attr: Attribute<U256BE>| -> Option<u64> {
+                    find!(
+                        v: Value<U256BE>,
+                        pattern!(data, [{ &selected_id @ attr: ?v }])
+                    ).next().and_then(u256be_to_u64)
+                };
+                let load_short = |data: &TribleSet, attr: Attribute<triblespace::prelude::valueschemas::ShortString>| -> Option<String> {
+                    find!(
+                        v: String,
+                        pattern!(data, [{ &selected_id @ attr: ?v }])
+                    ).next()
+                };
+
+                ui.push_id(selected_id, |ui| {
+                    let resp = ui.float(|ui| {
+                        // Full-bleed colored header bar.
+                        let header_text = colorhash::text_color_on(source_color);
+                        let header_width = ui.available_width();
+                        egui::Frame::NONE
+                            .fill(source_color)
+                            .inner_margin(egui::Margin::symmetric(8, 4))
+                            .show(ui, |ui| {
+                                ui.set_min_width(header_width);
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new(source_label).small().strong().color(header_text));
+                                    ui.label(egui::RichText::new(id_prefix(selected_id)).monospace().small().color(
+                                        header_text.linear_multiply(0.7),
+                                    ));
+                                });
+                            });
+
+                        // Body in a grid for proper margins.
+                        ui.grid(|g| { g.full(|ui| {
+                            let text_block = |ui: &mut egui::Ui, label: &str, text: &str, label_color: egui::Color32| {
+                                ui.label(egui::RichText::new(label).small().color(label_color));
+                                egui::Frame::NONE
+                                    .fill(color_frame())
+                                    .corner_radius(egui::CornerRadius::same(4))
+                                    .inner_margin(egui::Margin::symmetric(8, 4))
+                                    .show(ui, |ui| {
+                                        ui.add(
+                                            egui::Label::new(egui::RichText::new(text).monospace().small())
+                                                .wrap_mode(egui::TextWrapMode::Wrap),
+                                        );
                                     });
+                                ui.add_space(4.0);
+                            };
+
+                            let inline_pill = |ui: &mut egui::Ui, label: &str, value: &str, fill: egui::Color32| {
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new(label).small().color(color_muted()));
                                     egui::Frame::NONE
-                                        .stroke(egui::Stroke::new(1.0, color_muted()))
-                                        .inner_margin(egui::Margin::symmetric(8, 6))
+                                        .fill(fill)
+                                        .corner_radius(egui::CornerRadius::same(3))
+                                        .inner_margin(egui::Margin::symmetric(6, 2))
                                         .show(ui, |ui| {
-                                            render_blob_aware_text(ui, message.content.as_str(), None, None);
+                                            ui.label(egui::RichText::new(value).monospace().small().color(
+                                                colorhash::text_color_on(fill),
+                                            ));
                                         });
-                                    ui.add_space(4.0);
+                                });
+                            };
+
+                            let muted = color_muted();
+                            let red = egui::Color32::LIGHT_RED;
+
+                            match selected_source {
+                                TimelineSource::Shell => {
+                                    // The timeline event id is the request entity.
+                                    // Result attributes live on a separate entity with about_request → selected_id.
+                                    let result_id: Option<Id> = find!(
+                                        rid: Id,
+                                        pattern!(&exec_data, [{ ?rid @ playground_exec::about_request: &selected_id }])
+                                    ).next();
+
+                                    // Metadata row: exit code + duration + cwd.
+                                    let exit_code = result_id.and_then(|rid| {
+                                        find!(v: Value<U256BE>, pattern!(&exec_data, [{ &rid @ playground_exec::exit_code: ?v }]))
+                                            .next().and_then(u256be_to_u64)
+                                    });
+                                    let duration = result_id.and_then(|rid| {
+                                        find!(v: Value<U256BE>, pattern!(&exec_data, [{ &rid @ playground_exec::duration_ms: ?v }]))
+                                            .next().and_then(u256be_to_u64)
+                                    });
+                                    let cwd = load_blob!(&exec_data, playground_exec::cwd);
+                                    if exit_code.is_some() || duration.is_some() || cwd.is_some() {
+                                        ui.horizontal_wrapped(|ui| {
+                                            if let Some(code) = exit_code {
+                                                let (label, fill) = if code == 0 {
+                                                    ("exit 0", color_done())
+                                                } else {
+                                                    ("exit err", color_blocked())
+                                                };
+                                                inline_pill(ui, "", &format!("{label} ({code})"), fill);
+                                            }
+                                            if let Some(ms) = duration {
+                                                let text = if ms >= 1000 { format!("{:.1}s", ms as f64 / 1000.0) } else { format!("{ms}ms") };
+                                                inline_pill(ui, "", &text, color_frame());
+                                            }
+                                            if let Some(ref dir) = cwd {
+                                                ui.label(egui::RichText::new(dir).monospace().small().color(muted));
+                                            }
+                                        });
+                                        ui.add_space(4.0);
+                                    }
+                                    if let Some(cmd) = load_blob!(&exec_data, playground_exec::command_text) {
+                                        text_block(ui, "command", &cmd, muted);
+                                    }
+                                    if let Some(stdin) = load_blob!(&exec_data, playground_exec::stdin_text) {
+                                        if !stdin.trim().is_empty() {
+                                            text_block(ui, "stdin", &stdin, muted);
+                                        }
+                                    }
+                                    // stdout/stderr/error live on the result entity.
+                                    if let Some(rid) = result_id {
+                                        if let Some(stdout) = load_blob_of(&exec_data, &rid, playground_exec::stdout_text) {
+                                            if !stdout.trim().is_empty() {
+                                                text_block(ui, "stdout", &stdout, muted);
+                                            }
+                                        }
+                                        if let Some(stderr) = load_blob_of(&exec_data, &rid, playground_exec::stderr_text) {
+                                            if !stderr.trim().is_empty() {
+                                                text_block(ui, "stderr", &stderr, red);
+                                            }
+                                        }
+                                        if let Some(err) = load_blob_of(&exec_data, &rid, playground_exec::error) {
+                                            if !err.trim().is_empty() {
+                                                text_block(ui, "error", &err, red);
+                                            }
+                                        }
+                                    }
+                                }
+                                TimelineSource::Cognition => {
+                                    // selected_id is the result entity (has ordered_finished_at).
+                                    // Request entity (model, context) linked via about_request.
+                                    let request_id: Option<Id> = find!(
+                                        rid: Id,
+                                        pattern!(&exec_data, [{ &selected_id @ model_chat::about_request: ?rid }])
+                                    ).next();
+
+                                    // Model name lives on the request entity.
+                                    let model = request_id.and_then(|rid| {
+                                        find!(v: String, pattern!(&exec_data, [{ &rid @ model_chat::model: ?v }])).next()
+                                    });
+                                    // Token counts live on the result entity.
+                                    let input_tok = load_u256(&exec_data, model_chat::input_tokens);
+                                    let output_tok = load_u256(&exec_data, model_chat::output_tokens);
+                                    let cache_create = load_u256(&exec_data, model_chat::cache_creation_input_tokens);
+                                    let cache_read = load_u256(&exec_data, model_chat::cache_read_input_tokens);
+                                    if model.is_some() || input_tok.is_some() {
+                                        ui.horizontal_wrapped(|ui| {
+                                            if let Some(ref m) = model {
+                                                inline_pill(ui, "", m, color_cognition());
+                                            }
+                                            if let Some(i) = input_tok {
+                                                inline_pill(ui, "in", &format!("{i}"), color_frame());
+                                            }
+                                            if let Some(o) = output_tok {
+                                                inline_pill(ui, "out", &format!("{o}"), color_frame());
+                                            }
+                                            if let Some(c) = cache_read {
+                                                if c > 0 {
+                                                    inline_pill(ui, "cache", &format!("{c}"), color_done());
+                                                }
+                                            }
+                                            if let Some(c) = cache_create {
+                                                if c > 0 {
+                                                    inline_pill(ui, "+cache", &format!("{c}"), color_doing());
+                                                }
+                                            }
+                                        });
+                                        ui.add_space(4.0);
+                                    }
+                                    // Context/memory lives on the request entity.
+                                    if let Some(rid) = request_id {
+                                        if let Some(context) = load_blob_of(&exec_data, &rid, model_chat::context) {
+                                            text_block(ui, "memory", &context, muted);
+                                        }
+                                    }
+                                    // Output, reasoning, error live on the result entity.
+                                    if let Some(output) = load_blob!(&exec_data, model_chat::output_text) {
+                                        text_block(ui, "output", &output, muted);
+                                    }
+                                    if let Some(reasoning) = load_blob!(&exec_data, model_chat::reasoning_text) {
+                                        text_block(ui, "reasoning", &reasoning, muted);
+                                    }
+                                    if let Some(err) = load_blob!(&exec_data, model_chat::error) {
+                                        if !err.trim().is_empty() {
+                                            text_block(ui, "error", &err, red);
+                                        }
+                                    }
+                                }
+                                TimelineSource::LocalMessages => {
+                                    // From/to IDs.
+                                    let from_id: Option<Id> = find!(
+                                        v: Id,
+                                        pattern!(&local_data, [{ &selected_id @ local_messages::from: ?v }])
+                                    ).next();
+                                    let to_id: Option<Id> = find!(
+                                        v: Id,
+                                        pattern!(&local_data, [{ &selected_id @ local_messages::to: ?v }])
+                                    ).next();
+                                    // Resolve names from relations branch.
+                                    let resolve_name = |pid: Id| -> String {
+                                        find!(
+                                            name: String,
+                                            pattern!(&relations_data, [{ &pid @ relations::alias: ?name }])
+                                        ).next().unwrap_or_else(|| id_prefix(pid))
+                                    };
+                                    if from_id.is_some() || to_id.is_some() {
+                                        ui.horizontal_wrapped(|ui| {
+                                            if let Some(fid) = from_id {
+                                                inline_pill(ui, "from", &resolve_name(fid), color_local_msg());
+                                            }
+                                            if let Some(tid) = to_id {
+                                                inline_pill(ui, "to", &resolve_name(tid), color_frame());
+                                            }
+                                        });
+                                        ui.add_space(4.0);
+                                    }
+                                    if let Some(body) = load_blob!(&local_data, local_messages::body) {
+                                        text_block(ui, "message", &body, muted);
+                                    }
+                                }
+                                TimelineSource::Teams => {
+                                    // Author metadata.
+                                    let author_name = load_blob!(&teams_data, archive::author_name);
+                                    let author_role = load_blob!(&teams_data, archive::author_role);
+                                    let author_model = load_blob!(&teams_data, archive::author_model);
+                                    if author_name.is_some() || author_role.is_some() {
+                                        ui.horizontal_wrapped(|ui| {
+                                            if let Some(ref name) = author_name {
+                                                inline_pill(ui, "", name, color_teams());
+                                            }
+                                            if let Some(ref role) = author_role {
+                                                let role_color = match role.as_str() {
+                                                    "user" => color_user(),
+                                                    "assistant" => color_assistant(),
+                                                    "system" => color_system(),
+                                                    _ => color_frame(),
+                                                };
+                                                inline_pill(ui, "", role, role_color);
+                                            }
+                                            if let Some(ref m) = author_model {
+                                                ui.label(egui::RichText::new(m).monospace().small().color(muted));
+                                            }
+                                        });
+                                        ui.add_space(4.0);
+                                    }
+                                    if let Some(content) = load_blob!(&teams_data, archive::content) {
+                                        text_block(ui, "content", &content, muted);
+                                    }
+                                }
+                                TimelineSource::Goals => {
+                                    // Could be a goal entity or a status/note event.
+                                    let title = load_blob!(&compass_data, compass::title);
+                                    let status = load_short(&compass_data, compass::status);
+                                    let note = load_blob!(&compass_data, compass::note);
+
+                                    // If it's a status/note event, resolve parent goal.
+                                    let goal_id: Option<Id> = find!(
+                                        v: Id,
+                                        pattern!(&compass_data, [{ &selected_id @ compass::task: ?v }])
+                                    ).next();
+                                    let goal_title = goal_id.and_then(|gid| {
+                                        load_blob_of(&compass_data, &gid, compass::title)
+                                    });
+
+                                    // Tags on the goal (or on this entity if it is the goal).
+                                    let tag_target = goal_id.unwrap_or(selected_id);
+                                    let tags: Vec<String> = find!(
+                                        v: String,
+                                        pattern!(&compass_data, [{ &tag_target @ compass::tag: ?v }])
+                                    ).collect();
+
+                                    // Pill row.
+                                    if status.is_some() || !tags.is_empty() {
+                                        ui.horizontal_wrapped(|ui| {
+                                            if let Some(ref s) = status {
+                                                let status_color = match s.as_str() {
+                                                    "todo" => color_todo(),
+                                                    "doing" => color_doing(),
+                                                    "blocked" => color_blocked(),
+                                                    "done" => color_done(),
+                                                    _ => color_frame(),
+                                                };
+                                                inline_pill(ui, "", s, status_color);
+                                            }
+                                            for t in &tags {
+                                                inline_pill(ui, "", t, colorhash::ral_categorical(t.as_bytes()));
+                                            }
+                                        });
+                                        ui.add_space(4.0);
+                                    }
+
+                                    // Goal title (own title or parent goal).
+                                    if let Some(ref t) = title {
+                                        text_block(ui, "goal", t, muted);
+                                    } else if let Some(ref t) = goal_title {
+                                        text_block(ui, "goal", t, muted);
+                                    }
+
+                                    // Note body (if this is a note event).
+                                    if let Some(ref n) = note {
+                                        text_block(ui, "note", n, muted);
+                                    }
                                 }
                             }
-                        });
-                        if resp.closed {
-                            state.context_float_request_id = None;
-                        }
+                        }); });
                     });
-                }
+                    if resp.closed {
+                        state.context_float_request_id = None;
+                    }
+                });
             }
         });
     });

@@ -9,7 +9,7 @@
 //! reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }
 //! serde = { version = "1", features = ["derive"] }
 //! serde_json = "1"
-//! triblespace = "0.32"
+//! triblespace = "0.33"
 //! ```
 
 use std::fs;
@@ -103,7 +103,6 @@ mod web_schema {
     attributes! {
         "0CA16690DE44435B773224C275FD4E76" as query: Handle<Blake3, LongString>;
         "D0A6B39F715FE17935540232656CE0A3" as provider: ShortString;
-        "283A66F0FCF94EBCB04DEBF323D2B30D" as created_at: NsTAIInterval;
         "D50E38414AB7068C78602DD56C785634" as result: GenId;
 
         "099BE36C62777693D66A5F6183ABE9F2" as url: Handle<Blake3, LongString>;
@@ -455,7 +454,7 @@ fn store_search(
             metadata::tag: &web_schema::kind_search,
             web_schema::query: query_handle,
             web_schema::provider: provider_str,
-            web_schema::created_at: created_at,
+            metadata::created_at: created_at,
             web_schema::result*: result_ids,
         };
 
@@ -486,7 +485,7 @@ fn store_fetch(cli: &Cli, branch_id: Id, provider: Provider, url: &str, content:
         let fetch_fragment = entity! { _ @
             metadata::tag: &web_schema::kind_fetch,
             web_schema::provider: provider_str,
-            web_schema::created_at: created_at,
+            metadata::created_at: created_at,
             web_schema::url: url_handle,
             web_schema::content: content_handle,
         };

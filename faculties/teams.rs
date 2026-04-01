@@ -11,7 +11,7 @@
 //! reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }
 //! serde = { version = "1", features = ["derive"] }
 //! serde_json = "1"
-//! triblespace = "0.32"
+//! triblespace = "0.33"
 //! ```
 
 use std::collections::{HashMap, HashSet};
@@ -68,7 +68,6 @@ mod archive_schema {
             "4FE6A8A43658BC2F61FEDF5CFB29EEFC" as pub author_model: Handle<Blake3, LongString>;
             "1F127324384335D12ECFE0CB84840925" as pub author_provider: Handle<Blake3, LongString>;
             "ACF09FF3D62B73983A222313FF0C52D2" as pub content: Handle<Blake3, LongString>;
-            "59FA7C04A43B96F31414D1B4544FAEC2" as pub created_at: NsTAIInterval;
 
             "D8A469EAC2518D1A85692E0BEBF20D6C" as pub content_type: ShortString;
             "8334E282F24A4C7779C8899191B29E00" as pub attachment: GenId;
@@ -141,7 +140,6 @@ mod archive_schema {
         metadata += metadata::Describe::describe(&archive::author_model, blobs)?;
         metadata += metadata::Describe::describe(&archive::author_provider, blobs)?;
         metadata += metadata::Describe::describe(&archive::content, blobs)?;
-        metadata += metadata::Describe::describe(&archive::created_at, blobs)?;
 
         metadata += metadata::Describe::describe(&archive::content_type, blobs)?;
         metadata += metadata::Describe::describe(&archive::attachment, blobs)?;
@@ -200,7 +198,6 @@ mod teams_schema {
             "57AABA4FBA3A5EC6EF28DC80CD6E0919" as pub delta_link: Handle<Blake3, LongString>;
             "438A29922F91F873A69C3856AA7A553F" as pub access_token: Handle<Blake3, LongString>;
             "60C85DD37D09D3D27BC6BFA0E8040EA9" as pub refresh_token: Handle<Blake3, LongString>;
-            "706CC590BF4684CA8FA00E4123C43124" as pub expires_at: valueschemas::NsTAIInterval;
             "0F7784BBDA2EE5B9009DE688472D6F24" as pub token_type: Handle<Blake3, LongString>;
             "139B46989D7F56C7DFE6259FD74479AC" as pub scope: Handle<Blake3, LongString>;
             "34ACCCECE281E1A0E191EEEBE7E47A23" as pub tenant: Handle<Blake3, LongString>;
@@ -293,7 +290,6 @@ mod teams_schema {
         metadata += metadata::Describe::describe(&teams::delta_link, blobs)?;
         metadata += metadata::Describe::describe(&teams::access_token, blobs)?;
         metadata += metadata::Describe::describe(&teams::refresh_token, blobs)?;
-        metadata += metadata::Describe::describe(&teams::expires_at, blobs)?;
         metadata += metadata::Describe::describe(&teams::token_type, blobs)?;
         metadata += metadata::Describe::describe(&teams::scope, blobs)?;
         metadata += metadata::Describe::describe(&teams::tenant, blobs)?;
@@ -797,7 +793,7 @@ fn log_event(config: &TeamsBridgeConfig, level: &str, message: &str) -> Result<(
         change += entity! { &log_id @
             metadata::tag: teams::kind_log,
             archive::author: author_id,
-            archive::created_at: created_at,
+            metadata::created_at: created_at,
             archive::content: content_handle,
         };
 
@@ -1157,8 +1153,8 @@ fn latest_token_state(catalog: &TribleSet) -> Option<TokenState> {
             ?token @
             metadata::tag: teams::kind_token,
             teams::access_token: ?access,
-            teams::expires_at: ?expires_at,
-            archive::created_at: ?created_at,
+            metadata::expires_at: ?expires_at,
+            metadata::created_at: ?created_at,
         }])
     ) {
         let created_key = interval_key(created_at);
@@ -1193,7 +1189,7 @@ fn latest_config_state(catalog: &TribleSet) -> Option<ConfigState> {
         pattern!(catalog, [{
             ?config @
             metadata::tag: teams::kind_config,
-            archive::created_at: ?created_at,
+            metadata::created_at: ?created_at,
         }])
     ) {
         let created_key = interval_key(created_at);
@@ -1352,9 +1348,9 @@ fn build_token_change(
 
     change += entity! { &token_id @
         metadata::tag: teams::kind_token,
-        archive::created_at: created_at,
+        metadata::created_at: created_at,
         teams::access_token: access_handle,
-        teams::expires_at: expires_at,
+        metadata::expires_at: expires_at,
         teams::tenant: tenant_handle,
         teams::client_id: client_handle,
         teams::refresh_token?: refresh_handle,
@@ -1402,7 +1398,7 @@ fn build_config_change(
 
     change += entity! { &config_id @
         metadata::tag: teams::kind_config,
-        archive::created_at: created_at,
+        metadata::created_at: created_at,
         teams::tenant?: tenant_handle,
         teams::client_id?: client_id_handle,
         teams::client_secret?: client_secret_handle,
@@ -2113,7 +2109,7 @@ fn read_messages(config: TeamsBridgeConfig, options: ReadOptions) -> Result<()> 
                 metadata::tag: archive::kind_message,
                 archive::content: ?content,
                 archive::author: ?author,
-                archive::created_at: ?created_at,
+                metadata::created_at: ?created_at,
                 teams::chat: ?chat,
             }])
         ) {
@@ -2266,7 +2262,7 @@ fn list_attachments(config: TeamsBridgeConfig, options: AttachmentListOptions) -
             pattern!(&catalog, [{
                 ?message @
                 archive::attachment: ?attachment,
-                archive::created_at: ?created_at,
+                metadata::created_at: ?created_at,
                 teams::chat: ?chat,
             }])
         ) {
@@ -2424,7 +2420,7 @@ fn backfill_attachments(config: TeamsBridgeConfig, options: AttachmentBackfillOp
                 ?message @
                 metadata::tag: archive::kind_message,
                 teams::chat: ?chat,
-                archive::created_at: ?created_at,
+                metadata::created_at: ?created_at,
                 archive::content: ?content,
             }])
         ) {
@@ -2752,7 +2748,7 @@ fn load_cursor_from_space(
             ?cursor @
             metadata::tag: teams::kind_cursor,
             teams::delta_link: ?delta_link,
-            archive::created_at: ?created_at,
+            metadata::created_at: ?created_at,
         }])
     ) {
         let key = interval_key(created_at);
@@ -2804,7 +2800,7 @@ fn build_cursor_change(
     change += entity! { &cursor_id @
         metadata::tag: teams::kind_cursor,
         teams::delta_link: handle,
-        archive::created_at: now,
+        metadata::created_at: now,
     };
     Ok(Some(change.difference(catalog)))
 }
@@ -3132,7 +3128,7 @@ impl CatalogIndex {
 
         let message_created_at_set = find!(
             (message: Id, created_at: Value<NsTAIInterval>),
-            pattern!(catalog, [{ ?message @ archive::created_at: ?created_at }])
+            pattern!(catalog, [{ ?message @ metadata::created_at: ?created_at }])
         )
         .into_iter()
         .map(|(message, _)| message)
@@ -3145,7 +3141,7 @@ impl CatalogIndex {
                 ?message @
                 metadata::tag: archive::kind_message,
                 teams::chat: ?chat,
-                archive::created_at: ?created_at,
+                metadata::created_at: ?created_at,
             }])
         ) {
             let key = interval_key(created_at);
@@ -3256,7 +3252,7 @@ fn build_ingest_change(
                 change += entity! { ExclusiveId::force_ref(&message.message_id) @
                     metadata::tag: archive::kind_message,
                     archive::author: message.author_id,
-                    archive::created_at: message.created_at,
+                    metadata::created_at: message.created_at,
                     archive::content: content_handle,
                     teams::chat: chat_id,
                     teams::message_raw: raw_handle,
@@ -3290,7 +3286,7 @@ fn build_ingest_change(
                         teams::chat?: message_chat,
                         teams::message_id?: message_external,
                         teams::message_raw?: message_raw,
-                        archive::created_at?: message_created_at,
+                        metadata::created_at?: message_created_at,
                         archive::content?: message_content,
                         archive::reply_to?: message_reply_to,
                     };

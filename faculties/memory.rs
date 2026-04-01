@@ -6,7 +6,7 @@
 //! ed25519-dalek = "2.1.1"
 //! hifitime = "4.2.3"
 //! rand_core = "0.6.4"
-//! triblespace = "0.32"
+//! triblespace = "0.33"
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -30,19 +30,11 @@ const DEFAULT_ARCHIVE_BRANCH: &str = "archive";
 
 const KIND_CHUNK_ID: Id = id_hex!("40E6004417F9B767AFF1F138DE3D3AAC");
 
-mod exec_schema {
-    use super::*;
-    attributes! {
-        "3BB7917C5E41E494FECE36FFE79FEF23" as finished_at: NsTAIInterval;
-    }
-}
-
 const KIND_EXEC_RESULT: Id = id_hex!("DF7165210F066E84D93E9A430BB0D4BD");
 
 mod archive_schema {
     use super::*;
     attributes! {
-        "59FA7C04A43B96F31414D1B4544FAEC2" as created_at: NsTAIInterval;
         "838CC157FFDD37C6AC7CC5A472E43ADB" as author: GenId;
         "E63EE961ABDB1D1BEC0789FDAFFB9501" as author_name: Handle<Blake3, LongString>;
     }
@@ -62,7 +54,6 @@ mod ctx {
     use super::*;
     attributes! {
         "3292CF0B3B6077991D8ECE6E2973D4B6" as summary: Handle<Blake3, LongString>;
-        "4036F38AB05D26764A1E5E456337F399" as created_at: NsTAIInterval;
         "502F7D33822A90366F0F0ADA0556177F" as start_at: NsTAIInterval;
         "DF84E872EB68FBFCA63D760F27FD8A6F" as end_at: NsTAIInterval;
         "9B83D68AECD6888AA9CE95E754494768" as child: GenId;
@@ -443,7 +434,7 @@ fn cmd_create(pile_path: &Path, args: &[String]) -> Result<()> {
         change += entity! { &chunk_id @
             metadata::tag: KIND_CHUNK_ID,
             ctx::summary: summary_handle,
-            ctx::created_at: created_at,
+            metadata::created_at: created_at,
             ctx::start_at: start_at,
             ctx::end_at: end_at,
         };
@@ -700,7 +691,7 @@ fn find_exec_by_time_range(
         pattern!(catalog, [{
             ?result_id @
             metadata::tag: &KIND_EXEC_RESULT,
-            exec_schema::finished_at: ?finished_at,
+            metadata::finished_at: ?finished_at,
         }])
     ) {
         let t = interval_key(finished_at);
@@ -731,7 +722,7 @@ fn find_archive_by_time_range(
         pattern!(catalog, [{
             ?msg_id @
             metadata::tag: &KIND_ARCHIVE_MESSAGE,
-            archive_schema::created_at: ?created_at,
+            metadata::created_at: ?created_at,
         }])
     ) {
         let t = interval_key(created_at);

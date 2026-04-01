@@ -6,7 +6,7 @@
 //! ed25519-dalek = "2.1.1"
 //! hifitime = "4.2.3"
 //! rand_core = "0.6.4"
-//! triblespace = "0.32"
+//! triblespace = "0.33"
 //! ```
 
 use anyhow::{Context, Result, bail};
@@ -48,7 +48,6 @@ mod local {
         "42C4DB210F7EAFAF38F179ADCB4A9D5B" as from: valueschemas::GenId;
         "95D58D3E68A43979F8AA51415541414C" as to: valueschemas::GenId;
         "23075866B369B5F393D43B30649469F6" as body: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
-        "5FA453867880877B613B7632A233419B" as created_at: valueschemas::NsTAIInterval;
 
         "2213B191326E9B99605FA094E516E50E" as about_message: valueschemas::GenId;
         "99E92F483731FA6D59115A8D6D187A37" as reader: valueschemas::GenId;
@@ -408,7 +407,7 @@ fn cmd_send(
             local::from: from_id,
             local::to: to_id,
             local::body: body_handle,
-            local::created_at: now,
+            metadata::created_at: now,
         };
 
         ws.commit(change, "local message");
@@ -499,7 +498,7 @@ fn cmd_list(
                 local::from: ?from,
                 local::to: ?to,
                 local::body: ?body,
-                local::created_at: ?created_at,
+                metadata::created_at: ?created_at,
             }])
         ) {
             let body_text = load_text(&mut ws, body)?;

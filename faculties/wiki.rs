@@ -8,7 +8,7 @@
 //! rand_core = "0.6.4"
 //! itertools = "0.14"
 //! regex = "1"
-//! triblespace = { path = "/path/to/workspace/triblespace-rs" }
+//! triblespace = "0.33"
 //! typst = "0.14"
 //! typst-syntax = "0.14"
 //! comemo = "0.5.1"
@@ -60,7 +60,6 @@ mod wiki {
     attributes! {
         "EBFC56D50B748E38A14F5FC768F1B9C1" as fragment: valueschemas::GenId;
         "6DBBE746B7DD7A4793CA098AB882F553" as content: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
-        "476F6E26FCA65A0B49E38CC44CF31467" as created_at: valueschemas::NsTAIInterval;
         "78BABEF1792531A2E51A372D96FE5F3E" as title: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
         "DEAFB7E307DF72389AD95A850F24BAA5" as links_to: valueschemas::GenId;
     }
@@ -360,7 +359,7 @@ fn latest_version_of(space: &TribleSet, fragment_id: Id) -> Option<Id> {
             ?vid @
             metadata::tag: &KIND_VERSION_ID,
             wiki::fragment: &fragment_id,
-            wiki::created_at: ?ts,
+            metadata::created_at: ?ts,
         }])
     )
     .max_by_key(|(_, ts)| *ts)
@@ -375,7 +374,7 @@ fn version_history_of(space: &TribleSet, fragment_id: Id) -> Vec<Id> {
             ?vid @
             metadata::tag: &KIND_VERSION_ID,
             wiki::fragment: &fragment_id,
-            wiki::created_at: ?ts,
+            metadata::created_at: ?ts,
         }])
     )
     .collect();
@@ -412,7 +411,7 @@ fn content_handle_of(space: &TribleSet, vid: Id) -> Option<TextHandle> {
 fn created_at_of(space: &TribleSet, vid: Id) -> Option<Lower> {
     find!(
         (ts: Lower),
-        pattern!(space, [{ vid @ wiki::created_at: ?ts }])
+        pattern!(space, [{ vid @ metadata::created_at: ?ts }])
     )
     .next()
     .map(|(ts,)| ts)
@@ -551,7 +550,7 @@ fn latest_versions(space: &TribleSet) -> HashMap<Id, (Id, Lower)> {
             ?vid @
             metadata::tag: &KIND_VERSION_ID,
             wiki::fragment: ?frag,
-            wiki::created_at: ?ts,
+            metadata::created_at: ?ts,
         }])
     )
     .into_grouping_map_by(|(_, frag, _)| *frag)
@@ -798,7 +797,7 @@ fn commit_version(
         wiki::fragment: &fragment_id,
         wiki::title: title_handle,
         wiki::content: content,
-        wiki::created_at: now_tai(),
+        metadata::created_at: now_tai(),
         metadata::tag*: tag_ids.iter(),
         wiki::links_to*: link_targets.iter(),
     };
@@ -1220,7 +1219,7 @@ fn cmd_import_all(repo: &mut Repo, bid: Id, dir: PathBuf) -> Result<()> {
                 wiki::fragment: frag_id,
                 wiki::title: title_handle,
                 wiki::content: content_handle,
-                wiki::created_at: now_tai(),
+                metadata::created_at: now_tai(),
                 metadata::tag*: all_tags.iter(),
                 wiki::links_to*: link_targets.iter(),
             };

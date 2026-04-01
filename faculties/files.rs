@@ -8,7 +8,7 @@
 //! rand_core = "0.6.4"
 //! reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 //! anybytes = "0.20"
-//! triblespace = { path = "/path/to/workspace/triblespace-rs" }
+//! triblespace = "0.33"
 //! ```
 
 use anyhow::{Context, Result, bail};
@@ -49,7 +49,7 @@ mod file {
         // file leaf: MIME type
         "BFE2C88ECD13D56F80967C343FC072EE" as mime: valueschemas::ShortString;
         // import: timestamp
-        "EA8B5429A86AF26D2B87F169AFEE3919" as imported_at: valueschemas::NsTAIInterval;
+        "3765160CC1A96BE38302B344718E4C49" as imported_at: valueschemas::NsTAIInterval;
         // TODO: migrate to metadata::tag (GenId) — should use canonical tag
         // entities with metadata::name, not inline ShortString. See wiki.rs TagIndex.
         "CDA941A27F86A7551779CF9524DE1D0F" as tag: valueschemas::ShortString;
