@@ -104,6 +104,22 @@ mod reason_events {
     }
 }
 
+mod wiki {
+    use triblespace::macros::id_hex;
+    use triblespace::prelude::blobschemas::LongString;
+    use triblespace::prelude::valueschemas::{Blake3, GenId, Handle};
+    use triblespace::prelude::*;
+
+    attributes! {
+        "EBFC56D50B748E38A14F5FC768F1B9C1" as pub fragment: GenId;
+        "78BABEF1792531A2E51A372D96FE5F3E" as pub title: Handle<Blake3, LongString>;
+        "6DBBE746B7DD7A4793CA098AB882F553" as pub content: Handle<Blake3, LongString>;
+    }
+
+    #[allow(non_upper_case_globals)]
+    pub const kind_version: Id = id_hex!("1AA0310347EDFED7874E8BFECC6438CF");
+}
+
 // ── Layout constants ────────────────────────────────────────────────
 const ACTIVITY_TIMELINE_HEIGHT: f32 = 980.0;
 const TURN_MEMORY_MAX_ROWS: usize = 160;
@@ -159,6 +175,7 @@ fn color_cognition() -> egui::Color32 { themes::ral(4011) }   // pearl violet
 fn color_teams() -> egui::Color32 { themes::ral(5012) }       // light blue
 fn color_local_msg() -> egui::Color32 { themes::ral(6032) }   // signal green
 fn color_goals() -> egui::Color32 { themes::ral(1012) }       // lemon yellow
+fn color_wiki() -> egui::Color32 { themes::ral(3012) }        // beige red
 
 fn color_system() -> egui::Color32 { themes::ral(5014) }      // pigeon blue
 fn color_user() -> egui::Color32 { themes::ral(6033) }        // mint turquoise
@@ -267,6 +284,7 @@ const BRANCH_COMPASS: &str = "compass";
 const BRANCH_LOCAL_MESSAGES: &str = "local-messages";
 const BRANCH_RELATIONS: &str = "relations";
 const BRANCH_TEAMS: &str = "teams";
+const BRANCH_WIKI: &str = "wiki";
 
 fn default_pile_path() -> String {
     let default_pile = diagnostics_default_pile().unwrap_or_else(|| {
@@ -285,6 +303,7 @@ struct DashboardState {
     local_messages_cat: BranchCatalog,
     relations_cat: BranchCatalog,
     teams_cat: BranchCatalog,
+    wiki_cat: BranchCatalog,
     branches: Vec<BranchEntry>,
     now_key: i128,
     local_draft: String,
@@ -318,6 +337,7 @@ impl Default for DashboardState {
             local_messages_cat: BranchCatalog::default(),
             relations_cat: BranchCatalog::default(),
             teams_cat: BranchCatalog::default(),
+            wiki_cat: BranchCatalog::default(),
             branches: Vec::new(),
             now_key: 0,
             local_draft: String::new(),
@@ -471,6 +491,7 @@ enum TimelineSource {
     Teams,
     LocalMessages,
     Goals,
+    Wiki,
 }
 
 #[derive(Debug, Clone)]
@@ -594,6 +615,7 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
                 state.local_messages_cat.reset();
                 state.relations_cat.reset();
                 state.teams_cat.reset();
+                state.wiki_cat.reset();
                 state.branches.clear();
             }
 
@@ -608,6 +630,7 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
                 state.local_messages_cat.reset();
                 state.relations_cat.reset();
                 state.teams_cat.reset();
+                state.wiki_cat.reset();
                 state.branches.clear();
             }
 
@@ -723,7 +746,8 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
                     && state.compass_cat.fully_loaded
                     && state.local_messages_cat.fully_loaded
                     && state.relations_cat.fully_loaded
-                    && state.teams_cat.fully_loaded;
+                    && state.teams_cat.fully_loaded
+                    && state.wiki_cat.fully_loaded;
 
                 // While history is still loading, refresh every frame.
                 // Once fully loaded, switch to timer-based incremental refresh.
@@ -766,6 +790,7 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
         let teams_data = state.teams_cat.catalog().clone();
         let compass_data = state.compass_cat.catalog().clone();
         let relations_data = state.relations_cat.catalog().clone();
+        let wiki_data = state.wiki_cat.catalog().clone();
         let now_key = state.now_key;
 
         // Initialize timeline_start to "now" if not yet set.
@@ -1056,7 +1081,23 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
                 push_event(&mut events, id, ts, TimelineSource::Goals, summary);
             }
 
-
+            // Wiki version events.
+            for (id, ts, title) in find!(
+                (id: Id, ts: Value<NsTAIInterval>, title: Value<Handle<Blake3, LongString>>),
+                and!(
+                    pattern!(&wiki_data, [{
+                        ?id @
+                        metadata::tag: &wiki::kind_version,
+                        metadata::created_at: ?ts,
+                        wiki::title: ?title,
+                    }]),
+                    wiki_data.value_in_range(ts, min_ts, max_ts),
+                )
+            ) {
+                if let Some(text) = load_text(ws, title) {
+                    push_event(&mut events, id, ts, TimelineSource::Wiki, truncate_single_line(&text, 80).to_string());
+                }
+            }
 
             // Render each event as a clickable chip.
             let event_left = viewport_rect.left() + 120.0;
@@ -1137,6 +1178,28 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
                         pattern!(data, [{ &selected_id @ attr: ?v }])
                     ).next()
                 };
+                let load_ts = |data: &TribleSet, attr: Attribute<NsTAIInterval>| -> Option<i128> {
+                    find!(
+                        v: Value<NsTAIInterval>,
+                        pattern!(data, [{ &selected_id @ attr: ?v }])
+                    ).next().map(interval_key)
+                };
+
+                // Resolve timestamp per source type.
+                let event_ts = match selected_source {
+                    TimelineSource::Shell => load_ts(&exec_data, playground_exec::ordered_requested_at),
+                    TimelineSource::Cognition => load_ts(&exec_data, model_chat::ordered_finished_at),
+                    TimelineSource::LocalMessages => load_ts(&local_data, local_messages::ordered_created_at),
+                    TimelineSource::Teams => load_ts(&teams_data, archive::ordered_created_at),
+                    TimelineSource::Goals => load_ts(&compass_data, compass::ordered_created_at)
+                        .or_else(|| load_ts(&compass_data, compass::ordered_at)),
+                    TimelineSource::Wiki => {
+                        find!(
+                            v: Value<NsTAIInterval>,
+                            pattern!(&wiki_data, [{ &selected_id @ metadata::created_at: ?v }])
+                        ).next().map(interval_key)
+                    }
+                };
 
                 ui.push_id(selected_id, |ui| {
                     let resp = ui.float(|ui| {
@@ -1153,6 +1216,11 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
                                     ui.label(egui::RichText::new(id_prefix(selected_id)).monospace().small().color(
                                         header_text.linear_multiply(0.7),
                                     ));
+                                    if let Some(ts) = event_ts {
+                                        ui.label(egui::RichText::new(format_time_marker(ts)).monospace().small().color(
+                                            header_text.linear_multiply(0.7),
+                                        ));
+                                    }
                                 });
                             });
 
@@ -1165,10 +1233,16 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
                                     .corner_radius(egui::CornerRadius::same(4))
                                     .inner_margin(egui::Margin::symmetric(8, 4))
                                     .show(ui, |ui| {
-                                        ui.add(
-                                            egui::Label::new(egui::RichText::new(text).monospace().small())
-                                                .wrap_mode(egui::TextWrapMode::Wrap),
-                                        );
+                                        egui::ScrollArea::vertical()
+                                            .id_salt(label)
+                                            .min_scrolled_height(200.0)
+                                            .max_height(200.0)
+                                            .show(ui, |ui| {
+                                                ui.add(
+                                                    egui::Label::new(egui::RichText::new(text).monospace().small())
+                                                        .wrap_mode(egui::TextWrapMode::Wrap),
+                                                );
+                                            });
                                     });
                                 ui.add_space(4.0);
                             };
@@ -1348,14 +1422,44 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
                                     if let Some(body) = load_blob!(&local_data, local_messages::body) {
                                         text_block(ui, "message", &body, muted);
                                     }
+                                    // Read receipts: entities with about_message → selected_id.
+                                    let read_receipts: Vec<(String, i128)> = find!(
+                                        (reader_id: Id, read_at: Value<NsTAIInterval>),
+                                        pattern!(&local_data, [{
+                                            _?receipt @
+                                            local_messages::about_message: &selected_id,
+                                            local_messages::reader: ?reader_id,
+                                            local_messages::ordered_read_at: ?read_at,
+                                        }])
+                                    ).map(|(rid, ts)| (resolve_name(rid), interval_key(ts))).collect();
+                                    if !read_receipts.is_empty() {
+                                        ui.horizontal_wrapped(|ui| {
+                                            for (name, ts) in &read_receipts {
+                                                inline_pill(ui, "read by", name, color_read());
+                                                ui.label(egui::RichText::new(format_time_marker(*ts)).monospace().small().color(muted));
+                                            }
+                                        });
+                                        ui.add_space(4.0);
+                                    }
                                 }
                                 TimelineSource::Teams => {
+                                    // Chat name.
+                                    let chat_id: Option<Id> = find!(
+                                        v: Id,
+                                        pattern!(&teams_data, [{ &selected_id @ teams::chat: ?v }])
+                                    ).next();
+                                    let chat_name = chat_id.and_then(|cid| {
+                                        load_blob_of(&teams_data, &cid, teams::chat_id)
+                                    });
                                     // Author metadata.
                                     let author_name = load_blob!(&teams_data, archive::author_name);
                                     let author_role = load_blob!(&teams_data, archive::author_role);
                                     let author_model = load_blob!(&teams_data, archive::author_model);
-                                    if author_name.is_some() || author_role.is_some() {
+                                    if author_name.is_some() || author_role.is_some() || chat_name.is_some() {
                                         ui.horizontal_wrapped(|ui| {
+                                            if let Some(ref chat) = chat_name {
+                                                inline_pill(ui, "chat", chat, color_frame());
+                                            }
                                             if let Some(ref name) = author_name {
                                                 inline_pill(ui, "", name, color_teams());
                                             }
@@ -1427,9 +1531,56 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
                                         text_block(ui, "goal", t, muted);
                                     }
 
+                                    // Parent goal hierarchy.
+                                    let actual_goal = goal_id.unwrap_or(selected_id);
+                                    let parent_id: Option<Id> = find!(
+                                        v: Id,
+                                        pattern!(&compass_data, [{ &actual_goal @ compass::parent: ?v }])
+                                    ).next();
+                                    if let Some(pid) = parent_id {
+                                        let parent_title = load_blob_of(&compass_data, &pid, compass::title);
+                                        if let Some(ref pt) = parent_title {
+                                            ui.horizontal(|ui| {
+                                                ui.label(egui::RichText::new("parent").small().color(muted));
+                                                ui.label(egui::RichText::new(pt).small());
+                                            });
+                                            ui.add_space(4.0);
+                                        }
+                                    }
+
                                     // Note body (if this is a note event).
                                     if let Some(ref n) = note {
                                         text_block(ui, "note", n, muted);
+                                    }
+                                }
+                                TimelineSource::Wiki => {
+                                    // Wiki tags (excluding the kind_version tag).
+                                    let tags: Vec<Id> = find!(
+                                        tag: Id,
+                                        pattern!(&wiki_data, [{ &selected_id @ metadata::tag: ?tag }])
+                                    ).filter(|t| *t != wiki::kind_version).collect();
+                                    // Resolve tag names upfront via load_blob_of.
+                                    let tag_names: Vec<(Id, String)> = tags.iter().map(|tag| {
+                                        let name = load_blob_of(&wiki_data, tag, metadata::name)
+                                            .unwrap_or_else(|| id_prefix(*tag));
+                                        (*tag, name)
+                                    }).collect();
+                                    if !tag_names.is_empty() {
+                                        ui.horizontal_wrapped(|ui| {
+                                            for (_tag, name) in &tag_names {
+                                                inline_pill(ui, "", name, colorhash::ral_categorical(name.as_bytes()));
+                                            }
+                                        });
+                                        ui.add_space(4.0);
+                                    }
+                                    // Title.
+                                    if let Some(title) = load_blob!(&wiki_data, wiki::title) {
+                                        ui.label(egui::RichText::new(&title).strong());
+                                        ui.add_space(4.0);
+                                    }
+                                    // Typst content.
+                                    if let Some(content) = load_blob!(&wiki_data, wiki::content) {
+                                        ui.typst(&content);
                                     }
                                 }
                             }
@@ -2077,6 +2228,7 @@ fn refresh_catalogs(state: &mut DashboardState) {
     refresh_role(repo, &branch_lookup, BRANCH_LOCAL_MESSAGES, &mut state.local_messages_cat, chunk);
     refresh_role(repo, &branch_lookup, BRANCH_RELATIONS, &mut state.relations_cat, chunk);
     refresh_role(repo, &branch_lookup, BRANCH_TEAMS, &mut state.teams_cat, chunk);
+    refresh_role(repo, &branch_lookup, BRANCH_WIKI, &mut state.wiki_cat, chunk);
 
     state.now_key = epoch_key(now_epoch());
 }
@@ -5407,23 +5559,6 @@ fn render_timeline_row(ui: &mut egui::Ui, now_key: i128, row: &TimelineRow) -> O
 
     context_clicked
 }
-
-/// Expanded details for a timeline event (shown when the chip is clicked).
-fn render_timeline_row_details(ui: &mut egui::Ui, now_key: i128, row: &TimelineRow, context_clicked: &mut Option<Id>) {
-    let (_, source_color) = timeline_source_style(row.source);
-    match &row.event {
-        TimelineEvent::Shell {
-            request_id,
-            status,
-            command,
-            worker_label,
-            exit_code,
-            stdout_text,
-            stderr_text,
-            error,
-        } => {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(format!("{}: {}", exec_status_text(*status), command));
                 let chip_resp = render_timeline_ctx_chip(ui, source_color);
                 if chip_resp.on_hover_text("Show model context for this turn").clicked() {
                     *context_clicked = Some(*request_id);
@@ -5616,88 +5751,7 @@ fn timeline_source_style(source: TimelineSource) -> (&'static str, egui::Color32
         TimelineSource::Teams => ("teams", color_teams()),
         TimelineSource::LocalMessages => ("local", color_local_msg()),
         TimelineSource::Goals => ("goals", color_goals()),
-    }
-}
-
-fn render_timeline_source_chip(ui: &mut egui::Ui, label: &str, fill: egui::Color32) {
-    let text_color = colorhash::text_color_on(fill);
-    egui::Frame::NONE
-        .fill(fill)
-        .corner_radius(egui::CornerRadius::same(5))
-        .inner_margin(egui::Margin::symmetric(8, 2))
-        .show(ui, |ui| {
-            ui.label(egui::RichText::new(label).small().color(text_color));
-        });
-}
-
-#[allow(clippy::too_many_arguments)]
-fn render_timeline_local_message(
-    ui: &mut egui::Ui,
-    from_id: Id,
-    to_id: Id,
-    from_label: &str,
-    to_label: &str,
-    status: &LocalMessageStatus,
-    body: &str,
-    is_sender: bool,
-    now_key: i128,
-    at: Option<i128>,
-) {
-    let bubble_width = (ui.available_width() * 0.75).max(220.0);
-    let age = format_age(now_key, at);
-    let meta = format!("{age} · {}", local_message_status_text(status));
-    let align = if is_sender {
-        egui::Layout::right_to_left(egui::Align::TOP)
-    } else {
-        egui::Layout::left_to_right(egui::Align::TOP)
-    };
-    let from_chip_color = colorhash::ral_categorical(from_id.as_ref());
-    let to_chip_color = colorhash::ral_categorical(to_id.as_ref());
-    // Subtle tint: blend sender color toward the frame background so body text stays readable.
-    let bubble_tint = themes::blend(from_chip_color, color_frame(), 0.8);
-    let text_color = colorhash::text_color_on(bubble_tint);
-
-    ui.with_layout(align, |ui| {
-        ui.vertical(|ui| {
-            ui.horizontal(|ui| {
-                render_person_chip(ui, from_label, from_chip_color);
-                ui.label(egui::RichText::new("\u{2192}").color(color_muted()).small());
-                render_person_chip(ui, to_label, to_chip_color);
-                ui.add_space(6.0);
-                render_local_status_chip(ui, status);
-            });
-            egui::Frame::NONE
-                .fill(bubble_tint)
-                .stroke(egui::Stroke::new(1.0, from_chip_color))
-                .corner_radius(egui::CornerRadius::same(6))
-                .inner_margin(egui::Margin::symmetric(10, 6))
-                .show(ui, |ui| {
-                    ui.set_max_width(bubble_width);
-                    render_blob_aware_text(ui, body, Some(text_color), Some(bubble_width));
-                });
-            ui.label(egui::RichText::new(meta).color(color_muted()).small());
-        });
-    });
-}
-
-fn render_timeline_goal_event(ui: &mut egui::Ui, goal: &CompassTaskRow, detail: Option<String>) {
-    // Compact inline goal summary for the timeline (not the full swimlane card).
-    let status_bg = status_color(&goal.status);
-    ui.horizontal_wrapped(|ui| {
-        render_goal_chip(ui, &goal.status, status_bg);
-        ui.label(
-            egui::RichText::new(&goal.title).monospace(),
-        );
-        ui.label(
-            egui::RichText::new(format!("[{}]", goal.id_prefix))
-                .monospace()
-                .color(color_muted()),
-        );
-    });
-    if let Some(detail) = detail {
-        ui.label(
-            egui::RichText::new(detail).small().color(color_muted()),
-        );
+        TimelineSource::Wiki => ("wiki", color_wiki()),
     }
 }
 
@@ -6072,74 +6126,6 @@ fn render_compass_swimlane_row(
     }
 }
 
-fn local_message_status(
-    row: &LocalMessageRow,
-    me_id: Option<Id>,
-    labels: &HashMap<Id, String>,
-) -> LocalMessageStatus {
-    let read_by = |reader_id: Id| row.readers.iter().any(|id| *id == reader_id);
-    match me_id {
-        Some(me) if row.to_id == me => {
-            if read_by(me) {
-                LocalMessageStatus::Read
-            } else {
-                LocalMessageStatus::Unread
-            }
-        }
-        Some(me) if row.from_id == me => {
-            if read_by(row.to_id) {
-                let to_label = format_id(labels, row.to_id);
-                LocalMessageStatus::ReadBy(to_label)
-            } else {
-                LocalMessageStatus::Sent
-            }
-        }
-        Some(me) if read_by(me) => LocalMessageStatus::Read,
-        Some(_) => LocalMessageStatus::Other,
-        None => {
-            if read_by(row.to_id) {
-                let to_label = format_id(labels, row.to_id);
-                LocalMessageStatus::ReadBy(to_label)
-            } else {
-                LocalMessageStatus::Sent
-            }
-        }
-    }
-}
-
-fn local_message_status_text(status: &LocalMessageStatus) -> String {
-    match status {
-        LocalMessageStatus::Unread => "unread".to_string(),
-        LocalMessageStatus::Read => "read".to_string(),
-        LocalMessageStatus::Sent => "sent".to_string(),
-        LocalMessageStatus::ReadBy(label) => format!("read-by:{label}"),
-        LocalMessageStatus::Other => "other".to_string(),
-    }
-}
-
-fn local_message_status_color(status: &LocalMessageStatus) -> egui::Color32 {
-    match status {
-        LocalMessageStatus::Unread => color_unread(),
-        LocalMessageStatus::Read => color_read(),
-        LocalMessageStatus::Sent => color_sent(),
-        LocalMessageStatus::ReadBy(_) => color_readby(),
-        LocalMessageStatus::Other => color_other(),
-    }
-}
-
-fn render_local_status_chip(ui: &mut egui::Ui, status: &LocalMessageStatus) {
-    let fill = local_message_status_color(status);
-    let text_color = colorhash::text_color_on(fill);
-    let label = truncate_single_line(&local_message_status_text(status), 40);
-    egui::Frame::NONE
-        .fill(fill)
-        .corner_radius(egui::CornerRadius::same(5))
-        .inner_margin(egui::Margin::symmetric(8, 2))
-        .show(ui, |ui| {
-            ui.label(egui::RichText::new(label).color(text_color).small());
-        });
-}
-
 fn render_person_chip(ui: &mut egui::Ui, label: &str, fill: egui::Color32) {
     let text_color = colorhash::text_color_on(fill);
     let label = truncate_single_line(label, 48);
@@ -6150,143 +6136,6 @@ fn render_person_chip(ui: &mut egui::Ui, label: &str, fill: egui::Color32) {
         .show(ui, |ui| {
             ui.label(egui::RichText::new(label).color(text_color).small());
         });
-}
-
-fn parse_response_json(raw: &str) -> Option<JsonValue> {
-    if let Ok(value) = serde_json::from_str::<JsonValue>(raw) {
-        return Some(value);
-    }
-
-    for line in raw.lines().rev() {
-        if let Ok(event) = serde_json::from_str::<JsonValue>(line) {
-            if event.get("type").and_then(JsonValue::as_str) == Some("response.completed") {
-                if let Some(response) = event.get("response") {
-                    return Some(response.clone());
-                }
-            }
-        }
-    }
-
-    None
-}
-
-fn extract_reasoning_summaries(response: &JsonValue) -> Vec<String> {
-    let mut summaries = Vec::new();
-    if let Some(output) = response.get("output").and_then(JsonValue::as_array) {
-        for item in output {
-            let Some(item_type) = item.get("type").and_then(JsonValue::as_str) else {
-                continue;
-            };
-            if item_type != "reasoning" {
-                continue;
-            }
-
-            let Some(summary_items) = item.get("summary").and_then(JsonValue::as_array) else {
-                continue;
-            };
-            for entry in summary_items {
-                if entry.get("type").and_then(JsonValue::as_str) != Some("summary_text") {
-                    continue;
-                }
-                if let Some(text) = entry.get("text").and_then(JsonValue::as_str) {
-                    summaries.push(text.to_string());
-                }
-            }
-        }
-    }
-
-    if let Some(choices) = response.get("choices").and_then(JsonValue::as_array) {
-        for choice in choices {
-            if let Some(message) = choice.get("message") {
-                collect_chat_reasoning_chunks(message, &mut summaries);
-            }
-            if let Some(delta) = choice.get("delta") {
-                collect_chat_reasoning_chunks(delta, &mut summaries);
-            }
-        }
-    }
-
-    summaries
-}
-
-fn collect_chat_reasoning_chunks(node: &JsonValue, out: &mut Vec<String>) {
-    for key in ["thinking", "reasoning", "reasoning_content"] {
-        if let Some(value) = node.get(key) {
-            collect_reasoning_value(value, out);
-        }
-    }
-    if let Some(content) = node.get("content").and_then(JsonValue::as_array) {
-        for part in content {
-            let kind = part
-                .get("type")
-                .and_then(JsonValue::as_str)
-                .unwrap_or_default();
-            if kind == "thinking"
-                || kind == "reasoning"
-                || kind == "reasoning_content"
-                || kind == "summary_text"
-            {
-                if let Some(text) = part
-                    .get("text")
-                    .and_then(JsonValue::as_str)
-                    .or_else(|| part.get("content").and_then(JsonValue::as_str))
-                {
-                    push_reasoning(out, text);
-                }
-                for key in ["thinking", "reasoning", "reasoning_content"] {
-                    if let Some(value) = part.get(key) {
-                        collect_reasoning_value(value, out);
-                    }
-                }
-            }
-        }
-    }
-    if let Some(summary_items) = node.get("summary").and_then(JsonValue::as_array) {
-        for entry in summary_items {
-            if entry.get("type").and_then(JsonValue::as_str) == Some("summary_text")
-                && let Some(text) = entry.get("text").and_then(JsonValue::as_str)
-            {
-                push_reasoning(out, text);
-            }
-        }
-    }
-}
-
-fn collect_reasoning_value(value: &JsonValue, out: &mut Vec<String>) {
-    if let Some(text) = value.as_str() {
-        push_reasoning(out, text);
-        return;
-    }
-    if let Some(array) = value.as_array() {
-        for item in array {
-            collect_reasoning_value(item, out);
-        }
-        return;
-    }
-    if let Some(object) = value.as_object() {
-        if let Some(text) = object.get("text").and_then(JsonValue::as_str) {
-            push_reasoning(out, text);
-        }
-        if let Some(content) = object.get("content") {
-            collect_reasoning_value(content, out);
-        }
-    }
-}
-
-fn push_reasoning(out: &mut Vec<String>, text: &str) {
-    let trimmed = text.trim();
-    if !trimmed.is_empty() {
-        out.push(trimmed.to_string());
-    }
-}
-
-fn exec_status_text(status: ExecStatus) -> &'static str {
-    match status {
-        ExecStatus::Pending => "pending",
-        ExecStatus::Running => "running",
-        ExecStatus::Done => "done",
-        ExecStatus::Failed => "failed",
-    }
 }
 
 fn format_age(now_key: i128, maybe_key: Option<i128>) -> String {
@@ -6378,10 +6227,6 @@ fn archive_handle_prefix(handle: Value<Handle<Blake3, SimpleArchive>>) -> String
         out.push_str(&format!("{byte:02x}"));
     }
     out
-}
-
-fn format_id(labels: &HashMap<Id, String>, id: Id) -> String {
-    labels.get(&id).cloned().unwrap_or_else(|| id_prefix(id))
 }
 
 fn repo_root() -> PathBuf {
