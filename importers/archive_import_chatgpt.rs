@@ -337,7 +337,7 @@ fn import_chatgpt_parsed_file(
                 common::metadata::tag: common::archive::kind_message,
                 common::archive::author: author_id,
                 common::archive::content: content_handle,
-                common::archive::created_at: created_at,
+                common::metadata::created_at: created_at,
                 common::archive::content_type?: content_type,
                 common::archive::attachment*: attachment_ids,
                 common::archive::reply_to?: reply_to,

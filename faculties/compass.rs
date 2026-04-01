@@ -399,18 +399,16 @@ fn active_priority_edges(space: &TribleSet) -> HashSet<(Id, Id)> {
     latest.into_iter().filter(|(_, (_, active))| *active).map(|(k, _)| k).collect()
 }
 
-/// Check if `to` is an ancestor of `from` in the parent tree.
+/// Check if `to` is an ancestor of `from` (or `from` itself) in the parent tree.
 fn is_ancestor(space: &TribleSet, from: Id, to: Id) -> bool {
-    let mut current = from;
-    loop {
-        if current == to {
-            return true;
-        }
-        match task_parent(space, current) {
-            Some(parent) => current = parent,
-            None => return false,
-        }
-    }
+    from == to || exists!(
+        (_start: Id, _end: Id),
+        and!(
+            _start.is(from.to_value()),
+            _end.is(to.to_value()),
+            path!(space, _start board::parent+ _end)
+        )
+    )
 }
 
 /// Count notes for a task.

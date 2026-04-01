@@ -864,13 +864,18 @@ fn find_links(
         }
     } else {
         // id is a fragment — also collect links to any of its versions.
-        for vid in version_history_of(space, id) {
-            for s in find!(
+        let versions: Vec<Id> = version_history_of(space, id);
+        if !versions.is_empty() {
+            let version_set: std::collections::HashSet<Id> = versions.into_iter().collect();
+            incoming.extend(find!(
                 source: Id,
-                pattern!(space, [{ ?source @ wiki::links_to: &vid }])
-            ) {
-                incoming.push(s);
-            }
+                temp!((vid),
+                    and!(
+                        (&version_set).has(vid),
+                        pattern!(space, [{ ?source @ wiki::links_to: ?vid }])
+                    )
+                )
+            ));
         }
     }
     incoming.sort();
@@ -1643,16 +1648,13 @@ fn cmd_list(
             let mut backlink_tags: Vec<Id> = Vec::new();
             // Check backlinks to both the version and the fragment ID,
             // since existing data may reference either.
-            let mut all_backlinks: Vec<Id> = find!(
+            let all_backlinks: Vec<Id> = find!(
                 src: Id,
-                pattern!(&space, [{ ?src @ wiki::links_to: vid }])
+                or!(
+                    pattern!(&space, [{ ?src @ wiki::links_to: vid }]),
+                    pattern!(&space, [{ ?src @ wiki::links_to: frag_id }])
+                )
             ).collect();
-            all_backlinks.extend(find!(
-                src: Id,
-                pattern!(&space, [{ ?src @ wiki::links_to: frag_id }])
-            ));
-            all_backlinks.sort();
-            all_backlinks.dedup();
             let latest_backlinks: Vec<&Id> = all_backlinks.iter().filter(|s| latest_vids.contains(*s)).collect();
             if !all_backlinks.is_empty() || !latest_backlinks.is_empty() {
                 static DBG_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);

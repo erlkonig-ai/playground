@@ -14,7 +14,7 @@
 //! triblespace = "0.33"
 //! ```
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Once;
@@ -910,81 +910,106 @@ fn message_attachments(
     attachments.sort();
     attachments.dedup();
 
+    // Batch-query each attribute across ALL attachments at once (7 queries total
+    // instead of 7*N).
+    let source_ids: HashMap<Id, Value<Handle<Blake3, LongString>>> = find!(
+        (att: Id, handle: Value<Handle<Blake3, LongString>>),
+        pattern!(catalog, [{
+            message_id @ common::archive::attachment: ?att,
+        }, {
+            ?att @ common::archive::attachment_source_id: ?handle,
+        }])
+    )
+    .into_iter()
+    .collect();
+
+    let names: HashMap<Id, Value<Handle<Blake3, LongString>>> = find!(
+        (att: Id, handle: Value<Handle<Blake3, LongString>>),
+        pattern!(catalog, [{
+            message_id @ common::archive::attachment: ?att,
+        }, {
+            ?att @ common::archive::attachment_name: ?handle,
+        }])
+    )
+    .into_iter()
+    .collect();
+
+    let mimes: HashMap<Id, String> = find!(
+        (att: Id, mime: String),
+        pattern!(catalog, [{
+            message_id @ common::archive::attachment: ?att,
+        }, {
+            ?att @ common::archive::attachment_mime: ?mime,
+        }])
+    )
+    .into_iter()
+    .collect();
+
+    let sizes: HashMap<Id, Value<U256BE>> = find!(
+        (att: Id, size: Value<U256BE>),
+        pattern!(catalog, [{
+            message_id @ common::archive::attachment: ?att,
+        }, {
+            ?att @ common::archive::attachment_size_bytes: ?size,
+        }])
+    )
+    .into_iter()
+    .collect();
+
+    let widths: HashMap<Id, Value<U256BE>> = find!(
+        (att: Id, width: Value<U256BE>),
+        pattern!(catalog, [{
+            message_id @ common::archive::attachment: ?att,
+        }, {
+            ?att @ common::archive::attachment_width_px: ?width,
+        }])
+    )
+    .into_iter()
+    .collect();
+
+    let heights: HashMap<Id, Value<U256BE>> = find!(
+        (att: Id, height: Value<U256BE>),
+        pattern!(catalog, [{
+            message_id @ common::archive::attachment: ?att,
+        }, {
+            ?att @ common::archive::attachment_height_px: ?height,
+        }])
+    )
+    .into_iter()
+    .collect();
+
+    let has_data_set: HashSet<Id> = find!(
+        (att: Id),
+        pattern!(catalog, [{
+            message_id @ common::archive::attachment: ?att,
+        }, {
+            ?att @ common::archive::attachment_data: _?handle,
+        }])
+    )
+    .into_iter()
+    .map(|(a,)| a)
+    .collect();
+
     let mut out = Vec::new();
     for attachment_id in attachments {
-        let source_id = find!(
-            (handle: Value<Handle<Blake3, LongString>>),
-            pattern!(catalog, [{ attachment_id @ common::archive::attachment_source_id: ?handle }])
-        )
-        .into_iter()
-        .next()
-        .map(|(h,)| h);
-        let source_id = match source_id {
-            Some(h) => Some(load_longstring(ws, h)?),
+        let source_id = match source_ids.get(&attachment_id) {
+            Some(&h) => Some(load_longstring(ws, h)?),
             None => None,
         };
-
-        let name = find!(
-            (handle: Value<Handle<Blake3, LongString>>),
-            pattern!(catalog, [{ attachment_id @ common::archive::attachment_name: ?handle }])
-        )
-        .into_iter()
-        .next()
-        .map(|(h,)| h);
-        let name = match name {
-            Some(h) => Some(load_longstring(ws, h)?),
+        let name = match names.get(&attachment_id) {
+            Some(&h) => Some(load_longstring(ws, h)?),
             None => None,
         };
-
-        let mime = find!(
-            (mime: String),
-            pattern!(catalog, [{ attachment_id @ common::archive::attachment_mime: ?mime }])
-        )
-        .into_iter()
-        .next()
-        .map(|(m,)| m);
-
-        let size_bytes = find!(
-            (size: Value<U256BE>),
-            pattern!(catalog, [{ attachment_id @ common::archive::attachment_size_bytes: ?size }])
-        )
-        .into_iter()
-        .next()
-        .and_then(|(s,)| u256be_to_u64(s));
-
-        let width_px = find!(
-            (width: Value<U256BE>),
-            pattern!(catalog, [{ attachment_id @ common::archive::attachment_width_px: ?width }])
-        )
-        .into_iter()
-        .next()
-        .and_then(|(w,)| u256be_to_u64(w));
-
-        let height_px = find!(
-            (height: Value<U256BE>),
-            pattern!(catalog, [{ attachment_id @ common::archive::attachment_height_px: ?height }])
-        )
-        .into_iter()
-        .next()
-        .and_then(|(h,)| u256be_to_u64(h));
-
-        let has_data = find!(
-            (handle: Value<_>),
-            pattern!(catalog, [{ attachment_id @ common::archive::attachment_data: ?handle }])
-        )
-        .into_iter()
-        .next()
-        .is_some();
 
         out.push(AttachmentRecord {
             id: attachment_id,
             source_id,
             name,
-            mime,
-            size_bytes,
-            width_px,
-            height_px,
-            has_data,
+            mime: mimes.get(&attachment_id).cloned(),
+            size_bytes: sizes.get(&attachment_id).and_then(|&s| u256be_to_u64(s)),
+            width_px: widths.get(&attachment_id).and_then(|&w| u256be_to_u64(w)),
+            height_px: heights.get(&attachment_id).and_then(|&h| u256be_to_u64(h)),
+            has_data: has_data_set.contains(&attachment_id),
         });
     }
     Ok(out)

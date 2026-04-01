@@ -238,7 +238,7 @@ fn import_codex_records(
                 common::metadata::tag: common::archive::kind_message,
                 common::archive::author: author_id,
                 common::archive::content: content_handle,
-                common::archive::created_at: created_at,
+                common::metadata::created_at: created_at,
                 common::import_schema::source_author: ws.put(message.author.clone()),
                 common::import_schema::source_role: ws.put(message.role.clone()),
                 common::import_schema::source_created_at: created_at,

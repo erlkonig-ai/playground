@@ -282,7 +282,7 @@ fn import_claude_code_records(
                 common::metadata::tag: common::archive::kind_message,
                 common::archive::author: author_id,
                 common::archive::content: content_handle,
-                common::archive::created_at: created_at,
+                common::metadata::created_at: created_at,
                 common::archive::author_model?: model_handle,
                 common::import_schema::source_author: ws.put(msg.author.clone()),
                 common::import_schema::source_role: ws.put(msg.role.clone()),
