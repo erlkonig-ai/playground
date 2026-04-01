@@ -414,7 +414,7 @@ mod common {
             .checkout(*catalog_head..next_head)
             .context("checkout workspace delta")?;
         if !delta.is_empty() {
-            *catalog += delta;
+            *catalog += delta.into_facts();
         }
         *catalog_head = next_head;
         Ok(())

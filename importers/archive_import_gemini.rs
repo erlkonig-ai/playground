@@ -38,7 +38,7 @@ fn import_gemini_path(
     let mut ws = repo
         .pull(branch_id)
         .map_err(|e| anyhow!("pull workspace: {e:?}"))?;
-    let mut catalog = ws.checkout(..).context("checkout workspace")?;
+    let mut catalog = ws.checkout(..).context("checkout workspace")?.into_facts();
     let mut catalog_head = ws.head();
     println!("gemini phase pull: done in {:?}", start.elapsed());
 
