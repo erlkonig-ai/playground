@@ -60,7 +60,6 @@ mod board {
 
         "C1EAAA039DA7F486E4A54CC87D42E72C" as task: valueschemas::GenId;
         "61C44E0F8A73443ED592A713151E99A4" as status: valueschemas::ShortString;
-        "4FB34DB057497FB845B3816521A9A05E" as at: valueschemas::NsTAIInterval;
         "47351DF00B3DDA96CB305157CD53D781" as note: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
         "B88842D9D00361A0F2728C478C79D75C" as higher: valueschemas::GenId;
         "18F3446C9E9281A248D370A56395A3F0" as lower: valueschemas::GenId;
@@ -310,7 +309,7 @@ fn task_latest_status(space: &TribleSet, task_id: Id) -> Option<(String, Interva
             metadata::tag: &KIND_STATUS_ID,
             board::task: &task_id,
             board::status: ?status,
-            board::at: ?at,
+            metadata::created_at: ?at,
         }])
     )
     .max_by(|a, b| interval_key(a.1).cmp(&interval_key(b.1)))
@@ -373,7 +372,7 @@ fn active_priority_edges(space: &TribleSet) -> HashSet<(Id, Id)> {
             metadata::tag: &KIND_PRIORITIZE_ID,
             board::higher: ?higher,
             board::lower: ?lower,
-            board::at: ?at,
+            metadata::created_at: ?at,
         }])
     ) {
         let key = interval_key(at);
@@ -388,7 +387,7 @@ fn active_priority_edges(space: &TribleSet) -> HashSet<(Id, Id)> {
             metadata::tag: &KIND_DEPRIORITIZE_ID,
             board::higher: ?higher,
             board::lower: ?lower,
-            board::at: ?at,
+            metadata::created_at: ?at,
         }])
     ) {
         let key = interval_key(at);
@@ -750,7 +749,7 @@ fn cmd_add(
             metadata::tag: &KIND_STATUS_ID,
             board::task: &task_ref,
             board::status: status.as_str(),
-            board::at: now,
+            metadata::created_at: now,
         };
 
         if let Some(note) = note {
@@ -759,7 +758,7 @@ fn cmd_add(
                 metadata::tag: &KIND_NOTE_ID,
                 board::task: &task_ref,
                 board::note: ws.put(note),
-                board::at: now,
+                metadata::created_at: now,
             };
         }
 
@@ -819,7 +818,7 @@ fn cmd_move(
             metadata::tag: &KIND_STATUS_ID,
             board::task: &task_id,
             board::status: status.as_str(),
-            board::at: now,
+            metadata::created_at: now,
         };
 
         ws.commit(change, "move goal");
@@ -847,7 +846,7 @@ fn cmd_note(pile: &Path, _branch_name: &str, branch_id: Id, id: String, note: St
             metadata::tag: &KIND_NOTE_ID,
             board::task: &task_id,
             board::note: ws.put(note),
-            board::at: now,
+            metadata::created_at: now,
         };
 
         ws.commit(change, "add goal note");
@@ -906,7 +905,7 @@ fn cmd_show(pile: &Path, _branch_name: &str, branch_id: Id, id: String) -> Resul
                 metadata::tag: &KIND_STATUS_ID,
                 board::task: &task_id,
                 board::status: ?status,
-                board::at: ?at,
+                metadata::created_at: ?at,
             }])
         ).map(|(status, at)| (status, interval_key(at), format_interval(at))).collect();
         if !history.is_empty() {
@@ -926,7 +925,7 @@ fn cmd_show(pile: &Path, _branch_name: &str, branch_id: Id, id: String) -> Resul
                 metadata::tag: &KIND_NOTE_ID,
                 board::task: &task_id,
                 board::note: ?note_handle,
-                board::at: ?at,
+                metadata::created_at: ?at,
             }])
         )
         .filter_map(|(h, at)| read_text(&mut ws, h).ok().map(|text| (text, interval_key(at), format_interval(at))))
@@ -1002,7 +1001,7 @@ fn cmd_prioritize(
             metadata::tag: &KIND_PRIORITIZE_ID,
             board::higher: &higher_id,
             board::lower: &lower_id,
-            board::at: now,
+            metadata::created_at: now,
         };
 
         ws.commit(change, "prioritize goal");
@@ -1045,7 +1044,7 @@ fn cmd_deprioritize(
             metadata::tag: &KIND_DEPRIORITIZE_ID,
             board::higher: &higher_id,
             board::lower: &lower_id,
-            board::at: now,
+            metadata::created_at: now,
         };
 
         ws.commit(change, "deprioritize goal");

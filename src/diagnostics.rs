@@ -78,7 +78,6 @@ mod compass {
 
         "C1EAAA039DA7F486E4A54CC87D42E72C" as pub task: GenId;
         "61C44E0F8A73443ED592A713151E99A4" as pub status: ShortString;
-        "4FB34DB057497FB845B3816521A9A05E" as pub at: NsTAIInterval;
         "47351DF00B3DDA96CB305157CD53D781" as pub note: Handle<Blake3, LongString>;
     }
 }
@@ -895,7 +894,7 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
             for (id, ts) in find!(
                 (id: Id, ts: Value<NsTAIInterval>),
                 and!(
-                    pattern!(&compass_data, [{ ?id @ compass::at: ?ts }]),
+                    pattern!(&compass_data, [{ ?id @ metadata::created_at: ?ts }]),
                     compass_data.value_in_range(ts, min_ts, max_ts),
                 )
             ) {
@@ -1028,7 +1027,7 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
                     TimelineSource::LocalMessages => load_ts(&local_data, metadata::created_at),
                     TimelineSource::Teams => load_ts(&teams_data, metadata::created_at),
                     TimelineSource::Goals => load_ts(&compass_data, metadata::created_at)
-                        .or_else(|| load_ts(&compass_data, compass::at)),
+                        .or_else(|| load_ts(&compass_data, metadata::created_at)),
                     TimelineSource::Wiki => {
                         find!(
                             v: Value<NsTAIInterval>,
@@ -4225,7 +4224,7 @@ fn render_compass_swimlanes_live(
             metadata::tag: &COMPASS_KIND_STATUS_ID,
             compass::task: ?task_id,
             compass::status: ?status,
-            compass::at: ?at,
+            metadata::created_at: ?at,
         }])
     ) {
         let at_key = interval_key(at);
@@ -4277,7 +4276,7 @@ fn render_compass_swimlanes_live(
                 metadata::tag: &COMPASS_KIND_NOTE_ID,
                 compass::task: &goal_id,
                 compass::note: ?note_handle,
-                compass::at: ?at,
+                metadata::created_at: ?at,
             }])
         ) {
             let body = ws

@@ -78,7 +78,6 @@ mod board {
 
         "C1EAAA039DA7F486E4A54CC87D42E72C" as task: valueschemas::GenId;
         "61C44E0F8A73443ED592A713151E99A4" as status: valueschemas::ShortString;
-        "4FB34DB057497FB845B3816521A9A05E" as at: valueschemas::NsTAIInterval;
     }
 }
 
@@ -303,7 +302,7 @@ fn task_latest_status(space: &TribleSet, task_id: Id) -> Option<(String, Interva
             metadata::tag: &KIND_STATUS_ID,
             board::task: &task_id,
             board::status: ?status,
-            board::at: ?at,
+            metadata::created_at: ?at,
         }])
     )
     .max_by(|a, b| interval_key(a.1).cmp(&interval_key(b.1)))
