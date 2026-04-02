@@ -114,14 +114,14 @@ pub(crate) fn run_exec_loop(
             };
 
             let started_e = now_epoch();
-            let ordered_started_at = epoch_interval(started_e);
+            let started_at = epoch_interval(started_e);
             let in_progress_id = ufoid();
             let mut change = TribleSet::new();
             change += entity! { &in_progress_id @
                 metadata::tag: playground_exec::kind_in_progress,
                 playground_exec::about_request: request.id,
                 playground_exec::worker: worker_id,
-                metadata::started_at: ordered_started_at,
+                metadata::started_at: started_at,
                 playground_exec::attempt: attempt,
             };
             ws.commit(change, "playground_exec in_progress");
@@ -172,14 +172,14 @@ pub(crate) fn run_exec_loop(
             } = output;
             let duration_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
             let finished_e = now_epoch();
-            let ordered_finished_at = epoch_interval(finished_e);
+            let finished_at = epoch_interval(finished_e);
 
             let result_id = ufoid();
             let mut change = TribleSet::new();
             change += entity! { &result_id @
                 metadata::tag: playground_exec::kind_command_result,
                 playground_exec::about_request: request.id,
-                metadata::finished_at: ordered_finished_at,
+                metadata::finished_at: finished_at,
                 playground_exec::attempt: attempt,
                 playground_exec::duration_ms: duration_ms,
             };

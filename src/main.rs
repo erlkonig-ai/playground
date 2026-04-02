@@ -2174,8 +2174,8 @@ fn load_context_chunks(catalog: &TribleSet) -> ContextChunkIndex {
             ?chunk_id @
             metadata::tag: playground_context::kind_chunk,
             playground_context::summary: ?summary,
-            playground_context::ordered_start_at: ?start_at,
-            playground_context::ordered_end_at: ?end_at,
+            playground_context::start_at: ?start_at,
+            playground_context::end_at: ?end_at,
         }])
     ) {
         index.chunks.insert(

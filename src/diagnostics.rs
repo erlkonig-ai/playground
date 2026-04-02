@@ -78,7 +78,7 @@ mod compass {
 
         "C1EAAA039DA7F486E4A54CC87D42E72C" as pub task: GenId;
         "61C44E0F8A73443ED592A713151E99A4" as pub status: ShortString;
-        "4FB34DB057497FB845B3816521A9A05E" as pub ordered_at: NsTAIInterval;
+        "4FB34DB057497FB845B3816521A9A05E" as pub at: NsTAIInterval;
         "47351DF00B3DDA96CB305157CD53D781" as pub note: Handle<Blake3, LongString>;
     }
 }
@@ -895,7 +895,7 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
             for (id, ts) in find!(
                 (id: Id, ts: Value<NsTAIInterval>),
                 and!(
-                    pattern!(&compass_data, [{ ?id @ compass::ordered_at: ?ts }]),
+                    pattern!(&compass_data, [{ ?id @ compass::at: ?ts }]),
                     compass_data.value_in_range(ts, min_ts, max_ts),
                 )
             ) {
@@ -1028,7 +1028,7 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
                     TimelineSource::LocalMessages => load_ts(&local_data, metadata::created_at),
                     TimelineSource::Teams => load_ts(&teams_data, metadata::created_at),
                     TimelineSource::Goals => load_ts(&compass_data, metadata::created_at)
-                        .or_else(|| load_ts(&compass_data, compass::ordered_at)),
+                        .or_else(|| load_ts(&compass_data, compass::at)),
                     TimelineSource::Wiki => {
                         find!(
                             v: Value<NsTAIInterval>,
@@ -1168,7 +1168,7 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
                                     }
                                 }
                                 TimelineSource::Cognition => {
-                                    // selected_id is the result entity (has ordered_finished_at).
+                                    // selected_id is the result entity (has metadata::finished_at).
                                     // Request entity (model, context) linked via about_request.
                                     let request_id: Option<Id> = find!(
                                         rid: Id,
@@ -1888,7 +1888,7 @@ fn apply_branch_defaults(state: &mut DashboardState) {
         return;
     }
 
-    // Find the latest config entity by ordered_updated_at.
+    // Find the latest config entity by metadata::updated_at.
     let mut latest: Option<(Id, i128)> = None;
     for (config_id, updated_at) in find!(
         (config_id: Id, updated_at: Value<NsTAIInterval>),
@@ -2571,8 +2571,8 @@ fn collect_context_chunks(data: &TribleSet) -> Vec<ContextChunkRow> {
             ?chunk_id @
             metadata::tag: playground_context::kind_chunk,
             playground_context::summary: ?summary,
-            playground_context::ordered_start_at: ?start_at,
-            playground_context::ordered_end_at: ?end_at,
+            playground_context::start_at: ?start_at,
+            playground_context::end_at: ?end_at,
         }])
     ) {
         rows.insert(
@@ -4225,7 +4225,7 @@ fn render_compass_swimlanes_live(
             metadata::tag: &COMPASS_KIND_STATUS_ID,
             compass::task: ?task_id,
             compass::status: ?status,
-            compass::ordered_at: ?at,
+            compass::at: ?at,
         }])
     ) {
         let at_key = interval_key(at);
@@ -4277,7 +4277,7 @@ fn render_compass_swimlanes_live(
                 metadata::tag: &COMPASS_KIND_NOTE_ID,
                 compass::task: &goal_id,
                 compass::note: ?note_handle,
-                compass::ordered_at: ?at,
+                compass::at: ?at,
             }])
         ) {
             let body = ws

@@ -308,14 +308,14 @@ pub(crate) fn run_model_loop(
                 Ok(messages) => messages,
                 Err(err) => {
                     let finished_e = now_epoch();
-                    let ordered_finished_at = epoch_interval(finished_e);
+                    let finished_at = epoch_interval(finished_e);
                     let result_id = ufoid();
                     let handle = ws.put(format!("parse chat context: {err}"));
                     let mut change = TribleSet::new();
                     change += entity! { &result_id @
                         metadata::tag: model_chat::kind_result,
                         model_chat::about_request: request.id,
-                        metadata::finished_at: ordered_finished_at,
+                        metadata::finished_at: finished_at,
                         model_chat::attempt: attempt,
                         model_chat::error: handle,
                     };
@@ -330,7 +330,7 @@ pub(crate) fn run_model_loop(
                 serde_json::to_string(&payload).context("serialize request payload")?;
 
             let started_e = now_epoch();
-            let ordered_started_at = epoch_interval(started_e);
+            let started_at = epoch_interval(started_e);
             let in_progress_id = ufoid();
             let request_raw_handle = ws.put(request_raw);
 
@@ -341,7 +341,7 @@ pub(crate) fn run_model_loop(
             change += entity! { &in_progress_id @
                 metadata::tag: model_chat::kind_in_progress,
                 model_chat::about_request: request.id,
-                metadata::started_at: ordered_started_at,
+                metadata::started_at: started_at,
                 model_chat::worker: worker_id,
                 model_chat::attempt: attempt,
             };
@@ -351,13 +351,13 @@ pub(crate) fn run_model_loop(
             let result = client.send_payload(&payload);
 
             let finished_e = now_epoch();
-            let ordered_finished_at = epoch_interval(finished_e);
+            let finished_at = epoch_interval(finished_e);
             let result_id = ufoid();
             let mut change = TribleSet::new();
             change += entity! { &result_id @
                 metadata::tag: model_chat::kind_result,
                 model_chat::about_request: request.id,
-                metadata::finished_at: ordered_finished_at,
+                metadata::finished_at: finished_at,
                 model_chat::attempt: attempt,
             };
 
