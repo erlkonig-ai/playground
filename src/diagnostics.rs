@@ -73,13 +73,11 @@ mod compass {
 
     attributes! {
         "EE18CEC15C18438A2FAB670E2E46E00C" as pub title: Handle<Blake3, LongString>;
-        "F9B56611861316B31A6C510B081C30B3" as pub created_at: ShortString;
         "5FF4941DCC3F6C35E9B3FD57216F69ED" as pub tag: ShortString;
         "9D2B6EBDA67E9BB6BE6215959D182041" as pub parent: GenId;
 
         "C1EAAA039DA7F486E4A54CC87D42E72C" as pub task: GenId;
         "61C44E0F8A73443ED592A713151E99A4" as pub status: ShortString;
-        "8200ADEDC8D4D3D6D01CDC7396DF9AEC" as pub at: ShortString;
         "4FB34DB057497FB845B3816521A9A05E" as pub ordered_at: NsTAIInterval;
         "47351DF00B3DDA96CB305157CD53D781" as pub note: Handle<Blake3, LongString>;
     }
