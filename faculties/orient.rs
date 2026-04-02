@@ -51,7 +51,6 @@ mod local {
         "42C4DB210F7EAFAF38F179ADCB4A9D5B" as from: valueschemas::GenId;
         "95D58D3E68A43979F8AA51415541414C" as to: valueschemas::GenId;
         "23075866B369B5F393D43B30649469F6" as body: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
-        "5FA453867880877B613B7632A233419B" as created_at: valueschemas::NsTAIInterval;
 
         "2213B191326E9B99605FA094E516E50E" as about_message: valueschemas::GenId;
         "99E92F483731FA6D59115A8D6D187A37" as reader: valueschemas::GenId;
@@ -64,7 +63,6 @@ mod config_schema {
 
     attributes! {
         "79F990573A9DCC91EF08A5F8CBA7AA25" as kind: valueschemas::GenId;
-        "5E32E36AD28B0B1E035D2DFCC20A3DC5" as updated_at: valueschemas::NsTAIInterval;
         "D1DC11B303725409AB8A30C6B59DB2D7" as persona_id: valueschemas::GenId;
     }
 }
@@ -75,7 +73,6 @@ mod board {
     use super::*;
     attributes! {
         "EE18CEC15C18438A2FAB670E2E46E00C" as title: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
-        "E915C4D678D0F484B89B4E85E55DB442" as created_at: valueschemas::NsTAIInterval;
         "5FF4941DCC3F6C35E9B3FD57216F69ED" as tag: valueschemas::ShortString;
         "9D2B6EBDA67E9BB6BE6215959D182041" as parent: valueschemas::GenId;
 
@@ -228,7 +225,7 @@ fn load_message_ids(space: &TribleSet) -> Vec<MessageRow> {
             metadata::tag: &KIND_MESSAGE_ID,
             local::from: ?from,
             local::to: ?to,
-            local::created_at: ?created_at,
+            metadata::created_at: ?created_at,
         }])
     )
     .map(|(id, from, to, created_at)| MessageRow {
@@ -335,7 +332,7 @@ fn load_config_identity(
         pattern!(&space, [{
             ?config_id @
             metadata::tag: &CONFIG_KIND_ID,
-            config_schema::updated_at: ?updated_at,
+            metadata::updated_at: ?updated_at,
         }])
     ) {
         let key = interval_key(updated_at);
@@ -456,7 +453,7 @@ fn cmd_show(pile: &Path, message_limit: usize, doing_limit: usize, todo_limit: u
             let (status, status_at) = task_latest_status(&compass_space, task_id)
                 .map(|(s, at)| (s.to_lowercase(), Some(interval_key(at))))
                 .unwrap_or_else(|| ("todo".to_string(), None));
-            let created_key: i128 = find!(s: IntervalValue, pattern!(&compass_space, [{ task_id @ board::created_at: ?s }]))
+            let created_key: i128 = find!(s: IntervalValue, pattern!(&compass_space, [{ task_id @ metadata::created_at: ?s }]))
                 .next().map(interval_key).unwrap_or(0);
             let sort_key = status_at.unwrap_or(created_key);
             if status == "doing" {

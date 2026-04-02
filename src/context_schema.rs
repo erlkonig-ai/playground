@@ -11,7 +11,6 @@ pub mod playground_context {
 
     attributes! {
         "3292CF0B3B6077991D8ECE6E2973D4B6" as pub summary: Handle<Blake3, LongString>;
-        "4036F38AB05D26764A1E5E456337F399" as pub ordered_created_at: NsTAIInterval;
         "502F7D33822A90366F0F0ADA0556177F" as pub ordered_start_at: NsTAIInterval;
         "DF84E872EB68FBFCA63D760F27FD8A6F" as pub ordered_end_at: NsTAIInterval;
         "CB97C36A32DEC70E0D1149E7C5D88588" as pub left: GenId;

@@ -51,7 +51,6 @@ mod reason_events {
 
     attributes! {
         "B10329D5D1087D15A3DAFF7A7CC50696" as text: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
-        "79C9CB4C48864D28B215D4264E1037BF" as ordered_created_at: valueschemas::NsTAIInterval;
         "E6B1C728F1AE9F46CAB4DBB60D1A9528" as about_turn: valueschemas::GenId;
         "721DED6DA776F2CF4FB91C54D9F82358" as worker: valueschemas::GenId;
         "514F4FE9F560FB155450462C8CF50749" as command_text: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
@@ -873,7 +872,7 @@ fn create_thought_and_request(
     change += entity! { &thought_id @
         metadata::tag: playground_cog::kind_thought,
         playground_cog::context: context_handle,
-        playground_cog::ordered_created_at: now_ordered,
+        metadata::created_at: now_ordered,
     };
     if let Some(exec_result_id) = about_exec_result {
         change += entity! { &thought_id @ playground_cog::about_exec_result: exec_result_id };
@@ -884,7 +883,7 @@ fn create_thought_and_request(
         metadata::tag: model_chat::kind_request,
         model_chat::about_thought: *thought_id,
         model_chat::context: context_handle,
-        model_chat::ordered_requested_at: now_ordered,
+        metadata::created_at: now_ordered,
         model_chat::model: config.model.model.as_str(),
     };
 
@@ -920,7 +919,7 @@ fn create_request_for_thought_from_catalog(
         metadata::tag: model_chat::kind_request,
         model_chat::about_thought: thought_id,
         model_chat::context: context_handle,
-        model_chat::ordered_requested_at: now_ordered,
+        metadata::created_at: now_ordered,
         model_chat::model: config.model.model.as_str(),
     };
     ws.commit(change, "create model request");
@@ -952,7 +951,7 @@ fn retry_model_request(
             metadata::tag: model_chat::kind_request,
             model_chat::about_thought: thought_id,
             model_chat::context: context_handle,
-            model_chat::ordered_requested_at: now_ordered,
+            metadata::created_at: now_ordered,
             model_chat::model: config.model.model.as_str(),
         };
         ws.commit(change, "retry model request");
@@ -1134,7 +1133,7 @@ fn latest_pending_model_request(catalog: &TribleSet) -> Option<ModelRequestInfo>
     .map(|request_id| {
         let requested_at = find!(
             ts: Value<NsTAIInterval>,
-            pattern!(catalog, [{ request_id @ model_chat::ordered_requested_at: ?ts }])
+            pattern!(catalog, [{ request_id @ metadata::created_at: ?ts }])
         )
         .next()
         .map(|ts| interval_key(ts))
@@ -1179,7 +1178,7 @@ fn latest_unrequested_thought(catalog: &TribleSet) -> Option<Id> {
     .map(|thought_id| {
         let created_at = find!(
             ts: Value<NsTAIInterval>,
-            pattern!(catalog, [{ thought_id @ playground_cog::ordered_created_at: ?ts }])
+            pattern!(catalog, [{ thought_id @ metadata::created_at: ?ts }])
         )
         .next()
         .map(|ts| interval_key(ts))
@@ -1239,7 +1238,7 @@ fn latest_model_result(catalog: &TribleSet, request_id: Id) -> Option<ModelResul
     .map(|result_id| {
             let finished_at = find!(
                 ts: Value<NsTAIInterval>,
-                pattern!(catalog, [{ result_id @ model_chat::ordered_finished_at: ?ts }])
+                pattern!(catalog, [{ result_id @ metadata::finished_at: ?ts }])
             )
             .next();
 
@@ -1289,7 +1288,7 @@ fn reason_events_for_turn(catalog: &TribleSet, turn_id: Id) -> Vec<ReasonEventIn
     .map(|reason_id| {
         let created_at = find!(
             ts: Value<NsTAIInterval>,
-            pattern!(catalog, [{ reason_id @ reason_events::ordered_created_at: ?ts }])
+            pattern!(catalog, [{ reason_id @ metadata::created_at: ?ts }])
         )
         .next()
         .map(|ts| interval_key(ts))
@@ -1380,7 +1379,7 @@ fn latest_moment_boundary_turn_id(catalog: &TribleSet) -> Option<Id> {
     .filter_map(|(boundary_id, turn_id)| {
         let created = find!(
             ts: Value<NsTAIInterval>,
-            pattern!(catalog, [{ boundary_id @ playground_cog::ordered_created_at: ?ts }])
+            pattern!(catalog, [{ boundary_id @ metadata::created_at: ?ts }])
         )
         .next()
         .map(|ts| interval_key(ts))?;
@@ -1427,7 +1426,7 @@ fn fill_command_result_fields(catalog: &TribleSet, info: &mut CommandResultInfo)
 
     info.finished_at = find!(
         ts: Value<NsTAIInterval>,
-        pattern!(catalog, [{ result_id @ playground_exec::ordered_finished_at: ?ts }])
+        pattern!(catalog, [{ result_id @ metadata::finished_at: ?ts }])
     )
     .next();
 
@@ -1518,7 +1517,7 @@ fn ensure_command_request(
     change += entity! { &request_id @
         metadata::tag: playground_exec::kind_command_request,
         playground_exec::command_text: command_handle,
-        playground_exec::ordered_requested_at: now_ordered,
+        metadata::created_at: now_ordered,
     };
     if let Some(thought_id) = thought_id {
         change += entity! { &request_id @ playground_exec::about_thought: thought_id };
@@ -1749,6 +1748,14 @@ fn build_context_messages(
             let timestamp = format_tai_interval_timestamp(finished_at);
             let output = format!("{timestamp}\n{}", format_moment_output(&exec_output));
             turn_cost += projection.command.chars().count() + output.chars().count();
+            // Images in blob refs are resolved to base64 at send time but the
+            // char-based budget only sees the short marker text.  Budget each
+            // image at ~1600 tokens (Anthropic's max per image) so we don't
+            // silently overshoot the context window.
+            let image_refs = count_blob_image_refs(&output)
+                + count_blob_image_refs(&projection.command);
+            turn_cost += image_refs * IMAGE_TOKENS_ESTIMATE
+                * config.model.chars_per_token.max(1) as usize;
             turn_messages.push(ChatMessage::assistant(projection.command));
             turn_messages.push(ChatMessage::user(output));
 
@@ -1807,6 +1814,20 @@ fn context_body_budget_chars(config: &Config) -> usize {
 
 fn u128_to_usize_saturating(value: u128) -> usize {
     usize::try_from(value).unwrap_or(usize::MAX)
+}
+
+/// Conservative estimate of tokens per inline image.  Anthropic tokenizes
+/// images by pixel area (~1 token per 32×32 tile, max 1568×1568 → ~2400
+/// tiles).  We use 1600 as a pragmatic upper bound that covers most
+/// real-world images without being wildly pessimistic.
+const IMAGE_TOKENS_ESTIMATE: usize = 1600;
+
+/// Count `![…](files:…)` blob-ref markers in a string.  These get resolved
+/// to base64 image blocks at send time; the budget must account for their
+/// token cost even though the marker text is short.
+fn count_blob_image_refs(text: &str) -> usize {
+    // Fast substring scan — no need to fully parse.
+    text.matches("](files:").count()
 }
 
 fn resolve_moment_boundary_end_key(

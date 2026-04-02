@@ -195,8 +195,8 @@ fn cmd_health(space: &TribleSet, ws: &mut Workspace<Pile<valueschemas::Blake3>>)
 
     println!("=== GAUGE: Research Health ===");
     println!();
-    println!("Fragments: {total}");
-    println!("Links: {link_count} ({:.1} per fragment)", link_count as f64 / total as f64);
+    println!("Versions: {total}");
+    println!("Links: {link_count} ({:.1} per version)", link_count as f64 / total as f64);
     println!("Orphans: {orphan_count} ({:.0}%)", 100.0 * orphan_count as f64 / total as f64);
     println!();
     println!("--- Epistemic Status ---");
@@ -232,7 +232,7 @@ fn cmd_health(space: &TribleSet, ws: &mut Workspace<Pile<valueschemas::Blake3>>)
         println!("  Predictions: {prediction} made ({refuted} refuted, track outcomes!)");
     }
     if review > 0 {
-        println!("  Review density: {:.1} reviews per published fragment",
+        println!("  Review density: {:.1} reviews per published finding",
             review as f64 / published.max(1) as f64);
     }
     println!();

@@ -90,7 +90,6 @@ mod config_schema {
     use super::*;
 
     attributes! {
-        "5E32E36AD28B0B1E035D2DFCC20A3DC5" as updated_at: NsTAIInterval;
         "328B29CE81665EE719C5A6E91695D4D4" as tavily_api_key: Handle<Blake3, LongString>;
         "AB0DF9F03F28A27A6DB95B693CC0EC53" as exa_api_key: Handle<Blake3, LongString>;
     }
@@ -339,7 +338,7 @@ fn latest_config_id(space: &TribleSet) -> Result<Option<Id>> {
         pattern!(space, [{
             ?config_id @
             metadata::tag: CONFIG_KIND_ID,
-            config_schema::updated_at: ?updated_at,
+            metadata::updated_at: ?updated_at,
         }])
     ) {
         let key = interval_key(updated_at);

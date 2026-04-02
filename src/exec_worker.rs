@@ -121,7 +121,7 @@ pub(crate) fn run_exec_loop(
                 metadata::tag: playground_exec::kind_in_progress,
                 playground_exec::about_request: request.id,
                 playground_exec::worker: worker_id,
-                playground_exec::ordered_started_at: ordered_started_at,
+                metadata::started_at: ordered_started_at,
                 playground_exec::attempt: attempt,
             };
             ws.commit(change, "playground_exec in_progress");
@@ -179,7 +179,7 @@ pub(crate) fn run_exec_loop(
             change += entity! { &result_id @
                 metadata::tag: playground_exec::kind_command_result,
                 playground_exec::about_request: request.id,
-                playground_exec::ordered_finished_at: ordered_finished_at,
+                metadata::finished_at: ordered_finished_at,
                 playground_exec::attempt: attempt,
                 playground_exec::duration_ms: duration_ms,
             };
@@ -484,7 +484,7 @@ fn next_pending_request(catalog: &TribleSet, worker_id: Id) -> Option<CommandReq
     candidates.sort_by_key(|(id, _)| {
         find!(
             (ts: Value<NsTAIInterval>),
-            pattern!(catalog, [{ *id @ playground_exec::ordered_requested_at: ?ts }])
+            pattern!(catalog, [{ *id @ metadata::created_at: ?ts }])
         )
         .next()
         .map(|(ts,)| interval_key(ts))

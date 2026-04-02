@@ -220,7 +220,7 @@ fn load_latest_config(
         pattern!(catalog, [{
             ?config_id @
             metadata::tag: playground_config::kind_config,
-            playground_config::ordered_updated_at: ?updated_at,
+            metadata::updated_at: ?updated_at,
         }])
     ) {
         let key = interval_key(updated_at);
@@ -370,7 +370,7 @@ fn load_latest_model_profile(
         pattern!(catalog, [{
             ?entry_id @
             metadata::tag: playground_config::kind_model_profile,
-            playground_config::ordered_updated_at: ?updated_at,
+            metadata::updated_at: ?updated_at,
             playground_config::model_profile_id: profile_id,
         }])
     ) {
@@ -479,7 +479,7 @@ fn store_config(ws: &mut Workspace<Pile>, config: &Config) -> Result<()> {
     let mut change = TribleSet::new();
     change += entity! { &config_id @
         metadata::tag: playground_config::kind_config,
-        playground_config::ordered_updated_at: now,
+        metadata::updated_at: now,
         playground_config::system_prompt: system_prompt,
         playground_config::branch: branch,
         playground_config::author: author,
@@ -522,7 +522,7 @@ fn store_config(ws: &mut Workspace<Pile>, config: &Config) -> Result<()> {
 
     change += entity! { &profile_entry_id @
         metadata::tag: playground_config::kind_model_profile,
-        playground_config::ordered_updated_at: now,
+        metadata::updated_at: now,
         playground_config::model_profile_id: profile_id,
         metadata::name: profile_name,
         playground_config::model_name: model_name,

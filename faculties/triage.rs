@@ -79,7 +79,6 @@ mod exec {
     attributes! {
         "AA2F34973589295FA70B538D92CD30F8" as kind: valueschemas::GenId;
         "79DD6A1A02E598033EDCE5C667E8E3E6" as command_text: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
-        "D8910A14B31096DF94DE9E807B87645F" as requested_at: valueschemas::NsTAIInterval;
         "C4C3870642CAB5F55E7E575B1A62E640" as about_request: valueschemas::GenId;
         "B68F9025545C7E616EB90C6440220348" as exit_code: valueschemas::U256BE;
         "CA7AF66AAF5105EC15625ED14E1A2AC0" as stdout_text: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
@@ -109,7 +108,6 @@ mod reason {
     use super::*;
     attributes! {
         "B10329D5D1087D15A3DAFF7A7CC50696" as text: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
-        "79C9CB4C48864D28B215D4264E1037BF" as created_at: valueschemas::NsTAIInterval;
         "E6B1C728F1AE9F46CAB4DBB60D1A9528" as about_turn: valueschemas::GenId;
         "514F4FE9F560FB155450462C8CF50749" as command_text: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
     }
@@ -675,7 +673,7 @@ fn collect_exec_state(
             ?request_id @
             metadata::tag: &KIND_EXEC_REQUEST_ID,
             exec::command_text: ?handle,
-            exec::requested_at: ?requested_at,
+            metadata::created_at: ?requested_at,
         }])
     ) {
         state.requests.insert(
@@ -847,7 +845,7 @@ fn collect_reason_state(
 
     for (reason_id, created_at) in find!(
         (reason_id: Id, created_at: Value<valueschemas::NsTAIInterval>),
-        pattern!(&space, [{ ?reason_id @ reason::created_at: ?created_at }])
+        pattern!(&space, [{ ?reason_id @ metadata::created_at: ?created_at }])
     ) {
         if let Some(row) = rows.get_mut(&reason_id) {
             row.created_at = Some(interval_key(created_at));
@@ -2172,7 +2170,7 @@ fn load_turn_context(
         pattern!(&space, [{
             ?request_id @
             metadata::tag: &KIND_EXEC_REQUEST_ID,
-            exec::requested_at: ?requested_at,
+            metadata::created_at: ?requested_at,
         }])
     ) {
         requests.push((request_id, interval_key(requested_at), None));
@@ -2519,7 +2517,7 @@ fn cmd_turn(
         pattern!(&space, [{
             ?request_id @
             metadata::tag: &KIND_EXEC_REQUEST_ID,
-            exec::requested_at: ?requested_at,
+            metadata::created_at: ?requested_at,
         }])
     ) {
         requests.push((request_id, interval_key(requested_at), None));

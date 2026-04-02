@@ -1,6 +1,5 @@
 use eframe::egui;
 use hifitime::Epoch;
-use serde_json::Value as JsonValue;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -32,9 +31,7 @@ use GORBIE::widgets::triblespace::PileRepoState;
 use GORBIE::widgets::{Button, TextField};
 
 use crate::blob_refs::{PromptChunk, split_blob_refs};
-use crate::chat_prompt::{ChatMessage, ChatRole};
 use crate::schema::model_chat;
-use crate::schema::playground_cog;
 use crate::schema::playground_config;
 use crate::schema::playground_context;
 use crate::schema::playground_exec;
@@ -42,7 +39,7 @@ use crate::schema::playground_exec;
 mod archive {
     use triblespace::macros::id_hex;
     use triblespace::prelude::blobschemas::LongString;
-    use triblespace::prelude::valueschemas::{Blake3, GenId, Handle, NsTAIInterval};
+    use triblespace::prelude::valueschemas::{Blake3, GenId, Handle};
     use triblespace::prelude::*;
 
     attributes! {
@@ -52,7 +49,6 @@ mod archive {
         "2D15150501ACCD9DFD96CB4BF19D1883" as pub author_role: Handle<Blake3, LongString>;
         "4FE6A8A43658BC2F61FEDF5CFB29EEFC" as pub author_model: Handle<Blake3, LongString>;
         "ACF09FF3D62B73983A222313FF0C52D2" as pub content: Handle<Blake3, LongString>;
-        "59FA7C04A43B96F31414D1B4544FAEC2" as pub ordered_created_at: NsTAIInterval;
     }
 
     #[allow(non_upper_case_globals)]
@@ -78,7 +74,6 @@ mod compass {
     attributes! {
         "EE18CEC15C18438A2FAB670E2E46E00C" as pub title: Handle<Blake3, LongString>;
         "F9B56611861316B31A6C510B081C30B3" as pub created_at: ShortString;
-        "E915C4D678D0F484B89B4E85E55DB442" as pub ordered_created_at: NsTAIInterval;
         "5FF4941DCC3F6C35E9B3FD57216F69ED" as pub tag: ShortString;
         "9D2B6EBDA67E9BB6BE6215959D182041" as pub parent: GenId;
 
@@ -87,20 +82,6 @@ mod compass {
         "8200ADEDC8D4D3D6D01CDC7396DF9AEC" as pub at: ShortString;
         "4FB34DB057497FB845B3816521A9A05E" as pub ordered_at: NsTAIInterval;
         "47351DF00B3DDA96CB305157CD53D781" as pub note: Handle<Blake3, LongString>;
-    }
-}
-
-mod reason_events {
-    use triblespace::prelude::attributes;
-    use triblespace::prelude::blobschemas;
-    use triblespace::prelude::valueschemas;
-
-    attributes! {
-        "B10329D5D1087D15A3DAFF7A7CC50696" as text: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
-        "79C9CB4C48864D28B215D4264E1037BF" as ordered_created_at: valueschemas::NsTAIInterval;
-        "E6B1C728F1AE9F46CAB4DBB60D1A9528" as about_turn: valueschemas::GenId;
-        "721DED6DA776F2CF4FB91C54D9F82358" as worker: valueschemas::GenId;
-        "514F4FE9F560FB155450462C8CF50749" as command_text: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
     }
 }
 
@@ -122,7 +103,6 @@ mod wiki {
 
 // ── Layout constants ────────────────────────────────────────────────
 const ACTIVITY_TIMELINE_HEIGHT: f32 = 980.0;
-const TURN_MEMORY_MAX_ROWS: usize = 160;
 const CONTEXT_TREE_HEIGHT: f32 = 720.0;
 const CONTEXT_ORIGIN_LIMIT: usize = 64;
 const LOCAL_COMPOSE_HEIGHT: f32 = 80.0;
@@ -186,11 +166,7 @@ fn color_doing() -> egui::Color32 { themes::ral(1003) }       // signal yellow
 fn color_blocked() -> egui::Color32 { themes::ral(3020) }     // traffic red
 fn color_done() -> egui::Color32 { themes::ral(5005) }        // signal blue
 
-fn color_unread() -> egui::Color32 { themes::ral(2010) }      // signal orange
 fn color_read() -> egui::Color32 { themes::ral(6017) }        // may green
-fn color_sent() -> egui::Color32 { themes::ral(7000) }        // squirrel grey
-fn color_readby() -> egui::Color32 { themes::ral(5015) }      // sky blue
-fn color_other() -> egui::Color32 { themes::ral(4008) }       // signal violet
 
 fn color_muted() -> egui::Color32 { themes::ral(7012) }       // basalt grey
 fn color_frame() -> egui::Color32 { themes::ral(7016) }       // anthracite grey
@@ -218,8 +194,6 @@ const RELATIONS_KIND_PERSON_ID: Id = id_hex!("D8ADDE47121F4E7868017463EC860726")
 const COMPASS_KIND_GOAL_ID: Id = id_hex!("83476541420F46402A6A9911F46FBA3B");
 const COMPASS_KIND_STATUS_ID: Id = id_hex!("89602B3277495F4E214D4A417C8CF260");
 const COMPASS_KIND_NOTE_ID: Id = id_hex!("D4E49A6F02A14E66B62076AE4C01715F");
-const REASON_KIND_EVENT_ID: Id = id_hex!("9D43BB36D8B4A6275CAF38A1D5DACF36");
-
 const COMPASS_DEFAULT_STATUSES: [&str; 4] = ["todo", "doing", "blocked", "done"];
 
 const LOCAL_KIND_SPECS: [(Id, &str); 2] = [
@@ -236,11 +210,9 @@ mod local_messages {
         "42C4DB210F7EAFAF38F179ADCB4A9D5B" as from: valueschemas::GenId;
         "95D58D3E68A43979F8AA51415541414C" as to: valueschemas::GenId;
         "23075866B369B5F393D43B30649469F6" as body: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
-        "5FA453867880877B613B7632A233419B" as ordered_created_at: valueschemas::NsTAIInterval;
 
         "2213B191326E9B99605FA094E516E50E" as about_message: valueschemas::GenId;
         "99E92F483731FA6D59115A8D6D187A37" as reader: valueschemas::GenId;
-        "CFEF2E96BC66FF3BE0A39C34E70A5032" as ordered_read_at: valueschemas::NsTAIInterval;
     }
 }
 
@@ -367,48 +339,6 @@ struct BranchEntry {
 }
 
 #[derive(Debug, Clone)]
-struct ExecRow {
-    request_id: Id,
-    command: String,
-    status: ExecStatus,
-    requested_at: Option<i128>,
-    started_at: Option<i128>,
-    finished_at: Option<i128>,
-    exit_code: Option<u64>,
-    worker: Option<Id>,
-    stdout_text: Option<String>,
-    stderr_text: Option<String>,
-    error: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ExecStatus {
-    Pending,
-    Running,
-    Done,
-    Failed,
-}
-
-#[derive(Debug, Clone)]
-struct LocalMessageRow {
-    id: Id,
-    created_at: Option<i128>,
-    from_id: Id,
-    to_id: Id,
-    body: String,
-    readers: Vec<Id>,
-}
-
-#[derive(Debug, Clone)]
-enum LocalMessageStatus {
-    Unread,
-    Read,
-    Sent,
-    ReadBy(String),
-    Other,
-}
-
-#[derive(Debug, Clone)]
 struct TeamsMessageRow {
     chat_id: Id,
     created_at: Option<i128>,
@@ -422,32 +352,6 @@ struct TeamsChatRow {
     label: String,
     last_at: Option<i128>,
     message_count: usize,
-}
-
-#[derive(Debug, Clone)]
-struct ReasoningSummaryRow {
-    created_at: Option<i128>,
-    summary: String,
-    input_tokens: Option<u64>,
-    output_tokens: Option<u64>,
-    cache_creation_input_tokens: Option<u64>,
-    cache_read_input_tokens: Option<u64>,
-}
-
-#[derive(Debug, Clone)]
-struct ReasonRow {
-    created_at: Option<i128>,
-    text: String,
-    turn_id: Option<Id>,
-    worker_id: Option<Id>,
-    command_text: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-struct TurnMemoryRow {
-    request_id: Id,
-    context_messages: Vec<ChatMessage>,
-    context_error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -495,65 +399,6 @@ enum TimelineSource {
 }
 
 #[derive(Debug, Clone)]
-enum TimelineEvent {
-    Shell {
-        request_id: Id,
-        status: ExecStatus,
-        command: String,
-        worker_label: Option<String>,
-        exit_code: Option<u64>,
-        stdout_text: Option<String>,
-        stderr_text: Option<String>,
-        error: Option<String>,
-    },
-    Cognition {
-        summary: String,
-        input_tokens: Option<u64>,
-        output_tokens: Option<u64>,
-        cache_creation_input_tokens: Option<u64>,
-        cache_read_input_tokens: Option<u64>,
-    },
-    Reason {
-        text: String,
-        turn_id: Option<Id>,
-        worker_label: Option<String>,
-        command_text: Option<String>,
-    },
-    Teams {
-        author: String,
-        chat_label: String,
-        content: String,
-    },
-    LocalMessage {
-        from_id: Id,
-        to_id: Id,
-        from_label: String,
-        to_label: String,
-        status: LocalMessageStatus,
-        body: String,
-        is_sender: bool,
-    },
-    GoalCreated {
-        goal: CompassTaskRow,
-    },
-    GoalStatus {
-        goal: CompassTaskRow,
-        to_status: String,
-    },
-    GoalNote {
-        goal: CompassTaskRow,
-        note: String,
-    },
-}
-
-#[derive(Debug, Clone)]
-struct TimelineRow {
-    at: Option<i128>,
-    source: TimelineSource,
-    event: TimelineEvent,
-}
-
-#[derive(Debug, Clone)]
 struct CompassTaskRow {
     id: Id,
     id_prefix: String,
@@ -576,13 +421,6 @@ impl CompassTaskRow {
 struct CompassNoteRow {
     at: Option<i128>,
     body: String,
-}
-
-#[derive(Debug, Clone)]
-struct CompassStatusRow {
-    task: Id,
-    status: String,
-    at: Option<i128>,
 }
 
 #[derive(Debug, Clone)]
@@ -994,7 +832,7 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
             for (id, ts, command) in find!(
                 (id: Id, ts: Value<NsTAIInterval>, command: Value<Handle<Blake3, LongString>>),
                 and!(
-                    pattern!(&exec_data, [{ ?id @ playground_exec::ordered_requested_at: ?ts, playground_exec::command_text: ?command }]),
+                    pattern!(&exec_data, [{ ?id @ metadata::created_at: ?ts, playground_exec::command_text: ?command }]),
                     exec_data.value_in_range(ts, min_ts, max_ts),
                 )
             ) {
@@ -1007,7 +845,7 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
             for (id, ts, reasoning) in find!(
                 (id: Id, ts: Value<NsTAIInterval>, reasoning: Value<Handle<Blake3, LongString>>),
                 and!(
-                    pattern!(&exec_data, [{ ?id @ model_chat::ordered_finished_at: ?ts, model_chat::reasoning_text: ?reasoning }]),
+                    pattern!(&exec_data, [{ ?id @ metadata::finished_at: ?ts, model_chat::reasoning_text: ?reasoning }]),
                     exec_data.value_in_range(ts, min_ts, max_ts),
                 )
             ) {
@@ -1020,7 +858,7 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
             for (id, ts, body) in find!(
                 (id: Id, ts: Value<NsTAIInterval>, body: Value<Handle<Blake3, LongString>>),
                 and!(
-                    pattern!(&local_data, [{ ?id @ local_messages::ordered_created_at: ?ts, local_messages::body: ?body }]),
+                    pattern!(&local_data, [{ ?id @ metadata::created_at: ?ts, local_messages::body: ?body }]),
                     local_data.value_in_range(ts, min_ts, max_ts),
                 )
             ) {
@@ -1033,7 +871,7 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
             for (id, ts, content) in find!(
                 (id: Id, ts: Value<NsTAIInterval>, content: Value<Handle<Blake3, LongString>>),
                 and!(
-                    pattern!(&teams_data, [{ ?id @ archive::ordered_created_at: ?ts, archive::content: ?content }]),
+                    pattern!(&teams_data, [{ ?id @ metadata::created_at: ?ts, archive::content: ?content }]),
                     teams_data.value_in_range(ts, min_ts, max_ts),
                 )
             ) {
@@ -1046,7 +884,7 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
             for (id, ts, title) in find!(
                 (id: Id, ts: Value<NsTAIInterval>, title: Value<Handle<Blake3, LongString>>),
                 and!(
-                    pattern!(&compass_data, [{ ?id @ compass::ordered_created_at: ?ts, compass::title: ?title }]),
+                    pattern!(&compass_data, [{ ?id @ metadata::created_at: ?ts, compass::title: ?title }]),
                     compass_data.value_in_range(ts, min_ts, max_ts),
                 )
             ) {
@@ -1187,11 +1025,11 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
 
                 // Resolve timestamp per source type.
                 let event_ts = match selected_source {
-                    TimelineSource::Shell => load_ts(&exec_data, playground_exec::ordered_requested_at),
-                    TimelineSource::Cognition => load_ts(&exec_data, model_chat::ordered_finished_at),
-                    TimelineSource::LocalMessages => load_ts(&local_data, local_messages::ordered_created_at),
-                    TimelineSource::Teams => load_ts(&teams_data, archive::ordered_created_at),
-                    TimelineSource::Goals => load_ts(&compass_data, compass::ordered_created_at)
+                    TimelineSource::Shell => load_ts(&exec_data, metadata::created_at),
+                    TimelineSource::Cognition => load_ts(&exec_data, metadata::finished_at),
+                    TimelineSource::LocalMessages => load_ts(&local_data, metadata::created_at),
+                    TimelineSource::Teams => load_ts(&teams_data, metadata::created_at),
+                    TimelineSource::Goals => load_ts(&compass_data, metadata::created_at)
                         .or_else(|| load_ts(&compass_data, compass::ordered_at)),
                     TimelineSource::Wiki => {
                         find!(
@@ -1429,7 +1267,7 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
                                             _?receipt @
                                             local_messages::about_message: &selected_id,
                                             local_messages::reader: ?reader_id,
-                                            local_messages::ordered_read_at: ?read_at,
+                                            metadata::updated_at: ?read_at,
                                         }])
                                     ).map(|(rid, ts)| (resolve_name(rid), interval_key(ts))).collect();
                                     if !read_receipts.is_empty() {
@@ -2059,7 +1897,7 @@ fn apply_branch_defaults(state: &mut DashboardState) {
         pattern!(config_data, [{
             ?config_id @
             metadata::tag: playground_config::kind_config,
-            playground_config::ordered_updated_at: ?updated_at,
+            metadata::updated_at: ?updated_at,
         }])
     ) {
         let key = interval_key(updated_at);
@@ -2390,7 +2228,7 @@ fn latest_model_profile_entry_id(data: &TribleSet, profile_id: Id) -> Option<Id>
         pattern!(data, [{
             ?entry_id @
             metadata::tag: playground_config::kind_model_profile,
-            playground_config::ordered_updated_at: ?updated_at,
+            metadata::updated_at: ?updated_at,
             playground_config::model_profile_id: profile_id,
         }])
     ) {
@@ -2419,222 +2257,8 @@ fn load_optional_u64_attr(data: &TribleSet, entity_id: Id, attr: Attribute<U256B
     .and_then(|v| v.try_from_value::<u64>().ok())
 }
 
-fn sort_exec_rows(rows: HashMap<Id, ExecRow>) -> Vec<ExecRow> {
-    let mut list: Vec<ExecRow> = rows.into_values().collect();
-    list.sort_by_key(|row| row.requested_at.unwrap_or(i128::MIN));
-    list.reverse();
-    list
-}
 
-fn collect_exec_rows(data: &TribleSet, ws: &mut Workspace<Pile>) -> Vec<ExecRow> {
-    let mut rows: HashMap<Id, ExecRow> = HashMap::new();
-    for (request_id, command) in find!(
-        (request_id: Id, command: Value<Handle<Blake3, LongString>>),
-        pattern!(data, [{
-            ?request_id @
-            metadata::tag: playground_exec::kind_command_request,
-            playground_exec::command_text: ?command,
-        }])
-    ) {
-        let command_text = load_text(ws, command).unwrap_or_else(|| "<missing>".to_string());
-        rows.insert(
-            request_id,
-            ExecRow {
-                request_id,
-                command: command_text,
-                status: ExecStatus::Pending,
-                requested_at: None,
-                started_at: None,
-                finished_at: None,
-                exit_code: None,
-                worker: None,
-                stdout_text: None,
-                stderr_text: None,
-                error: None,
-            },
-        );
-    }
 
-    for (request_id, requested_at) in find!(
-        (request_id: Id, requested_at: Value<NsTAIInterval>),
-        pattern!(data, [{ ?request_id @ playground_exec::ordered_requested_at: ?requested_at }])
-    ) {
-        if let Some(row) = rows.get_mut(&request_id) {
-            row.requested_at = Some(interval_key(requested_at));
-        }
-    }
-
-    let attempts = load_attempts(data);
-    let started_at = load_started_at(data);
-    let finished_at = load_finished_at(data);
-    let workers = load_workers(data);
-    let exit_codes = load_exit_codes(data);
-    let stdout_text = load_output_text(data, ws, playground_exec::stdout_text);
-    let stderr_text = load_output_text(data, ws, playground_exec::stderr_text);
-    let errors = load_errors(data, ws);
-
-    let progress = latest_progress(data, &attempts, &started_at, &workers);
-    let results = latest_results(
-        data,
-        &attempts,
-        &finished_at,
-        &exit_codes,
-        &stdout_text,
-        &stderr_text,
-        &errors,
-    );
-
-    for (request_id, row) in rows.iter_mut() {
-        let progress_info = progress.get(request_id);
-        let result_info = results.get(request_id);
-        row.started_at = progress_info.and_then(|info| info.started_at);
-        row.worker = progress_info.and_then(|info| info.worker);
-        row.finished_at = result_info.and_then(|info| info.finished_at);
-        row.exit_code = result_info.and_then(|info| info.exit_code);
-        row.stdout_text = result_info.and_then(|info| info.stdout_text.clone());
-        row.stderr_text = result_info.and_then(|info| info.stderr_text.clone());
-        row.error = result_info.and_then(|info| info.error.clone());
-
-        row.status = if let Some(result) = result_info {
-            if result.error.is_some() {
-                ExecStatus::Failed
-            } else {
-                ExecStatus::Done
-            }
-        } else if progress_info.is_some() {
-            ExecStatus::Running
-        } else {
-            ExecStatus::Pending
-        };
-    }
-
-    sort_exec_rows(rows)
-}
-
-fn collect_turn_memory_rows(
-    data: &TribleSet,
-    exec_rows: &[ExecRow],
-    ws: &mut Workspace<Pile>,
-) -> Vec<TurnMemoryRow> {
-    let mut thought_by_request: HashMap<Id, Id> = HashMap::new();
-    for (request_id, thought_id) in find!(
-        (request_id: Id, thought_id: Id),
-        pattern!(data, [{
-            ?request_id @
-            metadata::tag: playground_exec::kind_command_request,
-            playground_exec::about_thought: ?thought_id,
-        }])
-    ) {
-        thought_by_request.insert(request_id, thought_id);
-    }
-
-    let mut context_by_thought: HashMap<Id, Value<Handle<Blake3, LongString>>> = HashMap::new();
-    for (thought_id, context_handle) in find!(
-        (thought_id: Id, context_handle: Value<Handle<Blake3, LongString>>),
-        pattern!(data, [{
-            ?thought_id @
-            metadata::tag: playground_cog::kind_thought,
-            playground_cog::context: ?context_handle,
-        }])
-    ) {
-        context_by_thought.insert(thought_id, context_handle);
-    }
-
-    let mut rows = Vec::new();
-    for exec in exec_rows.iter().take(TURN_MEMORY_MAX_ROWS) {
-        let thought_id = thought_by_request.get(&exec.request_id).copied();
-        let mut context_messages = Vec::new();
-        let mut context_error = None;
-        if let Some(thought_id) = thought_id {
-            if let Some(context_handle) = context_by_thought.get(&thought_id).copied() {
-                match load_text(ws, context_handle) {
-                    Some(context_json) => match serde_json::from_str::<Vec<ChatMessage>>(&context_json) {
-                        Ok(messages) => context_messages = messages,
-                        Err(err) => {
-                            context_error = Some(format!("context parse error: {err}"));
-                        }
-                    },
-                    None => {
-                        context_error = Some("context blob missing".to_string());
-                    }
-                }
-            } else {
-                context_error = Some("thought has no context handle".to_string());
-            }
-        } else {
-            context_error = Some("request has no thought link".to_string());
-        }
-
-        rows.push(TurnMemoryRow {
-            request_id: exec.request_id,
-            context_messages,
-            context_error,
-        });
-    }
-    rows
-}
-
-fn collect_local_messages(data: &TribleSet, ws: &mut Workspace<Pile>) -> Vec<LocalMessageRow> {
-    let mut rows = Vec::new();
-    for (message_id, from, to, body_handle, created_at) in find!(
-        (
-            message_id: Id,
-            from: Id,
-            to: Id,
-            body_handle: Value<Handle<Blake3, LongString>>,
-            created_at: Value<NsTAIInterval>
-        ),
-        pattern!(&data, [{
-            ?message_id @
-            metadata::tag: &LOCAL_KIND_MESSAGE_ID,
-            local_messages::from: ?from,
-            local_messages::to: ?to,
-            local_messages::body: ?body_handle,
-            local_messages::ordered_created_at: ?created_at,
-        }])
-    ) {
-        let body = load_text(ws, body_handle).unwrap_or_else(|| "<missing>".to_string());
-        rows.push(LocalMessageRow {
-            id: message_id,
-            created_at: Some(interval_key(created_at)),
-            from_id: from,
-            to_id: to,
-            body,
-            readers: Vec::new(),
-        });
-    }
-
-    let mut reads: HashMap<Id, HashSet<Id>> = HashMap::new();
-    for (_read_id, message_id, reader_id, read_at) in find!(
-        (
-            read_id: Id,
-            message_id: Id,
-            reader_id: Id,
-            read_at: Value<NsTAIInterval>
-        ),
-        pattern!(&data, [{
-            ?read_id @
-            metadata::tag: &LOCAL_KIND_READ_ID,
-            local_messages::about_message: ?message_id,
-            local_messages::reader: ?reader_id,
-            local_messages::ordered_read_at: ?read_at,
-        }])
-    ) {
-        let _ = read_at;
-        reads.entry(message_id).or_default().insert(reader_id);
-    }
-
-    for row in &mut rows {
-        if let Some(readers) = reads.get(&row.id) {
-            let mut reader_list: Vec<Id> = readers.iter().copied().collect();
-            reader_list.sort_by_key(|id| format!("{id:x}"));
-            row.readers = reader_list;
-        }
-    }
-
-    rows.sort_by_key(|row| row.created_at.unwrap_or(i128::MIN));
-    rows
-}
 
 fn collect_relations_people(data: &TribleSet, ws: &mut Workspace<Pile>) -> Vec<RelationRow> {
     let mut people: HashMap<Id, RelationRow> = HashMap::new();
@@ -2873,7 +2497,7 @@ fn collect_teams_messages(
             teams::chat: ?chat_id,
             archive::author: ?author_id,
             archive::content: ?content_handle,
-            archive::ordered_created_at: ?created_at,
+            metadata::created_at: ?created_at,
         }])
     ) {
         let content = load_text(ws, content_handle).unwrap_or_else(|| "<missing>".to_string());
@@ -2933,169 +2557,7 @@ fn load_optional_string_attr(
     .and_then(|handle| load_text(ws, handle))
 }
 
-fn collect_reasoning_summaries(
-    data: &TribleSet,
-    ws: &mut Workspace<Pile>,
-) -> Vec<ReasoningSummaryRow> {
-    let mut rows = Vec::new();
-    let mut reasoning_by_result: HashMap<Id, Value<Handle<Blake3, LongString>>> = HashMap::new();
-    for (result_id, reasoning_handle) in find!(
-        (
-            result_id: Id,
-            reasoning_handle: Value<Handle<Blake3, LongString>>
-        ),
-        pattern!(data, [{
-            ?result_id @
-            metadata::tag: model_chat::kind_result,
-            model_chat::reasoning_text: ?reasoning_handle,
-        }])
-    ) {
-        reasoning_by_result.insert(result_id, reasoning_handle);
-    }
 
-    let mut raw_by_result: HashMap<Id, Value<Handle<Blake3, LongString>>> = HashMap::new();
-    for (result_id, raw_handle) in find!(
-        (
-            result_id: Id,
-            raw_handle: Value<Handle<Blake3, LongString>>
-        ),
-        pattern!(data, [{
-            ?result_id @
-            metadata::tag: model_chat::kind_result,
-            model_chat::response_raw: ?raw_handle,
-        }])
-    ) {
-        raw_by_result.insert(result_id, raw_handle);
-    }
-
-    let mut input_tok: HashMap<Id, u64> = HashMap::new();
-    let mut output_tok: HashMap<Id, u64> = HashMap::new();
-    let mut cache_create_tok: HashMap<Id, u64> = HashMap::new();
-    let mut cache_read_tok: HashMap<Id, u64> = HashMap::new();
-    for (id, v) in find!((id: Id, v: Value<U256BE>), pattern!(data, [{ ?id @ model_chat::input_tokens: ?v }])) {
-        if let Some(n) = u256be_to_u64(v) { input_tok.insert(id, n); }
-    }
-    for (id, v) in find!((id: Id, v: Value<U256BE>), pattern!(data, [{ ?id @ model_chat::output_tokens: ?v }])) {
-        if let Some(n) = u256be_to_u64(v) { output_tok.insert(id, n); }
-    }
-    for (id, v) in find!((id: Id, v: Value<U256BE>), pattern!(data, [{ ?id @ model_chat::cache_creation_input_tokens: ?v }])) {
-        if let Some(n) = u256be_to_u64(v) { cache_create_tok.insert(id, n); }
-    }
-    for (id, v) in find!((id: Id, v: Value<U256BE>), pattern!(data, [{ ?id @ model_chat::cache_read_input_tokens: ?v }])) {
-        if let Some(n) = u256be_to_u64(v) { cache_read_tok.insert(id, n); }
-    }
-
-    for (result_id, finished_at) in find!(
-        (result_id: Id, finished_at: Value<NsTAIInterval>),
-        pattern!(data, [{
-            ?result_id @
-            metadata::tag: model_chat::kind_result,
-            model_chat::ordered_finished_at: ?finished_at,
-        }])
-    ) {
-        let summary = if let Some(handle) = reasoning_by_result.get(&result_id).copied() {
-            load_text(ws, handle).unwrap_or_default()
-        } else if let Some(handle) = raw_by_result.get(&result_id).copied() {
-            let raw = load_text(ws, handle).unwrap_or_default();
-            match parse_response_json(&raw) {
-                Some(response_json) => extract_reasoning_summaries(&response_json).join("\n"),
-                None => String::new(),
-            }
-        } else {
-            String::new()
-        };
-
-        let it = input_tok.get(&result_id).copied();
-        let ot = output_tok.get(&result_id).copied();
-        let has_content = !summary.trim().is_empty() || it.is_some() || ot.is_some();
-        if !has_content {
-            continue;
-        }
-
-        rows.push(ReasoningSummaryRow {
-            created_at: Some(interval_key(finished_at)),
-            summary,
-            input_tokens: it,
-            output_tokens: ot,
-            cache_creation_input_tokens: cache_create_tok.get(&result_id).copied(),
-            cache_read_input_tokens: cache_read_tok.get(&result_id).copied(),
-        });
-    }
-    rows.sort_by_key(|row| row.created_at.unwrap_or(i128::MIN));
-    rows.reverse();
-    rows
-}
-
-fn collect_reason_rows(data: &TribleSet, ws: &mut Workspace<Pile>) -> Vec<ReasonRow> {
-    let mut rows = Vec::new();
-    let mut turn_by_reason: HashMap<Id, Id> = HashMap::new();
-    let mut worker_by_reason: HashMap<Id, Id> = HashMap::new();
-    let mut command_by_reason: HashMap<Id, String> = HashMap::new();
-
-    for (reason_id, turn_id) in find!(
-        (reason_id: Id, turn_id: Id),
-        pattern!(data, [{
-            ?reason_id @
-            metadata::tag: &REASON_KIND_EVENT_ID,
-            reason_events::about_turn: ?turn_id,
-        }])
-    ) {
-        turn_by_reason.insert(reason_id, turn_id);
-    }
-
-    for (reason_id, worker_id) in find!(
-        (reason_id: Id, worker_id: Id),
-        pattern!(data, [{
-            ?reason_id @
-            metadata::tag: &REASON_KIND_EVENT_ID,
-            reason_events::worker: ?worker_id,
-        }])
-    ) {
-        worker_by_reason.insert(reason_id, worker_id);
-    }
-
-    for (reason_id, command_handle) in find!(
-        (reason_id: Id, command_handle: Value<Handle<Blake3, LongString>>),
-        pattern!(data, [{
-            ?reason_id @
-            metadata::tag: &REASON_KIND_EVENT_ID,
-            reason_events::command_text: ?command_handle,
-        }])
-    ) {
-        let Some(command_text) = load_text(ws, command_handle) else {
-            continue;
-        };
-        command_by_reason.insert(reason_id, command_text);
-    }
-
-    for (reason_id, text_handle, created_at) in find!(
-        (
-            reason_id: Id,
-            text_handle: Value<Handle<Blake3, LongString>>,
-            created_at: Value<NsTAIInterval>
-        ),
-        pattern!(data, [{
-            ?reason_id @
-            metadata::tag: &REASON_KIND_EVENT_ID,
-            reason_events::text: ?text_handle,
-            reason_events::ordered_created_at: ?created_at,
-        }])
-    ) {
-        let Some(text) = load_text(ws, text_handle) else {
-            continue;
-        };
-        rows.push(ReasonRow {
-            created_at: Some(interval_key(created_at)),
-            text,
-            turn_id: turn_by_reason.get(&reason_id).copied(),
-            worker_id: worker_by_reason.get(&reason_id).copied(),
-            command_text: command_by_reason.get(&reason_id).cloned(),
-        });
-    }
-    rows.sort_by_key(|row| row.created_at.unwrap_or(i128::MIN));
-    rows.reverse();
-    rows
-}
 
 fn collect_context_chunks(data: &TribleSet) -> Vec<ContextChunkRow> {
     let mut rows: HashMap<Id, ContextChunkRow> = HashMap::new();
@@ -3277,400 +2739,6 @@ fn build_context_selected(
     })
 }
 
-/// Cheaply collect all event timestamps without blob reads.
-/// Returns a sorted (descending) Vec of (timestamp, source) pairs.
-/// This is Phase 1 of the two-phase timeline: establish the time range
-/// and determine which events are in the viewport before doing expensive
-/// blob reads in Phase 2.
-fn collect_timeline_timestamps(
-    exec_data: &TribleSet,
-    local_data: &TribleSet,
-    teams_data: &TribleSet,
-    compass_data: &TribleSet,
-) -> Vec<i128> {
-    let mut timestamps = Vec::new();
-
-    // Exec: requested_at (the primary exec timestamp)
-    for ts in find!(
-        ts: Value<NsTAIInterval>,
-        pattern!(exec_data, [{ playground_exec::ordered_requested_at: ?ts }])
-    ) {
-        timestamps.push(interval_key(ts));
-    }
-
-    // Reasoning summaries (cog::created_at)
-    for ts in find!(
-        ts: Value<NsTAIInterval>,
-        pattern!(exec_data, [{ playground_cog::ordered_created_at: ?ts }])
-    ) {
-        timestamps.push(interval_key(ts));
-    }
-
-    // Local messages
-    for ts in find!(
-        ts: Value<NsTAIInterval>,
-        pattern!(local_data, [{ local_messages::ordered_created_at: ?ts }])
-    ) {
-        timestamps.push(interval_key(ts));
-    }
-
-    // Teams messages
-    for ts in find!(
-        ts: Value<NsTAIInterval>,
-        pattern!(teams_data, [{ archive::ordered_created_at: ?ts }])
-    ) {
-        timestamps.push(interval_key(ts));
-    }
-
-    // Compass goals
-    for ts in find!(
-        ts: Value<NsTAIInterval>,
-        pattern!(compass_data, [{ compass::ordered_created_at: ?ts }])
-    ) {
-        timestamps.push(interval_key(ts));
-    }
-
-    // Compass status events
-    for ts in find!(
-        ts: Value<NsTAIInterval>,
-        pattern!(compass_data, [{ compass::ordered_at: ?ts }])
-    ) {
-        timestamps.push(interval_key(ts));
-    }
-
-    timestamps.sort_unstable();
-    timestamps.reverse(); // newest first
-    timestamps.dedup();
-    timestamps
-}
-
-fn build_activity_timeline(
-    exec_rows: &[ExecRow],
-    reasoning_rows: &[ReasoningSummaryRow],
-    reason_rows: &[ReasonRow],
-    local_rows: &[LocalMessageRow],
-    local_me_id: Option<Id>,
-    relation_labels: &HashMap<Id, String>,
-    teams_rows: &[TeamsMessageRow],
-    teams_chats: &[TeamsChatRow],
-    compass_rows: &[(CompassTaskRow, usize)],
-    compass_status_rows: &[CompassStatusRow],
-    compass_notes: &HashMap<Id, Vec<CompassNoteRow>>,
-    labels: &HashMap<Id, String>,
-    limit: usize,
-) -> (Vec<TimelineRow>, usize) {
-    let limit = limit.max(1);
-    let mut rows = Vec::new();
-
-    for row in exec_rows {
-        rows.push(TimelineRow {
-            at: row.finished_at.or(row.started_at).or(row.requested_at),
-            source: TimelineSource::Shell,
-            event: TimelineEvent::Shell {
-                request_id: row.request_id,
-                status: row.status,
-                command: row.command.clone(),
-                worker_label: row.worker.map(|worker_id| format_id(labels, worker_id)),
-                exit_code: row.exit_code,
-                stdout_text: row.stdout_text.clone(),
-                stderr_text: row.stderr_text.clone(),
-                error: row.error.clone(),
-            },
-        });
-    }
-
-    for row in reasoning_rows {
-        rows.push(TimelineRow {
-            at: row.created_at,
-            source: TimelineSource::Cognition,
-            event: TimelineEvent::Cognition {
-                summary: row.summary.clone(),
-                input_tokens: row.input_tokens,
-                output_tokens: row.output_tokens,
-                cache_creation_input_tokens: row.cache_creation_input_tokens,
-                cache_read_input_tokens: row.cache_read_input_tokens,
-            },
-        });
-    }
-
-    for row in reason_rows {
-        rows.push(TimelineRow {
-            at: row.created_at,
-            source: TimelineSource::Cognition,
-            event: TimelineEvent::Reason {
-                text: row.text.clone(),
-                turn_id: row.turn_id,
-                worker_label: row.worker_id.map(|worker_id| format_id(labels, worker_id)),
-                command_text: row.command_text.clone(),
-            },
-        });
-    }
-
-    for row in local_rows {
-        let from_label = format_id(relation_labels, row.from_id);
-        let to_label = format_id(relation_labels, row.to_id);
-        let status = local_message_status(row, local_me_id, relation_labels);
-        rows.push(TimelineRow {
-            at: row.created_at,
-            source: TimelineSource::LocalMessages,
-            event: TimelineEvent::LocalMessage {
-                from_id: row.from_id,
-                to_id: row.to_id,
-                from_label,
-                to_label,
-                status,
-                body: row.body.clone(),
-                is_sender: local_me_id == Some(row.from_id),
-            },
-        });
-    }
-
-    let mut team_chat_labels: HashMap<Id, String> = HashMap::new();
-    for row in teams_chats {
-        team_chat_labels.insert(row.id, row.label.clone());
-    }
-    for row in teams_rows {
-        let author = row.author_name.as_deref().unwrap_or("unknown");
-        let chat = team_chat_labels
-            .get(&row.chat_id)
-            .cloned()
-            .unwrap_or_else(|| id_prefix(row.chat_id));
-        rows.push(TimelineRow {
-            at: row.created_at,
-            source: TimelineSource::Teams,
-            event: TimelineEvent::Teams {
-                author: author.to_string(),
-                chat_label: chat,
-                content: row.content.clone(),
-            },
-        });
-    }
-
-    let mut goal_rows: HashMap<Id, CompassTaskRow> = HashMap::new();
-    for (goal, _depth) in compass_rows {
-        goal_rows.insert(goal.id, goal.clone());
-        rows.push(TimelineRow {
-            at: goal.created_at,
-            source: TimelineSource::Goals,
-            event: TimelineEvent::GoalCreated { goal: goal.clone() },
-        });
-    }
-
-    let fallback_goal = |task_id: Id| CompassTaskRow {
-        id: task_id,
-        id_prefix: id_prefix(task_id),
-        title: format!("[{}]", id_prefix(task_id)),
-        tags: Vec::new(),
-        created_at: None,
-        status: "todo".to_string(),
-        status_at: None,
-        note_count: 0,
-        parent: None,
-    };
-
-    for status in compass_status_rows {
-        let mut goal = goal_rows
-            .get(&status.task)
-            .cloned()
-            .unwrap_or_else(|| fallback_goal(status.task));
-        goal.status = status.status.clone();
-        goal.status_at = status.at;
-        rows.push(TimelineRow {
-            at: status.at,
-            source: TimelineSource::Goals,
-            event: TimelineEvent::GoalStatus {
-                goal,
-                to_status: status.status.clone(),
-            },
-        });
-    }
-
-    for (task_id, notes) in compass_notes {
-        let goal = goal_rows
-            .get(task_id)
-            .cloned()
-            .unwrap_or_else(|| fallback_goal(*task_id));
-        for note in notes {
-            rows.push(TimelineRow {
-                at: note.at,
-                source: TimelineSource::Goals,
-                event: TimelineEvent::GoalNote {
-                    goal: goal.clone(),
-                    note: note.body.clone(),
-                },
-            });
-        }
-    }
-
-    rows.sort_by_key(|row| row.at.unwrap_or(i128::MIN));
-    rows.reverse();
-    let total_rows = rows.len();
-    if rows.len() > limit {
-        rows.truncate(limit);
-    }
-    (rows, total_rows)
-}
-
-fn collect_compass_rows(
-    data: &TribleSet,
-    ws: &mut Workspace<Pile>,
-) -> Vec<(CompassTaskRow, usize)> {
-    let mut tasks: HashMap<Id, CompassTaskRow> = HashMap::new();
-
-    for (task_id, title_handle, created_at) in find!(
-        (
-            task_id: Id,
-            title_handle: Value<Handle<Blake3, LongString>>,
-            created_at: Value<NsTAIInterval>
-        ),
-        pattern!(&data, [{
-            ?task_id @
-            metadata::tag: &COMPASS_KIND_GOAL_ID,
-            compass::title: ?title_handle,
-            compass::ordered_created_at: ?created_at,
-        }])
-    ) {
-        if tasks.contains_key(&task_id) {
-            continue;
-        }
-        let title = load_text(ws, title_handle).unwrap_or_else(|| "<missing>".to_string());
-        tasks.insert(
-            task_id,
-            CompassTaskRow {
-                id: task_id,
-                id_prefix: id_prefix(task_id),
-                title,
-                tags: Vec::new(),
-                created_at: Some(interval_key(created_at)),
-                status: "todo".to_string(),
-                status_at: None,
-                note_count: 0,
-                parent: None,
-            },
-        );
-    }
-
-    for (task_id, tag) in find!(
-        (task_id: Id, tag: String),
-        pattern!(&data, [{ ?task_id @ metadata::tag: &COMPASS_KIND_GOAL_ID, compass::tag: ?tag }])
-    ) {
-        if let Some(task) = tasks.get_mut(&task_id) {
-            task.tags.push(tag);
-        }
-    }
-
-    for (task_id, parent_id) in find!(
-        (task_id: Id, parent_id: Id),
-        pattern!(&data, [{
-            ?task_id @
-            metadata::tag: &COMPASS_KIND_GOAL_ID,
-            compass::parent: ?parent_id,
-        }])
-    ) {
-        if let Some(task) = tasks.get_mut(&task_id) {
-            task.parent = Some(parent_id);
-        }
-    }
-
-    let mut status_map: HashMap<Id, (String, i128)> = HashMap::new();
-    for (task_id, status, at) in find!(
-        (task_id: Id, status: String, at: Value<NsTAIInterval>),
-        pattern!(&data, [{
-            _?event @
-            metadata::tag: &COMPASS_KIND_STATUS_ID,
-            compass::task: ?task_id,
-            compass::status: ?status,
-            compass::ordered_at: ?at,
-        }])
-    ) {
-        let at_key = interval_key(at);
-        status_map
-            .entry(task_id)
-            .and_modify(|current| {
-                if at_key > current.1 {
-                    *current = (status.clone(), at_key);
-                }
-            })
-            .or_insert_with(|| (status, at_key));
-    }
-
-    let mut note_counts: HashMap<Id, usize> = HashMap::new();
-    for task_id in find!(
-        task_id: Id,
-        pattern!(&data, [{
-            _?event @
-            metadata::tag: &COMPASS_KIND_NOTE_ID,
-            compass::task: ?task_id,
-        }])
-    ) {
-        *note_counts.entry(task_id).or_insert(0) += 1;
-    }
-
-    for task in tasks.values_mut() {
-        if let Some((status, at_key)) = status_map.get(&task.id) {
-            task.status = status.clone();
-            task.status_at = Some(*at_key);
-        }
-        if let Some(count) = note_counts.get(&task.id) {
-            task.note_count = *count;
-        }
-        task.tags.sort();
-        task.tags.dedup();
-    }
-
-    order_compass_rows(tasks.into_values().collect())
-}
-
-fn collect_compass_status_rows(data: &TribleSet) -> Vec<CompassStatusRow> {
-    let mut rows = Vec::new();
-    for (task_id, status, at) in find!(
-        (task_id: Id, status: String, at: Value<NsTAIInterval>),
-        pattern!(&data, [{
-            _?event @
-            metadata::tag: &COMPASS_KIND_STATUS_ID,
-            compass::task: ?task_id,
-            compass::status: ?status,
-            compass::ordered_at: ?at,
-        }])
-    ) {
-        rows.push(CompassStatusRow {
-            task: task_id,
-            status,
-            at: Some(interval_key(at)),
-        });
-    }
-    rows.sort_by(|a, b| b.at.cmp(&a.at));
-    rows
-}
-
-fn collect_compass_notes(
-    data: &TribleSet,
-    ws: &mut Workspace<Pile>,
-) -> HashMap<Id, Vec<CompassNoteRow>> {
-    let mut map: HashMap<Id, Vec<CompassNoteRow>> = HashMap::new();
-
-    for (task_id, note_handle, at) in find!(
-        (task_id: Id, note_handle: Value<Handle<Blake3, LongString>>, at: Value<NsTAIInterval>),
-        pattern!(&data, [{
-            _?event @
-            metadata::tag: &COMPASS_KIND_NOTE_ID,
-            compass::task: ?task_id,
-            compass::note: ?note_handle,
-            compass::ordered_at: ?at,
-        }])
-    ) {
-        let body = load_text(ws, note_handle).unwrap_or_else(|| "<missing>".to_string());
-        map.entry(task_id)
-            .or_default()
-            .push(CompassNoteRow { at: Some(interval_key(at)), body });
-    }
-
-    for notes in map.values_mut() {
-        notes.sort_by(|a, b| b.at.cmp(&a.at));
-    }
-
-    map
-}
 
 fn order_compass_rows(rows: Vec<CompassTaskRow>) -> Vec<(CompassTaskRow, usize)> {
     let mut by_id: HashMap<Id, CompassTaskRow> = HashMap::new();
@@ -3756,19 +2824,6 @@ fn order_compass_rows(rows: Vec<CompassTaskRow>) -> Vec<(CompassTaskRow, usize)>
     }
 
     ordered
-}
-
-fn collect_labels(data: &TribleSet, ws: &mut Workspace<Pile>) -> HashMap<Id, String> {
-    let mut map = HashMap::new();
-    for (entity_id, handle) in find!(
-        (entity_id: Id, handle: Value<Handle<Blake3, LongString>>),
-        pattern!(data, [{ ?entity_id @ metadata::name: ?handle }])
-    ) {
-        if let Some(label) = load_text(ws, handle) {
-            map.entry(entity_id).or_insert(label);
-        }
-    }
-    map
 }
 
 fn render_local_composer(
@@ -4187,7 +3242,7 @@ fn send_local_message(
         local_messages::from: from,
         local_messages::to: to,
         local_messages::body: body_handle,
-        local_messages::ordered_created_at: now_interval,
+        metadata::created_at: now_interval,
     };
 
     ws.commit(change, "local message");
@@ -4221,199 +3276,6 @@ fn ensure_local_metadata(ws: &mut Workspace<Pile>) -> Result<TribleSet, String> 
     Ok(change)
 }
 
-#[derive(Debug, Clone)]
-struct ProgressInfo {
-    attempt: u64,
-    started_at: Option<i128>,
-    worker: Option<Id>,
-}
-
-#[derive(Debug, Clone)]
-struct ResultInfo {
-    attempt: u64,
-    finished_at: Option<i128>,
-    exit_code: Option<u64>,
-    stdout_text: Option<String>,
-    stderr_text: Option<String>,
-    error: Option<String>,
-}
-
-fn load_attempts(data: &TribleSet) -> HashMap<Id, u64> {
-    let mut attempts = HashMap::new();
-    for (event_id, attempt) in find!(
-        (event_id: Id, attempt: Value<U256BE>),
-        pattern!(data, [{ ?event_id @ playground_exec::attempt: ?attempt }])
-    ) {
-        if let Some(value) = attempt.try_from_value::<u64>().ok() {
-            attempts.insert(event_id, value);
-        }
-    }
-    attempts
-}
-
-fn load_started_at(data: &TribleSet) -> HashMap<Id, i128> {
-    let mut intervals = HashMap::new();
-    for (event_id, interval) in find!(
-        (event_id: Id, interval: Value<NsTAIInterval>),
-        pattern!(data, [{ ?event_id @ playground_exec::ordered_started_at: ?interval }])
-    ) {
-        intervals.insert(event_id, interval_key(interval));
-    }
-    intervals
-}
-
-fn load_finished_at(data: &TribleSet) -> HashMap<Id, i128> {
-    let mut intervals = HashMap::new();
-    for (event_id, interval) in find!(
-        (event_id: Id, interval: Value<NsTAIInterval>),
-        pattern!(data, [{ ?event_id @ playground_exec::ordered_finished_at: ?interval }])
-    ) {
-        intervals.insert(event_id, interval_key(interval));
-    }
-    intervals
-}
-
-fn load_workers(data: &TribleSet) -> HashMap<Id, Id> {
-    let mut workers = HashMap::new();
-    for (event_id, worker) in find!(
-        (event_id: Id, worker: Id),
-        pattern!(data, [{ ?event_id @ playground_exec::worker: ?worker }])
-    ) {
-        workers.insert(event_id, worker);
-    }
-    workers
-}
-
-fn load_exit_codes(data: &TribleSet) -> HashMap<Id, u64> {
-    let mut codes = HashMap::new();
-    for (event_id, exit_code) in find!(
-        (event_id: Id, exit_code: Value<U256BE>),
-        pattern!(data, [{ ?event_id @ playground_exec::exit_code: ?exit_code }])
-    ) {
-        if let Some(code) = exit_code.try_from_value::<u64>().ok() {
-            codes.insert(event_id, code);
-        }
-    }
-    codes
-}
-
-fn load_output_text(
-    data: &TribleSet,
-    ws: &mut Workspace<Pile>,
-    attr: Attribute<Handle<Blake3, LongString>>,
-) -> HashMap<Id, String> {
-    let mut outputs = HashMap::new();
-    for (event_id, output_handle) in find!(
-        (event_id: Id, output_handle: Value<Handle<Blake3, LongString>>),
-        pattern!(data, [{ ?event_id @ attr: ?output_handle }])
-    ) {
-        if let Some(text) = load_text(ws, output_handle) {
-            outputs.insert(event_id, text);
-        }
-    }
-    outputs
-}
-
-fn load_errors(data: &TribleSet, ws: &mut Workspace<Pile>) -> HashMap<Id, String> {
-    let mut errors = HashMap::new();
-    for (event_id, error_handle) in find!(
-        (event_id: Id, error_handle: Value<Handle<Blake3, LongString>>),
-        pattern!(data, [{ ?event_id @ playground_exec::error: ?error_handle }])
-    ) {
-        if let Some(text) = load_text(ws, error_handle) {
-            errors.insert(event_id, text);
-        }
-    }
-    errors
-}
-
-fn latest_progress(
-    data: &TribleSet,
-    attempts: &HashMap<Id, u64>,
-    started_at: &HashMap<Id, i128>,
-    workers: &HashMap<Id, Id>,
-) -> HashMap<Id, ProgressInfo> {
-    let mut progress: HashMap<Id, ProgressInfo> = HashMap::new();
-    for (event_id, request_id) in find!(
-        (event_id: Id, request_id: Id),
-        pattern!(data, [{
-            ?event_id @
-            metadata::tag: playground_exec::kind_in_progress,
-            playground_exec::about_request: ?request_id,
-        }])
-    ) {
-        let attempt = attempts.get(&event_id).copied().unwrap_or(0);
-        let started_at = started_at.get(&event_id).copied();
-        let worker = workers.get(&event_id).copied();
-        let info = ProgressInfo {
-            attempt,
-            started_at,
-            worker,
-        };
-        progress
-            .entry(request_id)
-            .and_modify(|existing| {
-                if info.attempt > existing.attempt
-                    || (info.attempt == existing.attempt
-                        && info.started_at.unwrap_or(i128::MIN)
-                            > existing.started_at.unwrap_or(i128::MIN))
-                {
-                    *existing = info.clone();
-                }
-            })
-            .or_insert(info);
-    }
-    progress
-}
-
-fn latest_results(
-    data: &TribleSet,
-    attempts: &HashMap<Id, u64>,
-    finished_at: &HashMap<Id, i128>,
-    exit_codes: &HashMap<Id, u64>,
-    stdout_text: &HashMap<Id, String>,
-    stderr_text: &HashMap<Id, String>,
-    errors: &HashMap<Id, String>,
-) -> HashMap<Id, ResultInfo> {
-    let mut results: HashMap<Id, ResultInfo> = HashMap::new();
-    for (event_id, request_id) in find!(
-        (event_id: Id, request_id: Id),
-        pattern!(data, [{
-            ?event_id @
-            metadata::tag: playground_exec::kind_command_result,
-            playground_exec::about_request: ?request_id,
-        }])
-    ) {
-        let attempt = attempts.get(&event_id).copied().unwrap_or(0);
-        let finished_at = finished_at.get(&event_id).copied();
-        let exit_code = exit_codes.get(&event_id).copied();
-        let stdout_text = stdout_text.get(&event_id).cloned();
-        let stderr_text = stderr_text.get(&event_id).cloned();
-        let error = errors.get(&event_id).cloned();
-        let info = ResultInfo {
-            attempt,
-            finished_at,
-            exit_code,
-            stdout_text,
-            stderr_text,
-            error,
-        };
-        results
-            .entry(request_id)
-            .and_modify(|existing| {
-                if info.attempt > existing.attempt
-                    || (info.attempt == existing.attempt
-                        && info.finished_at.unwrap_or(i128::MIN)
-                            > existing.finished_at.unwrap_or(i128::MIN))
-                {
-                    *existing = info.clone();
-                }
-            })
-            .or_insert(info);
-    }
-    results
-}
-
 fn render_agent_config(
     ui: &mut egui::Ui,
     reveal_secrets: &mut bool,
@@ -4433,7 +3295,7 @@ fn render_agent_config(
         pattern!(data, [{
             ?config_id @
             metadata::tag: playground_config::kind_config,
-            playground_config::ordered_updated_at: ?updated_at,
+            metadata::updated_at: ?updated_at,
         }])
     ) {
         let key = interval_key(updated_at);
@@ -4662,12 +3524,6 @@ fn mask_secret(secret: &str) -> String {
     format!("{prefix}…{suffix}")
 }
 
-struct TimelineResponse {
-    context_clicked: Option<Id>,
-    /// The user scrolled near the bottom — load more events.
-    wants_more: bool,
-}
-
 /// Choose a tick interval (in nanoseconds) that gives ~5-10 ticks
 /// for the given viewport time span.
 const TICK_INTERVALS: &[i128] = {
@@ -4690,31 +3546,6 @@ const TICK_INTERVALS: &[i128] = {
     ]
 };
 
-/// Returns (major_interval, minor_interval, promotion_t).
-/// Major is picked from TICK_INTERVALS. Minor = major / 5 for uniform density.
-/// `promotion_t` is 0.0..1.0 — how far minor ticks are toward becoming major.
-fn ruler_levels(viewport_ns: i128) -> (i128, i128, f32) {
-    let target_major = 6;
-    let raw = viewport_ns / target_major;
-
-    let mut major_idx = 0;
-    for (i, &interval) in TICK_INTERVALS.iter().enumerate() {
-        if interval >= raw {
-            major_idx = i;
-            break;
-        }
-        major_idx = i;
-    }
-
-    let major = TICK_INTERVALS[major_idx];
-    let minor = major / 5; // uniform: always 5 minor ticks per major
-
-    let major_count = viewport_ns as f64 / major as f64;
-    let t = 1.0 - ((major_count - 3.0) / (target_major as f64 - 3.0)).clamp(0.0, 1.0) as f32;
-
-    (major, minor, t)
-}
-
 /// Format a TAI nanosecond key as a human-readable time marker.
 fn format_time_marker(key: i128) -> String {
     let ns = hifitime::Duration::from_total_nanoseconds(key);
@@ -4723,141 +3554,8 @@ fn format_time_marker(key: i128) -> String {
     format!("{y:04}-{m:02}-{d:02} {h:02}:{min:02}:{s:02}")
 }
 
-/// Format a TAI nanosecond key as a short time (just hours:minutes).
-fn format_time_short(key: i128) -> String {
-    let ns = hifitime::Duration::from_total_nanoseconds(key);
-    let epoch = Epoch::from_tai_duration(ns);
-    let (_, _, _, h, min, _, _) = epoch.to_gregorian_utc();
-    format!("{h:02}:{min:02}")
-}
-
-/// Render a time ruler marker between timeline events.
-fn render_time_marker(ui: &mut egui::Ui, key: i128, show_date: bool) {
-    let label = if show_date {
-        format_time_marker(key)
-    } else {
-        format_time_short(key)
-    };
-    let muted = color_muted();
-    ui.horizontal(|ui| {
-        let available = ui.available_width();
-        let label_galley = ui.painter().layout_no_wrap(
-            label.clone(),
-            egui::FontId::monospace(10.0),
-            muted,
-        );
-        let label_w = label_galley.size().x;
-        // Horizontal line fills space up to the label, then the label sits right-aligned.
-        let line_w = (available - label_w - 8.0).max(0.0);
-        let (line_rect, _) = ui.allocate_exact_size(
-            egui::vec2(line_w, 1.0),
-            egui::Sense::hover(),
-        );
-        let y = line_rect.center().y;
-        ui.painter().line_segment(
-            [egui::pos2(line_rect.left(), y), egui::pos2(line_rect.right(), y)],
-            egui::Stroke::new(1.0, muted),
-        );
-        ui.add_space(4.0);
-        ui.label(egui::RichText::new(label).small().monospace().color(muted));
-    });
-}
-
-/// Decide how many nanoseconds of gap warrants a time marker between events.
-/// Returns (should_show_marker, should_show_date).
-fn should_show_time_marker(prev_key: i128, cur_key: i128) -> (bool, bool) {
-    let gap_ns = prev_key.saturating_sub(cur_key).max(0);
-    let gap_minutes = gap_ns / 60_000_000_000;
-    let gap_hours = gap_minutes / 60;
-
-    if gap_hours >= 24 {
-        (true, true) // date + time for day-level gaps
-    } else if gap_minutes >= 5 {
-        (true, false) // time only for multi-minute gaps
-    } else {
-        (false, false) // no marker for short gaps
-    }
-}
-
 /// Default scale: pixels per minute of wall time.
 const TIMELINE_DEFAULT_SCALE: f32 = 2.0;
-/// Minimum event-to-event gap in pixels (so events never overlap).
-const TIMELINE_MIN_EVENT_GAP: f32 = 2.0;
-
-fn render_activity_timeline(
-    ui: &mut egui::Ui,
-    now_key: i128,
-    rows: &[TimelineRow],
-    has_more: bool,
-    px_per_minute: f32,
-) -> TimelineResponse {
-    let mut context_clicked = None;
-    let max_height = if diagnostics_is_headless() {
-        1800.0
-    } else {
-        ACTIVITY_TIMELINE_HEIGHT
-    };
-    let min_scrolled_height = if diagnostics_is_headless() {
-        320.0
-    } else {
-        ACTIVITY_TIMELINE_HEIGHT
-    };
-    let output = egui::ScrollArea::vertical()
-        .id_salt("activity_timeline_scroll")
-        .auto_shrink([false, false])
-        .min_scrolled_height(min_scrolled_height)
-        .max_height(max_height)
-        .show(ui, |ui| {
-            let mut prev_key: Option<i128> = None;
-
-            for row in rows {
-                // Proportional spacing: gap = time_delta * scale.
-                if let (Some(prev), Some(cur)) = (prev_key, row.at) {
-                    let gap_ns = prev.saturating_sub(cur).max(0);
-                    let gap_minutes = gap_ns as f64 / 60_000_000_000.0;
-                    let gap_px = (gap_minutes as f32 * px_per_minute)
-                        .max(TIMELINE_MIN_EVENT_GAP);
-                    ui.add_space(gap_px);
-
-                    // Time markers at significant gaps.
-                    let (show, show_date) = should_show_time_marker(prev, cur);
-                    if show {
-                        render_time_marker(ui, cur, show_date);
-                    }
-                } else if prev_key.is_none() {
-                    if let Some(cur) = row.at {
-                        render_time_marker(ui, cur, true);
-                    }
-                }
-                prev_key = row.at.or(prev_key);
-
-                if let Some(id) = render_timeline_row(ui, now_key, row) {
-                    context_clicked = Some(id);
-                }
-            }
-            if has_more {
-                ui.add_space(6.0);
-                ui.label(egui::RichText::new("Scroll for more...").small().color(color_muted()));
-            }
-        });
-
-    let wants_more = if has_more {
-        let viewport_bottom = output.state.offset.y + output.inner_rect.height();
-        let content_height = output.content_size.y;
-        viewport_bottom >= content_height - 200.0
-    } else {
-        false
-    };
-    TimelineResponse { context_clicked, wants_more }
-}
-
-fn turn_memory_role_style(role: ChatRole) -> (&'static str, egui::Color32) {
-    match role {
-        ChatRole::System => ("system", color_system()),
-        ChatRole::User => ("user", color_user()),
-        ChatRole::Assistant => ("assistant", color_assistant()),
-    }
-}
 
 fn render_context_compaction(
     ui: &mut egui::Ui,
@@ -5434,316 +4132,6 @@ fn render_context_selected_details(
     }
 }
 
-fn format_tokens_compact(n: u64) -> String {
-    if n >= 1_000_000 {
-        let m = n as f64 / 1_000_000.0;
-        if m >= 100.0 {
-            format!("{:.0}M", m)
-        } else if m >= 10.0 {
-            format!("{:.1}M", m)
-        } else {
-            format!("{:.2}M", m)
-        }
-    } else if n >= 1_000 {
-        let k = n as f64 / 1_000.0;
-        if k >= 100.0 {
-            format!("{:.0}k", k)
-        } else if k >= 10.0 {
-            format!("{:.1}k", k)
-        } else {
-            format!("{:.2}k", k)
-        }
-    } else {
-        n.to_string()
-    }
-}
-
-fn render_timeline_ctx_chip(ui: &mut egui::Ui, fill: egui::Color32) -> egui::Response {
-    let text_color = colorhash::text_color_on(fill);
-    egui::Frame::NONE
-        .fill(fill)
-        .corner_radius(egui::CornerRadius::same(5))
-        .inner_margin(egui::Margin::symmetric(6, 1))
-        .show(ui, |ui| {
-            ui.label(egui::RichText::new("ctx").small().color(text_color))
-        })
-        .inner
-}
-
-/// One-line summary for each event type (shown in the compact chip).
-fn timeline_event_summary(event: &TimelineEvent) -> String {
-    match event {
-        TimelineEvent::Shell { command, status, exit_code, .. } => {
-            let code = exit_code.map(|c| format!(" → {c}")).unwrap_or_default();
-            format!("{}: {}{code}", exec_status_text(*status), truncate_single_line(command, 80))
-        }
-        TimelineEvent::Cognition { summary, input_tokens, output_tokens, .. } => {
-            let tokens = match (input_tokens, output_tokens) {
-                (Some(i), Some(o)) => format!(" ({}→{})", format_tokens_compact(*i), format_tokens_compact(*o)),
-                _ => String::new(),
-            };
-            format!("{}{tokens}", truncate_single_line(summary, 80))
-        }
-        TimelineEvent::Reason { text, .. } => {
-            truncate_single_line(text, 80).to_string()
-        }
-        TimelineEvent::Teams { author, chat_label, content, .. } => {
-            format!("{author} in {chat_label}: {}", truncate_single_line(content, 60))
-        }
-        TimelineEvent::LocalMessage { from_label, to_label, body, .. } => {
-            format!("{from_label} → {to_label}: {}", truncate_single_line(body, 60))
-        }
-        TimelineEvent::GoalCreated { goal } => {
-            format!("created: {}", goal.title)
-        }
-        TimelineEvent::GoalStatus { goal, to_status } => {
-            format!("{} → {to_status}", goal.title)
-        }
-        TimelineEvent::GoalNote { goal, note } => {
-            format!("{}: {}", goal.title, truncate_single_line(note, 60))
-        }
-    }
-}
-
-fn render_timeline_row(ui: &mut egui::Ui, now_key: i128, row: &TimelineRow) -> Option<Id> {
-    let mut context_clicked = None;
-    let (source_label, source_color) = timeline_source_style(row.source);
-    let summary = timeline_event_summary(&row.event);
-
-    // Compact chip: [source] summary [age]
-    let resp = egui::Frame::NONE
-        .fill(color_frame())
-        .corner_radius(egui::CornerRadius::same(4))
-        .inner_margin(egui::Margin::symmetric(8, 3))
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                render_timeline_source_chip(ui, source_label, source_color);
-                ui.label(egui::RichText::new(&summary).small());
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(egui::RichText::new(format_age(now_key, row.at)).small().color(color_muted()));
-                });
-            });
-        })
-        .response;
-
-    // Click to expand details.
-    let expand_id = ui.make_persistent_id(("timeline_expand", row.at, source_label));
-    let expanded = ui.ctx().data_mut(|d| *d.get_persisted_mut_or(expand_id, false));
-
-    if resp.interact(egui::Sense::click()).clicked() {
-        ui.ctx().data_mut(|d| d.insert_persisted(expand_id, !expanded));
-    }
-    if resp.hovered() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
-
-    if expanded {
-        // Show full details below the chip, indented with a left accent border.
-        let (_, source_color) = timeline_source_style(row.source);
-        egui::Frame::NONE
-            .stroke(egui::Stroke::NONE)
-            .inner_margin(egui::Margin { left: 16, right: 0, top: 4, bottom: 4 })
-            .show(ui, |ui| {
-                // Accent bar on the left edge
-                let rect = ui.max_rect();
-                ui.painter().line_segment(
-                    [
-                        egui::pos2(rect.left() - 10.0, rect.top()),
-                        egui::pos2(rect.left() - 10.0, rect.bottom()),
-                    ],
-                    egui::Stroke::new(2.0, source_color.gamma_multiply(0.5)),
-                );
-                render_timeline_row_details(ui, now_key, row, &mut context_clicked);
-            });
-    }
-
-    context_clicked
-}
-                let chip_resp = render_timeline_ctx_chip(ui, source_color);
-                if chip_resp.on_hover_text("Show model context for this turn").clicked() {
-                    *context_clicked = Some(*request_id);
-                }
-            });
-            let mut details = Vec::new();
-            details.push(format!("req {}", id_prefix(*request_id)));
-            if let Some(worker_label) = worker_label.as_deref() {
-                details.push(format!("worker {worker_label}"));
-            }
-            if let Some(code) = exit_code {
-                details.push(format!("exit {code}"));
-            }
-            if !details.is_empty() {
-                ui.small(details.join(" · "));
-            }
-
-            let has_stdout = stdout_text
-                .as_deref()
-                .is_some_and(|text| !text.trim().is_empty());
-            let has_stderr = stderr_text
-                .as_deref()
-                .is_some_and(|text| !text.trim().is_empty());
-            let has_error = error.as_deref().is_some_and(|text| !text.trim().is_empty());
-            if has_stdout || has_stderr || has_error {
-                let mut output_meta = Vec::new();
-                if let Some(text) = stdout_text.as_deref() {
-                    let chars = text.chars().count();
-                    if chars > 0 {
-                        output_meta.push(format!("stdout {chars}c"));
-                    }
-                }
-                if let Some(text) = stderr_text.as_deref() {
-                    let chars = text.chars().count();
-                    if chars > 0 {
-                        output_meta.push(format!("stderr {chars}c"));
-                    }
-                }
-                if has_error {
-                    output_meta.push("error".to_string());
-                }
-                let title = if output_meta.is_empty() {
-                    "Output".to_string()
-                } else {
-                    format!("Output ({})", output_meta.join(" · "))
-                };
-                let frame_bg = color_frame();
-                let muted = color_muted();
-                egui::CollapsingHeader::new(title)
-                    .id_salt(format!("timeline_shell_output_{request_id:x}"))
-                    .default_open(false)
-                    .show(ui, |ui| {
-                        if let Some(text) = stdout_text
-                            .as_deref()
-                            .filter(|text| !text.trim().is_empty())
-                        {
-                            ui.small("stdout");
-                            egui::Frame::NONE
-                                .fill(frame_bg)
-                                .stroke(egui::Stroke::new(1.0, muted))
-                                .corner_radius(egui::CornerRadius::same(4))
-                                .inner_margin(egui::Margin::same(6))
-                                .show(ui, |ui| {
-                                    render_blob_aware_text(ui, text, None, None);
-                                });
-                        }
-                        if let Some(text) = stderr_text
-                            .as_deref()
-                            .filter(|text| !text.trim().is_empty())
-                        {
-                            ui.add_space(6.0);
-                            ui.small("stderr");
-                            egui::Frame::NONE
-                                .fill(frame_bg)
-                                .stroke(egui::Stroke::new(1.0, muted))
-                                .corner_radius(egui::CornerRadius::same(4))
-                                .inner_margin(egui::Margin::same(6))
-                                .show(ui, |ui| {
-                                    render_blob_aware_text(
-                                        ui,
-                                        text,
-                                        Some(egui::Color32::LIGHT_RED),
-                                        None,
-                                    );
-                                });
-                        }
-                        if let Some(text) = error.as_deref().filter(|text| !text.trim().is_empty())
-                        {
-                            ui.add_space(6.0);
-                            ui.small("error");
-                            egui::Frame::NONE
-                                .fill(frame_bg)
-                                .stroke(egui::Stroke::new(1.0, muted))
-                                .corner_radius(egui::CornerRadius::same(4))
-                                .inner_margin(egui::Margin::same(6))
-                                .show(ui, |ui| {
-                                    ui.colored_label(egui::Color32::LIGHT_RED, text);
-                                });
-                        }
-                    });
-            }
-        }
-        TimelineEvent::Cognition {
-            summary,
-            input_tokens,
-            output_tokens,
-            cache_creation_input_tokens,
-            cache_read_input_tokens,
-        } => {
-            ui.add(
-                egui::Label::new(egui::RichText::new(summary).monospace())
-                    .wrap_mode(egui::TextWrapMode::Wrap),
-            );
-            if input_tokens.is_some() || output_tokens.is_some() {
-                let f = |v: &Option<u64>| -> String {
-                    v.map_or("-".into(), format_tokens_compact)
-                };
-                ui.small(format!(
-                    "in={} out={} cache_r={} cache_w={}",
-                    f(input_tokens),
-                    f(output_tokens),
-                    f(cache_read_input_tokens),
-                    f(cache_creation_input_tokens),
-                ));
-            }
-        }
-        TimelineEvent::Reason {
-            text,
-            turn_id,
-            worker_label,
-            command_text,
-        } => {
-            ui.small("reason");
-            ui.add(
-                egui::Label::new(egui::RichText::new(text).monospace())
-                    .wrap_mode(egui::TextWrapMode::Wrap),
-            );
-            let mut details = Vec::new();
-            if let Some(turn_id) = turn_id {
-                details.push(format!("turn {}", id_prefix(*turn_id)));
-            }
-            if let Some(worker_label) = worker_label.as_deref() {
-                details.push(format!("worker {worker_label}"));
-            }
-            if !details.is_empty() {
-                ui.small(details.join(" · "));
-            }
-            if let Some(command_text) = command_text {
-                ui.small(format!("act: {command_text}"));
-            }
-        }
-        TimelineEvent::Teams {
-            author,
-            chat_label,
-            content,
-        } => {
-            ui.small(format!("{author} in {chat_label}"));
-            render_blob_aware_text(ui, content, None, None);
-        }
-        TimelineEvent::LocalMessage {
-            from_id,
-            to_id,
-            from_label,
-            to_label,
-            status,
-            body,
-            is_sender,
-        } => {
-            render_timeline_local_message(
-                ui, *from_id, *to_id, from_label, to_label, status, body, *is_sender, now_key,
-                row.at,
-            );
-        }
-        TimelineEvent::GoalCreated { goal } => {
-            render_timeline_goal_event(ui, goal, None);
-        }
-        TimelineEvent::GoalStatus { goal, to_status } => {
-            render_timeline_goal_event(ui, goal, Some(format!("status -> {to_status}")));
-        }
-        TimelineEvent::GoalNote { goal, note } => {
-            render_timeline_goal_event(ui, goal, Some(format!("note: {note}")));
-        }
-    }
-}
-
 fn timeline_source_style(source: TimelineSource) -> (&'static str, egui::Color32) {
     match source {
         TimelineSource::Shell => ("shell", color_shell()),
@@ -5775,7 +4163,7 @@ fn render_compass_swimlanes_live(
             ?task_id @
             metadata::tag: &COMPASS_KIND_GOAL_ID,
             compass::title: ?title_handle,
-            compass::ordered_created_at: ?created_at,
+            metadata::created_at: ?created_at,
         }])
     ) {
         if tasks.contains_key(&task_id) {

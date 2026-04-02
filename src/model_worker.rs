@@ -315,7 +315,7 @@ pub(crate) fn run_model_loop(
                     change += entity! { &result_id @
                         metadata::tag: model_chat::kind_result,
                         model_chat::about_request: request.id,
-                        model_chat::ordered_finished_at: ordered_finished_at,
+                        metadata::finished_at: ordered_finished_at,
                         model_chat::attempt: attempt,
                         model_chat::error: handle,
                     };
@@ -341,7 +341,7 @@ pub(crate) fn run_model_loop(
             change += entity! { &in_progress_id @
                 metadata::tag: model_chat::kind_in_progress,
                 model_chat::about_request: request.id,
-                model_chat::ordered_started_at: ordered_started_at,
+                metadata::started_at: ordered_started_at,
                 model_chat::worker: worker_id,
                 model_chat::attempt: attempt,
             };
@@ -357,7 +357,7 @@ pub(crate) fn run_model_loop(
             change += entity! { &result_id @
                 metadata::tag: model_chat::kind_result,
                 model_chat::about_request: request.id,
-                model_chat::ordered_finished_at: ordered_finished_at,
+                metadata::finished_at: ordered_finished_at,
                 model_chat::attempt: attempt,
             };
 
@@ -495,7 +495,7 @@ fn next_pending_model_request(catalog: &TribleSet, worker_id: Id) -> Option<Mode
     candidates.sort_by_key(|(id, _)| {
         find!(
             (ts: Value<NsTAIInterval>),
-            pattern!(catalog, [{ *id @ model_chat::ordered_requested_at: ?ts }])
+            pattern!(catalog, [{ *id @ metadata::created_at: ?ts }])
         )
         .next()
         .map(|(ts,)| interval_key(ts))
