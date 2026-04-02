@@ -90,6 +90,9 @@ enum Command {
         /// Tags (by name). Unknown tags are minted automatically.
         #[arg(long)]
         tag: Vec<String>,
+        /// Allow links to fragment IDs (instead of requiring version IDs)
+        #[arg(long)]
+        force: bool,
     },
     /// Create a new version of an existing fragment
     Edit {
@@ -103,6 +106,9 @@ enum Command {
         /// Tags (replaces previous version's tags)
         #[arg(long)]
         tag: Vec<String>,
+        /// Allow links to fragment IDs (instead of requiring version IDs)
+        #[arg(long)]
+        force: bool,
     },
     /// Show a fragment (latest version) or a specific version
     Show {
@@ -760,6 +766,7 @@ fn commit_version(
     tags: &[Id],
     space: &TribleSet,
     message: &str,
+    force_fragment_links: bool,
 ) -> Result<Id> {
     let mut tag_ids = tags.to_vec();
     tag_ids.push(KIND_VERSION_ID);
@@ -776,15 +783,20 @@ fn commit_version(
         .filter(|l| l.target != fragment_id)
         .collect();
 
-    // Warn if any link targets are fragments instead of versions.
-    for link in &wiki_links {
-        let is_version = find!(
-            _tag: Id,
-            pattern!(space, [{ link.target @ metadata::tag: &KIND_VERSION_ID }])
-        ).next().is_some();
-        if !is_version {
-            eprintln!("WARNING: link target {:x} is a fragment, not a version. \
-                Use the version ID for stable references.", link.target);
+    // Reject links to fragments (should target versions for stable references).
+    if !force_fragment_links {
+        let bad_links: Vec<Id> = wiki_links.iter()
+            .filter(|link| {
+                !find!(_tag: Id, pattern!(space, [{ link.target @ metadata::tag: &KIND_VERSION_ID }]))
+                    .next().is_some()
+            })
+            .map(|link| link.target)
+            .collect();
+        if !bad_links.is_empty() {
+            let ids: Vec<String> = bad_links.iter().map(|id| format!("{:x}", id)).collect();
+            bail!("link targets are fragments, not versions: {}. \
+                Use version IDs for stable references, or pass --force to override.",
+                ids.join(", "));
         }
     }
 
@@ -1258,6 +1270,7 @@ fn cmd_create(
     title: String,
     content: String,
     tags: Vec<String>,
+    force: bool,
 ) -> Result<()> {
     let title = load_value_or_file(&title, "title")?;
     let content = load_value_or_file(&content, "content")?;
@@ -1274,7 +1287,7 @@ fn cmd_create(
     let fragment_id = genid().id;
     let content_handle = ws.put(content);
     let vid = commit_version(
-        repo, &mut ws, change, fragment_id, &title, content_handle, &tag_ids, &space, "wiki create",
+        repo, &mut ws, change, fragment_id, &title, content_handle, &tag_ids, &space, "wiki create", force,
     )?;
 
     println!("fragment {}", fragment_id);
@@ -1289,6 +1302,7 @@ fn cmd_edit(
     content: Option<String>,
     new_title: Option<String>,
     tags: Vec<String>,
+    force: bool,
 ) -> Result<()> {
     let content = content.map(|c| load_value_or_file(&c, "content")).transpose()?;
     let new_title = new_title.map(|t| load_value_or_file(&t, "title")).transpose()?;
@@ -1325,7 +1339,7 @@ fn cmd_edit(
             .ok_or_else(|| anyhow::anyhow!("no content on previous version"))?,
     };
     let vid = commit_version(
-        repo, &mut ws, change, fragment_id, &title, content_handle, &tag_ids, &space, "wiki edit",
+        repo, &mut ws, change, fragment_id, &title, content_handle, &tag_ids, &space, "wiki edit", force,
     )?;
 
     println!("fragment {}", fragment_id);
@@ -1476,7 +1490,7 @@ fn cmd_archive(repo: &mut Repo, bid: Id, id: String) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("no content"))?;
     commit_version(
         repo, &mut ws, TribleSet::new(), fragment_id, &prev_title, prev_ch, &tags,
-        &space, "wiki archive",
+        &space, "wiki archive", true,
     )?;
 
     println!("archived: {} ({})", prev_title, fragment_id);
@@ -1503,7 +1517,7 @@ fn cmd_restore(repo: &mut Repo, bid: Id, id: String) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("no content"))?;
     commit_version(
         repo, &mut ws, TribleSet::new(), fragment_id, &prev_title, prev_ch, &tags,
-        &space, "wiki restore",
+        &space, "wiki restore", true,
     )?;
 
     println!("restored: {} ({})", prev_title, fragment_id);
@@ -1536,7 +1550,7 @@ fn cmd_revert(repo: &mut Repo, bid: Id, id: String, to: usize) -> Result<()> {
     let target_tags = tags_of(&space, target_vid);
     let vid = commit_version(
         repo, &mut ws, TribleSet::new(), fragment_id, &target_title, target_ch,
-        &target_tags, &space, "wiki revert",
+        &target_tags, &space, "wiki revert", true,
     )?;
 
     println!("reverted {} ({}) to v{to}: {}", fragment_id, vid, target_title);
@@ -1788,7 +1802,7 @@ fn cmd_tag_add(repo: &mut Repo, bid: Id, id: String, name: String) -> Result<()>
         .ok_or_else(|| anyhow::anyhow!("no content"))?;
     commit_version(
         repo, &mut ws, change, fragment_id, &prev_title, prev_ch, &tags,
-        &space, "wiki tag add",
+        &space, "wiki tag add", true,
     )?;
 
     println!("added #{name} to {} ({})", prev_title, fragment_id);
@@ -1822,7 +1836,7 @@ fn cmd_tag_remove(repo: &mut Repo, bid: Id, id: String, name: String) -> Result<
         .ok_or_else(|| anyhow::anyhow!("no content"))?;
     commit_version(
         repo, &mut ws, TribleSet::new(), fragment_id, &prev_title, prev_ch, &tags,
-        &space, "wiki tag remove",
+        &space, "wiki tag remove", true,
     )?;
 
     println!("removed #{name} from {} ({})", prev_title, fragment_id);
@@ -1928,7 +1942,7 @@ fn cmd_import(repo: &mut Repo, bid: Id, path: PathBuf, tags: Vec<String>) -> Res
         let fragment_id = genid().id;
         let content_handle = ws.put(content);
         let vid = commit_version(
-            repo, &mut ws, change, fragment_id, &title, content_handle, &tag_ids, &space, "wiki import",
+            repo, &mut ws, change, fragment_id, &title, content_handle, &tag_ids, &space, "wiki import", true,
         )?;
 
         println!("{}  {}  {}", fragment_id, vid, file.display());
@@ -2128,15 +2142,16 @@ fn main() -> Result<()> {
     };
 
     let result = match command {
-        Command::Create { title, content, tag } => {
-            cmd_create(&mut repo, branch_id, title, content, tag)
+        Command::Create { title, content, tag, force } => {
+            cmd_create(&mut repo, branch_id, title, content, tag, force)
         }
         Command::Edit {
             id,
             content,
             title,
             tag,
-        } => cmd_edit(&mut repo, branch_id, id, content, title, tag),
+            force,
+        } => cmd_edit(&mut repo, branch_id, id, content, title, tag, force),
         Command::Show { id, latest } => cmd_show(&mut repo, branch_id, id, latest),
         Command::Export { id } => cmd_export(&mut repo, branch_id, id),
         Command::Diff { id, from, to } => cmd_diff(&mut repo, branch_id, id, from, to),
