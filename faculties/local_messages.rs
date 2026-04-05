@@ -6,7 +6,7 @@
 //! ed25519-dalek = "2.1.1"
 //! hifitime = "4.2.3"
 //! rand_core = "0.6.4"
-//! triblespace = "0.33"
+//! triblespace = "0.34.1"
 //! ```
 
 use anyhow::{Context, Result, bail};
@@ -655,4 +655,3 @@ fn main() -> Result<()> {
         ),
     }
 }
-

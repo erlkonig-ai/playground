@@ -1,7 +1,7 @@
 #!/usr/bin/env rust-script
 //! ```cargo
 //! [dependencies]
-//! triblespace = "0.33"
+//! triblespace = "0.34.1"
 //! ed25519-dalek = { version = "2.1.0", features = ["rand_core"] }
 //! rand = "0.8"
 //! hex = "0.4"
