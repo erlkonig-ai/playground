@@ -116,10 +116,10 @@ Prompts can also be loaded from files:
 
 ```bash
 cargo run --manifest-path playground/Cargo.toml -- --pile /path/to/pile/self.pile config set system-prompt @./system_prompt.txt
-./playground/faculties/headspace --pile /path/to/pile/self.pile lens set factual prompt @./memory_lens_factual.txt
-./playground/faculties/headspace --pile /path/to/pile/self.pile lens set factual compaction-prompt @./memory_lens_factual_compaction.txt
-./playground/faculties/headspace --pile /path/to/pile/self.pile lens add reflective --prompt @./memory_lens_reflective.txt --compaction-prompt @./memory_lens_reflective_compaction.txt --max-output-tokens 160
-./playground/faculties/headspace --pile /path/to/pile/self.pile lens list
+./faculties/headspace.rs --pile /path/to/pile/self.pile lens set factual prompt @./memory_lens_factual.txt
+./faculties/headspace.rs --pile /path/to/pile/self.pile lens set factual compaction-prompt @./memory_lens_factual_compaction.txt
+./faculties/headspace.rs --pile /path/to/pile/self.pile lens add reflective --prompt @./memory_lens_reflective.txt --compaction-prompt @./memory_lens_reflective_compaction.txt --max-output-tokens 160
+./faculties/headspace.rs --pile /path/to/pile/self.pile lens list
 ```
 
 Use `@-` to read a value from stdin (for both `playground config set` and `headspace` value fields).
@@ -143,50 +143,22 @@ cargo run --manifest-path playground/Cargo.toml -- --pile /path/to/pile/self.pil
 Clear an optional config field:
 
 ```bash
-./playground/faculties/headspace --pile /path/to/pile/self.pile lens reset factual prompt
-./playground/faculties/headspace --pile /path/to/pile/self.pile lens remove reflective
+./faculties/headspace.rs --pile /path/to/pile/self.pile lens reset factual prompt
+./faculties/headspace.rs --pile /path/to/pile/self.pile lens remove reflective
 ```
 
 Manage LLM profiles (headspaces):
 
 ```bash
-./playground/faculties/headspace --pile /path/to/pile/self.pile list
-./playground/faculties/headspace --pile /path/to/pile/self.pile add "oss-120" --model gpt-oss:120b --base-url http://localhost:11434/v1/responses
-./playground/faculties/headspace --pile /path/to/pile/self.pile use oss-120
-./playground/faculties/headspace --pile /path/to/pile/self.pile set reasoning-effort medium
-./playground/faculties/headspace --pile /path/to/pile/self.pile set api-key sk-...
+./faculties/headspace.rs --pile /path/to/pile/self.pile list
+./faculties/headspace.rs --pile /path/to/pile/self.pile add "oss-120" --model gpt-oss:120b --base-url http://localhost:11434/v1/responses
+./faculties/headspace.rs --pile /path/to/pile/self.pile use oss-120
+./faculties/headspace.rs --pile /path/to/pile/self.pile set reasoning-effort medium
+./faculties/headspace.rs --pile /path/to/pile/self.pile set api-key sk-...
 ```
 
 LLM/headspace settings (model/base-url/reasoning/api-key, compaction profile, and memory lenses)
 are managed by the `headspace` faculty. Compaction merge arity is runtime config.
-
-## Workspace snapshots (in the pile)
-
-Capture a curated snapshot of the workspace into the pile (branch `workspace` by default):
-
-```bash
-./playground/faculties/workspace.rs --pile /path/to/pile/self.pile capture \
-  playground/faculties /workspace/faculties \
-  --label "seed:faculties"
-```
-
-List snapshots:
-
-```bash
-./playground/faculties/workspace.rs --pile /path/to/pile/self.pile list
-```
-
-Restore the latest snapshot into a target directory:
-
-```bash
-./playground/faculties/workspace.rs --pile /path/to/pile/self.pile restore /tmp/workspace
-```
-
-Snapshots are used by the exec worker to bootstrap `/workspace` on startup.
-Bootstrap now performs a non-destructive merge of the latest snapshot lineage:
-- missing files/dirs/symlinks are created,
-- existing matching entries are kept as-is,
-- conflicting existing paths are left untouched.
 
 ## Running With a VM (exec worker in VM)
 
@@ -210,8 +182,8 @@ Commands executed by the exec worker receive:
 Reason notes (useful when a model/provider does not expose reasoning output):
 
 ```bash
-./playground/faculties/reason "Why this action makes sense"
-./playground/faculties/reason "Why this command now" -- git status
+./faculties/reason.rs "Why this action makes sense"
+./faculties/reason.rs "Why this command now" -- git status
 ```
 
 `reason` logs a structured rationale event into the active exec/cognition branch

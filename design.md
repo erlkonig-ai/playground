@@ -220,10 +220,8 @@ Shared paths (example):
 - VM: `/pile`
 
 The executor only needs access to the pile plus `/workspace` inside the VM.
-When using snapshots, the workspace contents live entirely inside the VM and
-can be seeded with `./playground/faculties/workspace.rs capture <local> <vm>` on the host. Anything else (network,
-system binaries, secrets) can be mediated by the VM config or a dedicated
-sandbox profile.
+Anything else (network, system binaries, secrets) can be mediated by the VM
+config or a dedicated sandbox profile.
 
 Operationally, use `playground run` to start the core loop + LLM worker on the
 host and the executor inside the Lima VM. The Lima configuration is defined in
