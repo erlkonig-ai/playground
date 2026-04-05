@@ -1,4 +1,0 @@
-#!/bin/sh
-# Breath faculty — marks the boundary between memory and present moment.
-# The output is intentionally static so it remains cacheable.
-echo "present moment begins."
