@@ -108,18 +108,25 @@ Playground stores its configuration inside the pile. Use the `config` subcommand
 
 ```bash
 cargo run --manifest-path playground/Cargo.toml -- --pile /path/to/pile/self.pile config show
-cargo run --manifest-path playground/Cargo.toml -- --pile /path/to/pile/self.pile config set poll-ms 100
-cargo run --manifest-path playground/Cargo.toml -- --pile /path/to/pile/self.pile config set memory-compaction-arity 8
+cargo run --manifest-path playground/Cargo.toml -- --pile $PILE config set poll-ms 100
+cargo run --manifest-path playground/Cargo.toml -- --pile $PILE config set memory-compaction-arity 8
+```
+
+All faculties honor the `PILE` environment variable, so export it once
+per shell and skip the `--pile` flag on every call:
+
+```bash
+export PILE=/path/to/pile/self.pile
 ```
 
 Prompts can also be loaded from files:
 
 ```bash
-cargo run --manifest-path playground/Cargo.toml -- --pile /path/to/pile/self.pile config set system-prompt @./system_prompt.txt
-./faculties/headspace.rs --pile /path/to/pile/self.pile lens set factual prompt @./memory_lens_factual.txt
-./faculties/headspace.rs --pile /path/to/pile/self.pile lens set factual compaction-prompt @./memory_lens_factual_compaction.txt
-./faculties/headspace.rs --pile /path/to/pile/self.pile lens add reflective --prompt @./memory_lens_reflective.txt --compaction-prompt @./memory_lens_reflective_compaction.txt --max-output-tokens 160
-./faculties/headspace.rs --pile /path/to/pile/self.pile lens list
+cargo run --manifest-path playground/Cargo.toml -- --pile $PILE config set system-prompt @./system_prompt.txt
+./faculties/headspace.rs lens set factual prompt @./memory_lens_factual.txt
+./faculties/headspace.rs lens set factual compaction-prompt @./memory_lens_factual_compaction.txt
+./faculties/headspace.rs lens add reflective --prompt @./memory_lens_reflective.txt --compaction-prompt @./memory_lens_reflective_compaction.txt --max-output-tokens 160
+./faculties/headspace.rs lens list
 ```
 
 Use `@-` to read a value from stdin (for both `playground config set` and `headspace` value fields).
@@ -135,26 +142,26 @@ python3 playground/scripts/render_prompts.py --check
 You can pin branch ids in config (recommended) so faculties resolve stable branch identities:
 
 ```bash
-cargo run --manifest-path playground/Cargo.toml -- --pile /path/to/pile/self.pile config set compass-branch-id <hex-id>
-cargo run --manifest-path playground/Cargo.toml -- --pile /path/to/pile/self.pile config set local-messages-branch-id <hex-id>
-cargo run --manifest-path playground/Cargo.toml -- --pile /path/to/pile/self.pile config set relations-branch-id <hex-id>
+cargo run --manifest-path playground/Cargo.toml -- --pile $PILE config set compass-branch-id <hex-id>
+cargo run --manifest-path playground/Cargo.toml -- --pile $PILE config set local-messages-branch-id <hex-id>
+cargo run --manifest-path playground/Cargo.toml -- --pile $PILE config set relations-branch-id <hex-id>
 ```
 
 Clear an optional config field:
 
 ```bash
-./faculties/headspace.rs --pile /path/to/pile/self.pile lens reset factual prompt
-./faculties/headspace.rs --pile /path/to/pile/self.pile lens remove reflective
+./faculties/headspace.rs lens reset factual prompt
+./faculties/headspace.rs lens remove reflective
 ```
 
 Manage LLM profiles (headspaces):
 
 ```bash
-./faculties/headspace.rs --pile /path/to/pile/self.pile list
-./faculties/headspace.rs --pile /path/to/pile/self.pile add "oss-120" --model gpt-oss:120b --base-url http://localhost:11434/v1/responses
-./faculties/headspace.rs --pile /path/to/pile/self.pile use oss-120
-./faculties/headspace.rs --pile /path/to/pile/self.pile set reasoning-effort medium
-./faculties/headspace.rs --pile /path/to/pile/self.pile set api-key sk-...
+./faculties/headspace.rs list
+./faculties/headspace.rs add "oss-120" --model gpt-oss:120b --base-url http://localhost:11434/v1/responses
+./faculties/headspace.rs use oss-120
+./faculties/headspace.rs set reasoning-effort medium
+./faculties/headspace.rs set api-key sk-...
 ```
 
 LLM/headspace settings (model/base-url/reasoning/api-key, compaction profile, and memory lenses)
