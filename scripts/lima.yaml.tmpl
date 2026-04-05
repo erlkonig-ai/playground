@@ -18,6 +18,9 @@ mounts:
   - location: "__PLAYGROUND_ROOT__"
     mountPoint: "/opt/playground"
     writable: false
+  - location: "__FACULTIES_ROOT__"
+    mountPoint: "/opt/faculties"
+    writable: true
   - location: "__PILE_ROOT__"
     mountPoint: "/pile"
     writable: true
@@ -66,6 +69,15 @@ provision:
         echo "[playground] installing rust-script"
         cargo install --locked rust-script
       fi
+      # Put faculties on PATH for direct invocation (e.g. compass.rs list).
+      if ! grep -q '/opt/faculties' "$HOME/.bashrc" 2>/dev/null; then
+        echo 'export PATH="/opt/faculties:$PATH"' >> "$HOME/.bashrc"
+      fi
+      # Warm rust-script cache for each faculty so first real invocation is fast.
+      echo "[playground] warming rust-script cache for faculties"
+      for f in /opt/faculties/*.rs; do
+        "$f" --help >/dev/null 2>&1 || true
+      done
       echo "[playground] user provision done"
       echo "[playground] starting exec service"
       sudo systemctl enable playground-exec.service

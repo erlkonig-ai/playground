@@ -411,10 +411,27 @@ fn prepare_lima_service(config: &Config, args: &LimaExecArgs) -> Result<()> {
         .file_name()
         .ok_or_else(|| anyhow!("pile path missing filename"))?;
     let pile_vm = PathBuf::from("/pile").join(pile_name);
+
+    // Faculties live as a sibling of the playground repo (github.com/triblespace/faculties).
+    // The playground/faculties/ symlink inside /opt/playground resolves to /opt/faculties
+    // inside the VM, so both paths work identically.
+    let faculties_root = playground_root
+        .parent()
+        .ok_or_else(|| anyhow!("playground root has no parent"))?
+        .join("faculties");
+    if !faculties_root.is_dir() {
+        return Err(anyhow!(
+            "faculties repo not found at {}. Clone it with:\n  git clone git@github.com:triblespace/faculties.git {}",
+            faculties_root.display(),
+            faculties_root.display(),
+        ));
+    }
+
     render_lima_template(
         &template,
         &config_path,
         &playground_root,
+        &faculties_root,
         &pile_root,
         &workspace_root,
         &pile_vm,
@@ -451,6 +468,7 @@ fn render_lima_template(
     template: &Path,
     out_path: &Path,
     playground_root: &Path,
+    faculties_root: &Path,
     pile_root: &Path,
     workspace_root: &Path,
     pile_vm: &Path,
@@ -461,6 +479,7 @@ fn render_lima_template(
 
     let replacements = [
         ("__PLAYGROUND_ROOT__", playground_root),
+        ("__FACULTIES_ROOT__", faculties_root),
         ("__PILE_ROOT__", pile_root),
         ("__WORKSPACE_ROOT__", workspace_root),
         ("__PILE_PATH__", pile_vm),
