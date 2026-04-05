@@ -61,7 +61,54 @@ pub fn split_blob_refs(input: &str) -> Vec<PromptChunk> {
     if chunks.is_empty() {
         chunks.push(PromptChunk::Text(String::new()));
     }
+    // Second pass: scan text chunks for typst #image("files:…") refs.
+    let chunks = split_typst_image_refs(chunks);
     merge_adjacent_text_chunks(chunks)
+}
+
+/// Scan text chunks for `#image("files:<64-hex>")` and split them into
+/// `Blob` chunks.  Leaves non-matching text untouched.
+fn split_typst_image_refs(chunks: Vec<PromptChunk>) -> Vec<PromptChunk> {
+    const PREFIX: &str = "#image(\"files:";
+    let mut out = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        let PromptChunk::Text(text) = &chunk else {
+            out.push(chunk);
+            continue;
+        };
+        let mut cursor = 0usize;
+        while let Some(start_rel) = text[cursor..].find(PREFIX) {
+            let start = cursor + start_rel;
+            if start > cursor {
+                out.push(PromptChunk::Text(text[cursor..start].to_owned()));
+            }
+            let digest_start = start + PREFIX.len();
+            let rest = &text[digest_start..];
+            // Expect exactly 64 hex chars followed by `")`
+            if rest.len() >= 66
+                && rest[..64].bytes().all(|b| b.is_ascii_hexdigit())
+                && rest[64..].starts_with("\")")
+            {
+                let digest_hex = rest[..64].to_ascii_uppercase();
+                let raw_end = digest_start + 66; // 64 hex + `")`
+                let raw = &text[start..raw_end];
+                out.push(PromptChunk::Blob(BlobRef {
+                    alt: String::new(),
+                    digest_hex,
+                    raw: raw.to_owned(),
+                }));
+                cursor = raw_end;
+            } else {
+                // Not a valid ref, emit the prefix as text and advance past it.
+                out.push(PromptChunk::Text(text[start..start + PREFIX.len()].to_owned()));
+                cursor = start + PREFIX.len();
+            }
+        }
+        if cursor < text.len() {
+            out.push(PromptChunk::Text(text[cursor..].to_owned()));
+        }
+    }
+    out
 }
 
 pub fn unknown_blob_handle_from_hex(hex: &str) -> Option<Value<Handle<Blake3, UnknownBlob>>> {
@@ -137,6 +184,22 @@ mod tests {
             blob.digest_hex,
             "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
         );
+    }
+
+    #[test]
+    fn parses_typst_image_ref() {
+        let input = "text before #image(\"files:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\") text after";
+        let chunks = split_blob_refs(input);
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0], PromptChunk::Text("text before ".to_string()));
+        let PromptChunk::Blob(blob) = &chunks[1] else {
+            panic!("expected blob");
+        };
+        assert_eq!(
+            blob.digest_hex,
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        );
+        assert_eq!(chunks[2], PromptChunk::Text(" text after".to_string()));
     }
 
     #[test]

@@ -8,7 +8,7 @@
 //! rand_core = "0.6.4"
 //! itertools = "0.14"
 //! regex = "1"
-//! triblespace = "0.33"
+//! triblespace = "0.34.1"
 //! typst = "0.14"
 //! typst-syntax = "0.14"
 //! comemo = "0.5.1"
@@ -227,6 +227,15 @@ enum Command {
         /// File with scheme:prefix lines. Use @path or @- for stdin.
         input: String,
     },
+    /// Apply lint transforms (markdown→typst, expand short IDs) to all latest versions.
+    Lint {
+        /// Actually write fixed versions (default: dry-run)
+        #[arg(long)]
+        fix: bool,
+        /// Only check for issues, don't show diffs (CI mode)
+        #[arg(long)]
+        check: bool,
+    },
 }
 
 #[derive(clap::Subcommand)]
@@ -442,21 +451,62 @@ fn links_of(space: &TribleSet, vid: Id) -> Vec<Id> {
     .collect()
 }
 
+/// Expand a hex prefix into a min/max ID range for range queries.
+/// E.g. prefix "ab55" → min=ab550000...00, max=ab55ffff...ff
+fn prefix_to_range(hex_prefix: &str) -> Result<(Id, Id)> {
+    let clean = hex_prefix.trim().to_lowercase();
+    if clean.is_empty() || clean.len() > 32 {
+        bail!("invalid prefix length: expected 1-32 hex chars, got {}", clean.len());
+    }
+    if !clean.chars().all(|c| c.is_ascii_hexdigit()) {
+        bail!("invalid hex prefix '{clean}'");
+    }
+    // Pad to 32 hex chars (16 bytes) with 0s for min, Fs for max.
+    let min_hex = format!("{:0<32}", clean);
+    let max_hex = format!("{:f<32}", clean);
+    let min = Id::from_hex(&min_hex)
+        .ok_or_else(|| anyhow::anyhow!("failed to parse min id from prefix '{clean}'"))?;
+    let max = Id::from_hex(&max_hex)
+        .ok_or_else(|| anyhow::anyhow!("failed to parse max id from prefix '{clean}'"))?;
+    Ok((min, max))
+}
+
 /// Resolve a hex prefix to an ID. Matches both version and fragment IDs.
+/// Uses entity range queries on the EAV index for O(log n) lookup.
 fn resolve_prefix(space: &TribleSet, input: &str) -> Result<Id> {
-    let needle = input.trim().to_lowercase();
+    let trimmed = input.trim().to_lowercase();
+    // Fast path: full 32-char hex ID.
+    if trimmed.len() == 32 {
+        return Id::from_hex(&trimmed)
+            .ok_or_else(|| anyhow::anyhow!("invalid id '{trimmed}'"));
+    }
+    let (min, max) = prefix_to_range(&trimmed)?;
     let mut matches = Vec::new();
     let mut seen_frags = std::collections::HashSet::new();
+    // Use entity range to narrow the search to version IDs in the prefix range.
     for (vid, frag) in find!(
         (vid: Id, frag: Id),
-        pattern!(space, [{ ?vid @ metadata::tag: &KIND_VERSION_ID, wiki::fragment: ?frag }])
+        and!(
+            pattern!(space, [{ ?vid @ metadata::tag: &KIND_VERSION_ID, wiki::fragment: ?frag }]),
+            space.entity_in_range(vid, min, max),
+        )
     ) {
-        let vid_hex = format!("{vid:x}");
-        let frag_hex = format!("{frag:x}");
-        if vid_hex.starts_with(&needle) {
-            matches.push(vid);
-        }
-        if seen_frags.insert(frag) && frag_hex.starts_with(&needle) {
+        matches.push(vid);
+        seen_frags.insert(frag);
+    }
+    // Also check if the prefix matches a fragment ID (stored as a value, not entity).
+    // Fragment IDs are in the value position of wiki::fragment, so we need a separate scan.
+    // Use the value range constraint for this.
+    let frag_min_val: Value<valueschemas::GenId> = min.to_value();
+    let frag_max_val: Value<valueschemas::GenId> = max.to_value();
+    for (frag,) in find!(
+        (frag: Id),
+        and!(
+            pattern!(space, [{ metadata::tag: &KIND_VERSION_ID, wiki::fragment: ?frag }]),
+            space.value_in_range(frag, frag_min_val, frag_max_val),
+        )
+    ) {
+        if seen_frags.insert(frag) {
             matches.push(frag);
         }
     }
@@ -470,20 +520,28 @@ fn resolve_prefix(space: &TribleSet, input: &str) -> Result<Id> {
 }
 
 /// Resolve a hex prefix to a fragment ID only (not version IDs).
-/// Used for wiki: link resolution where the target is always a fragment.
+/// Uses value range queries for O(log n) lookup on fragment IDs.
 fn resolve_fragment_prefix(space: &TribleSet, input: &str) -> Result<Id> {
-    let needle = input.trim().to_lowercase();
-    let mut matches = Vec::new();
+    let trimmed = input.trim().to_lowercase();
+    // Fast path: full 32-char hex ID.
+    if trimmed.len() == 32 {
+        return Id::from_hex(&trimmed)
+            .ok_or_else(|| anyhow::anyhow!("invalid id '{trimmed}'"));
+    }
+    let (min, max) = prefix_to_range(&trimmed)?;
+    let frag_min_val: Value<valueschemas::GenId> = min.to_value();
+    let frag_max_val: Value<valueschemas::GenId> = max.to_value();
+    let mut matches: Vec<Id> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for (frag,) in find!(
         (frag: Id),
-        pattern!(space, [{ _?vid @ metadata::tag: &KIND_VERSION_ID, wiki::fragment: ?frag }])
+        and!(
+            pattern!(space, [{ metadata::tag: &KIND_VERSION_ID, wiki::fragment: ?frag }]),
+            space.value_in_range(frag, frag_min_val, frag_max_val),
+        )
     ) {
         if seen.insert(frag) {
-            let hex = format!("{frag:x}");
-            if hex.starts_with(&needle) {
-                matches.push(frag);
-            }
+            matches.push(frag);
         }
     }
     matches.sort();
@@ -495,12 +553,7 @@ fn resolve_fragment_prefix(space: &TribleSet, input: &str) -> Result<Id> {
     }
 }
 
-/// Parse a full 64-character hex ID. Returns an error for any other input.
-fn parse_full_id(input: &str) -> Result<Id> {
-    let trimmed = input.trim();
-    Id::from_hex(trimmed)
-        .ok_or_else(|| anyhow::anyhow!("invalid id '{trimmed}': expected a full 32-char hex id (use `wiki resolve` to expand a prefix)"))
-}
+
 
 /// Given an ID, resolve to the fragment it belongs to.
 /// Identity for fragment IDs, lookup for version IDs.
@@ -747,6 +800,143 @@ mod typst_validate {
     }
 }
 
+// ── lint / auto-fix ────────────────────────────────────────────────
+
+/// Apply lint transforms to content: markdown→typst syntax, expand short IDs.
+/// Returns the transformed content. The TribleSet is used for ID expansion.
+fn lint_fix(content: &str, space: &TribleSet) -> String {
+    let mut out = String::with_capacity(content.len());
+    let mut in_code_block = false;
+    for line in content.lines() {
+        if line.trim_start().starts_with("```") {
+            in_code_block = !in_code_block;
+        }
+        let fixed = if in_code_block {
+            line.to_string() // Skip all transforms inside code blocks
+        } else {
+            lint_line(line, space)
+        };
+        out.push_str(&fixed);
+        out.push('\n');
+    }
+    // Remove trailing newline if original didn't have one
+    if !content.ends_with('\n') && out.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
+/// Transform a single line: headings, bold, links.
+fn lint_line(line: &str, space: &TribleSet) -> String {
+    let mut s = lint_headings(line);
+    s = lint_bold(&s);
+    s = lint_links(&s, space);
+    s = lint_horizontal_rule(&s);
+    s
+}
+
+/// `## Heading` → `== Heading` (only at line start, with space after #)
+fn lint_headings(line: &str) -> String {
+    if line.starts_with("### ") {
+        format!("=== {}", &line[4..])
+    } else if line.starts_with("## ") {
+        format!("== {}", &line[3..])
+    } else if line.starts_with("# ") {
+        format!("= {}", &line[2..])
+    } else {
+        line.to_string()
+    }
+}
+
+/// `**text**` → `*text*` (double-star bold only)
+fn lint_bold(line: &str) -> String {
+    // Replace **...** with *...* but avoid already-correct *...* (single star)
+    let mut result = String::with_capacity(line.len());
+    let mut chars = line.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        if c == '*' {
+            if let Some(&(_, '*')) = chars.peek() {
+                // Found **, look for closing **
+                chars.next(); // consume second *
+                if chars.peek().is_none() { break; }
+                let mut found_close = false;
+                let mut inner = String::new();
+                while let Some((_, ic)) = chars.next() {
+                    if ic == '*' {
+                        if let Some(&(_, '*')) = chars.peek() {
+                            chars.next(); // consume closing **
+                            found_close = true;
+                            break;
+                        }
+                    }
+                    inner.push(ic);
+                }
+                if found_close {
+                    result.push('*');
+                    result.push_str(&inner);
+                    result.push('*');
+                } else {
+                    // No closing **, emit as-is
+                    result.push_str(&line[i..]);
+                    return result;
+                }
+            } else {
+                result.push(c);
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
+/// `[text](wiki:ID)` → `#link("wiki:ID")[text]` and same for `files:`
+fn lint_links(line: &str, space: &TribleSet) -> String {
+    use regex::Regex;
+    // Match [text](wiki:HEX) or [text](files:HEX)
+    let re = Regex::new(r"\[([^\]]+)\]\((wiki|files):([0-9a-fA-F]+)\)").unwrap();
+    re.replace_all(line, |caps: &regex::Captures| {
+        let text = &caps[1];
+        let scheme = &caps[2];
+        let hex = &caps[3];
+        // Try to expand short ID
+        let full_hex = match try_expand_id(hex, space) {
+            Ok(id) => format!("{:x}", id),
+            Err(_) => hex.to_lowercase(), // Keep as-is if can't resolve
+        };
+        format!("#link(\"{scheme}:{full_hex}\")[{text}]")
+    }).to_string()
+}
+
+/// `---` alone on a line → removed (typst doesn't have horizontal rules by default)
+fn lint_horizontal_rule(line: &str) -> String {
+    let trimmed = line.trim();
+    if trimmed == "---" || trimmed == "***" || trimmed == "___" {
+        String::new()
+    } else {
+        line.to_string()
+    }
+}
+
+/// Try to expand a hex prefix to a full ID using the space.
+/// Prefers fragment IDs over version IDs for wiki: links.
+/// Returns Ok(Id) if unique, Err if ambiguous/missing/already full.
+fn try_expand_id(hex: &str, space: &TribleSet) -> Result<Id> {
+    let clean = hex.trim().to_lowercase();
+    if clean.len() == 32 {
+        return Id::from_hex(&clean)
+            .ok_or_else(|| anyhow::anyhow!("invalid hex"));
+    }
+    if clean.len() < 4 {
+        bail!("prefix too short");
+    }
+    // Prefer fragment resolution (stable pointers) over version resolution
+    match resolve_fragment_prefix(space, &clean) {
+        Ok(id) => Ok(id),
+        Err(_) => resolve_prefix(space, &clean), // Fall back to version IDs
+    }
+}
+
 /// Validate typst content by compiling in-process. No temp files, no shell-out.
 fn validate_typst(content: &str) -> Result<()> {
     let world = typst_validate::ValidateWorld::new(content);
@@ -787,8 +977,7 @@ fn commit_version(
     if !force_fragment_links {
         let bad_links: Vec<Id> = wiki_links.iter()
             .filter(|link| {
-                !find!(_tag: Id, pattern!(space, [{ link.target @ metadata::tag: &KIND_VERSION_ID }]))
-                    .next().is_some()
+                !is_version(space, link.target)
             })
             .map(|link| link.target)
             .collect();
@@ -1117,6 +1306,74 @@ fn cmd_check(repo: &mut Repo, bid: Id, try_compile: bool) -> Result<()> {
     Ok(())
 }
 
+fn cmd_lint(repo: &mut Repo, bid: Id, do_fix: bool, check_only: bool) -> Result<()> {
+    let mut ws = repo.pull(bid).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
+    let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+    let latest = latest_versions(&space);
+
+    let mut changed = 0u32;
+    let mut errors = 0u32;
+    let mut checked = 0u32;
+
+    for (&frag_id, &(vid, _ts)) in &latest {
+        let Some(ch) = content_handle_of(&space, vid) else { continue; };
+        let Ok(content) = ws.get::<View<str>, _>(ch) else { continue; };
+        let original = content.as_ref().to_string();
+        checked += 1;
+
+        let fixed = lint_fix(&original, &space);
+
+        if fixed != original {
+            changed += 1;
+            let title = read_title(&space, &mut ws, vid).unwrap_or_default();
+
+            if check_only {
+                eprintln!("LINT {:x} — {title}", frag_id);
+                errors += 1;
+            } else if do_fix {
+                // Validate typst on the fixed version
+                if let Err(e) = validate_typst(&fixed) {
+                    eprintln!("LINT_TYPST_ERROR {:x} — {title}: {e}", frag_id);
+                    errors += 1;
+                    continue;
+                }
+                let tag_ids = tags_of(&space, vid);
+                let content_handle = ws.put(fixed);
+                let change = TribleSet::new();
+                match commit_version(
+                    repo, &mut ws, change, frag_id, &title, content_handle,
+                    &tag_ids, &space, "wiki lint --fix", true,
+                ) {
+                    Ok(new_vid) => println!("FIXED {:x} — {title} → {new_vid}", frag_id),
+                    Err(e) => {
+                        eprintln!("LINT_COMMIT_ERROR {:x} — {title}: {e}", frag_id);
+                        errors += 1;
+                    }
+                }
+            } else {
+                // Dry-run: show what would change
+                println!("WOULD FIX {:x} — {title}", frag_id);
+                // Show a compact summary of changes
+                let orig_lines: Vec<&str> = original.lines().collect();
+                let fixed_lines: Vec<&str> = fixed.lines().collect();
+                for (i, (o, f)) in orig_lines.iter().zip(fixed_lines.iter()).enumerate() {
+                    if o != f {
+                        println!("  L{}: - {}", i + 1, o);
+                        println!("  L{}: + {}", i + 1, f);
+                    }
+                }
+            }
+        }
+    }
+
+    println!();
+    println!("Checked: {checked}, Changed: {changed}, Errors: {errors}");
+    if check_only && changed > 0 {
+        bail!("{changed} fragments need lint fixes");
+    }
+    Ok(())
+}
+
 fn cmd_export_all(repo: &mut Repo, bid: Id, dir: PathBuf) -> Result<()> {
     fs::create_dir_all(&dir).context("create output directory")?;
     let mut ws = repo.pull(bid).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
@@ -1213,6 +1470,8 @@ fn cmd_import_all(repo: &mut Repo, bid: Id, dir: PathBuf) -> Result<()> {
                 .unwrap_or_default();
             if new_content == existing_content { continue; }
 
+            // Lint-fix then validate typst
+            let new_content = lint_fix(&new_content, &space);
             if let Err(e) = validate_typst(&new_content) {
                 eprintln!("TYPST_ERROR {}: {}", path.display(), e);
                 continue;
@@ -1281,7 +1540,8 @@ fn cmd_create(
     let mut change = TribleSet::new();
     let tag_ids = resolve_tags(&space, &mut ws, &tags, &mut change);
 
-    // Always validate typst compilation
+    // Lint-fix then validate typst compilation
+    let content = lint_fix(&content, &space);
     validate_typst(&content)?;
 
     let fragment_id = genid().id;
@@ -1310,9 +1570,9 @@ fn cmd_edit(
         bail!("nothing to change — provide content, --title, or --tag");
     }
 
-    let resolved = parse_full_id(&id)?;
     let mut ws = repo.pull(bid).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
     let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+    let resolved = resolve_prefix(&space, &id)?;
     let fragment_id = to_fragment(&space, resolved)?;
     let prev_vid = latest_version_of(&space, fragment_id)
         .ok_or_else(|| anyhow::anyhow!("no versions for fragment {}", fragment_id))?;
@@ -1331,9 +1591,10 @@ fn cmd_edit(
     // Validate typst if tagged (either explicitly or inherited)
     let content_handle = match &content {
         Some(text) => {
-            // Always validate typst compilation
-            validate_typst(text)?;
-            ws.put(text.clone())
+            // Lint-fix then validate typst compilation
+            let fixed = lint_fix(text, &space);
+            validate_typst(&fixed)?;
+            ws.put(fixed)
         }
         None => content_handle_of(&space, prev_vid)
             .ok_or_else(|| anyhow::anyhow!("no content on previous version"))?,
@@ -1348,9 +1609,9 @@ fn cmd_edit(
 }
 
 fn cmd_show(repo: &mut Repo, bid: Id, id: String, follow_latest: bool) -> Result<()> {
-    let parsed_id = parse_full_id(&id)?;
     let mut ws = repo.pull(bid).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
     let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+    let parsed_id = resolve_prefix(&space, &id)?;
     let vid = resolve_to_show(&space, parsed_id, follow_latest)?;
     let fragment_id = version_fragment(&space, vid)
         .ok_or_else(|| anyhow::anyhow!("version has no fragment"))?;
@@ -1395,9 +1656,9 @@ fn cmd_show(repo: &mut Repo, bid: Id, id: String, follow_latest: bool) -> Result
 }
 
 fn cmd_export(repo: &mut Repo, bid: Id, id: String) -> Result<()> {
-    let parsed_id = parse_full_id(&id)?;
     let mut ws = repo.pull(bid).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
     let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+    let parsed_id = resolve_prefix(&space, &id)?;
     let vid = resolve_to_show(&space, parsed_id, false)?;
     let ch = content_handle_of(&space, vid)
         .ok_or_else(|| anyhow::anyhow!("no content"))?;
@@ -1414,9 +1675,9 @@ fn cmd_diff(
     from: Option<usize>,
     to: Option<usize>,
 ) -> Result<()> {
-    let resolved = parse_full_id(&id)?;
     let mut ws = repo.pull(bid).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
     let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+    let resolved = resolve_prefix(&space, &id)?;
     let fragment_id = to_fragment(&space, resolved)?;
     let history = version_history_of(&space, fragment_id);
     let n = history.len();
@@ -1469,9 +1730,9 @@ fn cmd_diff(
 }
 
 fn cmd_archive(repo: &mut Repo, bid: Id, id: String) -> Result<()> {
-    let resolved = parse_full_id(&id)?;
     let mut ws = repo.pull(bid).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
     let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+    let resolved = resolve_prefix(&space, &id)?;
     let fragment_id = to_fragment(&space, resolved)?;
     let prev_vid = latest_version_of(&space, fragment_id)
         .ok_or_else(|| anyhow::anyhow!("no versions for fragment {}", fragment_id))?;
@@ -1498,9 +1759,9 @@ fn cmd_archive(repo: &mut Repo, bid: Id, id: String) -> Result<()> {
 }
 
 fn cmd_restore(repo: &mut Repo, bid: Id, id: String) -> Result<()> {
-    let resolved = parse_full_id(&id)?;
     let mut ws = repo.pull(bid).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
     let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+    let resolved = resolve_prefix(&space, &id)?;
     let fragment_id = to_fragment(&space, resolved)?;
     let prev_vid = latest_version_of(&space, fragment_id)
         .ok_or_else(|| anyhow::anyhow!("no versions for fragment {}", fragment_id))?;
@@ -1529,9 +1790,9 @@ fn cmd_revert(repo: &mut Repo, bid: Id, id: String, to: usize) -> Result<()> {
         bail!("version number is 1-based");
     }
 
-    let resolved = parse_full_id(&id)?;
     let mut ws = repo.pull(bid).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
     let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+    let resolved = resolve_prefix(&space, &id)?;
     let fragment_id = to_fragment(&space, resolved)?;
     let history = version_history_of(&space, fragment_id);
 
@@ -1558,9 +1819,9 @@ fn cmd_revert(repo: &mut Repo, bid: Id, id: String, to: usize) -> Result<()> {
 }
 
 fn cmd_links(repo: &mut Repo, bid: Id, id: String) -> Result<()> {
-    let resolved = parse_full_id(&id)?;
     let mut ws = repo.pull(bid).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
     let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+    let resolved = resolve_prefix(&space, &id)?;
     let title = if is_version(&space, resolved) {
         read_title(&space, &mut ws, resolved).unwrap_or_else(|| "?".into())
     } else {
@@ -1748,9 +2009,9 @@ fn cmd_list(
 }
 
 fn cmd_history(repo: &mut Repo, bid: Id, id: String) -> Result<()> {
-    let resolved = parse_full_id(&id)?;
     let mut ws = repo.pull(bid).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
     let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+    let resolved = resolve_prefix(&space, &id)?;
     let fragment_id = to_fragment(&space, resolved)?;
     let history = version_history_of(&space, fragment_id);
 
@@ -1777,10 +2038,9 @@ fn cmd_tag_add(repo: &mut Repo, bid: Id, id: String, name: String) -> Result<()>
     if name.is_empty() {
         bail!("tag name cannot be empty");
     }
-    let resolved = parse_full_id(&id)?;
-
     let mut ws = repo.pull(bid).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
     let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+    let resolved = resolve_prefix(&space, &id)?;
     let fragment_id = to_fragment(&space, resolved)?;
     let prev_vid = latest_version_of(&space, fragment_id)
         .ok_or_else(|| anyhow::anyhow!("no versions for fragment {}", fragment_id))?;
@@ -1814,10 +2074,9 @@ fn cmd_tag_remove(repo: &mut Repo, bid: Id, id: String, name: String) -> Result<
     if name.is_empty() {
         bail!("tag name cannot be empty");
     }
-    let resolved = parse_full_id(&id)?;
-
     let mut ws = repo.pull(bid).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
     let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+    let resolved = resolve_prefix(&space, &id)?;
     let fragment_id = to_fragment(&space, resolved)?;
     let prev_vid = latest_version_of(&space, fragment_id)
         .ok_or_else(|| anyhow::anyhow!("no versions for fragment {}", fragment_id))?;
@@ -2178,6 +2437,7 @@ fn main() -> Result<()> {
             BatchAction::Import { dir } => cmd_import_all(&mut repo, branch_id, dir),
         },
         Command::FixTruncated { input } => cmd_fix_truncated(&mut repo, branch_id, input),
+        Command::Lint { fix, check } => cmd_lint(&mut repo, branch_id, fix, check),
     };
 
     repo.close().map_err(|e| anyhow::anyhow!("close: {e:?}"))?;

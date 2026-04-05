@@ -1822,12 +1822,14 @@ fn u128_to_usize_saturating(value: u128) -> usize {
 /// real-world images without being wildly pessimistic.
 const IMAGE_TOKENS_ESTIMATE: usize = 1600;
 
-/// Count `![…](files:…)` blob-ref markers in a string.  These get resolved
-/// to base64 image blocks at send time; the budget must account for their
-/// token cost even though the marker text is short.
+/// Count image blob-ref markers in a string.  Supports both markdown
+/// `![…](files:…)` and typst `#image("files:…")` syntax.  These get
+/// resolved to base64 image blocks at send time; the budget must account
+/// for their token cost even though the marker text is short.
 fn count_blob_image_refs(text: &str) -> usize {
     // Fast substring scan — no need to fully parse.
     text.matches("](files:").count()
+        + text.matches("#image(\"files:").count()
 }
 
 fn resolve_moment_boundary_end_key(
