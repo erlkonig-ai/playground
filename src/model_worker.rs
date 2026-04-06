@@ -1422,7 +1422,7 @@ mod tests {
                                     {"type": "text", "text": "Step 2"}
                                 ]
                             },
-                            {"type": "text", "text": "memory 1234"}
+                            {"type": "text", "text": "memory.rs 1234"}
                         ]
                     }
                 }
@@ -1452,7 +1452,7 @@ mod tests {
             let config = test_config();
             let messages = vec![
                 ChatMessage::system("sys"),
-                ChatMessage::assistant("orient show"),
+                ChatMessage::assistant("orient.rs show"),
                 ChatMessage::user("stdout:\nok\n"),
             ];
             let payload = build_openai_payload(&config, ws, "gpt-5", &messages);
@@ -1544,7 +1544,7 @@ mod tests {
             // Simulate: system, memory turns, breath, moment turns.
             let messages = vec![
                 ChatMessage::system("You are helpful."),
-                ChatMessage::user("memory block 1"),
+                ChatMessage::user("memory.rs block 1"),
                 ChatMessage::assistant("ack"),
                 ChatMessage::assistant("breath"),
                 ChatMessage::user("present moment begins."),
@@ -1631,7 +1631,7 @@ mod tests {
             "role": "assistant",
             "content": [
                 {"type": "thinking", "thinking": "Let me consider this carefully"},
-                {"type": "text", "text": "orient show"}
+                {"type": "text", "text": "orient.rs show"}
             ],
             "model": "claude-sonnet-4-6",
             "stop_reason": "end_turn"
@@ -1665,7 +1665,7 @@ mod tests {
             .and_then(JsonValue::as_str)
             .map(str::to_string);
 
-        assert_eq!(output_text, "orient show");
+        assert_eq!(output_text, "orient.rs show");
         assert_eq!(
             super::normalized_join(reasoning_parts),
             Some("Let me consider this carefully".to_string())

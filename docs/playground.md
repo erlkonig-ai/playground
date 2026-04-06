@@ -127,11 +127,11 @@ When the exec worker launches a command, it exports these environment variables:
 Reason notes (useful when the model/provider does not expose reasoning tokens):
 
 ```bash
-./playground/faculties/reason "Why this action makes sense"
-./playground/faculties/reason "Why this command now" -- git status
+./faculties/reason.rs "Why this action makes sense"
+./faculties/reason.rs "Why this command now" -- git status
 ```
 
-`reason` logs a structured rationale event into the active exec/cognition branch
+`reason.rs` logs a structured rationale event into the active exec/cognition branch
 and (when a command is provided) then runs it.
 
 ## Pile separation (severance model)

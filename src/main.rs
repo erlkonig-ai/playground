@@ -2031,7 +2031,7 @@ fn memory_cover_turn(
         .chunks
         .get(&chunk_id)
         .with_context(|| format!("missing context chunk {:x}", chunk_id))?;
-    let command = format!("memory {}", memory_ref(chunk));
+    let command = format!("memory.rs {}", memory_ref(chunk));
     let output = load_text(ws, chunk.summary).context("load memory chunk summary")?;
     let cost = command
         .chars()
@@ -2445,7 +2445,7 @@ fn synthetic_reason_command(reason_text: &str) -> String {
         .replace('\\', "\\\\")
         .replace('"', "\\\"")
         .replace('\n', "\\n");
-    format!("reason \"{escaped}\"")
+    format!("reason.rs \"{escaped}\"")
 }
 
 fn synthetic_reason_output_brief(event: &ReasonProjectionEvent) -> String {
