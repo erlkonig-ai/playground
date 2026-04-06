@@ -1367,6 +1367,7 @@ mod tests {
 
     fn with_test_workspace<T>(f: impl FnOnce(&mut Workspace<Pile<Blake3>>) -> T) -> T {
         let path = test_repo_path();
+        std::fs::File::create(&path).expect("create test pile file");
         let mut pile = Pile::<Blake3>::open(path.as_path()).expect("open test pile");
         pile.restore().expect("restore test pile");
         let mut repo = Repository::new(pile, SigningKey::from_bytes(&[7u8; 32]), TribleSet::new())
@@ -1384,6 +1385,7 @@ mod tests {
 
     fn test_config() -> Config {
         let path = test_repo_path();
+        std::fs::File::create(&path).expect("create test pile file");
         let mut config = Config::load(Some(path.as_path())).expect("load default config");
         config.model.model = "gpt-5".to_string();
         let _ = std::fs::remove_file(path);
