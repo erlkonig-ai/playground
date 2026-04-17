@@ -211,7 +211,7 @@ fn import_codex_records(
                 .root()
                 .expect("entity! must export a single root id");
             let message_entity = message_id
-                .aquire()
+                .acquire()
                 .expect("entity! root ids should be acquired in current thread");
             change += message_fragment;
             let content_handle = ws.put(message.content.clone());

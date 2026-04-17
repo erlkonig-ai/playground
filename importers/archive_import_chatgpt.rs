@@ -227,7 +227,7 @@ fn import_chatgpt_parsed_file(
                 continue;
             };
             let message_entity = message_id
-                .aquire()
+                .acquire()
                 .expect("entity! root ids should be acquired in current thread");
 
             let role = message
@@ -284,7 +284,7 @@ fn import_chatgpt_parsed_file(
                     .root()
                     .expect("entity! must export a single root id");
                 let attachment_entity = attachment_id
-                    .aquire()
+                    .acquire()
                     .expect("entity! root ids should be acquired in current thread");
                 attachment_ids.push(attachment_id);
 

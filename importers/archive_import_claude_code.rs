@@ -236,7 +236,7 @@ fn import_claude_code_records(
         // Attach message edges and raw provenance as non-identity attributes.
         {
             let conversation_entity = conversation_id
-                .aquire()
+                .acquire()
                 .expect("entity! root ids should be acquired in current thread");
             let msg_id_list: Vec<Id> = message_ids.iter().map(|(id, _)| *id).collect();
             change += entity! { &conversation_entity @
@@ -248,7 +248,7 @@ fn import_claude_code_records(
         // --- Pass 3: attach content attributes to messages. ---
         for (message_id, msg) in &message_ids {
             let message_entity = message_id
-                .aquire()
+                .acquire()
                 .expect("entity! root ids should be acquired in current thread");
 
             let author_key = format!("{}::{}", msg.author, msg.role);

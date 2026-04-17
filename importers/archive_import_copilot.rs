@@ -203,7 +203,7 @@ fn import_copilot_parsed_file(
             .root()
             .expect("entity! must export a single root id");
         let message_entity = message_id
-            .aquire()
+            .acquire()
             .expect("entity! root ids should be acquired in current thread");
         change += message_fragment;
 
