@@ -14,10 +14,10 @@ anyhow = "1"
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
-eframe = { version = "0.33", optional = true, features = ["persistence", "wgpu"] }
-GORBIE = { version = "0.9.14", optional = true, features = ["triblespace", "telemetry", "typst"] }
+eframe = { version = "0.34", optional = true, features = ["persistence", "wgpu"] }
+GORBIE = { version = "0.10", optional = true, features = ["triblespace", "telemetry", "typst"] }
 egui_plot = { version = "0.34", optional = true }
-faculties = "0.2"
+faculties = "0.8"
 hifitime = "4"
 libc = "0.2"
 rand = "0.8"
