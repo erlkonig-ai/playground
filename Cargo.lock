@@ -4,9 +4,9 @@ version = 4
 
 [[package]]
 name = "GORBIE"
-version = "0.9.13"
+version = "0.9.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "385df72d76349be945cbab814f0656c2c6adced68217853c746565141b1ce76f"
+checksum = "a708f33b02cda26718f0d8c50abbb7ef52caa9116afca805daf092a4e034a37d"
 dependencies = [
  "comemo",
  "ctrlc",
@@ -248,7 +248,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -259,7 +259,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -745,7 +745,6 @@ dependencies = [
  "cfg-if",
  "constant_time_eq",
  "cpufeatures 0.3.0",
- "digest 0.11.2",
 ]
 
 [[package]]
@@ -761,15 +760,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3078c7629b62d3f0439517fa394996acacc5cbc91c5a20d8c658e77abd503a71"
 dependencies = [
  "generic-array",
-]
-
-[[package]]
-name = "block-buffer"
-version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cdd35008169921d80bc60d3d0ab416eecb028c4cd653352907921d95084790be"
-dependencies = [
- "hybrid-array",
 ]
 
 [[package]]
@@ -1054,12 +1044,6 @@ checksum = "bde03770d3df201d4fb868f2c9c59e66a3e4e2bd06692a0fe701e7103c7e84d4"
 dependencies = [
  "error-code",
 ]
-
-[[package]]
-name = "cmov"
-version = "0.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "de0758edba32d61d1fd9f4d69491b47604b91ee2f7e6b33de7e54ca4ebe55dc3"
 
 [[package]]
 name = "cobs"
@@ -1361,15 +1345,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "crypto-common"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "77727bb15fa921304124b128af125e7e3b968275d1b108b379190264f4423710"
-dependencies = [
- "hybrid-array",
-]
-
-[[package]]
 name = "csv"
 version = "1.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1402,15 +1377,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ctutils"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1005a6d4446f5120ef475ad3d2af2b30c49c2c9c6904258e3bb30219bebed5e4"
-dependencies = [
- "cmov",
-]
-
-[[package]]
 name = "cursor-icon"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1425,7 +1391,7 @@ dependencies = [
  "cfg-if",
  "cpufeatures 0.2.17",
  "curve25519-dalek-derive",
- "digest 0.10.7",
+ "digest",
  "fiat-crypto",
  "rustc_version",
  "subtle",
@@ -1574,19 +1540,8 @@ version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
 dependencies = [
- "block-buffer 0.10.4",
- "crypto-common 0.1.7",
-]
-
-[[package]]
-name = "digest"
-version = "0.11.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4850db49bf08e663084f7fb5c87d202ef91a3907271aff24a94eb97ff039153c"
-dependencies = [
- "block-buffer 0.12.0",
- "crypto-common 0.2.1",
- "ctutils",
+ "block-buffer",
+ "crypto-common",
 ]
 
 [[package]]
@@ -2010,7 +1965,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2102,6 +2057,15 @@ name = "f256_pow5_div_pow2_lut"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "250ea0f9a0eb0e71b9040133a84777ddfd97a3c57689c249acb5917e1d869cb8"
+
+[[package]]
+name = "faculties"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "419660a59c412169a6a8e89c53b1dcfb737fb192e8b7a322d52c419c2f37ce62"
+dependencies = [
+ "triblespace",
+]
 
 [[package]]
 name = "fancy-regex"
@@ -2849,15 +2813,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "135b12329e5e3ce057a9f972339ea52bc954fe1e9358ef27f95e89716fbc5424"
 
 [[package]]
-name = "hybrid-array"
-version = "0.4.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a79f2aff40c18ab8615ddc5caa9eb5b96314aef18fe5823090f204ad988e813"
-dependencies = [
- "typenum",
-]
-
-[[package]]
 name = "hypher"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2875,7 +2830,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.58.0",
+ "windows-core 0.61.2",
 ]
 
 [[package]]
@@ -3790,7 +3745,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4468,6 +4423,7 @@ dependencies = [
  "ed25519-dalek",
  "eframe",
  "egui_plot",
+ "faculties",
  "hifitime",
  "libc",
  "rand 0.8.5",
@@ -5066,7 +5022,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5270,7 +5226,7 @@ checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
 dependencies = [
  "cfg-if",
  "cpufeatures 0.2.17",
- "digest 0.10.7",
+ "digest",
 ]
 
 [[package]]
@@ -5642,7 +5598,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6007,9 +5963,9 @@ dependencies = [
 
 [[package]]
 name = "triblespace"
-version = "0.34.1"
+version = "0.36.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "87ab4b6c266dc64a886c57c02a4f1d4bc53c385620f731881e129ec950caa830"
+checksum = "4f5aba5668a7dcdfdf040c39e45f56d374f87183b557ee189491e235104a3efd"
 dependencies = [
  "ed25519-dalek",
  "log",
@@ -6023,9 +5979,9 @@ dependencies = [
 
 [[package]]
 name = "triblespace-core"
-version = "0.34.1"
+version = "0.36.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e471f64bde8c86b1915c3f2671cfd91ef52709845d0d654a6b24223ccbd93467"
+checksum = "75c55035df90cc481ef44bce7c6e941562f2c03e59f2f9f10ab3266dd9b0f758"
 dependencies = [
  "anybytes",
  "arbitrary",
@@ -6035,7 +5991,6 @@ dependencies = [
  "bytes",
  "const_blake3",
  "crossbeam-channel",
- "digest 0.11.2",
  "ed25519",
  "ed25519-dalek",
  "ethnum",
@@ -6074,9 +6029,9 @@ dependencies = [
 
 [[package]]
 name = "triblespace-core-macros"
-version = "0.34.1"
+version = "0.36.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b27fc12e7d15a2d80268686ed3741473bc2a4d52184072edaf4a9bc54d15dd6"
+checksum = "59325056dee286271e451f33619b6f27a05884e4dabb4e2f67322a4b279776c5"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -6086,9 +6041,9 @@ dependencies = [
 
 [[package]]
 name = "triblespace-macros"
-version = "0.34.1"
+version = "0.36.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e5be38596321a310f5f49c25732aa39bf6ad4d66a8b99da413fbef4cbc803910"
+checksum = "4e84048f3aa52f41eb59a0d98b11a816e782e2f74215ae5c190e2379ceda2bad"
 dependencies = [
  "ed25519-dalek",
  "hex",
@@ -6102,9 +6057,9 @@ dependencies = [
 
 [[package]]
 name = "triblespace-macros-common"
-version = "0.34.1"
+version = "0.36.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2e3bf07da550a7076a903c8c5f1db3a45a10353c18b3144da1c879456c9e798d"
+checksum = "b5bc2e0779a5275b55de2093251eaf3e5e7a8d5e7aa9d40121a850857257e574"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -6428,7 +6383,7 @@ checksum = "f2f6fb2847f6742cd76af783a2a2c49e9375d0a111c7bef6f71cd9e738c72d6e"
 dependencies = [
  "memoffset",
  "tempfile",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7322,7 +7277,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

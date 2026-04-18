@@ -16,7 +16,7 @@ use triblespace::core::repo::{
 use triblespace::core::trible::TribleSet;
 use triblespace::core::value::Value;
 use triblespace::core::value::schemas::hash::{Blake3, Handle};
-use triblespace::macros::{entity, find, id_hex, pattern};
+use triblespace::macros::{entity, find, pattern};
 use triblespace::prelude::valueschemas::{GenId, NsTAIInterval, U256BE};
 use triblespace::prelude::{
     Attribute, BlobStore, BlobStoreGet, BranchStore, ToBlob, TryFromValue, TryToValue,
@@ -36,66 +36,27 @@ use crate::schema::playground_config;
 use crate::schema::playground_context;
 use crate::schema::playground_exec;
 
+// Schemas re-exported from the central `faculties` crate so the
+// dashboard, the faculty CLIs, and any GORBIE widget see identical
+// attribute IDs. Shaped as local aliases to minimize call-site churn.
+
 mod archive {
-    use triblespace::macros::id_hex;
-    use triblespace::prelude::blobschemas::LongString;
-    use triblespace::prelude::valueschemas::{Blake3, GenId, Handle};
-    use triblespace::prelude::*;
-
-    attributes! {
-        "5F10520477A04E5FB322C85CC78C6762" as pub kind: GenId;
-        "838CC157FFDD37C6AC7CC5A472E43ADB" as pub author: GenId;
-        "E63EE961ABDB1D1BEC0789FDAFFB9501" as pub author_name: Handle<Blake3, LongString>;
-        "2D15150501ACCD9DFD96CB4BF19D1883" as pub author_role: Handle<Blake3, LongString>;
-        "4FE6A8A43658BC2F61FEDF5CFB29EEFC" as pub author_model: Handle<Blake3, LongString>;
-        "ACF09FF3D62B73983A222313FF0C52D2" as pub content: Handle<Blake3, LongString>;
-    }
-
-    #[allow(non_upper_case_globals)]
-    pub const kind_message: Id = id_hex!("1A0841C92BBDA0A26EA9A8252D6ECD9B");
+    pub use faculties::schemas::archive::archive::{
+        author, author_model, author_name, author_role, content, kind_message,
+    };
 }
 
 mod teams {
-    use triblespace::prelude::blobschemas::LongString;
-    use triblespace::prelude::valueschemas::{Blake3, GenId, Handle};
-    use triblespace::prelude::*;
-
-    attributes! {
-        "1E525B603A0060D9FA132B3D4EE9538A" as pub chat: GenId;
-        "B6089037C04529F55D2A2D1A668DBE95" as pub chat_id: Handle<Blake3, LongString>;
-    }
+    pub use faculties::schemas::teams::teams::{chat, chat_id};
 }
 
 mod compass {
-    use triblespace::prelude::blobschemas::LongString;
-    use triblespace::prelude::valueschemas::{Blake3, GenId, Handle, NsTAIInterval, ShortString};
-    use triblespace::prelude::*;
-
-    attributes! {
-        "EE18CEC15C18438A2FAB670E2E46E00C" as pub title: Handle<Blake3, LongString>;
-        "5FF4941DCC3F6C35E9B3FD57216F69ED" as pub tag: ShortString;
-        "9D2B6EBDA67E9BB6BE6215959D182041" as pub parent: GenId;
-
-        "C1EAAA039DA7F486E4A54CC87D42E72C" as pub task: GenId;
-        "61C44E0F8A73443ED592A713151E99A4" as pub status: ShortString;
-        "47351DF00B3DDA96CB305157CD53D781" as pub note: Handle<Blake3, LongString>;
-    }
+    pub use faculties::schemas::compass::board::{note, parent, status, tag, task, title};
 }
 
 mod wiki {
-    use triblespace::macros::id_hex;
-    use triblespace::prelude::blobschemas::LongString;
-    use triblespace::prelude::valueschemas::{Blake3, GenId, Handle};
-    use triblespace::prelude::*;
-
-    attributes! {
-        "EBFC56D50B748E38A14F5FC768F1B9C1" as pub fragment: GenId;
-        "78BABEF1792531A2E51A372D96FE5F3E" as pub title: Handle<Blake3, LongString>;
-        "6DBBE746B7DD7A4793CA098AB882F553" as pub content: Handle<Blake3, LongString>;
-    }
-
-    #[allow(non_upper_case_globals)]
-    pub const kind_version: Id = id_hex!("1AA0310347EDFED7874E8BFECC6438CF");
+    pub use faculties::schemas::wiki::KIND_VERSION_ID as kind_version;
+    pub use faculties::schemas::wiki::attrs::{content, title};
 }
 
 // ── Layout constants ────────────────────────────────────────────────
@@ -185,48 +146,25 @@ fn diagnostics_is_headless() -> bool {
     DIAGNOSTICS_HEADLESS.load(Ordering::Relaxed)
 }
 
-const LOCAL_KIND_MESSAGE_ID: Id = id_hex!("A3556A66B00276797FCE8A2742AB850F");
-const LOCAL_KIND_READ_ID: Id = id_hex!("B663C15BB6F2BF591EA870386DD48537");
-const RELATIONS_KIND_PERSON_ID: Id = id_hex!("D8ADDE47121F4E7868017463EC860726");
-const COMPASS_KIND_GOAL_ID: Id = id_hex!("83476541420F46402A6A9911F46FBA3B");
-const COMPASS_KIND_STATUS_ID: Id = id_hex!("89602B3277495F4E214D4A417C8CF260");
-const COMPASS_KIND_NOTE_ID: Id = id_hex!("D4E49A6F02A14E66B62076AE4C01715F");
-const COMPASS_DEFAULT_STATUSES: [&str; 4] = ["todo", "doing", "blocked", "done"];
-
-const LOCAL_KIND_SPECS: [(Id, &str); 2] = [
-    (LOCAL_KIND_MESSAGE_ID, "local_message"),
-    (LOCAL_KIND_READ_ID, "local_read"),
-];
+use faculties::schemas::compass::{
+    DEFAULT_STATUSES as COMPASS_DEFAULT_STATUSES, KIND_GOAL_ID as COMPASS_KIND_GOAL_ID,
+    KIND_NOTE_ID as COMPASS_KIND_NOTE_ID, KIND_STATUS_ID as COMPASS_KIND_STATUS_ID,
+};
+use faculties::schemas::local_messages::{
+    KIND_MESSAGE_ID as LOCAL_KIND_MESSAGE_ID, KIND_SPECS as LOCAL_KIND_SPECS,
+};
+use faculties::schemas::relations::KIND_PERSON_ID as RELATIONS_KIND_PERSON_ID;
 
 mod local_messages {
-    use triblespace::prelude::attributes;
-    use triblespace::prelude::blobschemas;
-    use triblespace::prelude::valueschemas;
-
-    attributes! {
-        "42C4DB210F7EAFAF38F179ADCB4A9D5B" as from: valueschemas::GenId;
-        "95D58D3E68A43979F8AA51415541414C" as to: valueschemas::GenId;
-        "23075866B369B5F393D43B30649469F6" as body: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
-
-        "2213B191326E9B99605FA094E516E50E" as about_message: valueschemas::GenId;
-        "99E92F483731FA6D59115A8D6D187A37" as reader: valueschemas::GenId;
-    }
+    pub use faculties::schemas::local_messages::local::{
+        about_message, body, from, reader, to,
+    };
 }
 
 mod relations {
-    use triblespace::prelude::attributes;
-    use triblespace::prelude::blobschemas;
-    use triblespace::prelude::valueschemas;
-
-    attributes! {
-        "8F162B593D390E1424394DBF6883A72C" as alias: valueschemas::ShortString;
-        "32B22FBA3EC2ADC3FFEB48483FE8961F" as affinity: valueschemas::ShortString;
-        "9B3329149D54CB9A8E8075E4AA862649" as teams_user_id: valueschemas::ShortString;
-        "B563A063474CBE62ED25A8D0E9A1853C" as email: valueschemas::ShortString;
-        "DC0916CB5F640984EFE359A33105CA9A" as display_name: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
-        "F0AD0BBFAC4C4C899637573DC965622E" as first_name: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
-        "764DD765142B3F4725B614BD3B9118EC" as last_name: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
-    }
+    pub use faculties::schemas::relations::relations::{
+        affinity, alias, display_name, email, first_name, last_name, teams_user_id,
+    };
 }
 
 #[derive(Clone, Debug)]
