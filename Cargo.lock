@@ -2112,9 +2112,7 @@ checksum = "250ea0f9a0eb0e71b9040133a84777ddfd97a3c57689c249acb5917e1d869cb8"
 
 [[package]]
 name = "faculties"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7b9f71655ccfb926b02dd88b140dd0d24a8045a9eb71e839b4e1577a655f93fe"
+version = "0.11.1"
 dependencies = [
  "triblespace",
 ]
