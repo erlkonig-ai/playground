@@ -3,13 +3,13 @@ use std::fs;
 use anyhow::{Context, Result, anyhow};
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
-use triblespace::core::blob::schemas::simplearchive::SimpleArchive;
+use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::id::ExclusiveId;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, ReadError};
 use triblespace::core::repo::{PullError, Repository, Workspace};
-use triblespace::prelude::blobschemas::LongString;
-use triblespace::prelude::valueschemas::{Blake3, Handle};
+use triblespace::prelude::blobencodings::LongString;
+use triblespace::prelude::inlineencodings::{Blake3, Handle};
 use triblespace::prelude::*;
 
 use crate::config::Config;
@@ -29,8 +29,7 @@ pub(crate) fn init_repo(config: &Config) -> Result<(Repository<Pile>, Id)> {
         return Err(err);
     }
 
-    let metadata = build_playground_metadata(&mut pile)
-        .map_err(|err| anyhow!("build playground metadata: {err:?}"))?;
+    let metadata = build_playground_metadata();
     let mut repo = Repository::new(pile, SigningKey::generate(&mut OsRng), metadata)
         .map_err(|err| anyhow!("create repository: {err:?}"))?;
     let branch_id = repo
@@ -56,7 +55,7 @@ pub(crate) fn close_repo(repo: Repository<Pile>) -> Result<()> {
     repo.into_storage().close().context("close pile")
 }
 
-pub(crate) type CommitHandle = Value<Handle<Blake3, SimpleArchive>>;
+pub(crate) type CommitHandle = Inline<Handle<SimpleArchive>>;
 
 pub(crate) fn current_branch_head(
     repo: &mut Repository<Pile>,
@@ -103,7 +102,7 @@ pub(crate) fn refresh_cached_checkout(
 
 pub(crate) fn load_text(
     ws: &mut Workspace<Pile>,
-    handle: Value<Handle<Blake3, LongString>>,
+    handle: Inline<Handle<LongString>>,
 ) -> Result<String> {
     let view: View<str> = ws.get(handle).context("read text blob")?;
     Ok(view.as_ref().to_string())
@@ -119,7 +118,7 @@ pub(crate) fn ensure_worker_name(
     let catalog = ws.checkout(..).context("checkout workspace")?;
 
     let exists = find!(
-        (name_handle: Value<Handle<Blake3, LongString>>),
+        (name_handle: Inline<Handle<LongString>>),
         pattern!(&catalog, [{ worker_id @ metadata::name: ?name_handle }])
     )
     .into_iter()
@@ -130,9 +129,9 @@ pub(crate) fn ensure_worker_name(
     }
 
     let name_blob = label.to_owned().to_blob();
-    let name_handle = name_blob.get_handle::<Blake3>();
+    let name_handle = name_blob.get_handle();
     repo.storage_mut()
-        .put(name_blob)
+        .put::<LongString, _>(name_blob)
         .map_err(|err| anyhow!("store worker name blob: {err:?}"))?;
 
     let mut change = TribleSet::new();

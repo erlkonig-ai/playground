@@ -1,18 +1,17 @@
-use triblespace::core::blob::schemas::UnknownBlob;
-use triblespace::core::metadata;
+use triblespace::core::blob::encodings::UnknownBlob;
 use triblespace::macros::id_hex;
-use triblespace::prelude::blobschemas::LongString;
-use triblespace::prelude::valueschemas::{Blake3, GenId, Handle, U256BE};
+use triblespace::prelude::blobencodings::LongString;
+use triblespace::prelude::inlineencodings::{GenId, Handle, U256BE};
 use triblespace::prelude::*;
 
 pub mod playground_exec {
     use super::*;
 
     attributes! {
-        "79DD6A1A02E598033EDCE5C667E8E3E6" as pub command_text: Handle<Blake3, LongString>;
-        "4A7EA49FD72113D2DC497B407994B4F9" as pub cwd: Handle<Blake3, LongString>;
-        "17F4EA6F885F359C4CA967EE8478FA13" as pub stdin: Handle<Blake3, UnknownBlob>;
-        "FC48EA2441A1EECAC29C6A2032C09C1E" as pub stdin_text: Handle<Blake3, LongString>;
+        "79DD6A1A02E598033EDCE5C667E8E3E6" as pub command_text: Handle<LongString>;
+        "4A7EA49FD72113D2DC497B407994B4F9" as pub cwd: Handle<LongString>;
+        "17F4EA6F885F359C4CA967EE8478FA13" as pub stdin: Handle<UnknownBlob>;
+        "FC48EA2441A1EECAC29C6A2032C09C1E" as pub stdin_text: Handle<LongString>;
         "7FFF32386EBB2AE92094B7D88DE2743D" as pub timeout_ms: U256BE;
         "6A968C3FA5667F591D7C41B497CE4559" as pub sandbox_profile: GenId;
         "C4C3870642CAB5F55E7E575B1A62E640" as pub about_request: GenId;
@@ -21,12 +20,12 @@ pub mod playground_exec {
         "442A275ABC6834231FC65A4B89773ECD" as pub worker: GenId;
         "79474B948670C7D0322C309EB65219F8" as pub attempt: U256BE;
         "B68F9025545C7E616EB90C6440220348" as pub exit_code: U256BE;
-        "579EA2A82FB6A4D5B1E409D4F7747E2F" as pub stdout: Handle<Blake3, UnknownBlob>;
-        "6F1CB839CAE28A34C5107F36EB7939C3" as pub stderr: Handle<Blake3, UnknownBlob>;
-        "CA7AF66AAF5105EC15625ED14E1A2AC0" as pub stdout_text: Handle<Blake3, LongString>;
-        "BE4D1876B22EAF93AAD1175DB76D1C72" as pub stderr_text: Handle<Blake3, LongString>;
+        "579EA2A82FB6A4D5B1E409D4F7747E2F" as pub stdout: Handle<UnknownBlob>;
+        "6F1CB839CAE28A34C5107F36EB7939C3" as pub stderr: Handle<UnknownBlob>;
+        "CA7AF66AAF5105EC15625ED14E1A2AC0" as pub stdout_text: Handle<LongString>;
+        "BE4D1876B22EAF93AAD1175DB76D1C72" as pub stderr_text: Handle<LongString>;
         "26AD99A81ACA4EE8A6C37CE02A4CC53D" as pub duration_ms: U256BE;
-        "E9C77284C7DDCF522A8AC4622FE3FB11" as pub error: Handle<Blake3, LongString>;
+        "E9C77284C7DDCF522A8AC4622FE3FB11" as pub error: Handle<LongString>;
     }
 
     #[allow(non_upper_case_globals)]
@@ -43,41 +42,6 @@ pub mod playground_exec {
 
 }
 
-pub fn build_playground_exec_metadata<B>(
-    blobs: &mut B,
-) -> std::result::Result<Fragment, B::PutError>
-where
-    B: BlobStore<Blake3>,
-{
-    let attrs = playground_exec::describe(blobs)?;
-
-    let mut protocol = entity! { ExclusiveId::force_ref(&playground_exec::playground_exec_metadata) @
-        metadata::name: blobs.put("playground_exec")?,
-        metadata::description: blobs.put("Playground exec protocol.")?,
-        metadata::tag: metadata::KIND_PROTOCOL,
-        metadata::attribute*: attrs,
-    };
-
-    protocol += entity! { ExclusiveId::force_ref(&playground_exec::kind_command_request) @
-        metadata::name: blobs.put("kind_command_request")?,
-        metadata::description: blobs.put("Command request entity kind.")?,
-        metadata::tag: metadata::KIND_TAG,
-    };
-    protocol += entity! { ExclusiveId::force_ref(&playground_exec::kind_in_progress) @
-        metadata::name: blobs.put("kind_in_progress")?,
-        metadata::description: blobs.put("Command in-progress entity kind.")?,
-        metadata::tag: metadata::KIND_TAG,
-    };
-    protocol += entity! { ExclusiveId::force_ref(&playground_exec::kind_command_result) @
-        metadata::name: blobs.put("kind_command_result")?,
-        metadata::description: blobs.put("Command result entity kind.")?,
-        metadata::tag: metadata::KIND_TAG,
-    };
-    protocol += entity! { ExclusiveId::force_ref(&playground_exec::kind_timeout_extension) @
-        metadata::name: blobs.put("kind_timeout_extension")?,
-        metadata::description: blobs.put("Control event that extends the deadline for an in-flight command.")?,
-        metadata::tag: metadata::KIND_TAG,
-    };
-
-    Ok(protocol)
+pub fn build_playground_exec_metadata() -> Fragment {
+    playground_exec::describe()
 }

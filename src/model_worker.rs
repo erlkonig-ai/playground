@@ -10,12 +10,12 @@ use base64::Engine as _;
 use ureq;
 use serde_json::Value as JsonValue;
 use triblespace::core::blob::Bytes;
-use triblespace::core::blob::schemas::UnknownBlob;
+use triblespace::core::blob::encodings::UnknownBlob;
 use triblespace::core::metadata;
 use triblespace::core::import::json::JsonObjectImporter;
 use triblespace::core::repo::Workspace;
-use triblespace::prelude::blobschemas::LongString;
-use triblespace::prelude::valueschemas::{Blake3, Handle, NsTAIInterval, ShortString};
+use triblespace::prelude::blobencodings::LongString;
+use triblespace::prelude::inlineencodings::{Blake3, Handle, NsTAIInterval, ShortString};
 use triblespace::prelude::*;
 
 use crate::blob_refs::{PromptChunk, split_blob_refs, unknown_blob_handle_from_hex};
@@ -31,8 +31,8 @@ use crate::time_util::{epoch_interval, interval_key, now_epoch};
 #[derive(Debug, Clone)]
 struct ModelRequest {
     id: Id,
-    context: Value<Handle<Blake3, LongString>>,
-    model: Option<Value<ShortString>>,
+    context: Inline<Handle<LongString>>,
+    model: Option<Inline<ShortString>>,
 }
 
 #[derive(Debug)]
@@ -300,7 +300,7 @@ pub(crate) fn run_model_loop(
             let context_text = load_text(&mut ws, request.context).context("load context")?;
             let model = request
                 .model
-                .and_then(|value| value.try_from_value::<String>().ok())
+                .and_then(|value| value.try_from_inline::<String>().ok())
                 .unwrap_or_else(|| config.model.model.clone());
 
             let attempt: u64 = 1;
@@ -398,9 +398,9 @@ pub(crate) fn run_model_loop(
                         change += entity! { &result_id @ model_chat::cache_read_input_tokens: n };
                     }
 
-                    let mut import_blobs = MemoryBlobStore::<Blake3>::new();
+                    let mut import_blobs = MemoryBlobStore::new();
                     let mut importer =
-                        JsonObjectImporter::<_, Blake3>::new(&mut import_blobs, None);
+                        JsonObjectImporter::<_>::new(&mut import_blobs, None);
                     match importer.import_blob(raw_blob) {
                         Ok(fragment) => {
                             let import_reader = import_blobs
@@ -482,7 +482,7 @@ fn next_pending_model_request(catalog: &TribleSet, worker_id: Id) -> Option<Mode
     .collect();
 
     let mut candidates: Vec<_> = find!(
-        (request_id: Id, context: Value<Handle<Blake3, LongString>>),
+        (request_id: Id, context: Inline<Handle<LongString>>),
         pattern!(catalog, [{
             ?request_id @
             metadata::tag: model_chat::kind_request,
@@ -494,7 +494,7 @@ fn next_pending_model_request(catalog: &TribleSet, worker_id: Id) -> Option<Mode
 
     candidates.sort_by_key(|(id, _)| {
         find!(
-            (ts: Value<NsTAIInterval>),
+            (ts: Inline<NsTAIInterval>),
             pattern!(catalog, [{ *id @ metadata::created_at: ?ts }])
         )
         .next()
@@ -505,7 +505,7 @@ fn next_pending_model_request(catalog: &TribleSet, worker_id: Id) -> Option<Mode
     let (id, context) = candidates.into_iter().next()?;
 
     let model = find!(
-        (m: Value<ShortString>),
+        (m: Inline<ShortString>),
         pattern!(catalog, [{ id @ model_chat::model: ?m }])
     )
     .next()
@@ -1323,7 +1323,7 @@ mod tests {
     use triblespace::core::repo::Repository;
     use triblespace::core::repo::Workspace;
     use triblespace::core::repo::pile::Pile;
-    use triblespace::prelude::valueschemas::{Blake3, Handle};
+    use triblespace::prelude::inlineencodings::{Blake3, Handle};
     use triblespace::prelude::*;
 
     use crate::chat_prompt::ChatMessage;
@@ -1357,7 +1357,7 @@ mod tests {
         png.resize(210, 0x00);
         png.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, b'I', b'E', b'N', b'D', 0xAE, 0x42, 0x60, 0x82]);
         let blob: Blob<UnknownBlob> = Blob::new(Bytes::from(png));
-        let handle: Value<Handle<Blake3, UnknownBlob>> = ws.put(blob);
+        let handle: Inline<Handle<UnknownBlob>> = ws.put(blob);
         handle
             .raw
             .iter()

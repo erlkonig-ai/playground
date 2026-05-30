@@ -7,8 +7,8 @@ use rand::rngs::OsRng;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::{Repository, Workspace};
-use triblespace::prelude::blobschemas::LongString;
-use triblespace::prelude::valueschemas::{Blake3, GenId, Handle, NsTAIInterval, U256BE};
+use triblespace::prelude::blobencodings::LongString;
+use triblespace::prelude::inlineencodings::{Blake3, GenId, Handle, NsTAIInterval, U256BE};
 use triblespace::prelude::*;
 
 use crate::repo_ops::push_workspace;
@@ -216,7 +216,7 @@ fn load_latest_config(
     let mut latest: Option<(Id, i128)> = None;
 
     for (config_id, updated_at) in find!(
-        (config_id: Id, updated_at: Value<NsTAIInterval>),
+        (config_id: Id, updated_at: Inline<NsTAIInterval>),
         pattern!(catalog, [{
             ?config_id @
             metadata::tag: playground_config::kind_config,
@@ -238,113 +238,100 @@ fn load_latest_config(
     let mut config = default_config(pile_path.to_path_buf());
 
     if let Some(prompt) =
-        load_string_attr(ws, catalog, config_id, playground_config::system_prompt)?
+        load_string_attr(ws, catalog, config_id, &playground_config::system_prompt)?
     {
         config.system_prompt = prompt;
     }
-    if let Some(branch) = load_string_attr(ws, catalog, config_id, playground_config::branch)? {
+    if let Some(branch) = load_string_attr(ws, catalog, config_id, &playground_config::branch)? {
         config.branch = branch;
     }
-    if let Some(author) = load_string_attr(ws, catalog, config_id, playground_config::author)? {
+    if let Some(author) = load_string_attr(ws, catalog, config_id, &playground_config::author)? {
         config.author = author;
     }
-    if let Some(role) = load_string_attr(ws, catalog, config_id, playground_config::author_role)? {
+    if let Some(role) = load_string_attr(ws, catalog, config_id, &playground_config::author_role)? {
         config.author_role = role;
     }
-    if let Some(id) = load_id_attr(catalog, config_id, playground_config::persona_id) {
+    if let Some(id) = load_id_attr(catalog, config_id, &playground_config::persona_id) {
         config.persona_id = Some(id);
     }
-    if let Some(id) = load_id_attr(catalog, config_id, playground_config::active_model_profile_id) {
+    if let Some(id) = load_id_attr(catalog, config_id, &playground_config::active_model_profile_id) {
         config.model_profile_id = Some(id);
     }
-    if let Some(model) = load_string_attr(ws, catalog, config_id, playground_config::model_name)? {
+    if let Some(model) = load_string_attr(ws, catalog, config_id, &playground_config::model_name)? {
         config.model.model = model;
     }
-    if let Some(url) = load_string_attr(ws, catalog, config_id, playground_config::model_base_url)? {
+    if let Some(url) = load_string_attr(ws, catalog, config_id, &playground_config::model_base_url)? {
         config.model.base_url = url;
     }
-    if let Some(effort) = load_string_attr(
-        ws,
-        catalog,
-        config_id,
-        playground_config::model_reasoning_effort,
+    if let Some(effort) = load_string_attr(ws, catalog, config_id, &playground_config::model_reasoning_effort,
     )? {
         config.model.reasoning_effort = Some(effort);
     }
-    if let Some(key) = load_string_attr(ws, catalog, config_id, playground_config::model_api_key)? {
+    if let Some(key) = load_string_attr(ws, catalog, config_id, &playground_config::model_api_key)? {
         config.model.api_key = Some(key);
     }
-    if let Some(key) = load_string_attr(ws, catalog, config_id, playground_config::tavily_api_key)?
+    if let Some(key) = load_string_attr(ws, catalog, config_id, &playground_config::tavily_api_key)?
     {
         config.tavily_api_key = Some(key);
     }
-    if let Some(key) = load_string_attr(ws, catalog, config_id, playground_config::exa_api_key)? {
+    if let Some(key) = load_string_attr(ws, catalog, config_id, &playground_config::exa_api_key)? {
         config.exa_api_key = Some(key);
     }
     if let Some(cwd) =
-        load_string_attr(ws, catalog, config_id, playground_config::exec_default_cwd)?
+        load_string_attr(ws, catalog, config_id, &playground_config::exec_default_cwd)?
     {
         config.exec.default_cwd = Some(PathBuf::from(cwd));
     }
 
-    if let Some(id) = load_id_attr(catalog, config_id, playground_config::exec_sandbox_profile) {
+    if let Some(id) = load_id_attr(catalog, config_id, &playground_config::exec_sandbox_profile) {
         config.exec.sandbox_profile = Some(id);
     }
     if let Some(poll_ms) =
-        load_u256_attr(catalog, config_id, playground_config::poll_ms).and_then(|v| v.try_from_value::<u64>().ok())
+        load_u256_attr(catalog, config_id, &playground_config::poll_ms).and_then(|v| v.try_from_inline::<u64>().ok())
     {
         config.poll_ms = poll_ms;
     }
     if let Some(stream) =
-        load_u256_attr(catalog, config_id, playground_config::model_stream).and_then(|v| v.try_from_value::<u64>().ok())
+        load_u256_attr(catalog, config_id, &playground_config::model_stream).and_then(|v| v.try_from_inline::<u64>().ok())
     {
         config.model.stream = stream != 0;
     }
-    if let Some(tokens) = load_u256_attr(
-        catalog,
-        config_id,
-        playground_config::model_context_window_tokens,
+    if let Some(tokens) = load_u256_attr(catalog, config_id, &playground_config::model_context_window_tokens,
     )
-    .and_then(|v| v.try_from_value::<u64>().ok())
+    .and_then(|v| v.try_from_inline::<u64>().ok())
     {
         config.model.context_window_tokens = tokens;
     }
     if let Some(tokens) =
-        load_u256_attr(catalog, config_id, playground_config::model_max_output_tokens)
-            .and_then(|v| v.try_from_value::<u64>().ok())
+        load_u256_attr(catalog, config_id, &playground_config::model_max_output_tokens)
+            .and_then(|v| v.try_from_inline::<u64>().ok())
     {
         config.model.max_output_tokens = tokens;
     }
-    if let Some(tokens) = load_u256_attr(
-        catalog,
-        config_id,
-        playground_config::model_context_safety_margin_tokens,
+    if let Some(tokens) = load_u256_attr(catalog, config_id, &playground_config::model_context_safety_margin_tokens,
     )
-    .and_then(|v| v.try_from_value::<u64>().ok())
+    .and_then(|v| v.try_from_inline::<u64>().ok())
     {
         config.model.context_safety_margin_tokens = tokens;
     }
-    if let Some(chars) = load_u256_attr(
-        catalog,
-        config_id,
-        playground_config::model_chars_per_token,
+    if let Some(chars) = load_u256_attr(catalog, config_id, &playground_config::model_chars_per_token,
     )
-    .and_then(|v| v.try_from_value::<u64>().ok())
+    .and_then(|v| v.try_from_inline::<u64>().ok())
     {
         config.model.chars_per_token = chars;
     }
-    if let Some(v) = load_u256_attr(catalog, config_id, playground_config::model_max_inline_images)
-        .and_then(|v| v.try_from_value::<u64>().ok())
+    if let Some(v) = load_u256_attr(catalog, config_id, &playground_config::model_max_inline_images)
+        .and_then(|v| v.try_from_inline::<u64>().ok())
     {
         config.model.max_inline_images = v;
     }
-    if let Some(v) = load_u256_attr(catalog, config_id, playground_config::model_max_inline_image_bytes)
-        .and_then(|v| v.try_from_value::<u64>().ok())
+    if let Some(v) = load_u256_attr(catalog, config_id, &playground_config::model_max_inline_image_bytes)
+        .and_then(|v| v.try_from_inline::<u64>().ok())
     {
         config.model.max_inline_image_bytes = v;
     }
-    if let Some(v) = load_u256_attr(catalog, config_id, playground_config::model_vision)
-        .and_then(|v| v.try_from_value::<u64>().ok())
+    if let Some(v) = load_u256_attr(catalog, config_id, &playground_config::model_vision)
+        .and_then(|v| v.try_from_inline::<u64>().ok())
     {
         config.model.vision = v != 0;
     }
@@ -366,7 +353,7 @@ fn load_latest_model_profile(
     let mut latest: Option<(Id, i128)> = None;
 
     for (entry_id, updated_at) in find!(
-        (entry_id: Id, updated_at: Value<NsTAIInterval>),
+        (entry_id: Id, updated_at: Inline<NsTAIInterval>),
         pattern!(catalog, [{
             ?entry_id @
             metadata::tag: playground_config::kind_model_profile,
@@ -387,77 +374,64 @@ fn load_latest_model_profile(
     };
 
     let mut model = ModelConfig::default();
-    if let Some(name) = load_string_attr(ws, catalog, entry_id, playground_config::model_name)? {
+    if let Some(name) = load_string_attr(ws, catalog, entry_id, &playground_config::model_name)? {
         model.model = name;
     }
-    if let Some(url) = load_string_attr(ws, catalog, entry_id, playground_config::model_base_url)? {
+    if let Some(url) = load_string_attr(ws, catalog, entry_id, &playground_config::model_base_url)? {
         model.base_url = url;
     }
-    if let Some(effort) = load_string_attr(
-        ws,
-        catalog,
-        entry_id,
-        playground_config::model_reasoning_effort,
+    if let Some(effort) = load_string_attr(ws, catalog, entry_id, &playground_config::model_reasoning_effort,
     )? {
         model.reasoning_effort = Some(effort);
     }
-    if let Some(key) = load_string_attr(ws, catalog, entry_id, playground_config::model_api_key)? {
+    if let Some(key) = load_string_attr(ws, catalog, entry_id, &playground_config::model_api_key)? {
         model.api_key = Some(key);
     }
     if let Some(stream) =
-        load_u256_attr(catalog, entry_id, playground_config::model_stream).and_then(|v| v.try_from_value::<u64>().ok())
+        load_u256_attr(catalog, entry_id, &playground_config::model_stream).and_then(|v| v.try_from_inline::<u64>().ok())
     {
         model.stream = stream != 0;
     }
-    if let Some(tokens) = load_u256_attr(
-        catalog,
-        entry_id,
-        playground_config::model_context_window_tokens,
+    if let Some(tokens) = load_u256_attr(catalog, entry_id, &playground_config::model_context_window_tokens,
     )
-    .and_then(|v| v.try_from_value::<u64>().ok())
+    .and_then(|v| v.try_from_inline::<u64>().ok())
     {
         model.context_window_tokens = tokens;
     }
     if let Some(tokens) =
-        load_u256_attr(catalog, entry_id, playground_config::model_max_output_tokens)
-            .and_then(|v| v.try_from_value::<u64>().ok())
+        load_u256_attr(catalog, entry_id, &playground_config::model_max_output_tokens)
+            .and_then(|v| v.try_from_inline::<u64>().ok())
     {
         model.max_output_tokens = tokens;
     }
-    if let Some(tokens) = load_u256_attr(
-        catalog,
-        entry_id,
-        playground_config::model_context_safety_margin_tokens,
+    if let Some(tokens) = load_u256_attr(catalog, entry_id, &playground_config::model_context_safety_margin_tokens,
     )
-    .and_then(|v| v.try_from_value::<u64>().ok())
+    .and_then(|v| v.try_from_inline::<u64>().ok())
     {
         model.context_safety_margin_tokens = tokens;
     }
-    if let Some(chars) = load_u256_attr(
-        catalog,
-        entry_id,
-        playground_config::model_chars_per_token,
+    if let Some(chars) = load_u256_attr(catalog, entry_id, &playground_config::model_chars_per_token,
     )
-    .and_then(|v| v.try_from_value::<u64>().ok())
+    .and_then(|v| v.try_from_inline::<u64>().ok())
     {
         model.chars_per_token = chars;
     }
-    if let Some(v) = load_u256_attr(catalog, entry_id, playground_config::model_max_inline_images)
-        .and_then(|v| v.try_from_value::<u64>().ok())
+    if let Some(v) = load_u256_attr(catalog, entry_id, &playground_config::model_max_inline_images)
+        .and_then(|v| v.try_from_inline::<u64>().ok())
     {
         model.max_inline_images = v;
     }
-    if let Some(v) = load_u256_attr(catalog, entry_id, playground_config::model_max_inline_image_bytes)
-        .and_then(|v| v.try_from_value::<u64>().ok())
+    if let Some(v) = load_u256_attr(catalog, entry_id, &playground_config::model_max_inline_image_bytes)
+        .and_then(|v| v.try_from_inline::<u64>().ok())
     {
         model.max_inline_image_bytes = v;
     }
-    if let Some(v) = load_u256_attr(catalog, entry_id, playground_config::model_vision)
-        .and_then(|v| v.try_from_value::<u64>().ok())
+    if let Some(v) = load_u256_attr(catalog, entry_id, &playground_config::model_vision)
+        .and_then(|v| v.try_from_inline::<u64>().ok())
     {
         model.vision = v != 0;
     }
-    let name = load_string_attr(ws, catalog, entry_id, metadata::name)?
+    let name = load_string_attr(ws, catalog, entry_id, &metadata::name)?
         .unwrap_or_else(|| format!("profile-{profile_id:x}"));
     Ok(Some((model, name)))
 }
@@ -474,7 +448,7 @@ fn store_config(ws: &mut Workspace<Pile>, config: &Config) -> Result<()> {
     let branch = ws.put(config.branch.clone());
     let author = ws.put(config.author.clone());
     let author_role = ws.put(config.author_role.clone());
-    let poll_ms: Value<U256BE> = config.poll_ms.to_value();
+    let poll_ms: Inline<U256BE> = config.poll_ms.to_inline();
 
     let mut change = TribleSet::new();
     change += entity! { &config_id @
@@ -510,15 +484,15 @@ fn store_config(ws: &mut Workspace<Pile>, config: &Config) -> Result<()> {
     let profile_name = ws.put(config.model_profile_name.clone());
     let model_name = ws.put(config.model.model.clone());
     let model_base_url = ws.put(config.model.base_url.clone());
-    let model_stream: Value<U256BE> = if config.model.stream { 1u64 } else { 0u64 }.to_value();
-    let model_context_window_tokens: Value<U256BE> = config.model.context_window_tokens.to_value();
-    let model_max_output_tokens: Value<U256BE> = config.model.max_output_tokens.to_value();
-    let model_context_safety_margin_tokens: Value<U256BE> =
-        config.model.context_safety_margin_tokens.to_value();
-    let model_chars_per_token: Value<U256BE> = config.model.chars_per_token.to_value();
-    let model_max_inline_images: Value<U256BE> = config.model.max_inline_images.to_value();
-    let model_max_inline_image_bytes: Value<U256BE> = config.model.max_inline_image_bytes.to_value();
-    let model_vision: Value<U256BE> = if config.model.vision { 1u64 } else { 0u64 }.to_value();
+    let model_stream: Inline<U256BE> = if config.model.stream { 1u64 } else { 0u64 }.to_inline();
+    let model_context_window_tokens: Inline<U256BE> = config.model.context_window_tokens.to_inline();
+    let model_max_output_tokens: Inline<U256BE> = config.model.max_output_tokens.to_inline();
+    let model_context_safety_margin_tokens: Inline<U256BE> =
+        config.model.context_safety_margin_tokens.to_inline();
+    let model_chars_per_token: Inline<U256BE> = config.model.chars_per_token.to_inline();
+    let model_max_inline_images: Inline<U256BE> = config.model.max_inline_images.to_inline();
+    let model_max_inline_image_bytes: Inline<U256BE> = config.model.max_inline_image_bytes.to_inline();
+    let model_vision: Inline<U256BE> = if config.model.vision { 1u64 } else { 0u64 }.to_inline();
 
     change += entity! { &profile_entry_id @
         metadata::tag: playground_config::kind_model_profile,
@@ -554,10 +528,10 @@ fn load_string_attr(
     ws: &mut Workspace<Pile>,
     catalog: &TribleSet,
     config_id: Id,
-    attr: Attribute<Handle<Blake3, LongString>>,
+    attr: &Attribute<Handle<LongString>>,
 ) -> Result<Option<String>> {
     let mut handles = find!(
-        (entity: Id, handle: Value<Handle<Blake3, LongString>>),
+        (entity: Id, handle: Inline<Handle<LongString>>),
         pattern!(catalog, [{ ?entity @ attr: ?handle }])
     )
     .filter(|(entity, _)| *entity == config_id);
@@ -574,21 +548,21 @@ fn load_string_attr(
     Ok(Some(view.as_ref().to_string()))
 }
 
-fn load_id_attr(catalog: &TribleSet, config_id: Id, attr: Attribute<GenId>) -> Option<Id> {
+fn load_id_attr(catalog: &TribleSet, config_id: Id, attr: &Attribute<GenId>) -> Option<Id> {
     find!(
-        (entity: Id, value: Value<GenId>),
+        (entity: Id, value: Inline<GenId>),
         pattern!(catalog, [{ ?entity @ attr: ?value }])
     )
-    .find_map(|(entity, value)| (entity == config_id).then(|| value.try_from_value::<Id>().ok())?)
+    .find_map(|(entity, value)| (entity == config_id).then(|| value.try_from_inline::<Id>().ok())?)
 }
 
 fn load_u256_attr(
     catalog: &TribleSet,
     config_id: Id,
-    attr: Attribute<U256BE>,
-) -> Option<Value<U256BE>> {
+    attr: &Attribute<U256BE>,
+) -> Option<Inline<U256BE>> {
     find!(
-        (entity: Id, value: Value<U256BE>),
+        (entity: Id, value: Inline<U256BE>),
         pattern!(catalog, [{ ?entity @ attr: ?value }])
     )
     .find_map(|(entity, value)| (entity == config_id).then_some(value))

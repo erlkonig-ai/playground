@@ -10,12 +10,12 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use triblespace::core::blob::Bytes;
-use triblespace::core::blob::schemas::UnknownBlob;
+use triblespace::core::blob::encodings::UnknownBlob;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::Workspace;
-use triblespace::prelude::blobschemas::LongString;
-use triblespace::prelude::valueschemas::{Blake3, Handle, NsTAIInterval, U256BE};
+use triblespace::prelude::blobencodings::LongString;
+use triblespace::prelude::inlineencodings::{Blake3, Handle, NsTAIInterval, U256BE};
 use triblespace::prelude::*;
 
 use crate::config::Config;
@@ -32,11 +32,11 @@ const EXEC_CONTROL_POLL_MS: u64 = 100;
 #[derive(Debug, Clone)]
 struct CommandRequest {
     id: Id,
-    command: Value<Handle<Blake3, LongString>>,
-    cwd: Option<Value<Handle<Blake3, LongString>>>,
-    stdin: Option<Value<Handle<Blake3, UnknownBlob>>>,
-    stdin_text: Option<Value<Handle<Blake3, LongString>>>,
-    timeout_ms: Option<Value<U256BE>>,
+    command: Inline<Handle<LongString>>,
+    cwd: Option<Inline<Handle<LongString>>>,
+    stdin: Option<Inline<Handle<UnknownBlob>>>,
+    stdin_text: Option<Inline<Handle<LongString>>>,
+    timeout_ms: Option<Inline<U256BE>>,
 }
 
 #[derive(Debug)]
@@ -129,7 +129,7 @@ pub(crate) fn run_exec_loop(
 
             let initial_timeout_ms = request
                 .timeout_ms
-                .and_then(|v| v.try_from_value::<u64>().ok())
+                .and_then(|v| v.try_from_inline::<u64>().ok())
                 .unwrap_or(DEFAULT_EXEC_TIMEOUT_MS);
             let initial_timeout = Duration::from_millis(initial_timeout_ms);
             let started = Instant::now();
@@ -471,7 +471,7 @@ fn next_pending_request(catalog: &TribleSet, worker_id: Id) -> Option<CommandReq
     .collect();
 
     let mut candidates: Vec<_> = find!(
-        (request_id: Id, command: Value<Handle<Blake3, LongString>>),
+        (request_id: Id, command: Inline<Handle<LongString>>),
         pattern!(catalog, [{
             ?request_id @
             metadata::tag: playground_exec::kind_command_request,
@@ -483,7 +483,7 @@ fn next_pending_request(catalog: &TribleSet, worker_id: Id) -> Option<CommandReq
 
     candidates.sort_by_key(|(id, _)| {
         find!(
-            (ts: Value<NsTAIInterval>),
+            (ts: Inline<NsTAIInterval>),
             pattern!(catalog, [{ *id @ metadata::created_at: ?ts }])
         )
         .next()
@@ -494,28 +494,28 @@ fn next_pending_request(catalog: &TribleSet, worker_id: Id) -> Option<CommandReq
     let (id, command) = candidates.into_iter().next()?;
 
     let cwd = find!(
-        (v: Value<Handle<Blake3, LongString>>),
+        (v: Inline<Handle<LongString>>),
         pattern!(catalog, [{ id @ playground_exec::cwd: ?v }])
     )
     .next()
     .map(|(v,)| v);
 
     let stdin = find!(
-        (v: Value<Handle<Blake3, UnknownBlob>>),
+        (v: Inline<Handle<UnknownBlob>>),
         pattern!(catalog, [{ id @ playground_exec::stdin: ?v }])
     )
     .next()
     .map(|(v,)| v);
 
     let stdin_text = find!(
-        (v: Value<Handle<Blake3, LongString>>),
+        (v: Inline<Handle<LongString>>),
         pattern!(catalog, [{ id @ playground_exec::stdin_text: ?v }])
     )
     .next()
     .map(|(v,)| v);
 
     let timeout_ms = find!(
-        (v: Value<U256BE>),
+        (v: Inline<U256BE>),
         pattern!(catalog, [{ id @ playground_exec::timeout_ms: ?v }])
     )
     .next()
@@ -539,7 +539,7 @@ fn collect_timeout_extension_ms(
 ) -> Option<u64> {
     let mut extension_ms: Option<u64> = None;
     for (_event_id, timeout_ms) in find!(
-        (_event_id: Id, timeout_ms: Value<U256BE>),
+        (_event_id: Id, timeout_ms: Inline<U256BE>),
         pattern_changes!(updated, delta, [{
             ?_event_id @
             metadata::tag: playground_exec::kind_timeout_extension,
@@ -548,7 +548,7 @@ fn collect_timeout_extension_ms(
             playground_exec::timeout_ms: ?timeout_ms,
         }])
     ) {
-        let Some(timeout_ms) = timeout_ms.try_from_value::<u64>().ok() else {
+        let Some(timeout_ms) = timeout_ms.try_from_inline::<u64>().ok() else {
             continue;
         };
         if timeout_ms == 0 {
