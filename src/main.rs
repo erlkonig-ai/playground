@@ -11,12 +11,12 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use triblespace::core::blob::Bytes;
-use triblespace::core::blob::schemas::UnknownBlob;
+use triblespace::core::blob::encodings::UnknownBlob;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::{Repository, Workspace};
-use triblespace::prelude::blobschemas::LongString;
-use triblespace::prelude::valueschemas::{Blake3, Handle, NsTAIInterval, U256BE};
+use triblespace::prelude::blobencodings::LongString;
+use triblespace::prelude::inlineencodings::{Blake3, Handle, NsTAIInterval, U256BE};
 use triblespace::prelude::*;
 
 mod archive_schema;
@@ -46,14 +46,14 @@ const MEMORY_BRANCH_NAME: &str = "memory";
 
 mod reason_events {
     use triblespace::prelude::attributes;
-    use triblespace::prelude::blobschemas;
-    use triblespace::prelude::valueschemas;
+    use triblespace::prelude::blobencodings;
+    use triblespace::prelude::inlineencodings;
 
     attributes! {
-        "B10329D5D1087D15A3DAFF7A7CC50696" as text: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
-        "E6B1C728F1AE9F46CAB4DBB60D1A9528" as about_turn: valueschemas::GenId;
-        "721DED6DA776F2CF4FB91C54D9F82358" as worker: valueschemas::GenId;
-        "514F4FE9F560FB155450462C8CF50749" as command_text: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
+        "B10329D5D1087D15A3DAFF7A7CC50696" as text: inlineencodings::Handle<blobencodings::LongString>;
+        "E6B1C728F1AE9F46CAB4DBB60D1A9528" as about_turn: inlineencodings::GenId;
+        "721DED6DA776F2CF4FB91C54D9F82358" as worker: inlineencodings::GenId;
+        "514F4FE9F560FB155450462C8CF50749" as command_text: inlineencodings::Handle<blobencodings::LongString>;
     }
 }
 
@@ -758,8 +758,8 @@ struct MemoryCoverState {
 
 #[derive(Debug, Clone)]
 struct ReasonEventInfo {
-    text: Option<Value<Handle<Blake3, LongString>>>,
-    command_text: Option<Value<Handle<Blake3, LongString>>>,
+    text: Option<Inline<Handle<LongString>>>,
+    command_text: Option<Inline<Handle<LongString>>>,
 }
 
 fn ensure_model_request(
@@ -994,9 +994,9 @@ struct ModelResult {
 #[derive(Debug, Clone)]
 struct ModelResultInfo {
     id: Id,
-    output_text: Option<Value<Handle<Blake3, LongString>>>,
-    reasoning_text: Option<Value<Handle<Blake3, LongString>>>,
-    error: Option<Value<Handle<Blake3, LongString>>>,
+    output_text: Option<Inline<Handle<LongString>>>,
+    reasoning_text: Option<Inline<Handle<LongString>>>,
+    error: Option<Inline<Handle<LongString>>>,
 }
 
 fn wait_for_model_result(
@@ -1055,14 +1055,14 @@ struct ExecResult {
 struct CommandResultInfo {
     id: Id,
     about_request: Id,
-    finished_at: Option<Value<NsTAIInterval>>,
-    attempt: Option<Value<U256BE>>,
-    stdout: Option<Value<Handle<Blake3, UnknownBlob>>>,
-    stderr: Option<Value<Handle<Blake3, UnknownBlob>>>,
-    stdout_text: Option<Value<Handle<Blake3, LongString>>>,
-    stderr_text: Option<Value<Handle<Blake3, LongString>>>,
-    exit_code: Option<Value<U256BE>>,
-    error: Option<Value<Handle<Blake3, LongString>>>,
+    finished_at: Option<Inline<NsTAIInterval>>,
+    attempt: Option<Inline<U256BE>>,
+    stdout: Option<Inline<Handle<UnknownBlob>>>,
+    stderr: Option<Inline<Handle<UnknownBlob>>>,
+    stdout_text: Option<Inline<Handle<LongString>>>,
+    stderr_text: Option<Inline<Handle<LongString>>>,
+    exit_code: Option<Inline<U256BE>>,
+    error: Option<Inline<Handle<LongString>>>,
 }
 
 fn has_pending_command_request(catalog: &TribleSet) -> bool {
@@ -1151,7 +1151,7 @@ fn latest_pending_model_request(catalog: &TribleSet) -> Option<ModelRequestInfo>
     .filter(|request_id| !done.contains(request_id))
     .map(|request_id| {
         let requested_at = find!(
-            ts: Value<NsTAIInterval>,
+            ts: Inline<NsTAIInterval>,
             pattern!(catalog, [{ request_id @ metadata::created_at: ?ts }])
         )
         .next()
@@ -1196,7 +1196,7 @@ fn latest_unrequested_thought(catalog: &TribleSet) -> Option<Id> {
     .filter(|thought_id| !requested.contains(thought_id))
     .map(|thought_id| {
         let created_at = find!(
-            ts: Value<NsTAIInterval>,
+            ts: Inline<NsTAIInterval>,
             pattern!(catalog, [{ thought_id @ metadata::created_at: ?ts }])
         )
         .next()
@@ -1237,9 +1237,9 @@ fn thought_for_exec_result(catalog: &TribleSet, exec_result_id: Id) -> Option<Id
 fn thought_context_handle(
     catalog: &TribleSet,
     thought_id: Id,
-) -> Option<Value<Handle<Blake3, LongString>>> {
+) -> Option<Inline<Handle<LongString>>> {
     find!(
-        context: Value<Handle<Blake3, LongString>>,
+        context: Inline<Handle<LongString>>,
         pattern!(catalog, [{ thought_id @ playground_cog::context: ?context }])
     )
     .next()
@@ -1256,31 +1256,31 @@ fn latest_model_result(catalog: &TribleSet, request_id: Id) -> Option<ModelResul
     )
     .map(|result_id| {
             let finished_at = find!(
-                ts: Value<NsTAIInterval>,
+                ts: Inline<NsTAIInterval>,
                 pattern!(catalog, [{ result_id @ metadata::finished_at: ?ts }])
             )
             .next();
 
             let attempt = find!(
-                a: Value<U256BE>,
+                a: Inline<U256BE>,
                 pattern!(catalog, [{ result_id @ model_chat::attempt: ?a }])
             )
             .next();
 
             let output_text = find!(
-                t: Value<Handle<Blake3, LongString>>,
+                t: Inline<Handle<LongString>>,
                 pattern!(catalog, [{ result_id @ model_chat::output_text: ?t }])
             )
             .next();
 
             let reasoning_text = find!(
-                t: Value<Handle<Blake3, LongString>>,
+                t: Inline<Handle<LongString>>,
                 pattern!(catalog, [{ result_id @ model_chat::reasoning_text: ?t }])
             )
             .next();
 
             let error = find!(
-                t: Value<Handle<Blake3, LongString>>,
+                t: Inline<Handle<LongString>>,
                 pattern!(catalog, [{ result_id @ model_chat::error: ?t }])
             )
             .next();
@@ -1306,7 +1306,7 @@ fn reason_events_for_turn(catalog: &TribleSet, turn_id: Id) -> Vec<ReasonEventIn
     )
     .map(|reason_id| {
         let created_at = find!(
-            ts: Value<NsTAIInterval>,
+            ts: Inline<NsTAIInterval>,
             pattern!(catalog, [{ reason_id @ metadata::created_at: ?ts }])
         )
         .next()
@@ -1314,13 +1314,13 @@ fn reason_events_for_turn(catalog: &TribleSet, turn_id: Id) -> Vec<ReasonEventIn
         .unwrap_or(i128::MIN);
 
         let text = find!(
-            t: Value<Handle<Blake3, LongString>>,
+            t: Inline<Handle<LongString>>,
             pattern!(catalog, [{ reason_id @ reason_events::text: ?t }])
         )
         .next();
 
         let command_text = find!(
-            t: Value<Handle<Blake3, LongString>>,
+            t: Inline<Handle<LongString>>,
             pattern!(catalog, [{ reason_id @ reason_events::command_text: ?t }])
         )
         .next();
@@ -1336,9 +1336,9 @@ fn reason_events_for_turn(catalog: &TribleSet, turn_id: Id) -> Vec<ReasonEventIn
 fn command_request_command_handle(
     catalog: &TribleSet,
     request_id: Id,
-) -> Option<Value<Handle<Blake3, LongString>>> {
+) -> Option<Inline<Handle<LongString>>> {
     find!(
-        cmd: Value<Handle<Blake3, LongString>>,
+        cmd: Inline<Handle<LongString>>,
         pattern!(catalog, [{ request_id @ playground_exec::command_text: ?cmd }])
     )
     .next()
@@ -1397,7 +1397,7 @@ fn latest_moment_boundary_turn_id(catalog: &TribleSet) -> Option<Id> {
     )
     .filter_map(|(boundary_id, turn_id)| {
         let created = find!(
-            ts: Value<NsTAIInterval>,
+            ts: Inline<NsTAIInterval>,
             pattern!(catalog, [{ boundary_id @ metadata::created_at: ?ts }])
         )
         .next()
@@ -1444,67 +1444,67 @@ fn fill_command_result_fields(catalog: &TribleSet, info: &mut CommandResultInfo)
     let result_id = info.id;
 
     info.finished_at = find!(
-        ts: Value<NsTAIInterval>,
+        ts: Inline<NsTAIInterval>,
         pattern!(catalog, [{ result_id @ metadata::finished_at: ?ts }])
     )
     .next();
 
     info.attempt = find!(
-        a: Value<U256BE>,
+        a: Inline<U256BE>,
         pattern!(catalog, [{ result_id @ playground_exec::attempt: ?a }])
     )
     .next();
 
     info.stdout = find!(
-        s: Value<Handle<Blake3, UnknownBlob>>,
+        s: Inline<Handle<UnknownBlob>>,
         pattern!(catalog, [{ result_id @ playground_exec::stdout: ?s }])
     )
     .next();
 
     info.stderr = find!(
-        s: Value<Handle<Blake3, UnknownBlob>>,
+        s: Inline<Handle<UnknownBlob>>,
         pattern!(catalog, [{ result_id @ playground_exec::stderr: ?s }])
     )
     .next();
 
     info.stdout_text = find!(
-        t: Value<Handle<Blake3, LongString>>,
+        t: Inline<Handle<LongString>>,
         pattern!(catalog, [{ result_id @ playground_exec::stdout_text: ?t }])
     )
     .next();
 
     info.stderr_text = find!(
-        t: Value<Handle<Blake3, LongString>>,
+        t: Inline<Handle<LongString>>,
         pattern!(catalog, [{ result_id @ playground_exec::stderr_text: ?t }])
     )
     .next();
 
     info.exit_code = find!(
-        c: Value<U256BE>,
+        c: Inline<U256BE>,
         pattern!(catalog, [{ result_id @ playground_exec::exit_code: ?c }])
     )
     .next();
 
     info.error = find!(
-        e: Value<Handle<Blake3, LongString>>,
+        e: Inline<Handle<LongString>>,
         pattern!(catalog, [{ result_id @ playground_exec::error: ?e }])
     )
     .next();
 }
 
 fn model_result_rank(
-    attempt: Option<Value<U256BE>>,
-    finished_at: Option<Value<NsTAIInterval>>,
+    attempt: Option<Inline<U256BE>>,
+    finished_at: Option<Inline<NsTAIInterval>>,
 ) -> (u64, i128) {
     (
-        attempt.and_then(|v| v.try_from_value::<u64>().ok()).unwrap_or_default(),
+        attempt.and_then(|v| v.try_from_inline::<u64>().ok()).unwrap_or_default(),
         finished_at.map(interval_key).unwrap_or(i128::MIN),
     )
 }
 
 fn command_result_rank(result: &CommandResultInfo) -> (u64, i128) {
     (
-        result.attempt.and_then(|v| v.try_from_value::<u64>().ok()).unwrap_or_default(),
+        result.attempt.and_then(|v| v.try_from_inline::<u64>().ok()).unwrap_or_default(),
         result.finished_at.map(interval_key).unwrap_or(i128::MIN),
     )
 }
@@ -1609,9 +1609,9 @@ fn delta_has_command_result(updated: &TribleSet, delta: &TribleSet, request_id: 
 #[derive(Debug, Clone)]
 struct ContextChunk {
     id: Id,
-    summary: Value<Handle<Blake3, LongString>>,
-    start_at: Value<NsTAIInterval>,
-    end_at: Value<NsTAIInterval>,
+    summary: Inline<Handle<LongString>>,
+    start_at: Inline<NsTAIInterval>,
+    end_at: Inline<NsTAIInterval>,
     children: Vec<Id>,
     about_exec_result: Option<Id>,
     about_archive_message: Option<Id>,
@@ -2187,9 +2187,9 @@ fn load_context_chunks(catalog: &TribleSet) -> ContextChunkIndex {
     for (chunk_id, summary, start_at, end_at) in find!(
         (
             chunk_id: Id,
-            summary: Value<Handle<Blake3, LongString>>,
-            start_at: Value<NsTAIInterval>,
-            end_at: Value<NsTAIInterval>
+            summary: Inline<Handle<LongString>>,
+            start_at: Inline<NsTAIInterval>,
+            end_at: Inline<NsTAIInterval>
         ),
         pattern!(catalog, [{
             ?chunk_id @
@@ -2355,7 +2355,7 @@ fn load_exec_result(ws: &mut Workspace<Pile>, result: CommandResultInfo) -> Resu
         .stderr
         .map(|handle| ws.get(handle).context("read stderr bytes"))
         .transpose()?;
-    let exit_code = result.exit_code.and_then(|v| v.try_from_value::<u64>().ok());
+    let exit_code = result.exit_code.and_then(|v| v.try_from_inline::<u64>().ok());
     let error = result
         .error
         .map(|handle| load_text(ws, handle))

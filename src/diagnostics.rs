@@ -5,8 +5,8 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use triblespace::core::blob::schemas::longstring::LongString;
-use triblespace::core::blob::schemas::simplearchive::SimpleArchive;
+use triblespace::core::blob::encodings::longstring::LongString;
+use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::id::{ExclusiveId, Id};
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::Pile;
@@ -14,12 +14,12 @@ use triblespace::core::repo::{
     BlobStoreMeta, Checkout, CommitSelector, CommitSet, Repository, Workspace, nth_ancestors,
 };
 use triblespace::core::trible::TribleSet;
-use triblespace::core::value::Value;
-use triblespace::core::value::schemas::hash::{Blake3, Handle};
+use triblespace::core::inline::Inline;
+use triblespace::core::inline::schemas::hash::{Blake3, Handle};
 use triblespace::macros::{entity, find, pattern};
-use triblespace::prelude::valueschemas::{GenId, NsTAIInterval, U256BE};
+use triblespace::prelude::inlineencodings::{GenId, NsTAIInterval, U256BE};
 use triblespace::prelude::{
-    Attribute, BlobStore, BlobStoreGet, BranchStore, ToBlob, TryFromValue, TryToValue,
+    Attribute, BlobStore, BlobStoreGet, BranchStore, ToBlob, TryFromInline, TryToInline,
     View, and,
 };
 
@@ -292,7 +292,7 @@ struct TeamsChatRow {
 #[derive(Debug, Clone)]
 struct ContextChunkRow {
     id: Id,
-    summary: Value<Handle<Blake3, LongString>>,
+    summary: Inline<Handle<LongString>>,
     start_at: Option<i128>,
     end_at: Option<i128>,
     children: Vec<Id>,
@@ -745,8 +745,8 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
             // Build range bounds as NsTAIInterval values.
             let ts_min = Epoch::from_tai_duration(hifitime::Duration::from_total_nanoseconds(view_end));
             let ts_max = Epoch::from_tai_duration(hifitime::Duration::from_total_nanoseconds(view_start));
-            let min_ts: Value<NsTAIInterval> = (ts_min, ts_min).try_to_value().unwrap();
-            let max_ts: Value<NsTAIInterval> = (ts_max, ts_max).try_to_value().unwrap();
+            let min_ts: Inline<NsTAIInterval> = (ts_min, ts_min).try_to_inline().unwrap();
+            let max_ts: Inline<NsTAIInterval> = (ts_max, ts_max).try_to_inline().unwrap();
 
             // Direct rendering: each event painted at its exact timestamp position.
             struct VisibleEvent {
@@ -757,7 +757,7 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
             }
             let mut events: Vec<VisibleEvent> = Vec::new();
 
-            let push_event = |events: &mut Vec<VisibleEvent>, id: Id, ts: Value<NsTAIInterval>, source: TimelineSource, summary: String| {
+            let push_event = |events: &mut Vec<VisibleEvent>, id: Id, ts: Inline<NsTAIInterval>, source: TimelineSource, summary: String| {
                 let key = interval_key(ts);
                 let y = viewport_rect.top() + ((view_start - key) as f64 / ns_per_px) as f32;
                 events.push(VisibleEvent { y, id, source, summary });
@@ -765,7 +765,7 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
 
             // Shell exec events.
             for (id, ts, command) in find!(
-                (id: Id, ts: Value<NsTAIInterval>, command: Value<Handle<Blake3, LongString>>),
+                (id: Id, ts: Inline<NsTAIInterval>, command: Inline<Handle<LongString>>),
                 and!(
                     pattern!(&exec_data, [{ ?id @ metadata::created_at: ?ts, playground_exec::command_text: ?command }]),
                     exec_data.value_in_range(ts, min_ts, max_ts),
@@ -778,7 +778,7 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
 
             // Cognition.
             for (id, ts, reasoning) in find!(
-                (id: Id, ts: Value<NsTAIInterval>, reasoning: Value<Handle<Blake3, LongString>>),
+                (id: Id, ts: Inline<NsTAIInterval>, reasoning: Inline<Handle<LongString>>),
                 and!(
                     pattern!(&exec_data, [{ ?id @ metadata::finished_at: ?ts, model_chat::reasoning_text: ?reasoning }]),
                     exec_data.value_in_range(ts, min_ts, max_ts),
@@ -791,7 +791,7 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
 
             // Local messages.
             for (id, ts, body) in find!(
-                (id: Id, ts: Value<NsTAIInterval>, body: Value<Handle<Blake3, LongString>>),
+                (id: Id, ts: Inline<NsTAIInterval>, body: Inline<Handle<LongString>>),
                 and!(
                     pattern!(&local_data, [{ ?id @ metadata::created_at: ?ts, local_messages::body: ?body }]),
                     local_data.value_in_range(ts, min_ts, max_ts),
@@ -804,7 +804,7 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
 
             // Teams messages.
             for (id, ts, content) in find!(
-                (id: Id, ts: Value<NsTAIInterval>, content: Value<Handle<Blake3, LongString>>),
+                (id: Id, ts: Inline<NsTAIInterval>, content: Inline<Handle<LongString>>),
                 and!(
                     pattern!(&teams_data, [{ ?id @ metadata::created_at: ?ts, archive::content: ?content }]),
                     teams_data.value_in_range(ts, min_ts, max_ts),
@@ -817,7 +817,7 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
 
             // Compass goals.
             for (id, ts, title) in find!(
-                (id: Id, ts: Value<NsTAIInterval>, title: Value<Handle<Blake3, LongString>>),
+                (id: Id, ts: Inline<NsTAIInterval>, title: Inline<Handle<LongString>>),
                 and!(
                     pattern!(&compass_data, [{ ?id @ metadata::created_at: ?ts, compass::title: ?title }]),
                     compass_data.value_in_range(ts, min_ts, max_ts),
@@ -830,7 +830,7 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
 
             // Compass status/note events.
             for (id, ts) in find!(
-                (id: Id, ts: Value<NsTAIInterval>),
+                (id: Id, ts: Inline<NsTAIInterval>),
                 and!(
                     pattern!(&compass_data, [{ ?id @ metadata::created_at: ?ts }]),
                     compass_data.value_in_range(ts, min_ts, max_ts),
@@ -842,7 +842,7 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
                     pattern!(&compass_data, [{ &id @ compass::status: ?v }])
                 ).next();
                 let note_preview: Option<String> = find!(
-                    handle: Value<Handle<Blake3, LongString>>,
+                    handle: Inline<Handle<LongString>>,
                     pattern!(&compass_data, [{ &id @ compass::note: ?handle }])
                 ).next().and_then(|h| load_text(ws, h)).map(|t| truncate_single_line(&t, 60).to_string());
                 let summary = match (status, note_preview) {
@@ -856,7 +856,7 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
 
             // Wiki version events.
             for (id, ts, title) in find!(
-                (id: Id, ts: Value<NsTAIInterval>, title: Value<Handle<Blake3, LongString>>),
+                (id: Id, ts: Inline<NsTAIInterval>, title: Inline<Handle<LongString>>),
                 and!(
                     pattern!(&wiki_data, [{
                         ?id @
@@ -928,9 +928,9 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
             if let Some((selected_id, selected_source)) = state.context_float_request_id {
                 let (source_label, source_color) = timeline_source_style(selected_source);
 
-                let mut load_blob_of = |data: &TribleSet, eid: &Id, attr: Attribute<Handle<Blake3, LongString>>| -> Option<String> {
+                let mut load_blob_of = |data: &TribleSet, eid: &Id, attr: Attribute<Handle<LongString>>| -> Option<String> {
                     find!(
-                        handle: Value<Handle<Blake3, LongString>>,
+                        handle: Inline<Handle<LongString>>,
                         pattern!(data, [{ eid @ attr: ?handle }])
                     ).next().and_then(|h| load_text(ws, h))
                 };
@@ -941,11 +941,11 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
                 }
                 let load_u256 = |data: &TribleSet, attr: Attribute<U256BE>| -> Option<u64> {
                     find!(
-                        v: Value<U256BE>,
+                        v: Inline<U256BE>,
                         pattern!(data, [{ &selected_id @ attr: ?v }])
                     ).next().and_then(u256be_to_u64)
                 };
-                let load_short = |data: &TribleSet, attr: Attribute<triblespace::prelude::valueschemas::ShortString>| -> Option<String> {
+                let load_short = |data: &TribleSet, attr: Attribute<triblespace::prelude::inlineencodings::ShortString>| -> Option<String> {
                     find!(
                         v: String,
                         pattern!(data, [{ &selected_id @ attr: ?v }])
@@ -953,7 +953,7 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
                 };
                 let load_ts = |data: &TribleSet, attr: Attribute<NsTAIInterval>| -> Option<i128> {
                     find!(
-                        v: Value<NsTAIInterval>,
+                        v: Inline<NsTAIInterval>,
                         pattern!(data, [{ &selected_id @ attr: ?v }])
                     ).next().map(interval_key)
                 };
@@ -968,7 +968,7 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
                         .or_else(|| load_ts(&compass_data, metadata::created_at)),
                     TimelineSource::Wiki => {
                         find!(
-                            v: Value<NsTAIInterval>,
+                            v: Inline<NsTAIInterval>,
                             pattern!(&wiki_data, [{ &selected_id @ metadata::created_at: ?v }])
                         ).next().map(interval_key)
                     }
@@ -1049,11 +1049,11 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
 
                                     // Metadata row: exit code + duration + cwd.
                                     let exit_code = result_id.and_then(|rid| {
-                                        find!(v: Value<U256BE>, pattern!(&exec_data, [{ &rid @ playground_exec::exit_code: ?v }]))
+                                        find!(v: Inline<U256BE>, pattern!(&exec_data, [{ &rid @ playground_exec::exit_code: ?v }]))
                                             .next().and_then(u256be_to_u64)
                                     });
                                     let duration = result_id.and_then(|rid| {
-                                        find!(v: Value<U256BE>, pattern!(&exec_data, [{ &rid @ playground_exec::duration_ms: ?v }]))
+                                        find!(v: Inline<U256BE>, pattern!(&exec_data, [{ &rid @ playground_exec::duration_ms: ?v }]))
                                             .next().and_then(u256be_to_u64)
                                     });
                                     let cwd = load_blob!(&exec_data, playground_exec::cwd);
@@ -1197,7 +1197,7 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
                                     }
                                     // Read receipts: entities with about_message → selected_id.
                                     let read_receipts: Vec<(String, i128)> = find!(
-                                        (reader_id: Id, read_at: Value<NsTAIInterval>),
+                                        (reader_id: Id, read_at: Inline<NsTAIInterval>),
                                         pattern!(&local_data, [{
                                             _?receipt @
                                             local_messages::about_message: &selected_id,
@@ -1602,7 +1602,7 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
                 let pid = person.id;
 
                 for handle in find!(
-                    handle: Value<Handle<Blake3, LongString>>,
+                    handle: Inline<Handle<LongString>>,
                     pattern!(data, [{ &pid @ metadata::name: ?handle }])
                 ) {
                     if person.label.is_none() {
@@ -1610,7 +1610,7 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
                     }
                 }
                 for handle in find!(
-                    handle: Value<Handle<Blake3, LongString>>,
+                    handle: Inline<Handle<LongString>>,
                     pattern!(data, [{ &pid @ relations::display_name: ?handle }])
                 ) {
                     if person.display_name.is_none() {
@@ -1618,7 +1618,7 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
                     }
                 }
                 for handle in find!(
-                    handle: Value<Handle<Blake3, LongString>>,
+                    handle: Inline<Handle<LongString>>,
                     pattern!(data, [{ &pid @ relations::first_name: ?handle }])
                 ) {
                     if person.first_name.is_none() {
@@ -1626,7 +1626,7 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
                     }
                 }
                 for handle in find!(
-                    handle: Value<Handle<Blake3, LongString>>,
+                    handle: Inline<Handle<LongString>>,
                     pattern!(data, [{ &pid @ relations::last_name: ?handle }])
                 ) {
                     if person.last_name.is_none() {
@@ -1634,7 +1634,7 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
                     }
                 }
                 for handle in find!(
-                    handle: Value<Handle<Blake3, LongString>>,
+                    handle: Inline<Handle<LongString>>,
                     pattern!(data, [{ &pid @ metadata::description: ?handle }])
                 ) {
                     if person.note.is_none() {
@@ -1828,7 +1828,7 @@ fn apply_branch_defaults(state: &mut DashboardState) {
     // Find the latest config entity by metadata::updated_at.
     let mut latest: Option<(Id, i128)> = None;
     for (config_id, updated_at) in find!(
-        (config_id: Id, updated_at: Value<NsTAIInterval>),
+        (config_id: Id, updated_at: Inline<NsTAIInterval>),
         pattern!(config_data, [{
             ?config_id @
             metadata::tag: playground_config::kind_config,
@@ -2023,7 +2023,7 @@ fn list_branches(pile: &mut Pile<Blake3>) -> Result<Vec<BranchEntry>, String> {
                 let name = match reader.get::<TribleSet, _>(meta_handle) {
                     Ok(metadata_set) => {
                         let mut names = find!(
-                            handle: Value<Handle<Blake3, LongString>>,
+                            handle: Inline<Handle<LongString>>,
                             pattern!(&metadata_set, [{ metadata::name: ?handle }])
                         );
                         match (names.next(), names.next()) {
@@ -2159,7 +2159,7 @@ fn resolve_branch_ids(lookup: &BranchLookup, refs: &[String]) -> Result<Vec<Id>,
 fn latest_model_profile_entry_id(data: &TribleSet, profile_id: Id) -> Option<Id> {
     let mut latest: Option<(Id, i128)> = None;
     for (entry_id, updated_at) in find!(
-        (entry_id: Id, updated_at: Value<NsTAIInterval>),
+        (entry_id: Id, updated_at: Inline<NsTAIInterval>),
         pattern!(data, [{
             ?entry_id @
             metadata::tag: playground_config::kind_model_profile,
@@ -2177,19 +2177,19 @@ fn latest_model_profile_entry_id(data: &TribleSet, profile_id: Id) -> Option<Id>
 
 fn load_optional_id_attr(data: &TribleSet, entity_id: Id, attr: Attribute<GenId>) -> Option<Id> {
     find!(
-        value: Value<GenId>,
+        value: Inline<GenId>,
         pattern!(data, [{ entity_id @ attr: ?value }])
     )
-    .find_map(|value| Id::try_from_value(&value).ok())
+    .find_map(|value| Id::try_from_inline(&value).ok())
 }
 
 fn load_optional_u64_attr(data: &TribleSet, entity_id: Id, attr: Attribute<U256BE>) -> Option<u64> {
     find!(
-        value: Value<U256BE>,
+        value: Inline<U256BE>,
         pattern!(data, [{ entity_id @ attr: ?value }])
     )
     .next()
-    .and_then(|v| v.try_from_value::<u64>().ok())
+    .and_then(|v| v.try_from_inline::<u64>().ok())
 }
 
 
@@ -2220,7 +2220,7 @@ fn collect_relations_people(data: &TribleSet, ws: &mut Workspace<Pile>) -> Vec<R
     }
 
     for (person_id, handle) in find!(
-        (person_id: Id, handle: Value<Handle<Blake3, LongString>>),
+        (person_id: Id, handle: Inline<Handle<LongString>>),
         pattern!(data, [{ ?person_id @ metadata::name: ?handle }])
     ) {
         if let Some(person) = people.get_mut(&person_id) {
@@ -2233,7 +2233,7 @@ fn collect_relations_people(data: &TribleSet, ws: &mut Workspace<Pile>) -> Vec<R
     }
 
     for (person_id, handle) in find!(
-        (person_id: Id, handle: Value<Handle<Blake3, LongString>>),
+        (person_id: Id, handle: Inline<Handle<LongString>>),
         pattern!(data, [{ ?person_id @ relations::display_name: ?handle }])
     ) {
         if let Some(person) = people.get_mut(&person_id) {
@@ -2246,7 +2246,7 @@ fn collect_relations_people(data: &TribleSet, ws: &mut Workspace<Pile>) -> Vec<R
     }
 
     for (person_id, handle) in find!(
-        (person_id: Id, handle: Value<Handle<Blake3, LongString>>),
+        (person_id: Id, handle: Inline<Handle<LongString>>),
         pattern!(data, [{ ?person_id @ relations::first_name: ?handle }])
     ) {
         if let Some(person) = people.get_mut(&person_id) {
@@ -2259,7 +2259,7 @@ fn collect_relations_people(data: &TribleSet, ws: &mut Workspace<Pile>) -> Vec<R
     }
 
     for (person_id, handle) in find!(
-        (person_id: Id, handle: Value<Handle<Blake3, LongString>>),
+        (person_id: Id, handle: Inline<Handle<LongString>>),
         pattern!(data, [{ ?person_id @ relations::last_name: ?handle }])
     ) {
         if let Some(person) = people.get_mut(&person_id) {
@@ -2272,7 +2272,7 @@ fn collect_relations_people(data: &TribleSet, ws: &mut Workspace<Pile>) -> Vec<R
     }
 
     for (person_id, handle) in find!(
-        (person_id: Id, handle: Value<Handle<Blake3, LongString>>),
+        (person_id: Id, handle: Inline<Handle<LongString>>),
         pattern!(data, [{ ?person_id @ metadata::description: ?handle }])
     ) {
         if let Some(person) = people.get_mut(&person_id) {
@@ -2399,7 +2399,7 @@ fn collect_teams_messages(
 ) -> (Vec<TeamsMessageRow>, Vec<TeamsChatRow>) {
     let mut author_names: HashMap<Id, String> = HashMap::new();
     for (author_id, name_handle) in find!(
-        (author_id: Id, name_handle: Value<Handle<Blake3, LongString>>),
+        (author_id: Id, name_handle: Inline<Handle<LongString>>),
         pattern!(data, [{ ?author_id @ archive::author_name: ?name_handle }])
     ) {
         if let Some(name) = load_text(ws, name_handle) {
@@ -2409,7 +2409,7 @@ fn collect_teams_messages(
 
     let mut chat_labels: HashMap<Id, String> = HashMap::new();
     for (chat_id, chat_handle) in find!(
-        (chat_id: Id, chat_handle: Value<Handle<Blake3, LongString>>),
+        (chat_id: Id, chat_handle: Inline<Handle<LongString>>),
         pattern!(data, [{ ?chat_id @ teams::chat_id: ?chat_handle }])
     ) {
         if let Some(label) = load_text(ws, chat_handle) {
@@ -2423,8 +2423,8 @@ fn collect_teams_messages(
             message_id: Id,
             chat_id: Id,
             author_id: Id,
-            content_handle: Value<Handle<Blake3, LongString>>,
-            created_at: Value<NsTAIInterval>
+            content_handle: Inline<Handle<LongString>>,
+            created_at: Inline<NsTAIInterval>
         ),
         pattern!(data, [{
             ?message_id @
@@ -2479,10 +2479,10 @@ fn load_optional_string_attr(
     data: &TribleSet,
     ws: &mut Workspace<Pile>,
     entity_id: Id,
-    attr: Attribute<Handle<Blake3, LongString>>,
+    attr: Attribute<Handle<LongString>>,
 ) -> Option<String> {
     find!(
-        handle: Value<Handle<Blake3, LongString>>,
+        handle: Inline<Handle<LongString>>,
         pattern!(data, [{
             entity_id @
             attr: ?handle,
@@ -2500,9 +2500,9 @@ fn collect_context_chunks(data: &TribleSet) -> Vec<ContextChunkRow> {
     for (chunk_id, summary, start_at, end_at) in find!(
         (
             chunk_id: Id,
-            summary: Value<Handle<Blake3, LongString>>,
-            start_at: Value<NsTAIInterval>,
-            end_at: Value<NsTAIInterval>
+            summary: Inline<Handle<LongString>>,
+            start_at: Inline<NsTAIInterval>,
+            end_at: Inline<NsTAIInterval>
         ),
         pattern!(data, [{
             ?chunk_id @
@@ -3169,7 +3169,7 @@ fn send_local_message(
     let mut change = ensure_local_metadata(&mut ws)?;
 
     let now = now_epoch();
-    let now_interval: Value<NsTAIInterval> = (now, now).try_to_value().unwrap();
+    let now_interval: Inline<NsTAIInterval> = (now, now).try_to_inline().unwrap();
     let message_id = triblespace::prelude::ufoid();
     let body_handle = ws.put(body.to_string());
     change += entity! { &message_id @
@@ -3226,7 +3226,7 @@ fn render_agent_config(
     // Find the latest config entity.
     let mut latest: Option<(Id, i128)> = None;
     for (config_id, updated_at) in find!(
-        (config_id: Id, updated_at: Value<NsTAIInterval>),
+        (config_id: Id, updated_at: Inline<NsTAIInterval>),
         pattern!(data, [{
             ?config_id @
             metadata::tag: playground_config::kind_config,
@@ -3251,9 +3251,9 @@ fn render_agent_config(
     ui.add_space(8.0);
 
     // Helper closures for inline attribute loading.
-    let load_str = |entity_id: Id, attr: Attribute<Handle<Blake3, LongString>>, ws: &mut Option<Workspace<Pile>>| -> Option<String> {
+    let load_str = |entity_id: Id, attr: Attribute<Handle<LongString>>, ws: &mut Option<Workspace<Pile>>| -> Option<String> {
         find!(
-            handle: Value<Handle<Blake3, LongString>>,
+            handle: Inline<Handle<LongString>>,
             pattern!(data, [{ entity_id @ attr: ?handle }])
         )
         .next()
@@ -4091,8 +4091,8 @@ fn render_compass_swimlanes_live(
     for (task_id, title_handle, created_at) in find!(
         (
             task_id: Id,
-            title_handle: Value<Handle<Blake3, LongString>>,
-            created_at: Value<NsTAIInterval>
+            title_handle: Inline<Handle<LongString>>,
+            created_at: Inline<NsTAIInterval>
         ),
         pattern!(data, [{
             ?task_id @
@@ -4156,7 +4156,7 @@ fn render_compass_swimlanes_live(
     // ── Latest status per goal ──
     let mut status_map: HashMap<Id, (String, i128)> = HashMap::new();
     for (task_id, status, at) in find!(
-        (task_id: Id, status: String, at: Value<NsTAIInterval>),
+        (task_id: Id, status: String, at: Inline<NsTAIInterval>),
         pattern!(data, [{
             _?event @
             metadata::tag: &COMPASS_KIND_STATUS_ID,
@@ -4208,7 +4208,7 @@ fn render_compass_swimlanes_live(
     let notes: HashMap<Id, Vec<CompassNoteRow>> = if let Some(goal_id) = *expanded_goal {
         let mut map: HashMap<Id, Vec<CompassNoteRow>> = HashMap::new();
         for (note_handle, at) in find!(
-            (note_handle: Value<Handle<Blake3, LongString>>, at: Value<NsTAIInterval>),
+            (note_handle: Inline<Handle<LongString>>, at: Inline<NsTAIInterval>),
             pattern!(data, [{
                 _?event @
                 metadata::tag: &COMPASS_KIND_NOTE_ID,
@@ -4496,7 +4496,7 @@ fn truncate_single_line(text: &str, max: usize) -> String {
 
 fn load_text(
     ws: &mut Workspace<Pile>,
-    handle: Value<Handle<Blake3, LongString>>,
+    handle: Inline<Handle<LongString>>,
 ) -> Option<String> {
     ws.get::<View<str>, LongString>(handle)
         .ok()
@@ -4511,12 +4511,12 @@ fn epoch_key(epoch: Epoch) -> i128 {
     epoch.to_tai_duration().total_nanoseconds()
 }
 
-fn interval_key(interval: Value<NsTAIInterval>) -> i128 {
-    let (lower_ns, _): (i128, i128) = interval.try_from_value().unwrap();
+fn interval_key(interval: Inline<NsTAIInterval>) -> i128 {
+    let (lower_ns, _): (i128, i128) = interval.try_from_inline().unwrap();
     lower_ns
 }
 
-fn u256be_to_u64(value: Value<U256BE>) -> Option<u64> {
+fn u256be_to_u64(value: Inline<U256BE>) -> Option<u64> {
     let raw = value.raw;
     if raw[..24].iter().any(|byte| *byte != 0) {
         return None;
@@ -4534,7 +4534,7 @@ fn id_prefix(id: Id) -> String {
     out
 }
 
-fn longstring_handle_prefix(handle: Value<Handle<Blake3, LongString>>) -> String {
+fn longstring_handle_prefix(handle: Inline<Handle<LongString>>) -> String {
     let raw = handle.raw;
     let mut out = String::with_capacity(8);
     for byte in raw.iter().take(4) {
@@ -4543,7 +4543,7 @@ fn longstring_handle_prefix(handle: Value<Handle<Blake3, LongString>>) -> String
     out
 }
 
-fn archive_handle_prefix(handle: Value<Handle<Blake3, SimpleArchive>>) -> String {
+fn archive_handle_prefix(handle: Inline<Handle<SimpleArchive>>) -> String {
     let raw = handle.raw;
     let mut out = String::with_capacity(8);
     for byte in raw.iter().take(4) {

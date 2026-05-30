@@ -1,6 +1,6 @@
-use triblespace::core::blob::schemas::UnknownBlob;
-use triblespace::core::value::Value;
-use triblespace::core::value::schemas::hash::{Blake3, Handle, Hash};
+use triblespace::core::blob::encodings::UnknownBlob;
+use triblespace::core::inline::Inline;
+use triblespace::core::inline::encodings::hash::{Blake3, Handle, Hash};
 
 const FILES_SCHEME_PREFIX: &str = "files:";
 const LEGACY_BLOB_SCHEME_PREFIX: &str = "blob:blake3:";
@@ -111,7 +111,7 @@ fn split_typst_image_refs(chunks: Vec<PromptChunk>) -> Vec<PromptChunk> {
     out
 }
 
-pub fn unknown_blob_handle_from_hex(hex: &str) -> Option<Value<Handle<Blake3, UnknownBlob>>> {
+pub fn unknown_blob_handle_from_hex(hex: &str) -> Option<Inline<Handle<UnknownBlob>>> {
     let hash = Hash::<Blake3>::from_hex(hex).ok()?;
     Some(hash.into())
 }

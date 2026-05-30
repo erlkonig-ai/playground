@@ -15,16 +15,11 @@ pub use context_schema::playground_context;
 pub use exec_schema::playground_exec;
 pub use model_chat_schema::model_chat;
 
-pub fn build_playground_metadata<B>(
-    blobs: &mut B,
-) -> std::result::Result<triblespace::prelude::TribleSet, B::PutError>
-where
-    B: triblespace::prelude::BlobStore<triblespace::prelude::valueschemas::Blake3>,
-{
-    let mut metadata = exec_schema::build_playground_exec_metadata(blobs)?;
-    metadata += config_schema::build_playground_config_metadata(blobs)?;
-    metadata += cog_schema::build_playground_cog_metadata(blobs)?;
-    metadata += context_schema::build_playground_context_metadata(blobs)?;
-    metadata += model_chat_schema::build_model_chat_metadata(blobs)?;
-    Ok(metadata.into_facts())
+pub fn build_playground_metadata() -> triblespace::prelude::Fragment {
+    let mut bundle = exec_schema::build_playground_exec_metadata();
+    bundle += config_schema::build_playground_config_metadata();
+    bundle += cog_schema::build_playground_cog_metadata();
+    bundle += context_schema::build_playground_context_metadata();
+    bundle += model_chat_schema::build_model_chat_metadata();
+    bundle
 }
