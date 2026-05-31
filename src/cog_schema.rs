@@ -12,7 +12,7 @@ pub mod playground_cog {
         "CC8828B7462BFDA45A296C0A12C6333C" as pub moment_boundary_turn_id: GenId;
     }
 
-    #[allow(non_upper_case_globals)]
+    #[allow(non_upper_case_globals, dead_code)]
     pub const playground_cog_metadata: Id = id_hex!("369BE69D185F799CA5370205D34FC120");
 
     #[allow(non_upper_case_globals)]

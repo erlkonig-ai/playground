@@ -26,7 +26,7 @@ pub mod model_chat {
         "0A9C7D70295A65413375842916821032" as pub cache_read_input_tokens: U256BE;
     }
 
-    #[allow(non_upper_case_globals)]
+    #[allow(non_upper_case_globals, dead_code)]
     pub const model_chat_metadata: Id = id_hex!("E714890E7F711B393B6249A3E7198B89");
 
     #[allow(non_upper_case_globals)]

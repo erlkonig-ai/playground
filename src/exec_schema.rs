@@ -28,7 +28,7 @@ pub mod playground_exec {
         "E9C77284C7DDCF522A8AC4622FE3FB11" as pub error: Handle<LongString>;
     }
 
-    #[allow(non_upper_case_globals)]
+    #[allow(non_upper_case_globals, dead_code)]
     pub const playground_exec_metadata: Id = id_hex!("94563964DFC622200FAE6E5383D0B4FC");
 
     #[allow(non_upper_case_globals)]
