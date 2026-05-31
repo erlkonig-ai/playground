@@ -15,7 +15,7 @@ use triblespace::core::metadata;
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::Workspace;
 use triblespace::prelude::blobencodings::LongString;
-use triblespace::prelude::inlineencodings::{Blake3, Handle, NsTAIInterval, U256BE};
+use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval, U256BE};
 use triblespace::prelude::*;
 
 use crate::config::Config;

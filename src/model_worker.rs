@@ -15,7 +15,7 @@ use triblespace::core::metadata;
 use triblespace::core::import::json::JsonObjectImporter;
 use triblespace::core::repo::Workspace;
 use triblespace::prelude::blobencodings::LongString;
-use triblespace::prelude::inlineencodings::{Blake3, Handle, NsTAIInterval, ShortString};
+use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval, ShortString};
 use triblespace::prelude::*;
 
 use crate::blob_refs::{PromptChunk, split_blob_refs, unknown_blob_handle_from_hex};
@@ -1323,7 +1323,7 @@ mod tests {
     use triblespace::core::repo::Repository;
     use triblespace::core::repo::Workspace;
     use triblespace::core::repo::pile::Pile;
-    use triblespace::prelude::inlineencodings::{Blake3, Handle};
+    use triblespace::prelude::inlineencodings::{Handle};
     use triblespace::prelude::*;
 
     use crate::chat_prompt::ChatMessage;
