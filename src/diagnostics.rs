@@ -15,11 +15,11 @@ use triblespace::core::repo::{
 };
 use triblespace::core::trible::TribleSet;
 use triblespace::core::inline::Inline;
-use triblespace::core::inline::schemas::hash::{Blake3, Handle};
+use triblespace::core::inline::encodings::hash::{Blake3, Handle};
 use triblespace::macros::{entity, find, pattern};
 use triblespace::prelude::inlineencodings::{GenId, NsTAIInterval, U256BE};
 use triblespace::prelude::{
-    Attribute, BlobStore, BlobStoreGet, BranchStore, ToBlob, TryFromInline, TryToInline,
+    Attribute, BlobStore, BlobStoreGet, IntoBlob, PinStore, TryFromInline, TryToInline,
     View, and,
 };
 
@@ -928,7 +928,7 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
             if let Some((selected_id, selected_source)) = state.context_float_request_id {
                 let (source_label, source_color) = timeline_source_style(selected_source);
 
-                let mut load_blob_of = |data: &TribleSet, eid: &Id, attr: Attribute<Handle<LongString>>| -> Option<String> {
+                let mut load_blob_of = |data: &TribleSet, eid: &Id, attr: &Attribute<Handle<LongString>>| -> Option<String> {
                     find!(
                         handle: Inline<Handle<LongString>>,
                         pattern!(data, [{ eid @ attr: ?handle }])
@@ -937,21 +937,21 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
                 // Convenience: default to selected_id.
                 // (macro because closures can't reborrow)
                 macro_rules! load_blob {
-                    ($data:expr, $attr:expr) => { load_blob_of($data, &selected_id, $attr) }
+                    ($data:expr, $attr:expr) => { load_blob_of($data, &selected_id, &$attr) }
                 }
-                let load_u256 = |data: &TribleSet, attr: Attribute<U256BE>| -> Option<u64> {
+                let load_u256 = |data: &TribleSet, attr: &Attribute<U256BE>| -> Option<u64> {
                     find!(
                         v: Inline<U256BE>,
                         pattern!(data, [{ &selected_id @ attr: ?v }])
                     ).next().and_then(u256be_to_u64)
                 };
-                let load_short = |data: &TribleSet, attr: Attribute<triblespace::prelude::inlineencodings::ShortString>| -> Option<String> {
+                let load_short = |data: &TribleSet, attr: &Attribute<triblespace::prelude::inlineencodings::ShortString>| -> Option<String> {
                     find!(
                         v: String,
                         pattern!(data, [{ &selected_id @ attr: ?v }])
                     ).next()
                 };
-                let load_ts = |data: &TribleSet, attr: Attribute<NsTAIInterval>| -> Option<i128> {
+                let load_ts = |data: &TribleSet, attr: &Attribute<NsTAIInterval>| -> Option<i128> {
                     find!(
                         v: Inline<NsTAIInterval>,
                         pattern!(data, [{ &selected_id @ attr: ?v }])
@@ -960,12 +960,12 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
 
                 // Resolve timestamp per source type.
                 let event_ts = match selected_source {
-                    TimelineSource::Shell => load_ts(&exec_data, metadata::created_at),
-                    TimelineSource::Cognition => load_ts(&exec_data, metadata::finished_at),
-                    TimelineSource::LocalMessages => load_ts(&local_data, metadata::created_at),
-                    TimelineSource::Teams => load_ts(&teams_data, metadata::created_at),
-                    TimelineSource::Goals => load_ts(&compass_data, metadata::created_at)
-                        .or_else(|| load_ts(&compass_data, metadata::created_at)),
+                    TimelineSource::Shell => load_ts(&exec_data, &metadata::created_at),
+                    TimelineSource::Cognition => load_ts(&exec_data, &metadata::finished_at),
+                    TimelineSource::LocalMessages => load_ts(&local_data, &metadata::created_at),
+                    TimelineSource::Teams => load_ts(&teams_data, &metadata::created_at),
+                    TimelineSource::Goals => load_ts(&compass_data, &metadata::created_at)
+                        .or_else(|| load_ts(&compass_data, &metadata::created_at)),
                     TimelineSource::Wiki => {
                         find!(
                             v: Inline<NsTAIInterval>,
@@ -1087,17 +1087,17 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
                                     }
                                     // stdout/stderr/error live on the result entity.
                                     if let Some(rid) = result_id {
-                                        if let Some(stdout) = load_blob_of(&exec_data, &rid, playground_exec::stdout_text) {
+                                        if let Some(stdout) = load_blob_of(&exec_data, &rid, &playground_exec::stdout_text) {
                                             if !stdout.trim().is_empty() {
                                                 text_block(ui, "stdout", &stdout, muted);
                                             }
                                         }
-                                        if let Some(stderr) = load_blob_of(&exec_data, &rid, playground_exec::stderr_text) {
+                                        if let Some(stderr) = load_blob_of(&exec_data, &rid, &playground_exec::stderr_text) {
                                             if !stderr.trim().is_empty() {
                                                 text_block(ui, "stderr", &stderr, red);
                                             }
                                         }
-                                        if let Some(err) = load_blob_of(&exec_data, &rid, playground_exec::error) {
+                                        if let Some(err) = load_blob_of(&exec_data, &rid, &playground_exec::error) {
                                             if !err.trim().is_empty() {
                                                 text_block(ui, "error", &err, red);
                                             }
@@ -1117,10 +1117,10 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
                                         find!(v: String, pattern!(&exec_data, [{ &rid @ model_chat::model: ?v }])).next()
                                     });
                                     // Token counts live on the result entity.
-                                    let input_tok = load_u256(&exec_data, model_chat::input_tokens);
-                                    let output_tok = load_u256(&exec_data, model_chat::output_tokens);
-                                    let cache_create = load_u256(&exec_data, model_chat::cache_creation_input_tokens);
-                                    let cache_read = load_u256(&exec_data, model_chat::cache_read_input_tokens);
+                                    let input_tok = load_u256(&exec_data, &model_chat::input_tokens);
+                                    let output_tok = load_u256(&exec_data, &model_chat::output_tokens);
+                                    let cache_create = load_u256(&exec_data, &model_chat::cache_creation_input_tokens);
+                                    let cache_read = load_u256(&exec_data, &model_chat::cache_read_input_tokens);
                                     if model.is_some() || input_tok.is_some() {
                                         ui.horizontal_wrapped(|ui| {
                                             if let Some(ref m) = model {
@@ -1147,7 +1147,7 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
                                     }
                                     // Context/memory lives on the request entity.
                                     if let Some(rid) = request_id {
-                                        if let Some(context) = load_blob_of(&exec_data, &rid, model_chat::context) {
+                                        if let Some(context) = load_blob_of(&exec_data, &rid, &model_chat::context) {
                                             text_block(ui, "memory", &context, muted);
                                         }
                                     }
@@ -1222,7 +1222,7 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
                                         pattern!(&teams_data, [{ &selected_id @ teams::chat: ?v }])
                                     ).next();
                                     let chat_name = chat_id.and_then(|cid| {
-                                        load_blob_of(&teams_data, &cid, teams::chat_id)
+                                        load_blob_of(&teams_data, &cid, &teams::chat_id)
                                     });
                                     // Author metadata.
                                     let author_name = load_blob!(&teams_data, archive::author_name);
@@ -1258,7 +1258,7 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
                                 TimelineSource::Goals => {
                                     // Could be a goal entity or a status/note event.
                                     let title = load_blob!(&compass_data, compass::title);
-                                    let status = load_short(&compass_data, compass::status);
+                                    let status = load_short(&compass_data, &compass::status);
                                     let note = load_blob!(&compass_data, compass::note);
 
                                     // If it's a status/note event, resolve parent goal.
@@ -1267,7 +1267,7 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
                                         pattern!(&compass_data, [{ &selected_id @ compass::task: ?v }])
                                     ).next();
                                     let goal_title = goal_id.and_then(|gid| {
-                                        load_blob_of(&compass_data, &gid, compass::title)
+                                        load_blob_of(&compass_data, &gid, &compass::title)
                                     });
 
                                     // Tags on the goal (or on this entity if it is the goal).
@@ -1311,7 +1311,7 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
                                         pattern!(&compass_data, [{ &actual_goal @ compass::parent: ?v }])
                                     ).next();
                                     if let Some(pid) = parent_id {
-                                        let parent_title = load_blob_of(&compass_data, &pid, compass::title);
+                                        let parent_title = load_blob_of(&compass_data, &pid, &compass::title);
                                         if let Some(ref pt) = parent_title {
                                             ui.horizontal(|ui| {
                                                 ui.label(egui::RichText::new("parent").small().color(muted));
@@ -1334,7 +1334,7 @@ fn diagnostics_ui(nb: &mut NotebookCtx) {
                                     ).filter(|t| *t != wiki::kind_version).collect();
                                     // Resolve tag names upfront via load_blob_of.
                                     let tag_names: Vec<(Id, String)> = tags.iter().map(|tag| {
-                                        let name = load_blob_of(&wiki_data, tag, metadata::name)
+                                        let name = load_blob_of(&wiki_data, tag, &metadata::name)
                                             .unwrap_or_else(|| id_prefix(*tag));
                                         (*tag, name)
                                     }).collect();
@@ -1857,7 +1857,7 @@ fn apply_branch_defaults(state: &mut DashboardState) {
         let refs = parse_branch_list(BRANCH_CONFIG);
         let ids = resolve_branch_ids(&lookup, &refs).ok()?;
         let mut ws = repo.pull(*ids.first()?).ok()?;
-        load_optional_string_attr(config_data, &mut ws, config_id, playground_config::branch)
+        load_optional_string_attr(config_data, &mut ws, config_id, &playground_config::branch)
     });
 
     if let Some(branch) = branch {
@@ -2006,9 +2006,9 @@ fn refresh_catalogs(state: &mut DashboardState) {
     state.now_key = epoch_key(now_epoch());
 }
 
-fn list_branches(pile: &mut Pile<Blake3>) -> Result<Vec<BranchEntry>, String> {
+fn list_branches(pile: &mut Pile) -> Result<Vec<BranchEntry>, String> {
     let reader = pile.reader().map_err(|err| err.to_string())?;
-    let iter = pile.branches().map_err(|err| err.to_string())?;
+    let iter = pile.pins().map_err(|err| err.to_string())?;
     let mut branches = Vec::new();
     for branch in iter {
         let branch_id = branch.map_err(|err| err.to_string())?;
@@ -2175,7 +2175,7 @@ fn latest_model_profile_entry_id(data: &TribleSet, profile_id: Id) -> Option<Id>
     latest.map(|(entry_id, _)| entry_id)
 }
 
-fn load_optional_id_attr(data: &TribleSet, entity_id: Id, attr: Attribute<GenId>) -> Option<Id> {
+fn load_optional_id_attr(data: &TribleSet, entity_id: Id, attr: &Attribute<GenId>) -> Option<Id> {
     find!(
         value: Inline<GenId>,
         pattern!(data, [{ entity_id @ attr: ?value }])
@@ -2183,7 +2183,7 @@ fn load_optional_id_attr(data: &TribleSet, entity_id: Id, attr: Attribute<GenId>
     .find_map(|value| Id::try_from_inline(&value).ok())
 }
 
-fn load_optional_u64_attr(data: &TribleSet, entity_id: Id, attr: Attribute<U256BE>) -> Option<u64> {
+fn load_optional_u64_attr(data: &TribleSet, entity_id: Id, attr: &Attribute<U256BE>) -> Option<u64> {
     find!(
         value: Inline<U256BE>,
         pattern!(data, [{ entity_id @ attr: ?value }])
@@ -2479,7 +2479,7 @@ fn load_optional_string_attr(
     data: &TribleSet,
     ws: &mut Workspace<Pile>,
     entity_id: Id,
-    attr: Attribute<Handle<LongString>>,
+    attr: &Attribute<Handle<LongString>>,
 ) -> Option<String> {
     find!(
         handle: Inline<Handle<LongString>>,
@@ -3202,7 +3202,7 @@ fn ensure_local_metadata(ws: &mut Workspace<Pile>) -> Result<TribleSet, String> 
 
     for (id, label) in LOCAL_KIND_SPECS {
         if !existing_kinds.contains(&id) {
-            let name_handle = label.to_owned().to_blob().get_handle::<Blake3>();
+            let name_handle = label.to_owned().to_blob().get_handle();
             change += entity! { ExclusiveId::force_ref(&id) @ metadata::name: name_handle };
             existing_kinds.insert(id);
         }
@@ -3251,7 +3251,7 @@ fn render_agent_config(
     ui.add_space(8.0);
 
     // Helper closures for inline attribute loading.
-    let load_str = |entity_id: Id, attr: Attribute<Handle<LongString>>, ws: &mut Option<Workspace<Pile>>| -> Option<String> {
+    let load_str = |entity_id: Id, attr: &Attribute<Handle<LongString>>, ws: &mut Option<Workspace<Pile>>| -> Option<String> {
         find!(
             handle: Inline<Handle<LongString>>,
             pattern!(data, [{ entity_id @ attr: ?handle }])
@@ -3259,23 +3259,23 @@ fn render_agent_config(
         .next()
         .and_then(|handle| ws.as_mut().and_then(|w| load_text(w, handle)))
     };
-    let load_id = |entity_id: Id, attr: Attribute<GenId>| -> Option<Id> {
+    let load_id = |entity_id: Id, attr: &Attribute<GenId>| -> Option<Id> {
         load_optional_id_attr(data, entity_id, attr)
     };
-    let load_u64 = |entity_id: Id, attr: Attribute<U256BE>| -> Option<u64> {
+    let load_u64 = |entity_id: Id, attr: &Attribute<U256BE>| -> Option<u64> {
         load_optional_u64_attr(data, entity_id, attr)
     };
 
     // Resolve model profile: if an active profile is set, use the latest profile entry.
-    let persona_id = load_id(config_id, playground_config::persona_id);
-    let branch = load_str(config_id, playground_config::branch, ws);
-    let author = load_str(config_id, playground_config::author, ws);
-    let author_role = load_str(config_id, playground_config::author_role, ws);
-    let poll_ms = load_u64(config_id, playground_config::poll_ms);
-    let model_profile_id = load_id(config_id, playground_config::active_model_profile_id);
+    let persona_id = load_id(config_id, &playground_config::persona_id);
+    let branch = load_str(config_id, &playground_config::branch, ws);
+    let author = load_str(config_id, &playground_config::author, ws);
+    let author_role = load_str(config_id, &playground_config::author_role, ws);
+    let poll_ms = load_u64(config_id, &playground_config::poll_ms);
+    let model_profile_id = load_id(config_id, &playground_config::active_model_profile_id);
     let (model_entity_id, model_profile_name) = if let Some(profile_id) = model_profile_id {
         if let Some(entry_id) = latest_model_profile_entry_id(data, profile_id) {
-            let name = load_str(entry_id, metadata::name, ws);
+            let name = load_str(entry_id, &metadata::name, ws);
             (entry_id, name)
         } else {
             (config_id, None)
@@ -3284,20 +3284,20 @@ fn render_agent_config(
         (config_id, None)
     };
 
-    let model_name = load_str(model_entity_id, playground_config::model_name, ws);
-    let model_base_url = load_str(model_entity_id, playground_config::model_base_url, ws);
-    let model_reasoning_effort = load_str(model_entity_id, playground_config::model_reasoning_effort, ws);
-    let model_stream = load_u64(model_entity_id, playground_config::model_stream).map(|v| v != 0);
-    let model_context_window_tokens = load_u64(model_entity_id, playground_config::model_context_window_tokens);
-    let model_max_output_tokens = load_u64(model_entity_id, playground_config::model_max_output_tokens);
-    let model_context_safety_margin_tokens = load_u64(model_entity_id, playground_config::model_context_safety_margin_tokens);
-    let model_chars_per_token = load_u64(model_entity_id, playground_config::model_chars_per_token);
-    let model_api_key = load_str(model_entity_id, playground_config::model_api_key, ws);
-    let tavily_api_key = load_str(config_id, playground_config::tavily_api_key, ws);
-    let exa_api_key = load_str(config_id, playground_config::exa_api_key, ws);
-    let exec_default_cwd = load_str(config_id, playground_config::exec_default_cwd, ws);
-    let exec_sandbox_profile = load_id(config_id, playground_config::exec_sandbox_profile);
-    let system_prompt = load_str(config_id, playground_config::system_prompt, ws);
+    let model_name = load_str(model_entity_id, &playground_config::model_name, ws);
+    let model_base_url = load_str(model_entity_id, &playground_config::model_base_url, ws);
+    let model_reasoning_effort = load_str(model_entity_id, &playground_config::model_reasoning_effort, ws);
+    let model_stream = load_u64(model_entity_id, &playground_config::model_stream).map(|v| v != 0);
+    let model_context_window_tokens = load_u64(model_entity_id, &playground_config::model_context_window_tokens);
+    let model_max_output_tokens = load_u64(model_entity_id, &playground_config::model_max_output_tokens);
+    let model_context_safety_margin_tokens = load_u64(model_entity_id, &playground_config::model_context_safety_margin_tokens);
+    let model_chars_per_token = load_u64(model_entity_id, &playground_config::model_chars_per_token);
+    let model_api_key = load_str(model_entity_id, &playground_config::model_api_key, ws);
+    let tavily_api_key = load_str(config_id, &playground_config::tavily_api_key, ws);
+    let exa_api_key = load_str(config_id, &playground_config::exa_api_key, ws);
+    let exec_default_cwd = load_str(config_id, &playground_config::exec_default_cwd, ws);
+    let exec_sandbox_profile = load_id(config_id, &playground_config::exec_sandbox_profile);
+    let system_prompt = load_str(config_id, &playground_config::system_prompt, ws);
 
     let config_row = |ui: &mut egui::Ui, label: &str, value: &str| {
         ui.label(egui::RichText::new(label).color(color_muted()));

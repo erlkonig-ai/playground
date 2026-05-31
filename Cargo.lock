@@ -4,9 +4,9 @@ version = 4
 
 [[package]]
 name = "GORBIE"
-version = "0.10.0"
+version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e14065364f6a3f89262b83ad8d03f6b524e8061617da07be7f8cd654cf9f7c65"
+checksum = "d3fa89572830e2f2a1ce013a5d2c9d5ddb1d9c42a438d0abdf7c10b7b451c18d"
 dependencies = [
  "comemo",
  "ctrlc",
@@ -14,7 +14,7 @@ dependencies = [
  "earcutr",
  "ed25519-dalek",
  "eframe",
- "egui 0.34.1",
+ "egui",
  "egui-wgpu",
  "gorbie-commonmark",
  "gorbie-macros",
@@ -24,7 +24,7 @@ dependencies = [
  "pollster",
  "rand_core 0.6.4",
  "tracing",
- "triblespace 0.36.0",
+ "triblespace",
  "ttf-parser",
  "typst",
  "typst-syntax",
@@ -123,7 +123,7 @@ dependencies = [
  "accesskit_consumer",
  "hashbrown 0.16.1",
  "static_assertions",
- "windows 0.62.2",
+ "windows",
  "windows-core",
 ]
 
@@ -1225,15 +1225,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2459377285ad874054d797f3ccebf984978aa39129f6eafde5cdc8315b612f8"
 
 [[package]]
-name = "const_blake3"
-version = "0.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "73669b833cef325e02d23313debfb6fc18651590af0812036cc42239286a712d"
-dependencies = [
- "blake3",
-]
-
-[[package]]
 name = "constant_time_eq"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1757,22 +1748,13 @@ dependencies = [
 
 [[package]]
 name = "ecolor"
-version = "0.33.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "71ddb8ac7643d1dba1bb02110e804406dd459a838efcb14011ced10556711a8e"
-dependencies = [
- "emath 0.33.3",
-]
-
-[[package]]
-name = "ecolor"
 version = "0.34.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "137c0ce4ce4152ff7e223a7ce22ee1057cdff61fce0a45c32459c3ccec64868d"
 dependencies = [
  "bytemuck",
  "color-hex",
- "emath 0.34.1",
+ "emath",
  "serde",
 ]
 
@@ -1819,7 +1801,7 @@ dependencies = [
  "ahash",
  "bytemuck",
  "document-features",
- "egui 0.34.1",
+ "egui",
  "egui-wgpu",
  "egui-winit",
  "egui_glow",
@@ -1857,23 +1839,6 @@ checksum = "b2972feb8dffe7bc8c5463b1dacda1b0dfbed3710e50f977d965429692d74cd8"
 
 [[package]]
 name = "egui"
-version = "0.33.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a9b567d356674e9a5121ed3fedfb0a7c31e059fe71f6972b691bcd0bfc284e3"
-dependencies = [
- "ahash",
- "bitflags 2.11.0",
- "emath 0.33.3",
- "epaint 0.33.3",
- "log",
- "nohash-hasher",
- "profiling",
- "smallvec",
- "unicode-segmentation",
-]
-
-[[package]]
-name = "egui"
 version = "0.34.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f34aaf627da598dfadd64b0fee6101d22e9c451d1e5348157312720b7f459f0f"
@@ -1881,8 +1846,8 @@ dependencies = [
  "accesskit",
  "ahash",
  "bitflags 2.11.0",
- "emath 0.34.1",
- "epaint 0.34.1",
+ "emath",
+ "epaint",
  "log",
  "nohash-hasher",
  "profiling",
@@ -1901,8 +1866,8 @@ dependencies = [
  "ahash",
  "bytemuck",
  "document-features",
- "egui 0.34.1",
- "epaint 0.34.1",
+ "egui",
+ "epaint",
  "log",
  "profiling",
  "thiserror 2.0.18",
@@ -1921,7 +1886,7 @@ dependencies = [
  "accesskit_winit",
  "arboard",
  "bytemuck",
- "egui 0.34.1",
+ "egui",
  "log",
  "objc2 0.6.4",
  "objc2-foundation 0.3.2",
@@ -1942,7 +1907,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "62bfc6870c68d3f254e33aca8200095d422e09edacb0f365f79fe23a5ba10963"
 dependencies = [
  "ahash",
- "egui 0.34.1",
+ "egui",
  "ehttp",
  "enum-map",
  "image",
@@ -1959,7 +1924,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a3b28d39ab6c0cac238190e6cb1e8c9047d02cb470ab942a7a3302e4cb3a8e74"
 dependencies = [
  "bytemuck",
- "egui 0.34.1",
+ "egui",
  "glow",
  "log",
  "memoffset",
@@ -1971,13 +1936,13 @@ dependencies = [
 
 [[package]]
 name = "egui_plot"
-version = "0.34.1"
+version = "0.35.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "67fc9b427a837264e55381a5cade6e28fe83ac5b165a61b9c888548c732a9c95"
+checksum = "d7bd66213736bf9a9a53dc4888570b9194fc0db906507517a7fcc787e888ac47"
 dependencies = [
  "ahash",
- "egui 0.33.3",
- "emath 0.33.3",
+ "egui",
+ "emath",
 ]
 
 [[package]]
@@ -2015,12 +1980,6 @@ name = "email_address"
 version = "0.2.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e079f19b08ca6239f47f8ba8509c11cf3ea30095831f7fed61441475edd8c449"
-
-[[package]]
-name = "emath"
-version = "0.33.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "491bdf728bf25ddd9ad60d4cf1c48588fa82c013a2440b91aa7fc43e34a07c32"
 
 [[package]]
 name = "emath"
@@ -2133,30 +2092,14 @@ dependencies = [
 
 [[package]]
 name = "epaint"
-version = "0.33.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "009d0dd3c2163823a0abdb899451ecbc78798dec545ee91b43aff1fa790bab62"
-dependencies = [
- "ab_glyph",
- "ahash",
- "ecolor 0.33.3",
- "emath 0.33.3",
- "log",
- "nohash-hasher",
- "parking_lot",
- "profiling",
-]
-
-[[package]]
-name = "epaint"
 version = "0.34.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "04f3017dd67f147a697ee0c8484fb568fd9553e2a0c114be5020dbbc11962841"
 dependencies = [
  "ahash",
  "bytemuck",
- "ecolor 0.34.1",
- "emath 0.34.1",
+ "ecolor",
+ "emath",
  "epaint_default_fonts",
  "font-types 0.11.3",
  "log",
@@ -2315,7 +2258,7 @@ dependencies = [
  "serde_json",
  "tracing",
  "tracing-subscriber",
- "triblespace 0.44.0",
+ "triblespace",
  "typst",
  "typst-syntax",
 ]
@@ -2632,19 +2575,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "generator"
-version = "0.7.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5cc16584ff22b460a382b7feec54b23d2908d858152e5739a120b949293bd74e"
-dependencies = [
- "cc",
- "libc",
- "log",
- "rustversion",
- "windows 0.48.0",
-]
-
-[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2842,7 +2772,7 @@ version = "0.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d58d870b6f4d9a1704fc60a6249a30dc29a3fb58cac696bcdc296a7b96bf274"
 dependencies = [
- "egui 0.34.1",
+ "egui",
  "egui_extras",
  "gorbie-commonmark-backend",
  "pulldown-cmark",
@@ -2854,7 +2784,7 @@ version = "0.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e069e2c7c45d3486da3c72347105d8607b43e428c3aa37193a79c98dbaa53e22"
 dependencies = [
- "egui 0.34.1",
+ "egui",
  "egui_extras",
  "pulldown-cmark",
  "syntect",
@@ -2883,7 +2813,7 @@ dependencies = [
  "log",
  "presser",
  "thiserror 2.0.18",
- "windows 0.62.2",
+ "windows",
 ]
 
 [[package]]
@@ -3935,19 +3865,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 dependencies = [
  "value-bag",
-]
-
-[[package]]
-name = "loom"
-version = "0.5.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff50ecb28bb86013e935fb6683ab1f6d3a20016f123c76fd4c27470076ac30f5"
-dependencies = [
- "cfg-if",
- "generator",
- "scoped-tls",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -5013,7 +4930,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokenizers",
- "triblespace 0.44.0",
+ "triblespace",
  "ureq",
 ]
 
@@ -5535,16 +5452,6 @@ dependencies = [
  "getrandom 0.2.17",
  "libredox",
  "thiserror 1.0.69",
-]
-
-[[package]]
-name = "reft-light"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "137e789ad4ba6f1f02fda3222d514cda8a3e2241a05c66847c02c9c4c654e8fc"
-dependencies = [
- "loom",
- "slab",
 ]
 
 [[package]]
@@ -6944,9 +6851,9 @@ dependencies = [
 
 [[package]]
 name = "triblespace"
-version = "0.36.0"
+version = "0.44.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4f5aba5668a7dcdfdf040c39e45f56d374f87183b557ee189491e235104a3efd"
+checksum = "9415c4ec56c2b3f6b3dd70bbdbd83410765d55ead68b36e060de4d652a2de4db"
 dependencies = [
  "ed25519-dalek",
  "log",
@@ -6954,68 +6861,8 @@ dependencies = [
  "thread_local",
  "tracing",
  "tracing-subscriber",
- "triblespace-core 0.36.0",
- "triblespace-macros 0.36.0",
-]
-
-[[package]]
-name = "triblespace"
-version = "0.44.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9415c4ec56c2b3f6b3dd70bbdbd83410765d55ead68b36e060de4d652a2de4db"
-dependencies = [
- "triblespace-core 0.44.0",
- "triblespace-macros 0.44.0",
-]
-
-[[package]]
-name = "triblespace-core"
-version = "0.36.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "75c55035df90cc481ef44bce7c6e941562f2c03e59f2f9f10ab3266dd9b0f758"
-dependencies = [
- "anybytes",
- "arbitrary",
- "arrayvec",
- "blake3",
- "bytemuck",
- "bytes",
- "const_blake3",
- "crossbeam-channel",
- "ed25519",
- "ed25519-dalek",
- "ethnum",
- "f256",
- "futures",
- "hex",
- "hex-literal",
- "hifitime",
- "indxvec",
- "itertools",
- "jerky",
- "json-event-parser",
- "memmap2",
- "num-rational",
- "object_store",
- "page_size",
- "proptest",
- "quick_cache",
- "rand 0.8.5",
- "reft-light",
- "rustversion",
- "ryu",
- "serde_json",
- "signature",
- "siphasher",
- "sptr",
- "tokio",
- "triblespace-core-macros 0.36.0",
- "url",
- "uuid",
- "ux",
- "wasmi 0.31.2",
- "winnow 0.7.15",
- "zerocopy",
+ "triblespace-core",
+ "triblespace-macros",
 ]
 
 [[package]]
@@ -7060,25 +6907,13 @@ dependencies = [
  "smallvec",
  "sptr",
  "tokio",
- "triblespace-core-macros 0.44.0",
+ "triblespace-core-macros",
  "url",
  "uuid",
  "ux",
  "wasmi 0.31.2",
  "winnow 0.7.15",
  "zerocopy",
-]
-
-[[package]]
-name = "triblespace-core-macros"
-version = "0.36.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "59325056dee286271e451f33619b6f27a05884e4dabb4e2f67322a4b279776c5"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
- "triblespace-macros-common 0.36.0",
 ]
 
 [[package]]
@@ -7090,23 +6925,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
- "triblespace-macros-common 0.44.0",
-]
-
-[[package]]
-name = "triblespace-macros"
-version = "0.36.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4e84048f3aa52f41eb59a0d98b11a816e782e2f74215ae5c190e2379ceda2bad"
-dependencies = [
- "ed25519-dalek",
- "hex",
- "proc-macro2",
- "quote",
- "syn",
- "triblespace-core 0.36.0",
- "triblespace-core-macros 0.36.0",
- "triblespace-macros-common 0.36.0",
+ "triblespace-macros-common",
 ]
 
 [[package]]
@@ -7120,20 +6939,9 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
- "triblespace-core 0.44.0",
- "triblespace-core-macros 0.44.0",
- "triblespace-macros-common 0.44.0",
-]
-
-[[package]]
-name = "triblespace-macros-common"
-version = "0.36.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b5bc2e0779a5275b55de2093251eaf3e5e7a8d5e7aa9d40121a850857257e574"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
+ "triblespace-core",
+ "triblespace-core-macros",
+ "triblespace-macros-common",
 ]
 
 [[package]]
@@ -8362,7 +8170,7 @@ dependencies = [
  "web-sys",
  "wgpu-naga-bridge",
  "wgpu-types",
- "windows 0.62.2",
+ "windows",
  "windows-core",
 ]
 
@@ -8420,15 +8228,6 @@ name = "winapi-x86_64-pc-windows-gnu"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "712e227841d057c1ee1cd2fb22fa7e5a5461ae8e48fa2ca79ec42cfc1931183f"
-
-[[package]]
-name = "windows"
-version = "0.48.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e686886bc078bc1b0b600cac0147aadb815089b6e4da64016cbd754b6342700f"
-dependencies = [
- "windows-targets 0.48.5",
-]
 
 [[package]]
 name = "windows"
