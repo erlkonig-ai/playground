@@ -25,13 +25,18 @@ A chunk is an entity tagged with `kind_chunk` carrying these attributes:
 
 | Attribute | Schema | Description |
 |-----------|--------|-------------|
-| `summary` | `Handle<Blake3, LongString>` | Text summary stored as a blob |
+| `summary` | `Handle<LongString>` | Text summary stored as a blob |
 | `created_at` | `NsTAIInterval` | When the chunk was created |
 | `start_at` | `NsTAIInterval` | Temporal scope start (inclusive) |
 | `end_at` | `NsTAIInterval` | Temporal scope end (inclusive) |
 | `child` | `GenId` (repeated) | Arbitrary n-ary tree children |
-| `about_exec_result` | `GenId` (optional) | Provenance link to cognition branch |
-| `about_archive_message` | `GenId` (optional) | Provenance link to archive branch |
+
+Provenance to specific cognition turns or archive messages is computed
+*at read-time* via temporal overlap rather than stored as a chunk-side
+attribute (see Provenance below). The `about_exec_result` /
+`about_archive_message` attributes remain declared in the schema for
+backward compatibility with chunks written under earlier versions, but
+new chunks do not set them.
 
 Time ranges use `NsTAIInterval` (TAI nanosecond intervals), allowing chunks
 to represent non-instant events. Queries use overlap logic, not equality.
@@ -59,9 +64,6 @@ The faculty:
 2. Sets `start_at`/`end_at` from the range (defaults to now)
 3. Parses the summary for `(memory:<range>)` or `[text](memory:<hex>)` links
    and creates `child` edges to referenced chunks
-4. If no children are specified, scans the cognition and archive branches for
-   events in the time range and creates `about_exec_result` /
-   `about_archive_message` provenance links
 
 All queries use `pattern!` directly on the `TribleSet` — no pre-materialization
 into Rust structs. Chunk metadata is loaded on demand.
@@ -121,12 +123,38 @@ preventing unsummarized events from being skipped.
 
 ## Provenance
 
-Chunks can optionally link to the raw events they summarize:
+Provenance — "which raw events does this chunk summarize?" — is recovered
+by *temporal overlap* rather than stored as chunk-side references:
 
-- `about_exec_result` points to a cognition-branch execution result entity
-  (carries `finished_at` timestamp)
-- `about_archive_message` points to an archive-branch message entity
-  (carries `created_at`, `author`, content)
+```
+memory provenance <chunk-id>
+```
 
-These links allow the model to trace a summary back to the specific shell
-interactions or imported messages it was derived from.
+returns every cognition exec result whose `finished_at` and every archive
+message whose `created_at` falls within the chunk's `[start_at, end_at]`
+interval, chronologically ordered.
+
+This loose coupling means:
+
+- **Chunks can be written before the data lands.** A reflective summary
+  written today against a not-yet-imported chatgpt-data-dump becomes
+  automatically associated with that data the moment it lands on the
+  archive branch, because the time-range query catches it.
+- **No rewrite pass on import.** New archive data joins the existing
+  provenance fabric just by being timestamped.
+- **Multi-source unification.** Cognition (playground exec results) and
+  archive (imported message history) are queried together; the model
+  doesn't need to know which branch a piece of evidence came from.
+
+This is the [coordinate-and-cursor pattern][cc] applied to memory
+provenance — facts indexed by time, relationships computed by overlap.
+
+[cc]: # "wiki:b72c62851e4e4989138a2a45d75c813b in the Liora pile"
+
+### Legacy: `about_exec_result` / `about_archive_message`
+
+Earlier chunks (written before the loose-coupling refactor in faculties
+0.18) may carry `ctx::about_exec_result` and `ctx::about_archive_message`
+attributes set at write-time. The schema preserves these attribute IDs so
+older chunks remain queryable, and tools that read them (e.g. `triage`)
+continue to work. New chunks do not set them.
