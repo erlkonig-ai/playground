@@ -1,5 +1,5 @@
 use triblespace::prelude::blobencodings::LongString;
-use triblespace::prelude::inlineencodings::{Blake3, GenId, Handle, ShortString};
+use triblespace::prelude::inlineencodings::{GenId, Handle, ShortString};
 use triblespace::prelude::*;
 
 pub mod playground_archive {

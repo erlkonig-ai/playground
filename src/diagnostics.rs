@@ -15,7 +15,7 @@ use triblespace::core::repo::{
 };
 use triblespace::core::trible::TribleSet;
 use triblespace::core::inline::Inline;
-use triblespace::core::inline::encodings::hash::{Blake3, Handle};
+use triblespace::core::inline::encodings::hash::{Handle};
 use triblespace::macros::{entity, find, pattern};
 use triblespace::prelude::inlineencodings::{GenId, NsTAIInterval, U256BE};
 use triblespace::prelude::{

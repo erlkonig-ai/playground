@@ -9,7 +9,7 @@ use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, ReadError};
 use triblespace::core::repo::{PullError, Repository, Workspace};
 use triblespace::prelude::blobencodings::LongString;
-use triblespace::prelude::inlineencodings::{Blake3, Handle};
+use triblespace::prelude::inlineencodings::{Handle};
 use triblespace::prelude::*;
 
 use crate::config::Config;
