@@ -17,7 +17,7 @@ pub mod playground_context {
         "A4E2B712CA28AB1EED76C34DE72AFA39" as pub about_archive_message: GenId;
     }
 
-    #[allow(non_upper_case_globals)]
+    #[allow(non_upper_case_globals, dead_code)]
     pub const playground_context_metadata: Id = id_hex!("2B490ED2CEAC5496F7F9601724B99A48");
 
     #[allow(non_upper_case_globals)]

@@ -34,7 +34,7 @@ pub mod playground_config {
     }
 
     /// Root id for describing the playground_config protocol.
-    #[allow(non_upper_case_globals)]
+    #[allow(non_upper_case_globals, dead_code)]
     pub const playground_config_metadata: Id = id_hex!("F696CB4F22D5EAEE7E42A820F9458A35");
 
     /// Tag for configuration entries.
