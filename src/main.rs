@@ -228,6 +228,7 @@ fn main() -> Result<()> {
             let pile_path = resolve_pile_path(cli.pile.clone(), instance.as_str());
             let config = Config::load(Some(pile_path.as_path())).context("load config")?;
             let stop = install_stop_handler();
+            eprintln!("playground core: pile={} (Ctrl+C to stop)", pile_path.display());
             run_loop(config, Some(stop))
         }
         CommandMode::Exec(args) => {
@@ -235,6 +236,7 @@ fn main() -> Result<()> {
             let pile_path = resolve_pile_path(cli.pile.clone(), instance.as_str());
             let config = Config::load(Some(pile_path.as_path())).context("load config")?;
             let stop = install_stop_handler();
+            eprintln!("playground exec: pile={} (Ctrl+C to stop)", pile_path.display());
             run_exec_worker(config, args, Some(stop))
         }
         CommandMode::Model(args) => {
@@ -242,6 +244,11 @@ fn main() -> Result<()> {
             let pile_path = resolve_pile_path(cli.pile.clone(), instance.as_str());
             let config = Config::load(Some(pile_path.as_path())).context("load config")?;
             let stop = install_stop_handler();
+            eprintln!(
+                "playground model: pile={} model={} (Ctrl+C to stop)",
+                pile_path.display(),
+                config.model.model
+            );
             run_model_worker(config, args, Some(stop))
         }
         #[cfg(feature = "diagnostics")]
