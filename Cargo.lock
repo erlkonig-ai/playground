@@ -4919,6 +4919,7 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "clap",
+ "ctrlc",
  "ed25519-dalek",
  "eframe",
  "egui_plot",

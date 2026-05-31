@@ -13,6 +13,7 @@ diagnostics = ["dep:eframe", "dep:GORBIE", "dep:egui_plot"]
 anyhow = "1"
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
+ctrlc = "3"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 eframe = { version = "0.34", optional = true, features = ["persistence", "wgpu"] }
 GORBIE = { version = "0.16", optional = true, features = ["triblespace", "telemetry", "typst"] }

@@ -196,6 +196,18 @@ struct Cli {
     command: Option<CommandMode>,
 }
 
+/// Install a SIGINT/SIGTERM handler that flips a shared stop flag.
+/// Workers polling the flag will exit cleanly at their next sleep boundary
+/// (typically within a poll_ms — 1 ms by default).
+fn install_stop_handler() -> Arc<AtomicBool> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_handler = stop.clone();
+    let _ = ctrlc::set_handler(move || {
+        stop_handler.store(true, Ordering::Relaxed);
+    });
+    stop
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let Some(command) = cli.command else {
@@ -215,19 +227,22 @@ fn main() -> Result<()> {
             let instance = default_instance_name();
             let pile_path = resolve_pile_path(cli.pile.clone(), instance.as_str());
             let config = Config::load(Some(pile_path.as_path())).context("load config")?;
-            run_loop(config)
+            let stop = install_stop_handler();
+            run_loop(config, Some(stop))
         }
         CommandMode::Exec(args) => {
             let instance = default_instance_name();
             let pile_path = resolve_pile_path(cli.pile.clone(), instance.as_str());
             let config = Config::load(Some(pile_path.as_path())).context("load config")?;
-            run_exec_worker(config, args)
+            let stop = install_stop_handler();
+            run_exec_worker(config, args, Some(stop))
         }
         CommandMode::Model(args) => {
             let instance = default_instance_name();
             let pile_path = resolve_pile_path(cli.pile.clone(), instance.as_str());
             let config = Config::load(Some(pile_path.as_path())).context("load config")?;
-            run_model_worker(config, args)
+            let stop = install_stop_handler();
+            run_model_worker(config, args, Some(stop))
         }
         #[cfg(feature = "diagnostics")]
         CommandMode::Diagnostics(args) => {
@@ -256,7 +271,7 @@ fn run_with_exec(mut config: Config, args: RunArgs) -> Result<()> {
     let poll_ms = args.poll_ms.unwrap_or(config.poll_ms);
     config.poll_ms = poll_ms;
 
-    let stop = Arc::new(AtomicBool::new(false));
+    let stop = install_stop_handler();
     let model_stop = stop.clone();
     let model_config = config.clone();
     let model_worker_id = *ufoid();
@@ -267,7 +282,7 @@ fn run_with_exec(mut config: Config, args: RunArgs) -> Result<()> {
     let instance = env_string("PLAYGROUND_LIMA_INSTANCE").unwrap_or_else(|| args.lima.instance.clone());
     prepare_lima_service(&config, &args.lima)?;
 
-    let core_result = run_loop(config);
+    let core_result = run_loop(config, Some(stop.clone()));
     stop.store(true, Ordering::Relaxed);
 
     // Stop the Lima VM so it doesn't keep writing to the pile after exit.
@@ -282,16 +297,16 @@ fn run_with_exec(mut config: Config, args: RunArgs) -> Result<()> {
     Ok(())
 }
 
-fn run_exec_worker(config: Config, args: WorkerArgs) -> Result<()> {
+fn run_exec_worker(config: Config, args: WorkerArgs, stop: Option<Arc<AtomicBool>>) -> Result<()> {
     let poll_ms = args.poll_ms.unwrap_or(config.poll_ms);
     let worker_id = parse_worker_id(args.worker_id)?;
-    exec_worker::run_exec_loop(config, worker_id, poll_ms, None)
+    exec_worker::run_exec_loop(config, worker_id, poll_ms, stop)
 }
 
-fn run_model_worker(config: Config, args: WorkerArgs) -> Result<()> {
+fn run_model_worker(config: Config, args: WorkerArgs, stop: Option<Arc<AtomicBool>>) -> Result<()> {
     let poll_ms = args.poll_ms.unwrap_or(config.poll_ms);
     let worker_id = parse_worker_id(args.worker_id)?;
-    model_worker::run_model_loop(config, worker_id, poll_ms, None)
+    model_worker::run_model_loop(config, worker_id, poll_ms, stop)
 }
 
 fn handle_config(pile: Option<&Path>, command: ConfigCommand) -> Result<()> {
@@ -676,7 +691,7 @@ fn print_config(config: &Config, show_secrets: bool) {
     );
 }
 
-fn run_loop(config: Config) -> Result<()> {
+fn run_loop(config: Config, stop: Option<Arc<AtomicBool>>) -> Result<()> {
     let (mut repo, branch_id) = init_repo(&config).context("open triblespace repo")?;
     let exec_cwd = config
         .exec
@@ -690,8 +705,11 @@ fn run_loop(config: Config) -> Result<()> {
         let mut request_info = ensure_model_request(&mut repo, branch_id, &config, &mut prev_cover)?;
 
         loop {
+            if stop.as_ref().is_some_and(|s| s.load(Ordering::Relaxed)) {
+                break;
+            }
             let model_result =
-                wait_for_model_result(&mut repo, branch_id, request_info.id, config.poll_ms)?;
+                wait_for_model_result(&mut repo, branch_id, request_info.id, config.poll_ms, stop.as_ref())?;
             if let Some(error) = model_result.error {
                 eprintln!(
                     "warning: model request {request_id:x} failed: {error}",
@@ -1004,10 +1022,14 @@ fn wait_for_model_result(
     branch_id: Id,
     request_id: Id,
     poll_ms: u64,
+    stop: Option<&Arc<AtomicBool>>,
 ) -> Result<ModelResult> {
     let mut cached_head = None;
     let mut cached_catalog = TribleSet::new();
     loop {
+        if stop.is_some_and(|s| s.load(Ordering::Relaxed)) {
+            return Err(anyhow!("interrupted"));
+        }
         let branch_head = current_branch_head(repo, branch_id)?;
         if branch_head == cached_head {
             sleep(Duration::from_millis(poll_ms));
