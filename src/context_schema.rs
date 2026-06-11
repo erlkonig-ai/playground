@@ -12,7 +12,7 @@ pub mod playground_context {
         "DF84E872EB68FBFCA63D760F27FD8A6F" as pub end_at: NsTAIInterval;
         "CB97C36A32DEC70E0D1149E7C5D88588" as pub left: GenId;
         "087D07E3D9D94F0C4E96813C7BC5E74C" as pub right: GenId;
-        "9B83D68AECD6888AA9CE95E754494768" as pub child: GenId;
+        "9B83D68AECD6888AA9CE95E754494768" as pub reference: GenId; // renamed from `child` (same id): contextualised cross-reference; cover still walks it as split-sets until the containment-LOD rewrite
         "316834CC6B0EA6F073BF5362D67AC530" as pub about_exec_result: GenId;
         "A4E2B712CA28AB1EED76C34DE72AFA39" as pub about_archive_message: GenId;
     }

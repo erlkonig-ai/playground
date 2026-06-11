@@ -2247,7 +2247,7 @@ fn load_context_chunks(catalog: &TribleSet) -> ContextChunkIndex {
         pattern!(catalog, [{
             ?chunk_id @
             metadata::tag: playground_context::kind_chunk,
-            playground_context::child: ?child_id,
+            playground_context::reference: ?child_id,
         }])
     ) {
         if let Some(chunk) = index.chunks.get_mut(&chunk_id) {

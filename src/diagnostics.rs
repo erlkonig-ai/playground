@@ -2530,7 +2530,7 @@ fn collect_context_chunks(data: &TribleSet) -> Vec<ContextChunkRow> {
         pattern!(data, [{
             ?chunk_id @
             metadata::tag: playground_context::kind_chunk,
-            playground_context::child: ?child_id,
+            playground_context::reference: ?child_id,
         }])
     ) {
         if let Some(row) = rows.get_mut(&chunk_id) {
