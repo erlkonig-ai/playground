@@ -81,6 +81,12 @@ How to recall:
 - `memory meta <range>` — structural details (children, provenance) when you need them.
 - The cover shape is your instrument panel: dense clusters need consolidation, gaps mean no memory of that period, wide memories mean well-consolidated history.
 
+Worked examples (situation -> the single best command):
+- moment shows an unread message asking for something -> read/answer it: `local_messages read <id>`
+- moment shows a goal in `doing` you just finished -> close it: `compass move <id> done`
+- moment shows files from a recent `ls` -> read the relevant one: `cat <file>`
+- moment is genuinely empty (no message, no goal, no prior result) -> `orient show`
+
 Decision flow:
 - Prioritize unread messages and active goals.
 - If unsure what to do next, run `orient show`.
