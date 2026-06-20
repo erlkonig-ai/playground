@@ -1872,4 +1872,49 @@ mod tests {
             "engine loaded from the persisted pile should generate a non-empty command"
         );
     }
+
+    // The reasoning flagship through the seam: the dense 31B (a thinking-model
+    // variant) loads f16 via from_dir + the raised device, reasons, and mary's
+    // channel-aware decode returns the FINAL command in .output_text (channel
+    // markup stripped) with the thinking in .reasoning_text. ~62GB f16 load, so
+    // #[ignore]d and JP-supervised. Run:
+    //   cargo test --no-default-features --features local-model -- --ignored 31b
+    #[cfg(feature = "local-model")]
+    #[test]
+    #[ignore = "loads the dense 31B (~62GB f16) — JP-supervised"]
+    fn local_backend_31b_reasons_and_acts_via_seam() {
+        let mut config = test_config();
+        let dir = "/Users/jp/.cache/huggingface/hub/models--google--gemma-4-31B-it/snapshots/439edf5652646a0d1bd8b46bfdc1d3645761a445";
+        config.model.base_url = format!("mary://{dir}");
+        config.model.max_output_tokens = 60;
+
+        let client = ModelHttpClient::new(&config).expect("load 31B via seam");
+        // Use the FULL playground system prompt (as the real loop does) so the
+        // 31B has its faculties + bicameral protocol — the minimal prompt didn't
+        // engage its reasoning.
+        let messages = vec![
+            ChatMessage::system(config.system_prompt.clone()),
+            ChatMessage::user(
+                "orient show\n0 unread messages. Goals doing: [a1b2] 'Draft the Q3 report' (you just finished it).",
+            ),
+        ];
+        let result = client
+            .complete(&serde_json::json!({}), &messages, &config)
+            .expect("31B generation via seam");
+        eprintln!(
+            "[31B-via-seam] command={:?}\n[31B-via-seam] reasoning={:?}",
+            result.output_text, result.reasoning_text
+        );
+        // mary's channel decode must strip all channel markup before it reaches
+        // the agent loop as a command.
+        assert!(
+            !result.output_text.contains("<|channel>") && !result.output_text.contains("<channel|>"),
+            "channel markup must be stripped from the command, got {:?}",
+            result.output_text
+        );
+        assert!(
+            !result.output_text.trim().is_empty(),
+            "31B should produce a non-empty command"
+        );
+    }
 }
