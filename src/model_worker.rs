@@ -1841,4 +1841,35 @@ mod tests {
             "real mary engine should generate a non-empty command"
         );
     }
+
+    // The true shell-is-physics endpoint: weights live as tribles in a pile and
+    // load with NO safetensors on disk. The dir holds only config.json +
+    // tokenizer.json + weights.pile (produced once by `gemma_persist`). Run:
+    //   cargo test --no-default-features --features local-model -- --ignored persisted
+    #[cfg(feature = "local-model")]
+    #[test]
+    #[ignore = "loads weights from a persisted ~19GB tribles pile"]
+    fn local_backend_generates_from_persisted_pile() {
+        let mut config = test_config();
+        let dir = "/tmp/worker-scratch/e2b-persisted";
+        config.model.base_url = format!("mary://{dir}");
+        config.model.max_output_tokens = 16;
+
+        let client = ModelHttpClient::new(&config).expect("load mary engine from persisted pile");
+        let messages = vec![
+            ChatMessage::system("You are a shell agent. Reply with only one shell command, nothing else."),
+            ChatMessage::user("List files in the current directory in long format."),
+        ];
+        let result = client
+            .complete(&serde_json::json!({}), &messages, &config)
+            .expect("in-process generation from persisted pile");
+        eprintln!(
+            "[weights-as-tribles] output={:?} prompt_tokens={:?} completion_tokens={:?}",
+            result.output_text, result.input_tokens, result.output_tokens
+        );
+        assert!(
+            !result.output_text.trim().is_empty(),
+            "engine loaded from the persisted pile should generate a non-empty command"
+        );
+    }
 }

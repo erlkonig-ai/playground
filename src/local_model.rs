@@ -118,18 +118,31 @@ impl LocalTextEngine for StubEngine {
 /// `mary::local::load_gemma4_f16(config, tokenizer, &explicit_shard_paths, …)`
 /// with shard paths resolved from `model.safetensors.index.json`.
 ///
-/// Weights load through the pile (`mary::local::load_gemma4_from_pile`, compass
-/// ddc93544): the model lives as tribles. v1 still reads the safetensors dir and
-/// ingests it into a pile at load time; when mary persists the ingested pile as
-/// a standalone tribles blob store (the true shell-is-physics endpoint), this
-/// same call picks it up transparently — no change here.
+/// The model lives as tribles. Auto-detects how the weights are stored in `spec`:
+/// - if `<dir>/weights.pile` exists, the weights are *persisted as tribles* in a
+///   standalone pile — load directly from it with NO safetensors on disk (the
+///   true shell-is-physics endpoint, `mary::local::load_gemma4_from_persisted_pile_f16`,
+///   produced once by `gemma_persist <model-dir> <dir>/weights.pile`);
+/// - otherwise fall back to ingesting the safetensors dir through a pile at load
+///   time (`load_gemma4_from_pile`).
+/// Either way only `config.json` + `tokenizer.json` stay as plain files.
 #[cfg(feature = "local-model")]
 pub fn load_local_engine(spec: &str) -> anyhow::Result<Box<dyn LocalTextEngine>> {
     let dir = std::path::Path::new(spec);
     anyhow::ensure!(
         dir.is_dir(),
-        "mary:// model spec must be a directory with config.json/tokenizer.json/*.safetensors: {spec}"
+        "mary:// model spec must be a directory with config.json/tokenizer.json and either weights.pile or *.safetensors: {spec}"
     );
     let device = mary::nn::backend::WgpuDevice::default();
-    mary::local::load_gemma4_from_pile(dir, device)
+    let persisted = dir.join("weights.pile");
+    if persisted.is_file() {
+        mary::local::load_gemma4_from_persisted_pile_f16(
+            &persisted,
+            &dir.join("config.json"),
+            &dir.join("tokenizer.json"),
+            device,
+        )
+    } else {
+        mary::local::load_gemma4_from_pile(dir, device)
+    }
 }
