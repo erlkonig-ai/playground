@@ -465,11 +465,28 @@ fn prepare_lima_service(config: &Config, args: &LimaExecArgs) -> Result<()> {
         ));
     }
 
+    // mary is an (optional) path dependency of playground, so cargo must resolve
+    // its manifest even for the exec worker's `--no-default-features` build (mary
+    // itself is never compiled there). Mount it read-only at /opt/mary so the
+    // playground/../mary path resolves inside the VM.
+    let mary_root = playground_root
+        .parent()
+        .ok_or_else(|| anyhow!("playground root has no parent"))?
+        .join("mary");
+    if !mary_root.is_dir() {
+        return Err(anyhow!(
+            "mary repo not found at {} (playground depends on it as a path dep). Clone it with:\n  git clone git@github.com:erlkonig-ai/mary.git {}",
+            mary_root.display(),
+            mary_root.display(),
+        ));
+    }
+
     render_lima_template(
         &template,
         &config_path,
         &playground_root,
         &faculties_root,
+        &mary_root,
         &pile_root,
         &workspace_root,
         &pile_vm,
@@ -507,6 +524,7 @@ fn render_lima_template(
     out_path: &Path,
     playground_root: &Path,
     faculties_root: &Path,
+    mary_root: &Path,
     pile_root: &Path,
     workspace_root: &Path,
     pile_vm: &Path,
@@ -518,6 +536,7 @@ fn render_lima_template(
     let replacements = [
         ("__PLAYGROUND_ROOT__", playground_root),
         ("__FACULTIES_ROOT__", faculties_root),
+        ("__MARY_ROOT__", mary_root),
         ("__PILE_ROOT__", pile_root),
         ("__WORKSPACE_ROOT__", workspace_root),
         ("__PILE_PATH__", pile_vm),
