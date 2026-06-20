@@ -21,6 +21,12 @@ mounts:
   - location: "__FACULTIES_ROOT__"
     mountPoint: "/opt/faculties"
     writable: true
+  # mary is an optional path dep of playground; cargo resolves its manifest even
+  # for the exec worker's --no-default-features build (mary is never compiled
+  # there). Read-only mount so playground/../mary resolves inside the VM.
+  - location: "__MARY_ROOT__"
+    mountPoint: "/opt/mary"
+    writable: false
   - location: "__PILE_ROOT__"
     mountPoint: "/pile"
     writable: true

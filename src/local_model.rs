@@ -118,8 +118,11 @@ impl LocalTextEngine for StubEngine {
 /// `mary::local::load_gemma4_f16(config, tokenizer, &explicit_shard_paths, …)`
 /// with shard paths resolved from `model.safetensors.index.json`.
 ///
-/// When mary's `load_gemma4_from_pile` lands (compass ddc93544) this becomes a
-/// one-line swap — same `LocalTextEngine`, weights from the pile instead of disk.
+/// Weights load through the pile (`mary::local::load_gemma4_from_pile`, compass
+/// ddc93544): the model lives as tribles. v1 still reads the safetensors dir and
+/// ingests it into a pile at load time; when mary persists the ingested pile as
+/// a standalone tribles blob store (the true shell-is-physics endpoint), this
+/// same call picks it up transparently — no change here.
 #[cfg(feature = "local-model")]
 pub fn load_local_engine(spec: &str) -> anyhow::Result<Box<dyn LocalTextEngine>> {
     let dir = std::path::Path::new(spec);
@@ -128,5 +131,5 @@ pub fn load_local_engine(spec: &str) -> anyhow::Result<Box<dyn LocalTextEngine>>
         "mary:// model spec must be a directory with config.json/tokenizer.json/*.safetensors: {spec}"
     );
     let device = mary::nn::backend::WgpuDevice::default();
-    mary::local::load_gemma4_from_dir_f16(dir, device)
+    mary::local::load_gemma4_from_pile(dir, device)
 }
