@@ -26,6 +26,7 @@ mod config;
 #[cfg(feature = "diagnostics")]
 mod diagnostics;
 mod exec_worker;
+mod local_model;
 mod model_worker;
 mod relations_schema;
 mod repo_ops;
@@ -63,6 +64,8 @@ enum CommandMode {
     Run(RunArgs),
     #[command(about = "Run only the core loop (no model/exec workers)")]
     Core,
+    #[command(about = "Dump recent cognition state (model results + command requests) from the pile")]
+    Inspect,
     #[command(about = "Run only the exec worker (remote host)")]
     Exec(WorkerArgs),
     #[command(about = "Run only the Model worker (host)")]
@@ -168,6 +171,7 @@ enum ConfigField {
     AuthorRole,
     PersonaId,
     PollMs,
+    ModelBaseUrl,
     TavilyApiKey,
     ExaApiKey,
     ExecDefaultCwd,
@@ -230,6 +234,12 @@ fn main() -> Result<()> {
             let stop = install_stop_handler();
             eprintln!("playground core: pile={} (Ctrl+C to stop)", pile_path.display());
             run_loop(config, Some(stop))
+        }
+        CommandMode::Inspect => {
+            let instance = default_instance_name();
+            let pile_path = resolve_pile_path(cli.pile.clone(), instance.as_str());
+            let config = Config::load(Some(pile_path.as_path())).context("load config")?;
+            run_inspect(config)
         }
         CommandMode::Exec(args) => {
             let instance = default_instance_name();
@@ -355,6 +365,12 @@ fn apply_config_set(config: &mut Config, field: ConfigField, value: &str) -> Res
         }
         ConfigField::PollMs => {
             config.poll_ms = parse_u64(value, "poll_ms")?;
+        }
+        ConfigField::ModelBaseUrl => {
+            // The inference endpoint. http(s) URLs use the OpenAI/Anthropic HTTP
+            // backends; a `mary://<model-dir>` (or `local://`) scheme selects the
+            // in-process gemma engine (requires the `local-model` build).
+            config.model.base_url = load_value_or_file_trimmed(value, "model_base_url")?;
         }
         ConfigField::TavilyApiKey => {
             config.tavily_api_key = Some(load_value_or_file_trimmed(value, "tavily_api_key")?);
@@ -765,6 +781,96 @@ fn run_loop(config: Config, stop: Option<Arc<AtomicBool>>) -> Result<()> {
     result
 }
 
+/// Read-only dump of recent cognition state: every model_chat result (with its
+/// reasoning + output or error) in chronological order, plus the command
+/// requests the core loop derived from those outputs. Lets us inspect what a
+/// local-model worker actually produced without a GUI dashboard.
+fn run_inspect(config: Config) -> Result<()> {
+    let (mut repo, branch_id) = init_repo(&config).context("open triblespace repo")?;
+    let result = (|| -> Result<()> {
+        let mut ws = pull_workspace(&mut repo, branch_id, "pull workspace for inspect")?;
+        let catalog = ws.checkout(..).context("checkout workspace")?.into_facts();
+
+        let mut results: Vec<(i128, Id)> = find!(
+            result_id: Id,
+            pattern!(&catalog, [{
+                ?result_id @ metadata::tag: model_chat::kind_result
+            }])
+        )
+        .map(|result_id| {
+            let key = find!(
+                ts: Inline<NsTAIInterval>,
+                pattern!(&catalog, [{ result_id @ metadata::finished_at: ?ts }])
+            )
+            .next()
+            .map(interval_key)
+            .unwrap_or(i128::MIN);
+            (key, result_id)
+        })
+        .collect();
+        results.sort_by_key(|(k, _)| *k);
+
+        println!("=== model results ({}) ===", results.len());
+        for (_, result_id) in &results {
+            let output = find!(
+                t: Inline<Handle<LongString>>,
+                pattern!(&catalog, [{ result_id @ model_chat::output_text: ?t }])
+            )
+            .next()
+            .map(|h| load_text(&mut ws, h))
+            .transpose()?;
+            let reasoning = find!(
+                t: Inline<Handle<LongString>>,
+                pattern!(&catalog, [{ result_id @ model_chat::reasoning_text: ?t }])
+            )
+            .next()
+            .map(|h| load_text(&mut ws, h))
+            .transpose()?;
+            let error = find!(
+                t: Inline<Handle<LongString>>,
+                pattern!(&catalog, [{ result_id @ model_chat::error: ?t }])
+            )
+            .next()
+            .map(|h| load_text(&mut ws, h))
+            .transpose()?;
+            println!("--- result {result_id:x} ---");
+            if let Some(reasoning) = reasoning {
+                println!("[reasoning] {reasoning}");
+            }
+            if let Some(output) = output {
+                println!("[output] {output}");
+            }
+            if let Some(error) = error {
+                println!("[error] {error}");
+            }
+        }
+
+        let commands: Vec<String> = find!(
+            (request_id: Id, cmd: Inline<Handle<LongString>>),
+            pattern!(&catalog, [{
+                ?request_id @
+                metadata::tag: playground_exec::kind_command_request,
+                playground_exec::command_text: ?cmd,
+            }])
+        )
+        .map(|(_, cmd)| load_text(&mut ws, cmd))
+        .collect::<Result<_>>()?;
+        println!("\n=== command requests ({}) ===", commands.len());
+        for cmd in commands {
+            println!("[command] {cmd}");
+        }
+        Ok(())
+    })();
+
+    if let Err(err) = close_repo(repo) {
+        if result.is_ok() {
+            return Err(err);
+        }
+        eprintln!("warning: failed to close pile cleanly: {err:#}");
+    }
+    result
+}
+
 #[derive(Debug, Clone)]
 struct ModelRequestInfo {
     id: Id,
@@ -908,6 +1014,11 @@ fn create_thought_and_request(
         messages.insert(breath_idx, ChatMessage::assistant("breath".to_string()));
         // No exec result to attach pressure to in cold start; append as trailing message.
         messages.push(ChatMessage::user(format!("context filled to {fill_pct}%.")));
+        // Prepend the system prompt so the very first turn of a fresh worker has
+        // its operating instructions (mirrors context_for_exec_result_with_history).
+        // Without this, cold start ships breath + fill only — no protocol, no
+        // faculty list — and the model must guess what it is supposed to emit.
+        messages.insert(0, ChatMessage::system(config.system_prompt.clone()));
         serde_json::to_string(&messages).context("serialize cold-start context")?
     };
     let context_handle = ws.put(context_json);

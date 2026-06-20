@@ -21,6 +21,11 @@ use triblespace::prelude::*;
 use crate::blob_refs::{PromptChunk, split_blob_refs, unknown_blob_handle_from_hex};
 use crate::chat_prompt::{ChatMessage, ChatRole};
 use crate::config::Config;
+use crate::local_model::{turns_from_messages, LocalGenParams, LocalTextEngine};
+#[cfg(not(feature = "local-model"))]
+use crate::local_model::StubEngine;
+#[cfg(feature = "local-model")]
+use crate::local_model::load_local_engine;
 use crate::repo_util::{
     close_repo, current_branch_head, ensure_worker_name, init_repo, load_text, pull_workspace,
     push_workspace, refresh_cached_checkout,
@@ -50,25 +55,53 @@ struct ModelResult {
 enum ModelBackend {
     OpenAI { endpoint_url: String },
     Anthropic { endpoint_url: String },
+    /// In-process text generation (no HTTP). The brain runs in the substrate.
+    /// Selected when base_url uses a `mary://` or `local://` scheme. Holds a
+    /// warm engine, loaded once and reused across turns (Mutex because the
+    /// send path is `&self` while `generate` is `&mut`).
+    Local {
+        engine: std::sync::Mutex<Box<dyn LocalTextEngine>>,
+    },
 }
 
 impl ModelBackend {
-    fn from_config(config: &Config) -> Self {
+    fn from_config(config: &Config) -> Result<Self> {
         let base = config.model.base_url.trim().trim_end_matches('/');
         if base.contains("anthropic.com") {
-            Self::Anthropic {
+            Ok(Self::Anthropic {
                 endpoint_url: format!("{base}/v1/messages"),
+            })
+        } else if let Some(spec) = base
+            .strip_prefix("mary://")
+            .or_else(|| base.strip_prefix("local://"))
+        {
+            // With `local-model`, build a warm in-process gemma engine from the
+            // model dir; otherwise the stub keeps the loop alive for testing.
+            #[cfg(feature = "local-model")]
+            {
+                let engine = load_local_engine(spec).context("load local model engine")?;
+                Ok(Self::Local {
+                    engine: std::sync::Mutex::new(engine),
+                })
+            }
+            #[cfg(not(feature = "local-model"))]
+            {
+                let _ = spec;
+                Ok(Self::Local {
+                    engine: std::sync::Mutex::new(Box::new(StubEngine)),
+                })
             }
         } else {
-            Self::OpenAI {
+            Ok(Self::OpenAI {
                 endpoint_url: chat_completions_url(base),
-            }
+            })
         }
     }
 
     fn endpoint_url(&self) -> &str {
         match self {
             Self::OpenAI { endpoint_url } | Self::Anthropic { endpoint_url } => endpoint_url,
+            Self::Local { .. } => "in-process://local",
         }
     }
 
@@ -82,6 +115,20 @@ impl ModelBackend {
         match self {
             Self::OpenAI { .. } => build_openai_payload(config, ws, model, messages),
             Self::Anthropic { .. } => build_anthropic_payload(config, ws, model, messages),
+            // For Local there is no wire payload; we record a descriptive
+            // request_raw (the turns) for parity/observability.
+            Self::Local { .. } => serde_json::json!({
+                "backend": "local",
+                "model": model,
+                "messages": messages.iter().map(|m| serde_json::json!({
+                    "role": match m.role {
+                        ChatRole::System => "system",
+                        ChatRole::User => "user",
+                        ChatRole::Assistant => "assistant",
+                    },
+                    "content": m.content.as_str(),
+                })).collect::<Vec<_>>(),
+            }),
         }
     }
 
@@ -105,6 +152,8 @@ impl ModelBackend {
                     parse_anthropic_response(response)
                 }
             }
+            // Local never issues an HTTP request, so there is no response to parse.
+            Self::Local { .. } => Err(anyhow::anyhow!("parse_response is unused for the Local backend")),
         }
     }
 }
@@ -141,13 +190,52 @@ impl ModelHttpClient {
             .http_status_as_error(false)
             .build();
         let agent = ureq::Agent::new_with_config(agent_config);
-        let backend = ModelBackend::from_config(config);
+        let backend = ModelBackend::from_config(config)?;
         Ok(Self {
             agent,
             backend,
             api_key: config.model.api_key.clone(),
             stream: config.model.stream,
         })
+    }
+
+    /// Produce a result for this turn: in-process generation for the Local
+    /// backend, otherwise an HTTP request. `payload` is the descriptive
+    /// request_raw already recorded; `messages` carry the actual turns the
+    /// local engine consumes.
+    fn complete(
+        &self,
+        payload: &JsonValue,
+        messages: &[ChatMessage],
+        config: &Config,
+    ) -> Result<ModelResult> {
+        match &self.backend {
+            ModelBackend::Local { engine } => {
+                let turns = turns_from_messages(messages);
+                let params = LocalGenParams {
+                    max_tokens: config.model.max_output_tokens as usize,
+                    temperature: 0.0,
+                    top_p: None,
+                    stop: vec!["\n".to_string()],
+                    seed: None,
+                };
+                let generation = engine
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("local engine mutex poisoned"))?
+                    .generate(&turns, &params)?;
+                Ok(ModelResult {
+                    output_text: generation.text,
+                    reasoning_text: generation.reasoning,
+                    raw: serde_json::to_string(payload).unwrap_or_default(),
+                    response_id: None,
+                    input_tokens: Some(generation.prompt_tokens as u64),
+                    output_tokens: Some(generation.completion_tokens as u64),
+                    cache_creation_input_tokens: None,
+                    cache_read_input_tokens: None,
+                })
+            }
+            _ => self.send_payload(payload),
+        }
     }
 
     fn send_payload(&self, payload: &JsonValue) -> Result<ModelResult> {
@@ -237,6 +325,8 @@ impl ModelHttpClient {
                         .header("x-api-key", key)
                         .header("anthropic-version", "2023-06-01");
                 }
+                // Local never issues an HTTP request; send_request is unreachable for it.
+                ModelBackend::Local { .. } => {}
             }
         }
         request.send_json(payload)
@@ -348,7 +438,7 @@ pub(crate) fn run_model_loop(
             ws.commit(change, "model_chat in_progress");
             push_workspace(&mut repo, &mut ws).context("push in_progress")?;
 
-            let result = client.send_payload(&payload);
+            let result = client.complete(&payload, &messages, &config);
 
             let finished_e = now_epoch();
             let finished_at = epoch_interval(finished_e);
@@ -1330,7 +1420,7 @@ mod tests {
     use crate::config::Config;
 
     use super::{
-        Bytes, JsonValue, ModelBackend, UnknownBlob, build_anthropic_payload,
+        Bytes, JsonValue, ModelBackend, ModelHttpClient, UnknownBlob, build_anthropic_payload,
         build_openai_input_content, build_openai_payload, extract_reasoning_text,
     };
 
@@ -1345,7 +1435,7 @@ mod tests {
         ))
     }
 
-    fn put_test_png(ws: &mut Workspace<Pile<Blake3>>) -> String {
+    fn put_test_png(ws: &mut Workspace<Pile>) -> String {
         // 1x1 PNG (black), padded above MIN_IMAGE_BYTES with a comment chunk.
         let mut png = vec![
             0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, b'I', b'H',
@@ -1365,10 +1455,10 @@ mod tests {
             .collect()
     }
 
-    fn with_test_workspace<T>(f: impl FnOnce(&mut Workspace<Pile<Blake3>>) -> T) -> T {
+    fn with_test_workspace<T>(f: impl FnOnce(&mut Workspace<Pile>) -> T) -> T {
         let path = test_repo_path();
         std::fs::File::create(&path).expect("create test pile file");
-        let mut pile = Pile::<Blake3>::open(path.as_path()).expect("open test pile");
+        let mut pile = Pile::open(path.as_path()).expect("open test pile");
         pile.restore().expect("restore test pile");
         let mut repo = Repository::new(pile, SigningKey::from_bytes(&[7u8; 32]), TribleSet::new())
             .expect("create test repository");
@@ -1679,17 +1769,76 @@ mod tests {
     fn backend_from_config_detects_anthropic() {
         let mut config = test_config();
         config.model.base_url = "https://api.anthropic.com".to_string();
-        let backend = ModelBackend::from_config(&config);
+        let backend = ModelBackend::from_config(&config).unwrap();
         assert!(
             backend.endpoint_url().contains("/v1/messages"),
             "Anthropic backend should use /v1/messages endpoint"
         );
 
         config.model.base_url = "http://localhost:11434/v1".to_string();
-        let backend = ModelBackend::from_config(&config);
+        let backend = ModelBackend::from_config(&config).unwrap();
         assert!(
             backend.endpoint_url().contains("/chat/completions"),
             "Non-Anthropic backend should use /chat/completions endpoint"
+        );
+    }
+
+    // Stub-engine wiring test — valid only without the `local-model` feature
+    // (with it, `mary://` resolves a real model dir instead of the stub).
+    #[cfg(not(feature = "local-model"))]
+    #[test]
+    fn local_backend_selected_and_generates_in_process() {
+        let mut config = test_config();
+        config.model.base_url = "mary://gemma4".to_string();
+        let backend = ModelBackend::from_config(&config).unwrap();
+        assert!(
+            matches!(backend, ModelBackend::Local { .. }),
+            "mary:// scheme should select the in-process Local backend"
+        );
+        assert_eq!(backend.endpoint_url(), "in-process://local");
+
+        // The full turn path: complete() must produce a result with no HTTP,
+        // routing through the warm engine (StubEngine until mary lands).
+        let client = ModelHttpClient::new(&config).expect("build client");
+        let messages = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("present moment begins."),
+        ];
+        let result = client
+            .complete(&serde_json::json!({}), &messages, &config)
+            .expect("local completion");
+        assert_eq!(result.output_text, "orient show");
+        assert_eq!(result.output_tokens, Some(2));
+    }
+
+    // End-to-end proof of the real in-substrate path: playground's Local backend
+    // loads a warm gemma4 engine via mary and generates with no HTTP. Loads a
+    // real ~15GB model, so it is #[ignore]d; run explicitly:
+    //   cargo test --no-default-features --features local-model -- --ignored real_mary
+    #[cfg(feature = "local-model")]
+    #[test]
+    #[ignore = "loads a real gemma4 model from disk"]
+    fn local_backend_generates_with_real_mary_engine() {
+        let mut config = test_config();
+        let dir = "/Users/jp/.cache/huggingface/hub/models--google--gemma-4-E4B-it/snapshots/83df0a889143b1dbfc61b591bbc639540fd9ce4c";
+        config.model.base_url = format!("mary://{dir}");
+        config.model.max_output_tokens = 16;
+
+        let client = ModelHttpClient::new(&config).expect("load mary engine");
+        let messages = vec![
+            ChatMessage::system("You are a shell agent. Reply with only one shell command, nothing else."),
+            ChatMessage::user("List files in the current directory in long format."),
+        ];
+        let result = client
+            .complete(&serde_json::json!({}), &messages, &config)
+            .expect("in-process generation");
+        eprintln!(
+            "[in-substrate] output={:?} prompt_tokens={:?} completion_tokens={:?}",
+            result.output_text, result.input_tokens, result.output_tokens
+        );
+        assert!(
+            !result.output_text.trim().is_empty(),
+            "real mary engine should generate a non-empty command"
         );
     }
 }

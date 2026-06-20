@@ -8,6 +8,9 @@ publish = false
 [features]
 default = ["diagnostics"]
 diagnostics = ["dep:eframe", "dep:GORBIE", "dep:egui_plot"]
+# In-process text generation via mary (gemma4 in Burn). Heavy (pulls Burn/Metal/wgpu);
+# off by default. Enables ModelBackend::Local to call mary::local instead of HTTP.
+local-model = ["dep:mary"]
 
 [dependencies]
 anyhow = "1"
@@ -16,16 +19,17 @@ clap = { version = "4", features = ["derive"] }
 ctrlc = "3"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 eframe = { version = "0.34", optional = true, features = ["persistence", "wgpu"] }
-GORBIE = { version = "0.16", optional = true, features = ["triblespace", "telemetry", "typst"] }
+GORBIE = { version = "0.18", optional = true, features = ["triblespace", "telemetry", "typst"] }
 egui_plot = { version = "0.35", optional = true }
 faculties = { path = "../faculties" }
 hifitime = "4"
 libc = "0.2"
+mary = { path = "../mary", optional = true, default-features = false, features = ["local-model"] }
 rand = "0.8"
 rand_core = "0.9.5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-triblespace = { version = "0.44", default-features = false }
+triblespace = { version = "0.46.4", default-features = false }
 ureq = { version = "3", features = ["json", "rustls"] }
 
 [dev-dependencies]
