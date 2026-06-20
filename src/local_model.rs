@@ -133,7 +133,10 @@ pub fn load_local_engine(spec: &str) -> anyhow::Result<Box<dyn LocalTextEngine>>
         dir.is_dir(),
         "mary:// model spec must be a directory with config.json/tokenizer.json and either weights.pile or *.safetensors: {spec}"
     );
-    let device = mary::nn::backend::WgpuDevice::default();
+    // Raise wgpu's max_storage_buffer_binding_size cap (default 4 GiB) to 16 GiB:
+    // the dense 31B's embedding is ~5.6 GB even at f16 and overflows the default
+    // cap (a cubecl panic). Harmless for small models (verified).
+    let device = mary::local::init_metal_device_16gb();
     let persisted = dir.join("weights.pile");
     if persisted.is_file() {
         mary::local::load_gemma4_from_persisted_pile_f16(
