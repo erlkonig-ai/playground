@@ -9,18 +9,17 @@ use anyhow::{Context, Result, anyhow};
 use ed25519_dalek::SigningKey;
 use eframe::egui;
 use egui_plot::{Legend, Line, MarkerShape, Plot, PlotPoints, Points};
-use hifitime::Epoch;
 use rand::rngs::OsRng;
 use tokenizers::Tokenizer;
+use triblespace::core::metadata;
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::{Repository, Workspace};
-use triblespace::macros::id_hex;
-use triblespace::prelude::blobschemas::LongString;
-use triblespace::prelude::valueschemas::{Blake3, GenId, Handle, NsTAIInterval, U256BE};
+use triblespace::prelude::blobencodings::LongString;
+use triblespace::prelude::inlineencodings::{GenId, Handle, NsTAIInterval, U256BE};
 use triblespace::prelude::*;
 
 use GORBIE::NotebookCtx;
-use GORBIE::cards::{DEFAULT_CARD_PADDING, with_padding};
+use GORBIE::cards::DEFAULT_CARD_PADDING;
 use GORBIE::md;
 use GORBIE::notebook;
 use GORBIE::themes::colorhash;
@@ -55,8 +54,7 @@ const DEFAULT_DETQ_SUFFIX_WINDOW_RATIO: f32 = 0.05;
 const CURVE_SCALE_LADDER: [f32; 14] = [
     0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 24.0, 32.0,
 ];
-#[allow(non_upper_case_globals)]
-const CONFIG_BRANCH_ID: Id = id_hex!("6069A136254E1B87E4C0D2E0295DB382");
+const CONFIG_BRANCH_NAME: &str = "config";
 const DEFAULT_CONTEXT_WINDOW_TOKENS: u64 = 32 * 1024;
 const DEFAULT_MAX_OUTPUT_TOKENS: u64 = 1024;
 const DEFAULT_PROMPT_SAFETY_MARGIN_TOKENS: u64 = 512;
@@ -366,13 +364,27 @@ fn load_profile_calibration(args: &NotebookArgs) -> Result<Option<ProfileCalibra
 
     let mut pile =
         Pile::open(pile_path).with_context(|| format!("open pile '{}'", pile_path.display()))?;
-    pile.restore()
-        .with_context(|| format!("restore pile '{}'", pile_path.display()))?;
+    if let Err(err) = pile.refresh() {
+        // Fail loud: never auto-truncate a possibly newer-format pile.
+        let _ = pile.close();
+        return Err(match err {
+            triblespace::core::repo::pile::ReadError::CorruptPile { valid_length } => anyhow!(
+                "pile '{}' corrupt at byte {valid_length}: refusing to auto-repair (a stale \
+                 binary could truncate newer data). Repair explicitly with: trible pile restore {}",
+                pile_path.display(),
+                pile_path.display()
+            ),
+            other => anyhow!("refresh pile '{}': {other:?}", pile_path.display()),
+        });
+    }
     let mut repo = Repository::new(pile, SigningKey::generate(&mut OsRng), TribleSet::new())
         .map_err(|err| anyhow!("create repository: {err:?}"))?;
 
     let result = (|| -> Result<Option<ProfileCalibration>> {
-        let mut ws = match repo.pull(CONFIG_BRANCH_ID) {
+        let Ok(Some(config_branch_id)) = repo.lookup_branch(CONFIG_BRANCH_NAME) else {
+            return Ok(None);
+        };
+        let mut ws = match repo.pull(config_branch_id) {
             Ok(ws) => ws,
             Err(_) => return Ok(None),
         };
@@ -384,7 +396,7 @@ fn load_profile_calibration(args: &NotebookArgs) -> Result<Option<ProfileCalibra
         let profile_id = load_id_attr(
             &catalog,
             config_id,
-            playground_config::active_model_profile_id,
+            &playground_config::active_model_profile_id,
         );
         let mut llm = load_llm_settings(&mut ws, &catalog, config_id)?;
         if let Some(profile_id) = profile_id
@@ -402,16 +414,17 @@ fn load_profile_calibration(args: &NotebookArgs) -> Result<Option<ProfileCalibra
             &mut ws,
             &catalog,
             config_id,
-            playground_config::system_prompt,
+            &playground_config::system_prompt,
         )?
         .unwrap_or_default();
         let prompt_budget_chars = prompt_budget_chars_for_llm(&llm, system_prompt.as_str());
 
-        let context_branch_id = load_id_attr(&catalog, config_id, playground_config::branch_id)
-            .or_else(|| load_id_attr(&catalog, config_id, playground_config::exec_branch_id));
         let context_branch_name =
-            load_string_attr(&mut ws, &catalog, config_id, playground_config::branch)?
+            load_string_attr(&mut ws, &catalog, config_id, &playground_config::branch)?
                 .unwrap_or_else(|| DEFAULT_CONTEXT_BRANCH_NAME.to_string());
+        let context_branch_id = repo
+            .lookup_branch(&context_branch_name)
+            .map_err(|err| anyhow!("lookup branch '{context_branch_name}': {err:?}"))?;
 
         let (leaf_sizes, leaf_samples) = if let Some(branch_id) = context_branch_id {
             load_context_leaf_samples(&mut repo, branch_id, args.tokenizer_sample_limit)?
@@ -481,11 +494,11 @@ fn load_profile_calibration(args: &NotebookArgs) -> Result<Option<ProfileCalibra
 fn latest_config_entry(catalog: &TribleSet) -> Option<Id> {
     let mut latest: Option<(Id, i128)> = None;
     for (config_id, updated_at) in find!(
-        (config_id: Id, updated_at: Value<NsTAIInterval>),
+        (config_id: Id, updated_at: Inline<NsTAIInterval>),
         pattern!(catalog, [{
             ?config_id @
-            playground_config::kind: playground_config::kind_config,
-            playground_config::updated_at: ?updated_at,
+            metadata::tag: playground_config::kind_config,
+            metadata::updated_at: ?updated_at,
         }])
     ) {
         let key = interval_key(updated_at);
@@ -499,12 +512,12 @@ fn latest_config_entry(catalog: &TribleSet) -> Option<Id> {
 fn latest_llm_profile_entry(catalog: &TribleSet, profile_id: Id) -> Option<Id> {
     let mut latest: Option<(Id, i128)> = None;
     for (entry_id, updated_at) in find!(
-        (entry_id: Id, updated_at: Value<NsTAIInterval>),
+        (entry_id: Id, updated_at: Inline<NsTAIInterval>),
         pattern!(catalog, [{
             ?entry_id @
-            playground_config::kind: playground_config::kind_model_profile,
+            metadata::tag: playground_config::kind_model_profile,
             playground_config::model_profile_id: profile_id,
-            playground_config::updated_at: ?updated_at,
+            metadata::updated_at: ?updated_at,
         }])
     ) {
         let key = interval_key(updated_at);
@@ -521,37 +534,37 @@ fn load_llm_settings(
     entity_id: Id,
 ) -> Result<LlmSettings> {
     let mut llm = LlmSettings::default();
-    if let Some(model) = load_string_attr(ws, catalog, entity_id, playground_config::model_name)? {
+    if let Some(model) = load_string_attr(ws, catalog, entity_id, &playground_config::model_name)? {
         llm.model = model;
     }
     if let Some(base_url) =
-        load_string_attr(ws, catalog, entity_id, playground_config::model_base_url)?
+        load_string_attr(ws, catalog, entity_id, &playground_config::model_base_url)?
     {
         llm.base_url = base_url;
     }
     if let Some(tokens) = load_u64_attr(
         catalog,
         entity_id,
-        playground_config::model_context_window_tokens,
+        &playground_config::model_context_window_tokens,
     ) {
         llm.context_window_tokens = tokens;
     }
     if let Some(tokens) =
-        load_u64_attr(catalog, entity_id, playground_config::model_max_output_tokens)
+        load_u64_attr(catalog, entity_id, &playground_config::model_max_output_tokens)
     {
         llm.max_output_tokens = tokens;
     }
     if let Some(tokens) = load_u64_attr(
         catalog,
         entity_id,
-        playground_config::model_context_safety_margin_tokens,
+        &playground_config::model_context_safety_margin_tokens,
     ) {
         llm.prompt_safety_margin_tokens = tokens;
     }
     if let Some(tokens) = load_u64_attr(
         catalog,
         entity_id,
-        playground_config::model_chars_per_token,
+        &playground_config::model_chars_per_token,
     ) {
         llm.prompt_chars_per_token = tokens.max(1);
     }
@@ -582,10 +595,10 @@ fn load_context_leaf_samples(
     let mut lengths = Vec::new();
     let mut samples = Vec::new();
     for (summary,) in find!(
-        (summary: Value<Handle<Blake3, LongString>>),
+        (summary: Inline<Handle<LongString>>),
         pattern!(&catalog, [{
             _?chunk_id @
-            playground_context::kind: playground_context::kind_chunk,
+            metadata::tag: playground_context::kind_chunk,
             playground_context::summary: ?summary,
         }])
     ) {
@@ -611,7 +624,7 @@ fn load_exec_result_samples(
         (result_id: Id),
         pattern!(catalog, [{
             ?result_id @
-            playground_exec::kind: playground_exec::kind_command_result,
+            metadata::tag: playground_exec::kind_command_result,
         }])
     ) {
         result_ids.insert(result_id);
@@ -622,7 +635,7 @@ fn load_exec_result_samples(
 
     let mut grouped: HashMap<Id, Vec<String>> = HashMap::new();
     for (result_id, text) in find!(
-        (result_id: Id, text: Value<Handle<Blake3, LongString>>),
+        (result_id: Id, text: Inline<Handle<LongString>>),
         pattern!(catalog, [{ ?result_id @ playground_exec::stdout_text: ?text }])
     ) {
         if !result_ids.contains(&result_id) {
@@ -634,7 +647,7 @@ fn load_exec_result_samples(
             .push(load_blob_text(ws, text).context("read stdout_text")?);
     }
     for (result_id, text) in find!(
-        (result_id: Id, text: Value<Handle<Blake3, LongString>>),
+        (result_id: Id, text: Inline<Handle<LongString>>),
         pattern!(catalog, [{ ?result_id @ playground_exec::stderr_text: ?text }])
     ) {
         if !result_ids.contains(&result_id) {
@@ -646,7 +659,7 @@ fn load_exec_result_samples(
             .push(load_blob_text(ws, text).context("read stderr_text")?);
     }
     for (result_id, text) in find!(
-        (result_id: Id, text: Value<Handle<Blake3, LongString>>),
+        (result_id: Id, text: Inline<Handle<LongString>>),
         pattern!(catalog, [{ ?result_id @ playground_exec::error: ?text }])
     ) {
         if !result_ids.contains(&result_id) {
@@ -713,7 +726,7 @@ fn prompt_budget_chars_for_llm(llm: &LlmSettings, system_prompt: &str) -> usize 
 
 fn load_blob_text(
     ws: &mut Workspace<Pile>,
-    handle: Value<Handle<Blake3, LongString>>,
+    handle: Inline<Handle<LongString>>,
 ) -> Result<String> {
     let view: View<str> = ws.get(handle).context("read text blob")?;
     Ok(view.as_ref().to_string())
@@ -723,13 +736,12 @@ fn load_string_attr(
     ws: &mut Workspace<Pile>,
     catalog: &TribleSet,
     entity_id: Id,
-    attr: Attribute<Handle<Blake3, LongString>>,
+    attr: &Attribute<Handle<LongString>>,
 ) -> Result<Option<String>> {
     let mut handles = find!(
-        (entity: Id, handle: Value<Handle<Blake3, LongString>>),
+        (entity: Id, handle: Inline<Handle<LongString>>),
         pattern!(catalog, [{ ?entity @ attr: ?handle }])
     )
-    .into_iter()
     .filter(|(entity, _)| *entity == entity_id);
     let Some((_, handle)) = handles.next() else {
         return Ok(None);
@@ -743,37 +755,26 @@ fn load_string_attr(
     load_blob_text(ws, handle).map(Some)
 }
 
-fn load_id_attr(catalog: &TribleSet, entity_id: Id, attr: Attribute<GenId>) -> Option<Id> {
+fn load_id_attr(catalog: &TribleSet, entity_id: Id, attr: &Attribute<GenId>) -> Option<Id> {
     find!(
-        (entity: Id, value: Value<GenId>),
+        (entity: Id, value: Inline<GenId>),
         pattern!(catalog, [{ ?entity @ attr: ?value }])
     )
-    .into_iter()
-    .find_map(|(entity, value)| (entity == entity_id).then_some(Id::from_value(&value)))
+    .find_map(|(entity, value)| (entity == entity_id).then(|| value.try_from_inline::<Id>().ok())?)
 }
 
-fn load_u64_attr(catalog: &TribleSet, entity_id: Id, attr: Attribute<U256BE>) -> Option<u64> {
+fn load_u64_attr(catalog: &TribleSet, entity_id: Id, attr: &Attribute<U256BE>) -> Option<u64> {
     find!(
-        (entity: Id, value: Value<U256BE>),
+        (entity: Id, value: Inline<U256BE>),
         pattern!(catalog, [{ ?entity @ attr: ?value }])
     )
-    .into_iter()
     .find_map(|(entity, value)| (entity == entity_id).then_some(value))
-    .and_then(u256be_to_u64)
+    .and_then(|value| value.try_from_inline::<u64>().ok())
 }
 
-fn u256be_to_u64(value: Value<U256BE>) -> Option<u64> {
-    let raw = value.raw;
-    if raw[..24].iter().any(|byte| *byte != 0) {
-        return None;
-    }
-    let bytes: [u8; 8] = raw[24..32].try_into().ok()?;
-    Some(u64::from_be_bytes(bytes))
-}
-
-fn interval_key(interval: Value<NsTAIInterval>) -> i128 {
-    let (lower, _): (Epoch, Epoch) = interval.from_value();
-    lower.to_tai_duration().total_nanoseconds()
+fn interval_key(interval: Inline<NsTAIInterval>) -> i128 {
+    let (lower_ns, _): (i128, i128) = interval.try_from_inline().unwrap();
+    lower_ns
 }
 
 fn format_lag_series(
@@ -4137,7 +4138,7 @@ fn main(nb: &mut NotebookCtx) {
     if !bootstrap.warnings.is_empty() {
         let warnings = bootstrap.warnings.clone();
         nb.view(move |ui| {
-            with_padding(ui, DEFAULT_CARD_PADDING, |ui| {
+            ui.with_padding(DEFAULT_CARD_PADDING, |ui| {
                 ui.heading("Calibration warnings");
                 for warning in &warnings {
                     ui.colored_label(egui::Color32::from_rgb(220, 96, 96), warning);
@@ -4148,7 +4149,7 @@ fn main(nb: &mut NotebookCtx) {
 
     if let Some(profile) = bootstrap.profile.clone() {
         nb.view(move |ui| {
-            with_padding(ui, DEFAULT_CARD_PADDING, |ui| {
+            ui.with_padding(DEFAULT_CARD_PADDING, |ui| {
                 ui.heading("Profile calibration");
                 ui.label(format!("{} @ {}", profile.llm.model, profile.llm.base_url));
                 ui.label(format!(
@@ -4205,7 +4206,7 @@ fn main(nb: &mut NotebookCtx) {
 
     nb.view(|ui| {
         ui.add_space(4.0);
-        with_padding(ui, DEFAULT_CARD_PADDING, |ui| {
+        ui.with_padding(DEFAULT_CARD_PADDING, |ui| {
             md!(
                 ui,
                 "# Compaction Policy Study\n\
@@ -4223,7 +4224,7 @@ We compare multiple policies under the same budget and stream, asking:\n\
     });
 
     nb.view(|ui| {
-        with_padding(ui, DEFAULT_CARD_PADDING, |ui| {
+        ui.with_padding(DEFAULT_CARD_PADDING, |ui| {
             md!(
                 ui,
                 "## Experimental protocol\n\
@@ -4257,7 +4258,7 @@ Primary readouts:\n\
                 insert_state.job = Some(job);
             }
         }
-        with_padding(ui, DEFAULT_CARD_PADDING, |ui| {
+        ui.with_padding(DEFAULT_CARD_PADDING, |ui| {
             ui.label(egui::RichText::new("Controls").strong());
             let is_generating = insert_state.job.is_some();
             ui.horizontal_wrapped(|ui| {
@@ -4329,8 +4330,7 @@ Primary readouts:\n\
                             SelectionPolicy::DeterministicQuotaHeadroom,
                             "det-quota-headroom",
                         )
-                        .choice(SelectionPolicy::CurveHistory, "curve-history")
-                        .small(),
+                        .choice(SelectionPolicy::CurveHistory, "curve-history"),
                 );
             });
             ui.horizontal_wrapped(|ui| {
@@ -4357,8 +4357,7 @@ Primary readouts:\n\
                     ChoiceToggle::new(&mut state.churn_sampling_mode)
                         .choice(TraceSamplingMode::Dense, "dense")
                         .choice(TraceSamplingMode::Uniform, "uniform")
-                        .choice(TraceSamplingMode::Log, "log")
-                        .small(),
+                        .choice(TraceSamplingMode::Log, "log"),
                 );
             });
             ui.horizontal_wrapped(|ui| {
@@ -4433,7 +4432,7 @@ Primary readouts:\n\
             return;
         };
         let ratio = (done as f32 / total as f32).clamp(0.0, 1.0);
-        with_padding(ui, DEFAULT_CARD_PADDING, |ui| {
+        ui.with_padding(DEFAULT_CARD_PADDING, |ui| {
             ui.label(egui::RichText::new("Recomputing metrics").strong());
             ui.add(
                 ProgressBar::new(ratio)
@@ -4465,7 +4464,7 @@ Primary readouts:\n\
         let safe_cost = quantile_ceil(&costs, params.det_safe_quantile).max(1);
         let target_slots = (effective_budget / safe_cost).max(1);
 
-        with_padding(ui, DEFAULT_CARD_PADDING, |ui| {
+        ui.with_padding(DEFAULT_CARD_PADDING, |ui| {
             md!(
                 ui,
                 "## Method sheet\n\
@@ -4499,7 +4498,7 @@ _Hypothesis: deterministic quota + headroom should reduce churn while preserving
 
     nb.view(move |ui| {
         let selected_policy = state.read(ui).selection_policy;
-        with_padding(ui, DEFAULT_CARD_PADDING, |ui| {
+        ui.with_padding(DEFAULT_CARD_PADDING, |ui| {
             md!(
                 ui,
                 "## Approaches\n\
@@ -4513,7 +4512,7 @@ Each policy receives the same inputs (`frontier`, budget, target-age weights). T
 
     nb.view(move |ui| {
         let active = state.read(ui).selection_policy == SelectionPolicy::DistributionAware;
-        with_padding(ui, DEFAULT_CARD_PADDING, |ui| {
+        ui.with_padding(DEFAULT_CARD_PADDING, |ui| {
             md!(
                 ui,
                 "## Policy: `distribution` {}\n\
@@ -4548,7 +4547,7 @@ Each policy receives the same inputs (`frontier`, budget, target-age weights). T
 
     nb.view(move |ui| {
         let active = state.read(ui).selection_policy == SelectionPolicy::DeterministicSuffix;
-        with_padding(ui, DEFAULT_CARD_PADDING, |ui| {
+        ui.with_padding(DEFAULT_CARD_PADDING, |ui| {
             md!(
                 ui,
                 "## Policy: `deterministic-suffix` {}\n\
@@ -4584,7 +4583,7 @@ Each policy receives the same inputs (`frontier`, budget, target-age weights). T
     nb.view(move |ui| {
         let active =
             state.read(ui).selection_policy == SelectionPolicy::DeterministicQuotaHeadroom;
-        with_padding(ui, DEFAULT_CARD_PADDING, |ui| {
+        ui.with_padding(DEFAULT_CARD_PADDING, |ui| {
             md!(
                 ui,
                 "## Policy: `deterministic-quota-headroom` {}\n\
@@ -4620,7 +4619,7 @@ Each policy receives the same inputs (`frontier`, budget, target-age weights). T
 
     nb.view(move |ui| {
         let active = state.read(ui).selection_policy == SelectionPolicy::CurveHistory;
-        with_padding(ui, DEFAULT_CARD_PADDING, |ui| {
+        ui.with_padding(DEFAULT_CARD_PADDING, |ui| {
             md!(
                 ui,
                 "## Policy: `curve-history` {}\n\
@@ -4650,7 +4649,7 @@ Each policy receives the same inputs (`frontier`, budget, target-age weights). T
     });
 
     nb.view(move |ui| {
-        with_padding(ui, DEFAULT_CARD_PADDING, |ui| {
+        ui.with_padding(DEFAULT_CARD_PADDING, |ui| {
             md!(
                 ui,
                 "## Metrics\n\
@@ -4677,7 +4676,7 @@ Interpretation: high prefix retention with low churn indicates stronger turn-to-
             (Arc::clone(&derived.policy_traces), visible_leaves)
         };
 
-        with_padding(ui, DEFAULT_CARD_PADDING, |ui| {
+        ui.with_padding(DEFAULT_CARD_PADDING, |ui| {
             ui.label(egui::RichText::new("Cross-policy comparison").strong());
             ui.label(
                 "All approaches are computed from the same stream, budget, and sampling schedule.",
@@ -4954,7 +4953,7 @@ Interpretation: high prefix retention with low churn indicates stronger turn-to-
     });
 
     nb.view(move |ui| {
-        with_padding(ui, DEFAULT_CARD_PADDING, |ui| {
+        ui.with_padding(DEFAULT_CARD_PADDING, |ui| {
             md!(
                 ui,
                 "## Terminology\n\
@@ -4976,7 +4975,7 @@ In `deterministic-suffix`, split attempts start at the right edge, so updates co
         let stream_limit = state_snapshot.stream.len().max(2);
         sweep.cfg.max_steps = sweep.cfg.max_steps.clamp(2, stream_limit);
 
-        with_padding(ui, DEFAULT_CARD_PADDING, |ui| {
+        ui.with_padding(DEFAULT_CARD_PADDING, |ui| {
             md!(
                 ui,
                 "## Parameter sweep\n\
@@ -5192,7 +5191,7 @@ evaluated at `N={}` steps (steady-state from step `{}` / {:.0}%). Pareto-front s
             (s.visible_leaves, s.selection_policy, s.merge_arity)
         };
 
-        with_padding(ui, DEFAULT_CARD_PADDING, |ui| {
+        ui.with_padding(DEFAULT_CARD_PADDING, |ui| {
             md!(
                 ui,
                 "## Results overview\n\
@@ -5244,7 +5243,7 @@ evaluated at `N={}` steps (steady-state from step `{}` / {:.0}%). Pareto-front s
             let s = state.read(ui);
             (s.det_fill_ratio, s.det_safe_quantile)
         };
-        with_padding(ui, DEFAULT_CARD_PADDING, |ui| {
+        ui.with_padding(DEFAULT_CARD_PADDING, |ui| {
             ui.label(egui::RichText::new("Selected context cover").strong());
             ui.label("All policies share the same moment split (newest raw leaves); policy only shapes history.");
             match selection_policy {
@@ -5295,7 +5294,7 @@ evaluated at `N={}` steps (steady-state from step `{}` / {:.0}%). Pareto-front s
                 s.visible_leaves,
             )
         };
-        with_padding(ui, DEFAULT_CARD_PADDING, |ui| {
+        ui.with_padding(DEFAULT_CARD_PADDING, |ui| {
             ui.label(egui::RichText::new("Auto-insert churn").strong());
             ui.label(format!(
                 "Policy: {}. Checkpoints: {} mode, up to {} points over {} visible messages.",
@@ -5943,7 +5942,7 @@ evaluated at `N={}` steps (steady-state from step `{}` / {:.0}%). Pareto-front s
         let visible_leaves = state.read(ui).visible_leaves;
         let (count_buckets, char_buckets) =
             build_cover_age_histograms(&sim, &cover, visible_leaves);
-        with_padding(ui, DEFAULT_CARD_PADDING, |ui| {
+        ui.with_padding(DEFAULT_CARD_PADDING, |ui| {
             ui.label(egui::RichText::new("Cover age distribution").strong());
             ui.label("Buckets are in leaves-ago (0 = newest).");
             if count_buckets.is_empty() {
@@ -5999,7 +5998,7 @@ evaluated at `N={}` steps (steady-state from step `{}` / {:.0}%). Pareto-front s
             let s = state.read(ui);
             (s.context_budget, s.selection_policy)
         };
-        with_padding(ui, DEFAULT_CARD_PADDING, |ui| {
+        ui.with_padding(DEFAULT_CARD_PADDING, |ui| {
             md!(
                 ui,
                 "## Selection trace\n\
