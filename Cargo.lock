@@ -5,8 +5,6 @@ version = 4
 [[package]]
 name = "GORBIE"
 version = "0.18.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f0f5817f36e56df472b1d5f0bec3cafd8fe6ed52581fe0c8c1a312fb52571a9c"
 dependencies = [
  "comemo",
  "ctrlc",
@@ -4533,8 +4531,6 @@ dependencies = [
 [[package]]
 name = "gorbie-commonmark"
 version = "0.24.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1d58d870b6f4d9a1704fc60a6249a30dc29a3fb58cac696bcdc296a7b96bf274"
 dependencies = [
  "egui",
  "egui_extras",
@@ -4545,8 +4541,6 @@ dependencies = [
 [[package]]
 name = "gorbie-commonmark-backend"
 version = "0.24.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e069e2c7c45d3486da3c72347105d8607b43e428c3aa37193a79c98dbaa53e22"
 dependencies = [
  "egui",
  "egui_extras",
@@ -4557,8 +4551,6 @@ dependencies = [
 [[package]]
 name = "gorbie-macros"
 version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "26278b6f25d4219fc233576110e09ebb5b9ad4a185c11b9f3e2b12f3fa8597f1"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -5975,6 +5967,7 @@ dependencies = [
  "burn-train",
  "bytes",
  "cubecl",
+ "ed25519-dalek",
  "half",
  "image",
  "memmap2",
@@ -10212,9 +10205,7 @@ dependencies = [
 
 [[package]]
 name = "triblespace"
-version = "0.46.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c459ed198b2b0164f8d5eaedc8eaec507fe8504b2f436453e197860fdd0d1895"
+version = "0.47.0"
 dependencies = [
  "ed25519-dalek",
  "log",
@@ -10228,9 +10219,7 @@ dependencies = [
 
 [[package]]
 name = "triblespace-core"
-version = "0.46.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b691fb75cfdd688e3a718d1a6fa3b9c9e439e66eb533dfd72758e0130590161"
+version = "0.47.0"
 dependencies = [
  "anybytes",
  "arbitrary",
@@ -10239,7 +10228,6 @@ dependencies = [
  "blake3",
  "bytemuck",
  "bytes",
- "crossbeam-channel",
  "ed25519",
  "ed25519-dalek",
  "ethnum",
@@ -10279,9 +10267,7 @@ dependencies = [
 
 [[package]]
 name = "triblespace-core-macros"
-version = "0.46.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1679f172f8f58a10392d407ab6f9a8d8b97523c2ac1fd777ca7015cfe90f373d"
+version = "0.47.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -10291,9 +10277,7 @@ dependencies = [
 
 [[package]]
 name = "triblespace-macros"
-version = "0.46.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b01aa18378805a635b8c50cf63b2fc54097dd57772b1f614323f53134c2d1b1"
+version = "0.47.0"
 dependencies = [
  "ed25519-dalek",
  "hex",
@@ -10307,9 +10291,7 @@ dependencies = [
 
 [[package]]
 name = "triblespace-macros-common"
-version = "0.46.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "262d730258c26dd79167a59872bd1a9d51dc538a753035f138a3d4528487e0c2"
+version = "0.47.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -10318,9 +10300,7 @@ dependencies = [
 
 [[package]]
 name = "triblespace-search"
-version = "0.46.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "be15d1582fbb057af850e357dec942433cd0667c3d7b39ab65b93e9b95183e62"
+version = "0.47.0"
 dependencies = [
  "anybytes",
  "blake3",

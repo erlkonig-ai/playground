@@ -150,13 +150,13 @@ use faculties::schemas::compass::{
     DEFAULT_STATUSES as COMPASS_DEFAULT_STATUSES, KIND_GOAL_ID as COMPASS_KIND_GOAL_ID,
     KIND_NOTE_ID as COMPASS_KIND_NOTE_ID, KIND_STATUS_ID as COMPASS_KIND_STATUS_ID,
 };
-use faculties::schemas::local_messages::{
+use faculties::schemas::message::{
     KIND_MESSAGE_ID as LOCAL_KIND_MESSAGE_ID, KIND_SPECS as LOCAL_KIND_SPECS,
 };
 use faculties::schemas::relations::KIND_PERSON_ID as RELATIONS_KIND_PERSON_ID;
 
 mod local_messages {
-    pub use faculties::schemas::local_messages::local::{
+    pub use faculties::schemas::message::local::{
         about_message, body, from, reader, to,
     };
 }
