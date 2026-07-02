@@ -2467,8 +2467,6 @@ dependencies = [
 [[package]]
 name = "cubecl-runtime"
 version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b68491bf5b3e997ae36bdc4e63b4ccd6d2f0e86b3b596a5d7a48d2b9e92622a0"
 dependencies = [
  "ahash",
  "async-channel 2.5.0",
@@ -2515,8 +2513,6 @@ dependencies = [
 [[package]]
 name = "cubecl-wgpu"
 version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4d3663c6e1a86187172b2cee495b6b533e7d91a2cb37e26f421649e315fe4c3a"
 dependencies = [
  "async-channel 2.5.0",
  "bytemuck",
@@ -2532,6 +2528,8 @@ dependencies = [
  "half",
  "hashbrown 0.16.1",
  "log",
+ "objc2 0.6.4",
+ "objc2-metal 0.3.2",
  "sanitize-filename",
  "tracing",
  "wasm-bindgen-futures",

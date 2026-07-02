@@ -35,6 +35,16 @@ ureq = { version = "3", features = ["json", "rustls"] }
 [dev-dependencies]
 tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"] }
 
+# `[patch]` only takes effect from the root crate of a build, so mary's own
+# patch section is ignored when mary is consumed as a path dep here (the
+# `local-model` feature). Mirror it, like faculties does: the zero-copy
+# aliasing path needs the cubecl fork (adds `register_external_aliased`) and
+# the V3 256-byte-aligned local triblespace-core.
+[patch.crates-io]
+cubecl-runtime = { path = "../cubecl-fork/cubecl-runtime" }
+cubecl-wgpu = { path = "../cubecl-fork/cubecl-wgpu" }
+triblespace-core = { path = "../triblespace-rs/triblespace-core" }
+
 [[example]]
 name = "compaction_lsm"
 path = "notebooks/compaction_lsm.rs"
