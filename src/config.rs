@@ -184,8 +184,8 @@ fn open_config_repo(pile_path: &Path) -> Result<(Repository<Pile>, Id)> {
         fs::create_dir_all(parent).context("create pile directory")?;
     }
     let mut pile = Pile::open(pile_path).context("open pile")?;
-    if let Err(err) = pile.restore().context("restore pile") {
-        let close_res = pile.close().context("close pile after restore failure");
+    if let Err(err) = crate::repo_util::refresh_pile(&mut pile, pile_path) {
+        let close_res = pile.close().context("close pile after refresh failure");
         if let Err(close_err) = close_res {
             eprintln!("warning: failed to close pile cleanly: {close_err:#}");
         }

@@ -16,13 +16,34 @@ use crate::config::Config;
 pub(crate) use crate::repo_ops::push_workspace;
 use crate::schema::build_playground_metadata;
 
+/// Load the pile, failing loud on corruption instead of auto-truncating.
+///
+/// `Pile::restore()` silently truncates the file to the last valid record —
+/// under version skew (a stale binary reading a newer-format record) that is
+/// a silent data-loss hazard. Repair is explicit: `trible pile restore <path>`.
+pub(crate) fn refresh_pile(pile: &mut Pile, path: &std::path::Path) -> Result<()> {
+    if let Err(err) = pile.refresh() {
+        return Err(match err {
+            ReadError::CorruptPile { valid_length } => anyhow!(
+                "pile {} corrupt at byte {valid_length}: refusing to auto-repair (a stale \
+                 binary could truncate newer data). Repair the torn tail explicitly with: \
+                 trible pile restore {}",
+                path.display(),
+                path.display()
+            ),
+            other => anyhow!("refresh pile {}: {other:?}", path.display()),
+        });
+    }
+    Ok(())
+}
+
 pub(crate) fn init_repo(config: &Config) -> Result<(Repository<Pile>, Id)> {
     if let Some(parent) = config.pile_path.parent() {
         fs::create_dir_all(parent).context("create pile directory")?;
     }
     let mut pile = Pile::open(&config.pile_path).context("open pile")?;
-    if let Err(err) = pile.restore().context("restore pile") {
-        let close_res = pile.close().context("close pile after restore failure");
+    if let Err(err) = refresh_pile(&mut pile, &config.pile_path) {
+        let close_res = pile.close().context("close pile after refresh failure");
         if let Err(close_err) = close_res {
             eprintln!("warning: failed to close pile cleanly: {close_err:#}");
         }
@@ -63,17 +84,11 @@ pub(crate) fn current_branch_head(
 ) -> Result<Option<CommitHandle>> {
     match repo.storage_mut().head(branch_id) {
         Ok(head) => Ok(head),
-        Err(ReadError::CorruptPile { valid_length }) => {
-            eprintln!(
-                "warning: read branch head {branch_id:x}: corrupt pile tail (valid_length={valid_length}), restoring and retrying"
-            );
-            repo.storage_mut()
-                .restore()
-                .map_err(|err| anyhow!("restore pile after head corruption: {err:?}"))?;
-            repo.storage_mut()
-                .head(branch_id)
-                .map_err(|err| anyhow!("read branch head {branch_id:x} after restore: {err:?}"))
-        }
+        Err(ReadError::CorruptPile { valid_length }) => Err(anyhow!(
+            "read branch head {branch_id:x}: pile corrupt at byte {valid_length}: refusing to \
+             auto-repair (a stale binary could truncate newer data). Repair the torn tail \
+             explicitly with: trible pile restore <pile>"
+        )),
         Err(err) => Err(anyhow!("read branch head {branch_id:x}: {err:?}")),
     }
 }
@@ -154,14 +169,11 @@ pub(crate) fn pull_workspace(
             let Some(valid_length) = pull_corrupt_valid_length(&err) else {
                 return Err(anyhow!("{context}: {err:?}"));
             };
-            eprintln!(
-                "warning: {context}: corrupt pile tail (valid_length={valid_length}), restoring and retrying"
-            );
-            repo.storage_mut()
-                .restore()
-                .map_err(|restore_err| anyhow!("{context}: restore pile: {restore_err:?}"))?;
-            repo.pull(branch_id)
-                .map_err(|retry_err| anyhow!("{context} after restore: {retry_err:?}"))
+            Err(anyhow!(
+                "{context}: pile corrupt at byte {valid_length}: refusing to auto-repair (a \
+                 stale binary could truncate newer data). Repair the torn tail explicitly \
+                 with: trible pile restore <pile>"
+            ))
         }
     }
 }

@@ -1459,7 +1459,7 @@ mod tests {
         let path = test_repo_path();
         std::fs::File::create(&path).expect("create test pile file");
         let mut pile = Pile::open(path.as_path()).expect("open test pile");
-        pile.restore().expect("restore test pile");
+        pile.refresh().expect("refresh test pile");
         let mut repo = Repository::new(pile, SigningKey::from_bytes(&[7u8; 32]), TribleSet::new())
             .expect("create test repository");
         let branch_id = repo
