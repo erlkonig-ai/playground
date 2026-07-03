@@ -107,46 +107,49 @@ impl LocalTextEngine for StubEngine {
     }
 }
 
-/// Build a warm in-process gemma engine from a model directory (the v1 path).
-/// `spec` is the part after `mary://` / `local://` in base_url and must be a
-/// directory containing `config.json`, `tokenizer.json`, and `*.safetensors`.
+/// Default pile the gemma weights load from when neither `<dir>/weights.pile`
+/// nor `GEMMA_PILE` points elsewhere (written once by `gemma_persist`).
+#[cfg(feature = "local-model")]
+const DEFAULT_GEMMA_PILE: &str = "/Users/jp/Desktop/chatbot/liora/models/gemma_e4b.pile";
+
+/// Build a warm in-process gemma engine. `spec` is the part after `mary://` /
+/// `local://` in base_url and must be a directory containing `config.json` and
+/// `tokenizer.json` (small plain files; the HF snapshot dir works).
 ///
-/// The config/tokenizer/shard resolution lives in mary (Burn/HF plumbing stays
-/// on its side of the seam). For the 31B split-snapshot HF case — where
-/// config.json and the shards land in *different* HF snapshots — `from_dir`
-/// can't see the cross-snapshot shards; symlink them into one dir, or call
-/// `mary::local::load_gemma4_f16(config, tokenizer, &explicit_shard_paths, …)`
-/// with shard paths resolved from `model.safetensors.index.json`.
-///
-/// Auto-detects how the weights are stored in `spec`:
-/// - if `<dir>/weights.pile` exists, the weights are *persisted as tribles* in a
-///   standalone pile — load directly from it with NO safetensors on disk (the
-///   true shell-is-physics endpoint, `mary::local::load_gemma4_from_persisted_pile_f16`,
+/// The WEIGHTS load exclusively from a persisted pile — mary's runtime is
+/// pile-only, there is no safetensors path
+/// (`mary::local::load_gemma4_from_persisted_pile_f16`, streaming f16 so the
+/// dense 31B fits 128 GB). The pile is resolved in order:
+/// - `<dir>/weights.pile` if present (a self-contained model dir,
 ///   produced once by `gemma_persist <model-dir> <dir>/weights.pile`);
-/// - otherwise load f16 directly from the dir's `*.safetensors`
-///   (`load_gemma4_from_dir_f16`) — direct and light, so the dense 31B's ~60 GB
-///   fits without the transient ingest a pile round-trip would cost at load.
-/// Either way only `config.json` + `tokenizer.json` stay as plain files.
+/// - else the `GEMMA_PILE` env var (same knob `gemma_gen` honors);
+/// - else [`DEFAULT_GEMMA_PILE`].
 #[cfg(feature = "local-model")]
 pub fn load_local_engine(spec: &str) -> anyhow::Result<Box<dyn LocalTextEngine>> {
     let dir = std::path::Path::new(spec);
     anyhow::ensure!(
         dir.is_dir(),
-        "mary:// model spec must be a directory with config.json/tokenizer.json and either weights.pile or *.safetensors: {spec}"
+        "mary:// model spec must be a directory with config.json/tokenizer.json: {spec}"
     );
     // Raise wgpu's max_storage_buffer_binding_size cap (default 4 GiB) to 16 GiB:
     // the dense 31B's embedding is ~5.6 GB even at f16 and overflows the default
     // cap (a cubecl panic). Harmless for small models (verified).
     let device = mary::local::init_metal_device_16gb();
-    let persisted = dir.join("weights.pile");
-    if persisted.is_file() {
-        mary::local::load_gemma4_from_persisted_pile_f16(
-            &persisted,
-            &dir.join("config.json"),
-            &dir.join("tokenizer.json"),
-            device,
-        )
+    let local = dir.join("weights.pile");
+    let pile = if local.is_file() {
+        local
     } else {
-        mary::local::load_gemma4_from_dir_f16(dir, device)
-    }
+        std::env::var("GEMMA_PILE").unwrap_or_else(|_| DEFAULT_GEMMA_PILE.into()).into()
+    };
+    anyhow::ensure!(
+        pile.is_file(),
+        "gemma weights pile not found at {} (persist one with gemma_persist, or set GEMMA_PILE)",
+        pile.display()
+    );
+    mary::local::load_gemma4_from_persisted_pile_f16(
+        &pile,
+        &dir.join("config.json"),
+        &dir.join("tokenizer.json"),
+        device,
+    )
 }
