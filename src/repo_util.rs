@@ -18,16 +18,16 @@ use crate::schema::build_playground_metadata;
 
 /// Load the pile, failing loud on corruption instead of auto-truncating.
 ///
-/// `Pile::restore()` silently truncates the file to the last valid record —
+/// `Pile::amputate()` silently truncates the file to the last valid record —
 /// under version skew (a stale binary reading a newer-format record) that is
-/// a silent data-loss hazard. Repair is explicit: `trible pile restore <path>`.
+/// a silent data-loss hazard. Repair is explicit and destructive: `trible pile amputate <path>`.
 pub(crate) fn refresh_pile(pile: &mut Pile, path: &std::path::Path) -> Result<()> {
     if let Err(err) = pile.refresh() {
         return Err(match err {
             ReadError::CorruptPile { valid_length } => anyhow!(
                 "pile {} corrupt at byte {valid_length}: refusing to auto-repair (a stale \
                  binary could truncate newer data). Repair the torn tail explicitly with: \
-                 trible pile restore {}",
+                 trible pile amputate {}",
                 path.display(),
                 path.display()
             ),
@@ -87,7 +87,7 @@ pub(crate) fn current_branch_head(
         Err(ReadError::CorruptPile { valid_length }) => Err(anyhow!(
             "read branch head {branch_id:x}: pile corrupt at byte {valid_length}: refusing to \
              auto-repair (a stale binary could truncate newer data). Repair the torn tail \
-             explicitly with: trible pile restore <pile>"
+             explicitly with: trible pile amputate <pile>"
         )),
         Err(err) => Err(anyhow!("read branch head {branch_id:x}: {err:?}")),
     }
@@ -172,7 +172,7 @@ pub(crate) fn pull_workspace(
             Err(anyhow!(
                 "{context}: pile corrupt at byte {valid_length}: refusing to auto-repair (a \
                  stale binary could truncate newer data). Repair the torn tail explicitly \
-                 with: trible pile restore <pile>"
+                 with: trible pile amputate <pile>"
             ))
         }
     }
