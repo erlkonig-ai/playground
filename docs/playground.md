@@ -76,17 +76,21 @@ cargo run --manifest-path playground/Cargo.toml -- --pile /path/to/self.pile mem
 Seed explicit person ids for messaging and affinity metadata:
 
 ```bash
-./playground/faculties/relations.rs add <label> --id <hex-id>
-./playground/faculties/relations.rs list
+relations --pile /path/to/self.pile add <label> --id <hex-id>
+relations --pile /path/to/self.pile list
 ```
+
+(`relations` is a faculty binary from the standalone
+[faculties](https://github.com/triblespace/faculties) repo — install with
+`cargo install --path faculties --bins`. The old single-file
+`playground/faculties/*.rs` scripts and one-shot `playground/migrations/*`
+scripts are removed: they predate the V3 pile format, and running a stale
+copy against a live pile is how the 2026-07-03 truncation incident
+happened. If a fossil copy ever surfaces on disk, delete it — never run it.)
 
 Local messaging resolves participants via the `relations` branch, so make sure
-the persona id set in config also exists as a person entry.
-For older piles, run this one-time migration to backfill normalized lookup keys:
-
-```bash
-./playground/migrations/relations_backfill_norm.rs --pile /path/to/self.pile
-```
+the persona id set in config also exists as a person entry. The normalized
+lookup-key migration is long completed; no backfill step exists anymore.
 
 ## Running
 
