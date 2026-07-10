@@ -37,11 +37,31 @@ pub(crate) fn refresh_pile(pile: &mut Pile, path: &std::path::Path) -> Result<()
     Ok(())
 }
 
+/// Open a pile that is expected to already contain data, refusing an empty
+/// (0-byte) file. `Pile::open` treats a zero-length file as a valid *fresh*
+/// pile (`Bytes::empty`), which is how a truncated personal pile silently got
+/// re-seeded on 2026-07-10 (a stray `File::create` truncated it, then this
+/// runtime opened the empty file and wrote fresh branches). Faculties fail on
+/// a MISSING pile; this makes the playground runtime fail on an EMPTY one too.
+/// A deliberate new pile is bootstrapped explicitly, never opened at runtime.
+pub(crate) fn open_existing_pile(path: &std::path::Path) -> Result<Pile> {
+    if let Ok(meta) = std::fs::metadata(path) {
+        if meta.len() == 0 {
+            return Err(anyhow!(
+                "pile at {} is empty (0 bytes) — refusing to open a truncated or \
+                 uninitialized pile; restore it from backup or bootstrap explicitly",
+                path.display()
+            ));
+        }
+    }
+    Pile::open(path).context("open pile")
+}
+
 pub(crate) fn init_repo(config: &Config) -> Result<(Repository<Pile>, Id)> {
     if let Some(parent) = config.pile_path.parent() {
         fs::create_dir_all(parent).context("create pile directory")?;
     }
-    let mut pile = Pile::open(&config.pile_path).context("open pile")?;
+    let mut pile = open_existing_pile(&config.pile_path)?;
     if let Err(err) = refresh_pile(&mut pile, &config.pile_path) {
         let close_res = pile.close().context("close pile after refresh failure");
         if let Err(close_err) = close_res {
