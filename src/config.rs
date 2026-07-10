@@ -183,7 +183,7 @@ fn open_config_repo(pile_path: &Path) -> Result<(Repository<Pile>, Id)> {
     if let Some(parent) = pile_path.parent() {
         fs::create_dir_all(parent).context("create pile directory")?;
     }
-    let mut pile = Pile::open(pile_path).context("open pile")?;
+    let mut pile = crate::repo_util::open_existing_pile(pile_path)?;
     if let Err(err) = crate::repo_util::refresh_pile(&mut pile, pile_path) {
         let close_res = pile.close().context("close pile after refresh failure");
         if let Err(close_err) = close_res {
