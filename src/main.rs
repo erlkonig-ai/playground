@@ -73,6 +73,8 @@ enum CommandMode {
     #[cfg(feature = "diagnostics")]
     #[command(about = "Open the diagnostics dashboard")]
     Diagnostics(DiagnosticsArgs),
+    #[command(about = "One-shot model turn: prompt in, reply out (nothing recorded in the pile)")]
+    Once(OnceArgs),
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
@@ -121,6 +123,29 @@ struct DiagnosticsArgs {
     scale: Option<f32>,
     #[arg(long)]
     headless_wait_ms: Option<u64>,
+}
+
+/// One-shot turn — the seam the `converse` talk-loop bridge (faculties)
+/// calls per heard utterance. Same config/backends as the model worker
+/// (headspace-selected model, api key, `mary://` local engine), but no
+/// model_chat entities are recorded and nothing is pushed.
+#[derive(Args, Debug, Clone)]
+#[command(about = "One-shot model turn (the converse/talk-loop seam)")]
+struct OnceArgs {
+    #[arg(
+        value_name = "TEXT",
+        help = "The user prompt. Use @path to read a file, @- to read stdin."
+    )]
+    text: String,
+    #[arg(
+        long,
+        help = "Override the system prompt for this turn (default: the pile's configured system_prompt). Supports @path / @-."
+    )]
+    system: Option<String>,
+    #[arg(long, help = "Override the model id for this turn.")]
+    model: Option<String>,
+    #[arg(long, help = "Cap output tokens for this turn.")]
+    max_output_tokens: Option<u64>,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -274,6 +299,24 @@ fn main() -> Result<()> {
             diagnostics::set_default_pile(Some(pile_path));
             diagnostics::run_diagnostics(headless, out_dir, scale, headless_wait_ms)
                 .context("run diagnostics")?;
+            Ok(())
+        }
+        CommandMode::Once(args) => {
+            let instance = default_instance_name();
+            let pile_path = resolve_pile_path(cli.pile.clone(), instance.as_str());
+            let mut config = Config::load(Some(pile_path.as_path())).context("load config")?;
+            if let Some(n) = args.max_output_tokens {
+                config.model.max_output_tokens = n;
+            }
+            let text = load_value_or_file(args.text.as_str(), "text")?;
+            let system = match args.system.as_deref() {
+                Some(value) => load_value_or_file(value, "system")?,
+                None => config.system_prompt.clone(),
+            };
+            let messages = vec![ChatMessage::system(system), ChatMessage::user(text)];
+            let reply = model_worker::run_model_once(&config, &messages, args.model.as_deref())
+                .context("one-shot model turn")?;
+            println!("{}", reply.trim());
             Ok(())
         }
         CommandMode::Config { command } => {

@@ -350,6 +350,35 @@ fn is_retryable_request_error(err: &ureq::Error) -> bool {
     matches!(err, ureq::Error::Timeout(_) | ureq::Error::ConnectionFailed)
 }
 
+/// One-shot turn: prompt in, reply out — the seam `playground once` exposes
+/// and the `converse` talk-loop bridge calls per heard utterance. Uses the
+/// SAME backend selection + payload construction as the worker loop (config
+/// from the pile: model, base_url, api key, streaming, `mary://` local), but
+/// records no model_chat request/result entities and never pushes — the pile
+/// is opened only for config + `build_payload`'s blob-resolution seam.
+pub(crate) fn run_model_once(
+    config: &Config,
+    messages: &[ChatMessage],
+    model: Option<&str>,
+) -> Result<String> {
+    let (mut repo, branch_id) = init_repo(config).context("open triblespace repo")?;
+    let result = (|| -> Result<String> {
+        let mut ws = pull_workspace(&mut repo, branch_id, "pull workspace")?;
+        let client = ModelHttpClient::new(config)?;
+        let model = model.unwrap_or(config.model.model.as_str());
+        let payload = client.backend.build_payload(config, &mut ws, model, messages);
+        let result = client.complete(&payload, messages, config)?;
+        Ok(result.output_text)
+    })();
+    if let Err(err) = close_repo(repo) {
+        if result.is_ok() {
+            return Err(err);
+        }
+        eprintln!("warning: failed to close pile cleanly: {err:#}");
+    }
+    result
+}
+
 pub(crate) fn run_model_loop(
     config: Config,
     worker_id: Id,
