@@ -111,6 +111,9 @@ struct RunArgs {
 #[derive(Args, Debug, Clone)]
 #[command(about = "MCP sandbox-provider server settings")]
 struct McpArgs {
+    /// Which sandbox backend provisions sessions.
+    #[arg(long, value_enum, default_value_t = McpBackendKind::Lima)]
+    backend: McpBackendKind,
     /// Lima instance-name prefix; concrete instance is `<prefix>-<tenant>`.
     #[arg(long, default_value = "playground-sbx")]
     instance_prefix: String,
@@ -120,6 +123,28 @@ struct McpArgs {
     /// Lima session template (defaults to scripts/lima-session.yaml.tmpl).
     #[arg(long)]
     template: Option<PathBuf>,
+    /// Jail backend: SSH host that runs the jails (needs BatchMode keys +
+    /// non-interactive root via `sudo -n`).
+    #[arg(long, default_value = "ai.bultmann.eu")]
+    jail_host: String,
+    /// Jail backend: ZFS template snapshot cloned per session.
+    #[arg(long, default_value = "aitemp/playground/template@base")]
+    jail_template_snapshot: String,
+    /// Jail backend: parent dataset that holds per-session clones.
+    #[arg(long, default_value = "aitemp/playground")]
+    jail_dataset_parent: String,
+    /// Jail backend: jail-name prefix; concrete jail is `<prefix>-<tenant>`.
+    #[arg(long, default_value = "playground")]
+    jail_prefix: String,
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+enum McpBackendKind {
+    /// Local Lima VM per session (macOS host).
+    Lima,
+    /// FreeBSD jail per session on a remote host over SSH (pile-less v1;
+    /// see src/sandbox/jail.rs for the trust boundary).
+    Jail,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -354,13 +379,25 @@ fn main() -> Result<()> {
 /// supplied per `open_session` tool call, so one server can host several piles.
 /// Diagnostics go to stderr; stdout is reserved for the JSON-RPC stream.
 fn run_mcp(args: McpArgs) -> Result<()> {
-    let mut backend = sandbox::lima::LimaBackend::new(args.instance_prefix);
-    if let Some(root) = args.state_root {
-        backend.state_root = root;
-    }
-    backend.template = args.template;
+    let backend: Box<dyn sandbox::SandboxBackend> = match args.backend {
+        McpBackendKind::Lima => {
+            let mut backend = sandbox::lima::LimaBackend::new(args.instance_prefix);
+            if let Some(root) = args.state_root {
+                backend.state_root = root;
+            }
+            backend.template = args.template;
+            Box::new(backend)
+        }
+        McpBackendKind::Jail => {
+            let mut backend = sandbox::jail::JailBackend::ssh(args.jail_host);
+            backend.jail_prefix = args.jail_prefix;
+            backend.template_snapshot = args.jail_template_snapshot;
+            backend.dataset_parent = args.jail_dataset_parent;
+            Box::new(backend)
+        }
+    };
 
-    let provider = mcp::SandboxProvider::new(Box::new(backend));
+    let provider = mcp::SandboxProvider::new(backend);
     let server = mcp::McpServer::new(provider);
     eprintln!("playground mcp: sandbox provider on stdio (JSON-RPC 2.0)");
     let mut transport = mcp::StdioTransport::stdio();

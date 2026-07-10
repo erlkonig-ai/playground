@@ -11,9 +11,9 @@
 //! ## Concepts
 //!
 //! - A [`SandboxBackend`] provisions and tears down an isolated shell
-//!   environment (a **session**). Today the only backend is Lima
-//!   ([`lima::LimaBackend`]); `sandbox-exec`/seatbelt and FreeBSD jails slot in
-//!   behind the same trait later.
+//!   environment (a **session**). Backends: Lima ([`lima::LimaBackend`], local
+//!   VM) and FreeBSD jails ([`jail::JailBackend`], remote host over SSH);
+//!   `sandbox-exec`/seatbelt slots in behind the same trait later.
 //! - A [`Session`] is one live sandbox with stateful shell context (cwd, env,
 //!   running processes). Commands ([`SandboxBackend::exec`]) run *inside* a
 //!   session, so state persists across calls the way a real terminal does.
@@ -22,6 +22,7 @@
 //!   but cannot truncate it. This is the structural fix for the 2026-07 pile
 //!   truncation incident.
 
+pub mod jail;
 pub mod lima;
 
 use std::path::PathBuf;
@@ -51,6 +52,18 @@ impl SessionId {
 /// read and `>>`-append but not `O_TRUNC`. Backends realise it differently
 /// (macOS `chflags uappend` / `uappnd`, a read-only virtiofs mount plus an
 /// append-only overlay in the guest, a jail with `sappnd`, ...).
+///
+/// ## TRUST BOUNDARY (which backends may realise this at all)
+///
+/// A pile may only be exposed to a session whose substrate is a
+/// **Liora-controlled surface**. Local backends (Lima on the Mac) qualify.
+/// Remote backends on shared machines do NOT: [`jail::JailBackend`] runs on
+/// `ai.bultmann.eu`, which other people can access, so it deliberately ignores
+/// this mount — its sessions are pile-less, exec results come back over MCP,
+/// and the drive appends observations to the pile at home. Pile access from
+/// server jails is deferred until either an encrypted / capability-gated
+/// replica design or a `shared.pile`-only policy is decided (see the trust
+/// boundary section in [`jail`]'s module docs).
 #[derive(Debug, Clone)]
 pub struct PileMount {
     /// Absolute path to the pile on the host.
