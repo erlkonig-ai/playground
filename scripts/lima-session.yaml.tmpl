@@ -1,0 +1,54 @@
+# Lima config for a Playground SANDBOX-PROVIDER session VM.
+#
+# Unlike scripts/lima.yaml.tmpl (the `playground run` template, which starts a
+# systemd service that polls the pile), this template provisions a plain shell
+# VM that the host drives with `limactl shell <instance> -- sh -lc <cmd>`.
+#
+# The pile is mounted WRITABLE (append is required) but is made APPEND-ONLY
+# guest-side on first boot via `chattr +a` — the __GUEST_PILE_SETUP__ marker
+# below is replaced by src/sandbox/lima.rs::guest_pile_setup(). This is the
+# structural fix for the 2026-07 pile-truncation incident: append works, but
+# O_TRUNC/unlink/rename fail with EPERM inside the guest.
+
+images:
+  - location: "https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-arm64.img"
+    arch: "aarch64"
+  - location: "https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img"
+    arch: "x86_64"
+
+vmType: "vz"
+mountType: "virtiofs"
+
+cpus: 4
+memory: "8GiB"
+disk: "30GiB"
+
+mounts:
+  - location: "__PILE_ROOT__"
+    mountPoint: "/pile"
+    writable: true
+
+provision:
+  - mode: system
+    script: |
+      set -eu
+      echo "[playground-sandbox] system provision start"
+      apt-get update
+      apt-get install -y --no-install-recommends ca-certificates curl e2fsprogs
+      ln -sfn __PILE_PATH__ /self.pile
+      echo "[playground-sandbox] system provision done"
+  - mode: system
+    script: |
+      set -eu
+      # Seed session environment for every login shell (`sh -l` sources this).
+      cat >/etc/profile.d/playground-session.sh <<'ENVEOF'
+      __SESSION_ENV__
+      ENVEOF
+  - mode: user
+    script: |
+      set -eu
+      echo "[playground-sandbox] user provision start"
+      # Make the pile append-only inside the guest. Append (commits) keeps
+      # working; truncation/replacement is refused with EPERM.
+      __GUEST_PILE_SETUP__
+      echo "[playground-sandbox] user provision done"
