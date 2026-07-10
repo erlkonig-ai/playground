@@ -11,20 +11,23 @@
 //!
 //! This module defines the [`SandboxProvider`] (session registry +
 //! multi-tenancy) and, on top of it, a minimal dependency-free MCP server
-//! ([`McpServer`]): newline-delimited JSON-RPC 2.0 over a pluggable
-//! [`McpTransport`]. v1 ships a blocking stdio transport ([`StdioTransport`]);
-//! the internet-facing HTTP/SSE + per-sandbox-token transport is the next phase
-//! and is left as a documented seam (see [`McpTransport`]).
+//! ([`McpServer`]): JSON-RPC 2.0 over a pluggable transport. Two transports
+//! exist:
 //!
-//! ## No MCP crate dependency (deliberate, for v1)
+//!   - [`StdioTransport`] (here): newline-delimited JSON over stdin/stdout,
+//!     blocking, operator-local, unauthenticated.
+//!   - `crate::mcp_http` (feature `mcp-http`): Streamable HTTP with
+//!     per-sandbox bearer-token auth — the internet-facing transport. It calls
+//!     [`McpServer::handle_request`] directly and does tenant authorization
+//!     *before* dispatch.
+//!
+//! ## No MCP crate dependency (deliberate)
 //!
 //! The official Rust SDK [`rmcp`](https://crates.io/crates/rmcp) is
-//! tokio/async, and this crate is entirely synchronous today. Rather than pull
-//! a large async stack in for a blocking stdio server, v1 hand-rolls the small
-//! JSON-RPC surface over `serde_json` (already a dependency). When the
-//! HTTP/SSE transport lands it will need async anyway (triblespace now has both
-//! sync and async APIs); that is the point at which adopting `rmcp` or
-//! hyper+`spawn_blocking` should be reconsidered.
+//! tokio/async and large. The JSON-RPC surface here is small enough to
+//! hand-roll over `serde_json` (already a dependency); the HTTP transport
+//! bridges to this blocking core with `tokio::task::spawn_blocking` rather
+//! than rewriting the provider async.
 
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
@@ -119,6 +122,21 @@ impl SandboxProvider {
         Ok(())
     }
 
+    /// The tenant label a live session belongs to, or `None` if this provider
+    /// never opened it (or already closed it).
+    ///
+    /// This is the hook the HTTP transport uses to authorize `exec` /
+    /// `close_session` tool calls against the caller's token *before*
+    /// dispatch: a token may only touch sessions of its own tenant.
+    #[cfg(feature = "mcp-http")]
+    pub fn session_tenant(&self, session: &SessionId) -> Option<String> {
+        self.sessions
+            .lock()
+            .expect("sessions poisoned")
+            .get(session)
+            .map(|tenant| tenant.label.clone())
+    }
+
     fn ensure_known(&self, session: &SessionId) -> Result<()> {
         if self
             .sessions
@@ -150,22 +168,24 @@ impl SandboxProvider {
 // The three tools mirror the provider verbs: `open_session`, `exec`,
 // `close_session`.
 
-/// MCP protocol version this server advertises.
-const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
+/// The newest MCP protocol version this server speaks (and the one it
+/// advertises when the client requests something it doesn't know).
+const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
+
+/// All protocol versions this server can serve. `initialize` echoes the
+/// client's requested version when it is one of these (per-spec negotiation);
+/// otherwise it answers with [`MCP_PROTOCOL_VERSION`]. The tool surface is
+/// identical across all three, so no per-version branching exists elsewhere.
+const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 
 /// A message transport for the MCP server: read one request, write one
 /// response, both as a single JSON value (framing is the transport's business).
 ///
-/// v1 implements [`StdioTransport`] (newline-delimited JSON over stdin/stdout,
-/// blocking). This trait is the seam where the internet-facing transport slots
-/// in later.
-///
-/// TODO(sandbox-provider, next phase): add an `HttpSseTransport` that speaks MCP
-/// over HTTP+SSE with a **per-sandbox access token** (operator-distributed) in
-/// an `Authorization: Bearer <token>` header, checked before dispatch. That
-/// transport must be async (tokio/hyper); the plan is to run the blocking
-/// `SandboxProvider` calls under `spawn_blocking` behind it. Do NOT build it in
-/// this increment.
+/// [`StdioTransport`] (newline-delimited JSON over stdin/stdout, blocking)
+/// implements this. The Streamable-HTTP transport (`crate::mcp_http`,
+/// per-sandbox bearer tokens, feature `mcp-http`) deliberately does *not*: its
+/// request/response pairing is carried by HTTP itself, so it bypasses the
+/// pull-loop framing and calls [`McpServer::handle_request`] per POST.
 pub trait McpTransport {
     /// Read the next request frame. `Ok(None)` means the peer closed the
     /// connection (clean EOF); the server loop exits.
@@ -236,46 +256,67 @@ impl McpServer {
         McpServer { provider }
     }
 
+    /// The provider behind this server. The HTTP transport uses this for
+    /// pre-dispatch tenant authorization ([`SandboxProvider::session_tenant`]).
+    #[cfg(feature = "mcp-http")]
+    pub fn provider(&self) -> &SandboxProvider {
+        &self.provider
+    }
+
     /// Run the request/response loop until the transport reports EOF.
     pub fn serve(&self, transport: &mut dyn McpTransport) -> Result<()> {
         while let Some(request) = transport.read_message()? {
-            // JSON-RPC notifications (no `id`) get no response.
-            let id = request.get("id").cloned();
-            let method = request.get("method").and_then(Value::as_str).unwrap_or("");
-            let params = request.get("params").cloned().unwrap_or(Value::Null);
-
-            match self.dispatch(method, params) {
-                DispatchOutcome::Notification => { /* no reply */ }
-                DispatchOutcome::Result(result) => {
-                    if let Some(id) = id {
-                        transport.write_message(&json!({
-                            "jsonrpc": "2.0",
-                            "id": id,
-                            "result": result,
-                        }))?;
-                    }
-                }
-                DispatchOutcome::Error { code, message } => {
-                    if let Some(id) = id {
-                        transport.write_message(&json!({
-                            "jsonrpc": "2.0",
-                            "id": id,
-                            "error": { "code": code, "message": message },
-                        }))?;
-                    }
-                }
+            if let Some(response) = self.handle_request(&request) {
+                transport.write_message(&response)?;
             }
         }
         Ok(())
     }
 
+    /// Handle a single JSON-RPC message and produce the response, if any.
+    ///
+    /// Returns `None` for notifications (no `id`), which per JSON-RPC get no
+    /// reply. This is the transport-independent core: the stdio loop calls it
+    /// per line, the HTTP transport per POST body.
+    pub fn handle_request(&self, request: &Value) -> Option<Value> {
+        let id = request.get("id").cloned();
+        let method = request.get("method").and_then(Value::as_str).unwrap_or("");
+        let params = request.get("params").cloned().unwrap_or(Value::Null);
+
+        match self.dispatch(method, params) {
+            DispatchOutcome::Notification => None,
+            DispatchOutcome::Result(result) => id.map(|id| {
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": result,
+                })
+            }),
+            DispatchOutcome::Error { code, message } => id.map(|id| {
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": { "code": code, "message": message },
+                })
+            }),
+        }
+    }
+
     fn dispatch(&self, method: &str, params: Value) -> DispatchOutcome {
         match method {
-            "initialize" => DispatchOutcome::Result(json!({
-                "protocolVersion": MCP_PROTOCOL_VERSION,
-                "capabilities": { "tools": {} },
-                "serverInfo": { "name": "playground-sandbox", "version": env!("CARGO_PKG_VERSION") },
-            })),
+            "initialize" => {
+                // Version negotiation per spec: echo the client's requested
+                // version when we support it, otherwise offer our newest.
+                let requested = params.get("protocolVersion").and_then(Value::as_str);
+                let version = requested
+                    .filter(|v| SUPPORTED_PROTOCOL_VERSIONS.contains(v))
+                    .unwrap_or(MCP_PROTOCOL_VERSION);
+                DispatchOutcome::Result(json!({
+                    "protocolVersion": version,
+                    "capabilities": { "tools": {} },
+                    "serverInfo": { "name": "playground-sandbox", "version": env!("CARGO_PKG_VERSION") },
+                }))
+            }
             "notifications/initialized" => DispatchOutcome::Notification,
             "ping" => DispatchOutcome::Result(json!({})),
             "tools/list" => DispatchOutcome::Result(json!({ "tools": tool_schemas() })),
@@ -497,16 +538,18 @@ fn render_exec_result(result: &ExecResult) -> String {
     out
 }
 
+/// Test support shared with `crate::mcp_http`: a backend that needs no Lima.
 #[cfg(test)]
-mod tests {
+pub(crate) mod testing {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// A backend that records calls and needs no Lima. Session id = tenant label.
+    /// A backend that records calls and needs no Lima. Session id =
+    /// `mock-<tenant label>`.
     #[derive(Default)]
-    struct MockBackend {
-        execs: Arc<AtomicUsize>,
+    pub(crate) struct MockBackend {
+        pub(crate) execs: Arc<AtomicUsize>,
     }
 
     impl SandboxBackend for MockBackend {
@@ -529,6 +572,12 @@ mod tests {
             Ok(())
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::testing::MockBackend;
+    use super::*;
 
     /// Drive the whole handshake over an in-memory stdio transport and assert
     /// the JSON-RPC responses. Proves the server surface without Lima.

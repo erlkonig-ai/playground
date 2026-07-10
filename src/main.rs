@@ -28,8 +28,12 @@ mod diagnostics;
 mod exec_worker;
 mod local_model;
 // Sandbox provider layer (architecture layer 3). See src/sandbox/mod.rs and
-// src/mcp.rs. Exposed over MCP via the `mcp` subcommand (stdio transport, v1).
+// src/mcp.rs. Exposed over MCP via the `mcp` subcommand (stdio transport) and,
+// with the `mcp-http` feature, the `mcp-http` subcommand (Streamable HTTP with
+// per-sandbox bearer tokens, src/mcp_http.rs).
 mod mcp;
+#[cfg(feature = "mcp-http")]
+mod mcp_http;
 mod model_worker;
 mod sandbox;
 mod relations_schema;
@@ -81,6 +85,18 @@ enum CommandMode {
     Once(OnceArgs),
     #[command(about = "Serve the sandbox provider over MCP (JSON-RPC 2.0 on stdio)")]
     Mcp(McpArgs),
+    #[cfg(feature = "mcp-http")]
+    #[command(
+        name = "mcp-http",
+        about = "Serve the sandbox provider over Streamable-HTTP MCP (per-sandbox bearer tokens)"
+    )]
+    McpHttp(McpHttpArgs),
+    #[cfg(feature = "mcp-http")]
+    #[command(about = "Manage MCP access tokens (per-sandbox bearer auth)")]
+    Token {
+        #[command(subcommand)]
+        command: TokenCommand,
+    },
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
@@ -145,6 +161,87 @@ enum McpBackendKind {
     /// FreeBSD jail per session on a remote host over SSH (pile-less v1;
     /// see src/sandbox/jail.rs for the trust boundary).
     Jail,
+}
+
+#[cfg(feature = "mcp-http")]
+impl McpBackendKind {
+    /// The backend name as recorded in the token store and reported by
+    /// `SandboxBackend::name` — the three must agree for auth to line up.
+    fn name(self) -> &'static str {
+        match self {
+            McpBackendKind::Lima => "lima",
+            McpBackendKind::Jail => "jail",
+        }
+    }
+}
+
+#[cfg(feature = "mcp-http")]
+#[derive(Args, Debug, Clone)]
+#[command(about = "Streamable-HTTP MCP server settings")]
+struct McpHttpArgs {
+    /// Address to bind. Loopback by default; internet exposure is expected to
+    /// go behind a TLS-terminating reverse proxy (this server is plain HTTP).
+    #[arg(long, default_value = "127.0.0.1:8377")]
+    bind: std::net::SocketAddr,
+    /// Token store (JSON) minted with `playground token mint`.
+    #[arg(long, env = "PLAYGROUND_MCP_TOKENS")]
+    tokens: PathBuf,
+    /// Origin header values to accept (repeatable). Requests carrying any
+    /// other Origin are rejected (DNS-rebinding defence); requests without an
+    /// Origin header (plain MCP clients) always pass.
+    #[arg(long = "allow-origin")]
+    allow_origin: Vec<String>,
+    /// Idle MCP-session expiry in seconds (sessions are transport state only;
+    /// sandbox sessions survive and are reachable after re-initialize).
+    #[arg(long, default_value_t = 3600)]
+    idle_timeout_secs: u64,
+    /// Which sandbox backend provisions sessions.
+    #[arg(long, value_enum, default_value_t = McpBackendKind::Lima)]
+    backend: McpBackendKind,
+    /// Lima instance-name prefix; concrete instance is `<prefix>-<tenant>`.
+    #[arg(long, default_value = "playground-sbx")]
+    instance_prefix: String,
+    /// Directory for rendered per-session Lima configs.
+    #[arg(long)]
+    state_root: Option<PathBuf>,
+    /// Lima session template (defaults to scripts/lima-session.yaml.tmpl).
+    #[arg(long)]
+    template: Option<PathBuf>,
+    /// Jail backend: SSH host that runs the jails (needs BatchMode keys +
+    /// non-interactive root via `sudo -n`).
+    #[arg(long, default_value = "<jail-host>")]
+    jail_host: String,
+    /// Jail backend: ZFS template snapshot cloned per session.
+    #[arg(long, default_value = "aitemp/playground/template@base")]
+    jail_template_snapshot: String,
+    /// Jail backend: parent dataset that holds per-session clones.
+    #[arg(long, default_value = "aitemp/playground")]
+    jail_dataset_parent: String,
+    /// Jail backend: jail-name prefix; concrete jail is `<prefix>-<tenant>`.
+    #[arg(long, default_value = "playground")]
+    jail_prefix: String,
+}
+
+#[cfg(feature = "mcp-http")]
+#[derive(Subcommand, Debug)]
+enum TokenCommand {
+    #[command(about = "Mint a bearer token bound to a tenant (printed once, then only in the store)")]
+    Mint(TokenMintArgs),
+}
+
+#[cfg(feature = "mcp-http")]
+#[derive(Args, Debug, Clone)]
+#[command(about = "Token mint settings")]
+struct TokenMintArgs {
+    /// Tenant label the token acts as (sessions/sandboxes are scoped to it).
+    #[arg(long)]
+    tenant: String,
+    /// Token store (JSON) to append to; created if missing.
+    #[arg(long, env = "PLAYGROUND_MCP_TOKENS")]
+    tokens: PathBuf,
+    /// Backend the token is valid for (must match the serving `mcp-http --backend`).
+    #[arg(long, value_enum, default_value_t = McpBackendKind::Lima)]
+    backend: McpBackendKind,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -365,6 +462,12 @@ fn main() -> Result<()> {
             Ok(())
         }
         CommandMode::Mcp(args) => run_mcp(args),
+        #[cfg(feature = "mcp-http")]
+        CommandMode::McpHttp(args) => run_mcp_http(args),
+        #[cfg(feature = "mcp-http")]
+        CommandMode::Token { command } => match command {
+            TokenCommand::Mint(args) => run_token_mint(args),
+        },
         CommandMode::Config { command } => {
             let instance = default_instance_name();
             let pile_path = resolve_pile_path(cli.pile.clone(), instance.as_str());
@@ -402,6 +505,77 @@ fn run_mcp(args: McpArgs) -> Result<()> {
     eprintln!("playground mcp: sandbox provider on stdio (JSON-RPC 2.0)");
     let mut transport = mcp::StdioTransport::stdio();
     server.serve(&mut transport)
+}
+
+/// Serve the sandbox provider over Streamable-HTTP MCP with per-sandbox
+/// bearer-token auth. See `src/mcp_http.rs` for the protocol/auth model and
+/// the concurrency design.
+#[cfg(feature = "mcp-http")]
+fn run_mcp_http(args: McpHttpArgs) -> Result<()> {
+    let backend: Box<dyn sandbox::SandboxBackend> = match args.backend {
+        McpBackendKind::Lima => {
+            let mut backend = sandbox::lima::LimaBackend::new(args.instance_prefix);
+            if let Some(root) = args.state_root {
+                backend.state_root = root;
+            }
+            backend.template = args.template;
+            Box::new(backend)
+        }
+        McpBackendKind::Jail => {
+            let mut backend = sandbox::jail::JailBackend::ssh(args.jail_host);
+            backend.jail_prefix = args.jail_prefix;
+            backend.template_snapshot = args.jail_template_snapshot;
+            backend.dataset_parent = args.jail_dataset_parent;
+            Box::new(backend)
+        }
+    };
+
+    let tokens = mcp_http::TokenStore::load(&args.tokens)?;
+    let usable = tokens
+        .tokens
+        .values()
+        .filter(|entry| entry.backend == args.backend.name())
+        .count();
+    if usable == 0 {
+        eprintln!(
+            "warning: no tokens for backend '{}' in {} — every request will be rejected; \
+             mint one with `playground token mint --tenant <label> --backend {} --tokens {}`",
+            args.backend.name(),
+            args.tokens.display(),
+            args.backend.name(),
+            args.tokens.display(),
+        );
+    }
+
+    let provider = mcp::SandboxProvider::new(backend);
+    let server = mcp::McpServer::new(provider);
+    mcp_http::serve(
+        server,
+        tokens,
+        mcp_http::HttpServerConfig {
+            bind: args.bind,
+            backend_name: args.backend.name().to_string(),
+            allowed_origins: args.allow_origin,
+            idle_timeout: Duration::from_secs(args.idle_timeout_secs),
+        },
+    )
+}
+
+/// Mint a bearer token into the store. The token is printed to stdout exactly
+/// once; the store keeps it (mode 0600) for the server to check against.
+#[cfg(feature = "mcp-http")]
+fn run_token_mint(args: TokenMintArgs) -> Result<()> {
+    let mut store = mcp_http::TokenStore::load(&args.tokens)?;
+    let token = store.mint(&args.tenant, args.backend.name());
+    store.save(&args.tokens)?;
+    eprintln!(
+        "minted token for tenant '{}' (backend {}) into {} — shown once below, store it now:",
+        args.tenant,
+        args.backend.name(),
+        args.tokens.display(),
+    );
+    println!("{token}");
+    Ok(())
 }
 
 fn run_with_exec(mut config: Config, args: RunArgs) -> Result<()> {
