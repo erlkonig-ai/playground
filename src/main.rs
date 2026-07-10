@@ -27,7 +27,11 @@ mod config;
 mod diagnostics;
 mod exec_worker;
 mod local_model;
+// Sandbox provider layer (architecture layer 3). See src/sandbox/mod.rs and
+// src/mcp.rs. Exposed over MCP via the `mcp` subcommand (stdio transport, v1).
+mod mcp;
 mod model_worker;
+mod sandbox;
 mod relations_schema;
 mod repo_ops;
 mod repo_util;
@@ -75,6 +79,8 @@ enum CommandMode {
     Diagnostics(DiagnosticsArgs),
     #[command(about = "One-shot model turn: prompt in, reply out (nothing recorded in the pile)")]
     Once(OnceArgs),
+    #[command(about = "Serve the sandbox provider over MCP (JSON-RPC 2.0 on stdio)")]
+    Mcp(McpArgs),
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
@@ -100,6 +106,20 @@ struct RunArgs {
     poll_ms: Option<u64>,
     #[command(flatten)]
     lima: LimaExecArgs,
+}
+
+#[derive(Args, Debug, Clone)]
+#[command(about = "MCP sandbox-provider server settings")]
+struct McpArgs {
+    /// Lima instance-name prefix; concrete instance is `<prefix>-<tenant>`.
+    #[arg(long, default_value = "playground-sbx")]
+    instance_prefix: String,
+    /// Directory for rendered per-session Lima configs.
+    #[arg(long)]
+    state_root: Option<PathBuf>,
+    /// Lima session template (defaults to scripts/lima-session.yaml.tmpl).
+    #[arg(long)]
+    template: Option<PathBuf>,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -319,12 +339,32 @@ fn main() -> Result<()> {
             println!("{}", reply.trim());
             Ok(())
         }
+        CommandMode::Mcp(args) => run_mcp(args),
         CommandMode::Config { command } => {
             let instance = default_instance_name();
             let pile_path = resolve_pile_path(cli.pile.clone(), instance.as_str());
             handle_config(Some(pile_path.as_path()), command)
         }
     }
+}
+
+/// Serve the sandbox provider over MCP (stdio, JSON-RPC 2.0).
+///
+/// This does not open the pile itself — tenants (pile mount × driver) are
+/// supplied per `open_session` tool call, so one server can host several piles.
+/// Diagnostics go to stderr; stdout is reserved for the JSON-RPC stream.
+fn run_mcp(args: McpArgs) -> Result<()> {
+    let mut backend = sandbox::lima::LimaBackend::new(args.instance_prefix);
+    if let Some(root) = args.state_root {
+        backend.state_root = root;
+    }
+    backend.template = args.template;
+
+    let provider = mcp::SandboxProvider::new(Box::new(backend));
+    let server = mcp::McpServer::new(provider);
+    eprintln!("playground mcp: sandbox provider on stdio (JSON-RPC 2.0)");
+    let mut transport = mcp::StdioTransport::stdio();
+    server.serve(&mut transport)
 }
 
 fn run_with_exec(mut config: Config, args: RunArgs) -> Result<()> {
