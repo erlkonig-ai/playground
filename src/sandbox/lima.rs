@@ -21,14 +21,16 @@
 //! the same `limactl` verbs and the same virtiofs mount layout; they differ in
 //! *who drives exec* (systemd-in-guest vs. `limactl shell`-from-host).
 //!
-//! ## Append-only pile (the truncation fix)
+//! ## Append-only pile (intended, but a no-op on virtiofs today)
 //!
-//! The pile is mounted writable over virtiofs (a truncate on the host would
-//! break Time Machine, and macOS `chflags uappend` is host-side and does the
-//! same damage — see the task brief). Append-only is therefore enforced
-//! **guest-side**: on first boot the provision script sets the Linux
-//! append-only inode attribute (`chattr +a`) on the pile file inside the guest.
-//! See [`guest_pile_setup`] and the rendered template.
+//! The pile is mounted writable over virtiofs so the driver can append commits.
+//! The provision script *tries* to set the Linux append-only inode attribute
+//! (`chattr +a`) guest-side — but virtiofs does not support inode flags, so this
+//! currently fails with `Operation not supported` and provides no protection
+//! (measured 2026-07-11). See [`guest_pile_setup`] for the full measurement and
+//! the follow-on options for a durable guarantee. The mount is writable and a
+//! session can truncate its own pile; Lima sessions are trusted on this axis
+//! until a real enforcement mechanism lands.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -60,6 +62,12 @@ pub struct LimaBackend {
     pub template: Option<PathBuf>,
     /// Directory under which rendered per-session Lima configs are written.
     pub state_root: PathBuf,
+    /// Host directory of prebuilt Linux-aarch64 faculty binaries to stage into
+    /// every session (mounted read-only at `/opt/faculties`, put on PATH, with
+    /// `PILE` set to the mounted pile). When `None`, sessions come up without
+    /// faculties (the previous behaviour). Populate this via
+    /// [`super::faculties::ensure_faculties_bundle`].
+    pub faculties_bundle: Option<PathBuf>,
 }
 
 impl Default for LimaBackend {
@@ -68,6 +76,7 @@ impl Default for LimaBackend {
             instance_prefix: "playground-sbx".to_string(),
             template: None,
             state_root: std::env::temp_dir().join("playground-sandbox"),
+            faculties_bundle: None,
         }
     }
 }
@@ -146,6 +155,25 @@ impl LimaBackend {
             .collect();
         text = text.replace("__SESSION_ENV__", &env_exports);
 
+        // Faculties: mount the host bundle read-only at /opt/faculties and put
+        // it on PATH so `compass list` / `wiki search X` resolve in a session.
+        // PILE (the mounted pile guest path) is exported unconditionally by the
+        // template via __PILE_PATH__, so a faculty run in any session operates
+        // on the session's mounted pile. When no bundle is configured, both
+        // markers render empty (sessions come up without faculties).
+        let (faculties_mount, faculties_path_export) = match &self.faculties_bundle {
+            Some(bundle) => (
+                format!(
+                    "  - location: \"{}\"\n    mountPoint: \"/opt/faculties\"\n    writable: false",
+                    bundle.display()
+                ),
+                "export PATH=\"/opt/faculties:$PATH\"".to_string(),
+            ),
+            None => (String::new(), String::new()),
+        };
+        text = text.replace("__FACULTIES_MOUNT__", &faculties_mount);
+        text = text.replace("__FACULTIES_PATH_EXPORT__", &faculties_path_export);
+
         // Append-only enforcement fragment, injected guest-side (see
         // guest_pile_setup). The session template carries a __GUEST_PILE_SETUP__
         // marker; if the fallback (live) template is used, this is a no-op.
@@ -212,11 +240,21 @@ impl SandboxBackend for LimaBackend {
         let instance = session.as_str();
 
         // limactl shell <instance> -- sh -lc <command>. A per-call cwd is applied
-        // via `--workdir`; otherwise the guest default is used.
+        // via `--workdir`; otherwise we anchor at `/`. Without an explicit
+        // workdir `limactl shell` tries to cd into the *host* cwd mirrored in the
+        // guest — a path a session VM does not mount (it mounts only /pile and
+        // /opt/faculties) — and the login shell aborts before the command runs.
+        // `/` always exists, so the session's own `cd`/PILE-relative work is
+        // unaffected.
         let mut cmd = Command::new("limactl");
         cmd.arg("shell");
-        if let Some(cwd) = &request.cwd {
-            cmd.arg("--workdir").arg(cwd);
+        match &request.cwd {
+            Some(cwd) => {
+                cmd.arg("--workdir").arg(cwd);
+            }
+            None => {
+                cmd.arg("--workdir").arg("/");
+            }
         }
         cmd.arg(instance).arg("--").arg("sh").arg("-lc").arg(&request.command);
 
@@ -267,26 +305,29 @@ impl SandboxBackend for LimaBackend {
     }
 }
 
-/// Guest-side commands that make the pile mount append-only.
+/// Guest-side commands that *attempt* to make the pile mount append-only.
 ///
 /// The pile arrives via a *writable* virtiofs mount at `/pile` (writability is
-/// required so the driver can append commits). To prevent truncation/replacement
-/// from inside the guest, the boot provision sets the ext4/Linux append-only
-/// inode attribute with `chattr +a`. With `+a` set, a file may be opened for
-/// append (`O_APPEND`) and read, but `open(..., O_TRUNC)`, `unlink`, and rename
-/// fail with `EPERM` — even for root inside the guest. Because triblespace piles
-/// are append-only log files, this is exactly the right constraint: normal
-/// commits keep working, truncation cannot happen.
+/// required so the driver can append commits). The intent is to set the
+/// ext4/Linux append-only inode attribute with `chattr +a` so `open(...,
+/// O_TRUNC)`, `unlink`, and rename fail with `EPERM` while append keeps working.
 ///
-/// Caveat worth flagging for review: `chattr +a` semantics depend on the guest
-/// filesystem honouring inode attributes. On the *virtiofs-backed* mount the
-/// attribute is applied to the guest-visible inode; a determined guest process
-/// cannot clear it without `CAP_LINUX_IMMUTABLE` (which the session user lacks),
-/// but a guest with root *could* `chattr -a`. For a hostile-tenant threat model
-/// the durable guarantee still comes from the host never exposing a truncating
-/// handle plus append-only being re-asserted each boot; this fragment is the
-/// first, cheap line of defence and the structural fix for the accidental
-/// (non-adversarial) truncation class from 2026-07.
+/// KNOWN LIMITATION (measured 2026-07-11, `--backend lima` on an M4 Max): the
+/// `/pile` mount is **virtiofs**, which does **not** support Linux inode flags.
+/// `chattr +a` fails with `Operation not supported` (and `lsattr` likewise), so
+/// this fragment is a **no-op on the current mount** — a session can still
+/// truncate the pile (verified: `: > /pile/<pile>` succeeded and the host file
+/// went to 0 bytes). The command is written defensively (`... || true`) so the
+/// failure does not abort provisioning, but it provides **no** protection today.
+///
+/// This is a pre-existing property (the fragment predates faculty provisioning)
+/// and is left in place because it is harmless and becomes effective if the
+/// mount FS ever gains inode-flag support. The durable append-only guarantee
+/// must come from elsewhere — candidates for the follow-on: host-side
+/// `chflags uappnd/sappnd` on the pile file (the macOS analogue, applied before
+/// the mount), a FUSE/virtiofsd policy that rejects `O_TRUNC`, or keeping the
+/// pile off the guest entirely (the jail backend's pile-less model). Until one
+/// lands, a Lima session is trusted not to truncate its own pile, not prevented.
 ///
 /// Returned as shell fragments so the caller controls when they run and the code
 /// stays inert until rendered into the provision script.
@@ -306,6 +347,100 @@ pub fn guest_pile_setup(guest_pile: &Path) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::sandbox::{PileMount, Tenant};
+
+    fn render(spec: &SessionSpec, faculties_bundle: Option<PathBuf>) -> String {
+        let mut backend = LimaBackend::new("t");
+        // Point at the real session template so the markers actually exist.
+        backend.template =
+            Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/lima-session.yaml.tmpl"));
+        backend.faculties_bundle = faculties_bundle;
+        let out = std::env::temp_dir().join(format!(
+            "playground-render-test-{}-{}.yaml",
+            std::process::id(),
+            spec.tenant.label,
+        ));
+        backend.render_config(spec, &out).expect("render");
+        let text = std::fs::read_to_string(&out).expect("read rendered");
+        let _ = std::fs::remove_file(&out);
+        text
+    }
+
+    fn spec(label: &str) -> SessionSpec {
+        SessionSpec {
+            tenant: Tenant {
+                label: label.to_string(),
+                pile: PileMount {
+                    host_path: PathBuf::from("/tmp/scratch/self.pile"),
+                    guest_path: PathBuf::from("/pile/self.pile"),
+                    append_only: true,
+                },
+            },
+            cwd: None,
+            env: vec![],
+        }
+    }
+
+    /// With a faculties bundle configured, the rendered session config mounts it
+    /// read-only at /opt/faculties, puts it on PATH, and always exports PILE at
+    /// the mounted pile guest path — so a faculty run in a session resolves and
+    /// operates on that pile. Without a bundle, the mount/PATH markers render
+    /// empty but PILE is still exported.
+    #[test]
+    fn render_wires_faculties_and_pile() {
+        let with = render(&spec("with"), Some(PathBuf::from("/host/faculties-bundle")));
+        assert!(
+            with.contains("location: \"/host/faculties-bundle\"")
+                && with.contains("mountPoint: \"/opt/faculties\"")
+                && with.contains("writable: false"),
+            "expected faculties mount in rendered config:\n{with}"
+        );
+        // Regression: the placeholder tokens must NOT appear in the template's
+        // prose, or the global string-replace injects YAML into the comment
+        // header and corrupts the document. The mount `mountPoint` line must
+        // appear exactly once (in the real `mounts:` block, not duplicated into
+        // a comment), and no rendered comment line may carry injected YAML.
+        assert_eq!(
+            with.matches("mountPoint: \"/opt/faculties\"").count(),
+            1,
+            "faculties mount rendered more than once (token leaked into prose?):\n{with}"
+        );
+        for line in with.lines() {
+            let t = line.trim_start();
+            if t.starts_with('#') {
+                assert!(
+                    !t.contains("mountPoint:") && !t.contains("location: \"/host"),
+                    "YAML injected into a comment line: {line:?}"
+                );
+            }
+        }
+        assert!(
+            with.contains("export PATH=\"/opt/faculties:$PATH\""),
+            "expected faculties PATH export:\n{with}"
+        );
+        assert!(
+            with.contains("export PILE='/pile/self.pile'"),
+            "expected PILE export at the guest pile path:\n{with}"
+        );
+        // No unreplaced markers must survive into the guest config.
+        assert!(!with.contains("__FACULTIES_MOUNT__"));
+        assert!(!with.contains("__FACULTIES_PATH_EXPORT__"));
+
+        let without = render(&spec("without"), None);
+        // No actual mount / PATH export (the header comment mentions
+        // /opt/faculties in prose, so assert on the load-bearing lines only).
+        assert!(
+            !without.contains("mountPoint: \"/opt/faculties\""),
+            "no faculties mount when unconfigured:\n{without}"
+        );
+        assert!(
+            !without.contains("export PATH=\"/opt/faculties:$PATH\""),
+            "no faculties PATH export when unconfigured:\n{without}"
+        );
+        // PILE is still exported (faculties-independent).
+        assert!(without.contains("export PILE='/pile/self.pile'"));
+        assert!(!without.contains("__FACULTIES_MOUNT__"));
+        assert!(!without.contains("__FACULTIES_PATH_EXPORT__"));
+    }
 
     /// End-to-end regression for the pipe deadlock through a *real* Lima VM:
     /// with the old poll-then-collect exec, any command producing more than a

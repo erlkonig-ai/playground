@@ -22,6 +22,7 @@
 //!   but cannot truncate it. This is the structural fix for the 2026-07 pile
 //!   truncation incident.
 
+pub mod faculties;
 pub mod jail;
 pub mod lima;
 pub mod proc;

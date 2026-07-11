@@ -63,6 +63,31 @@
 //! system-append flag, un-clearable inside a jail at securelevel >= 1), the
 //! jail analogue of the Lima template's `guest_pile_setup`. Do NOT wire a pile
 //! path to the server before that decision.
+//!
+//! ## FACULTY PROVISIONING (follow-on, not yet implemented here)
+//!
+//! The Lima backend stages faculty CLIs into each session (a prebuilt
+//! Linux-aarch64 bundle mounted at `/opt/faculties` + on PATH, with `PILE` set;
+//! see [`super::faculties`] and `render_config` in [`super::lima`]). The jail
+//! backend does NOT do this yet — and until the pile lands on the server it is
+//! only half-useful (a faculty with no pile can print `--help` but not operate).
+//! The clean equivalent, to implement alongside (a)/(b) above:
+//!
+//!   1. Build the faculties for **FreeBSD/aarch64** (or amd64 to match the jail
+//!      host) once — `cargo build --release --no-default-features` for the same
+//!      allow-list ([`super::faculties::SESSION_FACULTIES`]) — and **bake the
+//!      resulting binaries into the ZFS template** (`template@base`), e.g. under
+//!      `/opt/faculties`, so every `zfs clone` inherits them for free (no
+//!      per-session copy; copy-on-write shares the blocks). Re-snapshot the
+//!      template when the faculties change.
+//!   2. Seed PATH + `PILE` in the session's `/etc/profile` exactly as the Lima
+//!      template does (the `open_session` `/etc/profile` seed already writes the
+//!      env block — add `export PATH=/opt/faculties:$PATH` and, once the pile is
+//!      mounted, `export PILE=<guest pile path>` there).
+//!
+//! This is a template-baking change plus two profile lines, not new backend
+//! surface — deliberately deferred to keep it paired with the pile-mount
+//! decision, since a pile-less faculty is not yet worth staging.
 
 use std::process::{Command, Stdio};
 use std::time::Duration;

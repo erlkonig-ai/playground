@@ -4,11 +4,22 @@
 # systemd service that polls the pile), this template provisions a plain shell
 # VM that the host drives with `limactl shell <instance> -- sh -lc <cmd>`.
 #
-# The pile is mounted WRITABLE (append is required) but is made APPEND-ONLY
-# guest-side on first boot via `chattr +a` — the __GUEST_PILE_SETUP__ marker
-# below is replaced by src/sandbox/lima.rs::guest_pile_setup(). This is the
-# structural fix for the 2026-07 pile-truncation incident: append works, but
-# O_TRUNC/unlink/rename fail with EPERM inside the guest.
+# The pile is mounted WRITABLE (append is required). A guest-side `chattr +a`
+# (injected by src/sandbox/lima.rs::guest_pile_setup()) *attempts* append-only
+# enforcement, but virtiofs does not support inode flags so it is a no-op today
+# (see that fn's doc for the measurement + the follow-on options). Sessions are
+# currently trusted not to truncate their own pile, not prevented from it.
+#
+# Faculties (wiki/compass/orient/message/files/teams/... CLI binaries) are staged
+# by mounting a host directory of prebuilt Linux-aarch64 faculty binaries at
+# /opt/faculties (read-only) and putting it on PATH, with PILE pointing at the
+# mounted pile. So `compass list` / `wiki search X` run in a session resolve and
+# operate on the session's mounted pile. src/sandbox/lima.rs::render_config fills
+# the placeholders below (a no-op when no faculties bundle is configured).
+#
+# NOTE: placeholder tokens are substituted by a GLOBAL string replace, so the
+# `__TOKEN__` names must never appear in this prose or they would be clobbered
+# here too.
 
 images:
   - location: "https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-arm64.img"
@@ -27,6 +38,7 @@ mounts:
   - location: "__PILE_ROOT__"
     mountPoint: "/pile"
     writable: true
+__FACULTIES_MOUNT__
 
 provision:
   - mode: system
@@ -34,14 +46,22 @@ provision:
       set -eu
       echo "[playground-sandbox] system provision start"
       apt-get update
-      apt-get install -y --no-install-recommends ca-certificates curl e2fsprogs
+      # libasound2: the faculty binaries link alsa-sys (via rodio, used for
+      # audio device enumeration), so the runtime ALSA lib must be present or
+      # they fail to load. e2fsprogs provides chattr for the append-only pile.
+      apt-get install -y --no-install-recommends ca-certificates curl e2fsprogs libasound2
       ln -sfn __PILE_PATH__ /self.pile
       echo "[playground-sandbox] system provision done"
   - mode: system
     script: |
       set -eu
       # Seed session environment for every login shell (`sh -l` sources this).
+      # PILE (mounted pile guest path) + the faculties dir on PATH are seeded
+      # here too, so a faculty CLI run in any session resolves and operates on
+      # the session's mounted pile.
       cat >/etc/profile.d/playground-session.sh <<'ENVEOF'
+      __FACULTIES_PATH_EXPORT__
+      export PILE='__PILE_PATH__'
       __SESSION_ENV__
       ENVEOF
   - mode: user

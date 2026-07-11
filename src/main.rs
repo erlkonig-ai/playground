@@ -15,7 +15,7 @@
 
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 
 mod mcp;
@@ -56,6 +56,12 @@ struct McpArgs {
     /// Lima session template (defaults to scripts/lima-session.yaml.tmpl).
     #[arg(long)]
     template: Option<PathBuf>,
+    /// Lima backend: host path to the `faculties` crate. When set, its CLI
+    /// binaries are built for Linux-aarch64 (once, cached) and staged into every
+    /// session on PATH with `PILE` pointing at the mounted pile, so `compass
+    /// list` / `wiki search X` run in a session operate on its pile.
+    #[arg(long, env = "PLAYGROUND_FACULTIES_SRC")]
+    faculties_src: Option<PathBuf>,
     /// Jail backend: SSH host that runs the jails (needs BatchMode keys +
     /// non-interactive root via `sudo -n`).
     #[arg(long, default_value = "<jail-host>")]
@@ -97,17 +103,19 @@ impl McpBackendKind {
     }
 
     /// Build the concrete backend this kind selects.
+    #[allow(clippy::too_many_arguments)]
     fn build(
         self,
         instance_prefix: String,
         state_root: Option<PathBuf>,
         template: Option<PathBuf>,
+        faculties_src: Option<PathBuf>,
         jail_host: String,
         jail_local: bool,
         jail_prefix: String,
         jail_template_snapshot: String,
         jail_dataset_parent: String,
-    ) -> Box<dyn sandbox::SandboxBackend> {
+    ) -> Result<Box<dyn sandbox::SandboxBackend>> {
         match self {
             McpBackendKind::Lima => {
                 let mut backend = sandbox::lima::LimaBackend::new(instance_prefix);
@@ -115,7 +123,17 @@ impl McpBackendKind {
                     backend.state_root = root;
                 }
                 backend.template = template;
-                Box::new(backend)
+                // Stage faculties: build (once, cached) a Linux-aarch64 bundle
+                // and hand its host path to the backend, which mounts it into
+                // every session on PATH with PILE set. Done up front (not per
+                // session) so the slow build happens at server start.
+                if let Some(src) = faculties_src {
+                    let builder = format!("{}-faculties-builder", backend.instance_prefix);
+                    let bundle = sandbox::faculties::ensure_faculties_bundle(&src, &builder)
+                        .context("provision faculties bundle for sandbox sessions")?;
+                    backend.faculties_bundle = Some(bundle);
+                }
+                Ok(Box::new(backend))
             }
             McpBackendKind::Jail => {
                 let mut backend = if jail_local {
@@ -126,7 +144,7 @@ impl McpBackendKind {
                 backend.jail_prefix = jail_prefix;
                 backend.template_snapshot = jail_template_snapshot;
                 backend.dataset_parent = jail_dataset_parent;
-                Box::new(backend)
+                Ok(Box::new(backend))
             }
         }
     }
@@ -164,6 +182,11 @@ struct McpHttpArgs {
     /// Lima session template (defaults to scripts/lima-session.yaml.tmpl).
     #[arg(long)]
     template: Option<PathBuf>,
+    /// Lima backend: host path to the `faculties` crate. When set, its CLI
+    /// binaries are built for Linux-aarch64 (once, cached) and staged into every
+    /// session on PATH with `PILE` set to the mounted pile.
+    #[arg(long, env = "PLAYGROUND_FACULTIES_SRC")]
+    faculties_src: Option<PathBuf>,
     /// Jail backend: SSH host that runs the jails (needs BatchMode keys +
     /// non-interactive root via `sudo -n`).
     #[arg(long, default_value = "<jail-host>")]
@@ -251,12 +274,13 @@ fn run_mcp(args: McpArgs) -> Result<()> {
         args.instance_prefix,
         args.state_root,
         args.template,
+        args.faculties_src,
         args.jail_host,
         args.jail_local,
         args.jail_prefix,
         args.jail_template_snapshot,
         args.jail_dataset_parent,
-    );
+    )?;
 
     let provider = mcp::SandboxProvider::new(backend);
     let server = mcp::McpServer::new(provider);
@@ -274,12 +298,13 @@ fn run_mcp_http(args: McpHttpArgs) -> Result<()> {
         args.instance_prefix,
         args.state_root,
         args.template,
+        args.faculties_src,
         args.jail_host,
         args.jail_local,
         args.jail_prefix,
         args.jail_template_snapshot,
         args.jail_dataset_parent,
-    );
+    )?;
 
     let tokens = mcp_http::TokenStore::load(&args.tokens)?;
     let usable = tokens
