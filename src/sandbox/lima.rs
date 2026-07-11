@@ -32,16 +32,15 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 
+use super::proc::drive_child;
 use super::{ExecRequest, ExecResult, SandboxBackend, SessionId, SessionSpec};
 
 /// Default per-command timeout when an [`ExecRequest`] does not specify one.
 const DEFAULT_EXEC_TIMEOUT: Duration = Duration::from_secs(300);
-/// Poll cadence while waiting for a `limactl shell` child to finish.
-const EXEC_POLL: Duration = Duration::from_millis(50);
 
 /// Lima-instance-backed sandbox. One [`SessionId`] maps to one Lima instance
 /// name.
@@ -229,41 +228,21 @@ impl SandboxBackend for LimaBackend {
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
 
-        let mut child = cmd.spawn().context("spawn limactl shell")?;
+        let child = cmd.spawn().context("spawn limactl shell")?;
 
-        if let Some(bytes) = &request.stdin {
-            use std::io::Write;
-            if let Some(mut handle) = child.stdin.take() {
-                let _ = handle.write_all(bytes);
-            }
-        }
-
+        // Concurrent stdin-feed + stdout/stderr drain (super::proc): a command
+        // pushing more than a pipe buffer of output — or consuming more than a
+        // pipe buffer of stdin — must not deadlock against the timeout loop.
         let timeout = request.timeout.unwrap_or(DEFAULT_EXEC_TIMEOUT);
-        let deadline = Instant::now() + timeout;
-        let mut timed_out = false;
-        loop {
-            match child.try_wait().context("wait on limactl shell")? {
-                Some(_) => break,
-                None => {
-                    if Instant::now() >= deadline {
-                        timed_out = true;
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        break;
-                    }
-                    std::thread::sleep(EXEC_POLL);
-                }
-            }
-        }
+        let out = drive_child(child, request.stdin.clone(), timeout)?;
 
-        let output = child.wait_with_output().context("collect limactl shell output")?;
         let mut result = ExecResult {
-            stdout: output.stdout,
-            stderr: output.stderr,
-            exit_code: output.status.code(),
+            stdout: out.stdout,
+            stderr: out.stderr,
+            exit_code: out.exit_code,
             error: None,
         };
-        if timed_out {
+        if out.timed_out {
             result.exit_code = Some(124);
             result.error = Some(format!("command timed out after {timeout:?}"));
         }
@@ -321,4 +300,73 @@ pub fn guest_pile_setup(guest_pile: &Path) -> Vec<String> {
             guest_pile.display()
         ),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sandbox::{PileMount, Tenant};
+
+    /// End-to-end regression for the pipe deadlock through a *real* Lima VM:
+    /// with the old poll-then-collect exec, any command producing more than a
+    /// pipe buffer (~64 KiB) of output blocked forever and surfaced as a
+    /// spurious exit-124 timeout. The pure drain logic is covered everywhere
+    /// by `crate::sandbox::proc::tests`; this test additionally proves the
+    /// `limactl shell` wiring. It boots (and tears down) a throwaway VM, so it
+    /// is gated: run with `SANDBOX_LIMA_TESTS=1 cargo test lima_exec`.
+    #[test]
+    fn lima_exec_survives_output_larger_than_a_pipe_buffer() {
+        if std::env::var("SANDBOX_LIMA_TESTS").as_deref() != Ok("1") {
+            eprintln!("skipping: set SANDBOX_LIMA_TESTS=1 to run (boots a real Lima VM)");
+            return;
+        }
+
+        // Scratch pile in a scratch dir — the Lima template mounts the pile's
+        // parent directory into the guest.
+        let scratch = std::env::temp_dir().join(format!(
+            "playground-lima-pipe-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&scratch).expect("create scratch dir");
+        let pile_path = scratch.join("test.pile");
+        std::fs::write(&pile_path, b"").expect("create scratch pile");
+
+        let backend = LimaBackend::new("playground-sbxtest");
+        let spec = SessionSpec {
+            tenant: Tenant {
+                label: "pipes".to_string(),
+                pile: PileMount {
+                    host_path: pile_path,
+                    guest_path: PathBuf::from("/pile/test.pile"),
+                    append_only: true,
+                },
+            },
+            cwd: None,
+            env: vec![],
+        };
+
+        let id = backend.open_session(&spec).expect("open lima session");
+        // 256 KiB of 'a' — several pipe buffers deep.
+        let req = ExecRequest {
+            command: "dd if=/dev/zero bs=1024 count=256 2>/dev/null | tr '\\0' 'a'".to_string(),
+            cwd: None,
+            stdin: None,
+            timeout: Some(Duration::from_secs(120)),
+        };
+        let result = backend.exec(&id, &req);
+        // Tear the VM down before asserting so a failure doesn't leak it.
+        let _ = backend.close_session(&id);
+        let _ = std::fs::remove_dir_all(&scratch);
+
+        let result = result.expect("exec");
+        assert_eq!(
+            result.exit_code,
+            Some(0),
+            "error: {:?}, stderr: {}",
+            result.error,
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(result.stdout.len(), 256 * 1024);
+        assert!(result.stdout.iter().all(|&b| b == b'a'));
+    }
 }

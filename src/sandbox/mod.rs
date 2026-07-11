@@ -24,6 +24,7 @@
 
 pub mod jail;
 pub mod lima;
+pub mod proc;
 
 use std::path::PathBuf;
 use std::time::Duration;
