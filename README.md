@@ -1,200 +1,80 @@
-# Playground
+# Playground — the sandbox-MCP provider
 
-## Diagnostics
+`playground` provisions isolated, stateful shells and exposes them over the
+[Model Context Protocol](https://modelcontextprotocol.io/). It is the **sandbox
+layer** (layer 3 of 4: Substrate / Verbs / **Sandbox** / Drive) — the exec
+transport a driver (the `drive` crate, the being's realtime cognition loop, or
+any MCP client) calls to run shell commands in a sandbox.
 
-Run the diagnostics dashboard to observe a pile:
+The cognition machinery — the model loop, context assembly, memory — lives in
+the `drive` crate now. This crate is only the provider.
 
-```bash
-cargo run --manifest-path playground/Cargo.toml -- diagnostics
-```
+## The MCP surface
 
-The dashboard defaults to `./personas/<instance>/pile/self.pile` (instance defaults to `playground`)
-and branch `cognition`; change the path or branch in the UI if
-your VM writes elsewhere.
+Because a shell is **stateful** (cwd, env, running processes), the surface is a
+session model, exposed as three tools:
 
-Prefill the dashboard with a pile path:
+- `open_session` — provision a sandbox bound to a pile (append-only) and a
+  tenant, and return a session id.
+- `exec` — run a shell command inside an open session (cwd/env persist across
+  calls).
+- `close_session` — tear the sandbox down.
 
-```bash
-cargo run --manifest-path playground/Cargo.toml -- --pile /path/to/self.pile diagnostics
-```
+Every session a connection opens is torn down when the connection ends (client
+EOF/disconnect) or the process is signalled (SIGINT/SIGTERM), so a crashed or
+disconnected client can never leak a VM or jail.
 
-## Notebooks
+## Backends
 
-Run the conceptual compaction notebook to explore carry merges as new messages are added:
+- **Lima** (`--backend lima`, default): a local Lima VM per session on a macOS
+  host. The pile is mounted append-only into the session.
+- **Jail** (`--backend jail`): a FreeBSD jail per session on a remote host over
+  SSH (or locally with `--jail-local`). Pile-less v1 — see the trust boundary
+  in `src/sandbox/jail.rs`.
 
-```bash
-cargo run --manifest-path playground/Cargo.toml --example compaction_lsm
-```
+## Serving
 
-## Running Playground
-
-Run core + LLM + Lima exec. Defaults to `./personas/<instance>/pile/self.pile`:
-
-```bash
-cargo run --manifest-path playground/Cargo.toml -- run
-```
-
-Point at a specific pile path:
-
-```bash
-cargo run --manifest-path playground/Cargo.toml -- --pile /path/to/pile/self.pile run
-```
-
-Run core + LLM and start the exec worker inside a Lima VM (macOS):
+Serve over stdio (JSON-RPC 2.0), operator-local and unauthenticated:
 
 ```bash
-cargo run --manifest-path playground/Cargo.toml --bin playground -- \
-  --pile /path/to/pile/self.pile run
+cargo run --manifest-path playground/Cargo.toml -- mcp
+cargo run --manifest-path playground/Cargo.toml -- mcp --backend jail --jail-local
 ```
 
-Run the core loop only (no LLM/exec workers):
+Serve over Streamable-HTTP with per-sandbox bearer-token auth (feature
+`mcp-http`, on by default) — the multi-tenant, internet-facing transport:
 
 ```bash
-cargo run --manifest-path playground/Cargo.toml -- --pile /path/to/pile/self.pile core
+cargo run --manifest-path playground/Cargo.toml -- mcp-http --tokens ./tokens.json
 ```
 
-Run the LLM worker only (split-host setups or local testing):
+Bind is loopback by default; internet exposure is expected to go behind a
+TLS-terminating reverse proxy (this server speaks plain HTTP only). See
+`src/mcp_http.rs` for the protocol and auth model.
+
+## Tokens (for `mcp-http`)
+
+Bearer tokens are minted into a JSON store and bound to a tenant + backend. The
+token is printed once, then only lives in the store:
 
 ```bash
-cargo run --manifest-path playground/Cargo.toml --bin playground -- --pile /path/to/pile/self.pile llm
+cargo run --manifest-path playground/Cargo.toml -- \
+  token mint --tenant alice --backend lima --tokens ./tokens.json
 ```
 
-Run the exec worker only (VM/split-host setups):
+`PLAYGROUND_MCP_TOKENS` sets the default store path for both `token mint` and
+`mcp-http`.
+
+## Deployment
+
+`deploy/freebsd/` holds the FreeBSD server profile: an rc.d service that runs
+`mcp-http --backend jail --jail-local` with `--no-default-features
+--features mcp-http` (no Burn/wgpu stack). See `deploy/freebsd/README.md`.
+
+## Build profiles
 
 ```bash
-cargo run --manifest-path playground/Cargo.toml --bin playground -- --pile /path/to/pile/self.pile exec
+cargo build                       # default: mcp + mcp-http + token
+cargo build --no-default-features # stdio mcp only (no tokio/axum)
+cargo test
 ```
-
-## Memory backfill (independent of requests)
-
-Estimate pending compaction work (archive by default):
-
-```bash
-cargo run --manifest-path playground/Cargo.toml -- --pile /path/to/pile/self.pile memory estimate
-```
-
-Include pending exec leaves in the estimate:
-
-```bash
-cargo run --manifest-path playground/Cargo.toml -- --pile /path/to/pile/self.pile memory estimate --include-exec
-```
-
-Optionally provide pricing to get a rough USD estimate:
-
-```bash
-cargo run --manifest-path playground/Cargo.toml -- --pile /path/to/pile/self.pile \
-  memory estimate \
-  --input-cost-per-1m-tokens 2.0 \
-  --output-cost-per-1m-tokens 6.0 \
-  --cost-currency EUR
-```
-
-Backfill context memory chunks without creating LLM requests:
-
-```bash
-cargo run --manifest-path playground/Cargo.toml -- --pile /path/to/pile/self.pile memory build
-```
-
-Cap archive ingestion per run (useful for staged backfills):
-
-```bash
-cargo run --manifest-path playground/Cargo.toml -- --pile /path/to/pile/self.pile \
-  memory build --max-archive-leaves 500
-```
-
-## Config in the pile
-
-Playground stores its configuration inside the pile. Use the `config` subcommand to inspect or update it:
-
-```bash
-cargo run --manifest-path playground/Cargo.toml -- --pile /path/to/pile/self.pile config show
-cargo run --manifest-path playground/Cargo.toml -- --pile $PILE config set poll-ms 100
-cargo run --manifest-path playground/Cargo.toml -- --pile $PILE config set memory-compaction-arity 8
-```
-
-All faculties honor the `PILE` environment variable, so export it once
-per shell and skip the `--pile` flag on every call:
-
-```bash
-export PILE=/path/to/pile/self.pile
-```
-
-Prompts can also be loaded from files:
-
-```bash
-cargo run --manifest-path playground/Cargo.toml -- --pile $PILE config set system-prompt @./system_prompt.txt
-./faculties/headspace.rs lens set factual prompt @./memory_lens_factual.txt
-./faculties/headspace.rs lens set factual compaction-prompt @./memory_lens_factual_compaction.txt
-./faculties/headspace.rs lens add reflective --prompt @./memory_lens_reflective.txt --compaction-prompt @./memory_lens_reflective_compaction.txt --max-output-tokens 160
-./faculties/headspace.rs lens list
-```
-
-Use `@-` to read a value from stdin (for both `playground config set` and `headspace` value fields).
-
-Prompt files in `playground/prompts/*.md` are generated from templates in
-`playground/prompts/templates/*.tmpl.md`. Re-render after editing templates or shared fragments:
-
-```bash
-python3 playground/scripts/render_prompts.py
-python3 playground/scripts/render_prompts.py --check
-```
-
-You can pin branch ids in config (recommended) so faculties resolve stable branch identities:
-
-```bash
-cargo run --manifest-path playground/Cargo.toml -- --pile $PILE config set compass-branch-id <hex-id>
-cargo run --manifest-path playground/Cargo.toml -- --pile $PILE config set local-messages-branch-id <hex-id>
-cargo run --manifest-path playground/Cargo.toml -- --pile $PILE config set relations-branch-id <hex-id>
-```
-
-Clear an optional config field:
-
-```bash
-./faculties/headspace.rs lens reset factual prompt
-./faculties/headspace.rs lens remove reflective
-```
-
-Manage LLM profiles (headspaces):
-
-```bash
-./faculties/headspace.rs list
-./faculties/headspace.rs add "oss-120" --model gpt-oss:120b --base-url http://localhost:11434/v1/responses
-./faculties/headspace.rs use oss-120
-./faculties/headspace.rs set reasoning-effort medium
-./faculties/headspace.rs set api-key sk-...
-```
-
-LLM/headspace settings (model/base-url/reasoning/api-key, compaction profile, and memory lenses)
-are managed by the `headspace` faculty. Compaction merge arity is runtime config.
-
-## Running With a VM (exec worker in VM)
-
-On macOS, use Lima to run the exec worker in a VM while the core loop + LLM worker run on the host:
-
-```bash
-cargo run --manifest-path playground/Cargo.toml -- --pile /path/to/pile/self.pile run
-```
-
-This command:
-- Creates/starts a Lima instance (default name `playground`).
-- Runs the core loop + LLM worker on the host.
-- Runs the exec worker inside the VM, pointed at the same pile.
-
-Commands executed by the exec worker receive:
-- `PILE` (active pile path),
-- `CONFIG_BRANCH_ID` (`6069A136254E1B87E4C0D2E0295DB382`),
-- `WORKER_ID` (exec worker id),
-- `TURN_ID` (current exec request id).
-
-Reason notes (useful when a model/provider does not expose reasoning output):
-
-```bash
-./faculties/reason.rs "Why this action makes sense"
-./faculties/reason.rs "Why this command now" -- git status
-```
-
-`reason` logs a structured rationale event into the active exec/cognition branch
-and (when a command is provided) then runs it.
-
-Pass a pile path as the first argument if you want a non-default location. The Lima VM is
-recreated on every run to ensure the exec environment matches the host.
