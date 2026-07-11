@@ -7,7 +7,11 @@ publish = false
 
 [features]
 default = ["diagnostics", "mcp-http"]
-diagnostics = ["dep:eframe", "dep:GORBIE", "dep:egui_plot"]
+# `faculties` is only consumed by the dashboard (src/diagnostics.rs reads the
+# faculty schemas), so it rides this feature: a `--no-default-features
+# --features mcp-http` build (the FreeBSD server profile, deploy/freebsd/)
+# stays free of the faculties -> mary/Burn stack.
+diagnostics = ["dep:eframe", "dep:GORBIE", "dep:egui_plot", "dep:faculties"]
 # In-process text generation via mary (gemma4 in Burn). Heavy (pulls Burn/Metal/wgpu);
 # off by default. Enables ModelBackend::Local to call mary::local instead of HTTP.
 local-model = ["dep:mary"]
@@ -20,13 +24,13 @@ mcp-http = ["dep:tokio", "dep:axum"]
 anyhow = "1"
 axum = { version = "0.8", optional = true, default-features = false, features = ["http1", "json", "tokio"] }
 base64 = "0.22"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 ctrlc = "3"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 eframe = { version = "0.34", optional = true, features = ["persistence", "wgpu"] }
 GORBIE = { version = "0.18", path = "../GORBIE", optional = true, features = ["triblespace", "telemetry", "typst"] }
 egui_plot = { version = "0.35", optional = true }
-faculties = { path = "../faculties" }
+faculties = { path = "../faculties", optional = true }
 hifitime = "4"
 libc = "0.2"
 mary = { path = "../mary", optional = true, default-features = false, features = ["local-model"] }

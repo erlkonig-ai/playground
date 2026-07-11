@@ -152,6 +152,11 @@ struct McpArgs {
     /// Jail backend: jail-name prefix; concrete jail is `<prefix>-<tenant>`.
     #[arg(long, default_value = "playground")]
     jail_prefix: String,
+    /// Jail backend: run zfs/jail/jexec directly on this machine instead of
+    /// over SSH (server-side hosting on the FreeBSD jail host itself;
+    /// `--jail-host` is ignored).
+    #[arg(long, default_value_t = false)]
+    jail_local: bool,
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
@@ -220,6 +225,11 @@ struct McpHttpArgs {
     /// Jail backend: jail-name prefix; concrete jail is `<prefix>-<tenant>`.
     #[arg(long, default_value = "playground")]
     jail_prefix: String,
+    /// Jail backend: run zfs/jail/jexec directly on this machine instead of
+    /// over SSH (server-side hosting on the FreeBSD jail host itself;
+    /// `--jail-host` is ignored).
+    #[arg(long, default_value_t = false)]
+    jail_local: bool,
 }
 
 #[cfg(feature = "mcp-http")]
@@ -492,7 +502,11 @@ fn run_mcp(args: McpArgs) -> Result<()> {
             Box::new(backend)
         }
         McpBackendKind::Jail => {
-            let mut backend = sandbox::jail::JailBackend::ssh(args.jail_host);
+            let mut backend = if args.jail_local {
+                sandbox::jail::JailBackend::local()
+            } else {
+                sandbox::jail::JailBackend::ssh(args.jail_host)
+            };
             backend.jail_prefix = args.jail_prefix;
             backend.template_snapshot = args.jail_template_snapshot;
             backend.dataset_parent = args.jail_dataset_parent;
@@ -522,7 +536,11 @@ fn run_mcp_http(args: McpHttpArgs) -> Result<()> {
             Box::new(backend)
         }
         McpBackendKind::Jail => {
-            let mut backend = sandbox::jail::JailBackend::ssh(args.jail_host);
+            let mut backend = if args.jail_local {
+                sandbox::jail::JailBackend::local()
+            } else {
+                sandbox::jail::JailBackend::ssh(args.jail_host)
+            };
             backend.jail_prefix = args.jail_prefix;
             backend.template_snapshot = args.jail_template_snapshot;
             backend.dataset_parent = args.jail_dataset_parent;

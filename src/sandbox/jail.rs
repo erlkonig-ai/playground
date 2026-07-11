@@ -22,15 +22,20 @@
 //!
 //! ## Host access model
 //!
-//! All server commands go through a small [`HostRunner`] trait. The production
-//! impl is [`SshRunner`] (`ssh -o BatchMode=yes <host> <command>`, root via
-//! `sudo -n`); tests use a mock runner, mirroring how `crate::mcp` tests use a
-//! mock backend. Because the backend *drives the server from wherever it
-//! runs*, `playground mcp --backend jail` works directly on the Mac — no
-//! playground binary is required on the FreeBSD side for v1. (If server-side
-//! hosting is ever wanted, a `LocalRunner` that spawns the same argv without
-//! the ssh wrapper is the only missing piece — plus building the crate on
-//! FreeBSD 15.)
+//! All server commands go through a small [`HostRunner`] trait. Two production
+//! impls exist:
+//!
+//!   - [`SshRunner`] (`ssh -o BatchMode=yes <host> <command>`, root via
+//!     `sudo -n`): the backend *drives the server from wherever it runs*, so
+//!     `playground mcp --backend jail` works directly on the Mac with no
+//!     playground binary on the FreeBSD side.
+//!   - [`LocalRunner`]: server-side hosting — the same argv spawned directly
+//!     on the jail host itself, no ssh wrapper. Selected with `--jail-local`;
+//!     this is what the `playground_mcp` rc.d service uses (see
+//!     `deploy/freebsd/`).
+//!
+//! Tests use a mock runner, mirroring how `crate::mcp` tests use a mock
+//! backend.
 //!
 //! ## Networking
 //!
@@ -59,13 +64,18 @@
 //! jail analogue of the Lima template's `guest_pile_setup`. Do NOT wire a pile
 //! path to the server before that decision.
 
-use std::io::Read;
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 
+use super::proc::drive_child;
 use super::{ExecRequest, ExecResult, SandboxBackend, SessionId, SessionSpec};
+
+/// Output of one host command, however it was transported. Local-backstop
+/// timeouts set `timed_out`; server-side `timeout(1)` expiry shows up as
+/// `exit_code == Some(124)` instead.
+pub use super::proc::ChildOutput as HostOutput;
 
 /// Default per-command timeout when an [`ExecRequest`] does not specify one.
 /// Matches `super::lima::DEFAULT_EXEC_TIMEOUT`.
@@ -76,28 +86,6 @@ const ADMIN_TIMEOUT: Duration = Duration::from_secs(120);
 /// server kill is authoritative; the local kill only fires if SSH itself
 /// wedges.
 const LOCAL_TIMEOUT_GRACE: Duration = Duration::from_secs(20);
-/// Poll cadence while waiting for a spawned host command (mirrors Lima).
-const EXEC_POLL: Duration = Duration::from_millis(50);
-
-/// Output of one host command, however it was transported.
-#[derive(Debug, Default, Clone)]
-pub struct HostOutput {
-    pub stdout: Vec<u8>,
-    pub stderr: Vec<u8>,
-    pub exit_code: Option<i32>,
-    /// True iff the *local* backstop killed the transport (server-side
-    /// `timeout(1)` expiry shows up as `exit_code == Some(124)` instead).
-    pub timed_out: bool,
-}
-
-impl HostOutput {
-    fn success(&self) -> bool {
-        !self.timed_out && self.exit_code == Some(0)
-    }
-    fn stderr_lossy(&self) -> String {
-        String::from_utf8_lossy(&self.stderr).trim().to_string()
-    }
-}
 
 /// Runs one argv on the jail host. The seam that makes [`JailBackend`]
 /// testable without a FreeBSD server (mirror of the mock-backend pattern in
@@ -108,6 +96,13 @@ pub trait HostRunner: Send + Sync {
     /// completely (drain concurrently — a full pipe must not deadlock the
     /// child).
     fn run(&self, argv: &[String], stdin: Option<&[u8]>, timeout: Duration) -> Result<HostOutput>;
+
+    /// Exit code that means "the transport itself failed", as opposed to the
+    /// host command's own status. `ssh` reserves 255 for this; a local spawn
+    /// has no separate transport, so the default is `None`.
+    fn transport_error_exit(&self) -> Option<i32> {
+        None
+    }
 }
 
 /// Production runner: `ssh -o BatchMode=yes -o ConnectTimeout=<n> <host> <cmd>`.
@@ -146,56 +141,41 @@ impl HostRunner for SshRunner {
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
 
-        let mut child = cmd.spawn().context("spawn ssh")?;
+        let child = cmd.spawn().context("spawn ssh")?;
 
-        if let Some(bytes) = stdin {
-            use std::io::Write;
-            if let Some(mut handle) = child.stdin.take() {
-                let _ = handle.write_all(bytes);
-                // drop closes the pipe so the remote command sees EOF
-            }
-        }
-
-        // Drain stdout/stderr on threads while polling for exit, so a child
+        // Concurrent stdin-feed + stdout/stderr drain (super::proc, extracted
+        // from the original inline implementation here): a remote command
         // producing more than a pipe buffer of output cannot deadlock against
-        // our timeout loop (a latent flaw in the Lima poll loop, fixed here).
-        let mut out_pipe = child.stdout.take().expect("stdout piped");
-        let mut err_pipe = child.stderr.take().expect("stderr piped");
-        let out_thread = std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = out_pipe.read_to_end(&mut buf);
-            buf
-        });
-        let err_thread = std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = err_pipe.read_to_end(&mut buf);
-            buf
-        });
+        // the timeout loop.
+        drive_child(child, stdin.map(|b| b.to_vec()), timeout)
+    }
 
-        let deadline = Instant::now() + timeout;
-        let mut timed_out = false;
-        let status = loop {
-            match child.try_wait().context("wait on ssh")? {
-                Some(status) => break status,
-                None => {
-                    if Instant::now() >= deadline {
-                        timed_out = true;
-                        let _ = child.kill();
-                        break child.wait().context("reap killed ssh")?;
-                    }
-                    std::thread::sleep(EXEC_POLL);
-                }
-            }
+    fn transport_error_exit(&self) -> Option<i32> {
+        Some(255) // ssh reserves 255 for its own failures
+    }
+}
+
+/// Server-side hosting runner: spawn the argv directly on this machine (which
+/// *is* the jail host), no ssh wrapper and no re-quoting — the argv reaches
+/// `execve` verbatim. Everything else (root via `sudo -n`, the command
+/// vocabulary, the namespace guard) is identical to [`SshRunner`], so the two
+/// are interchangeable behind [`JailBackend`].
+#[derive(Debug, Clone, Default)]
+pub struct LocalRunner;
+
+impl HostRunner for LocalRunner {
+    fn run(&self, argv: &[String], stdin: Option<&[u8]>, timeout: Duration) -> Result<HostOutput> {
+        let Some((program, args)) = argv.split_first() else {
+            bail!("empty argv");
         };
+        let mut cmd = Command::new(program);
+        cmd.args(args);
+        cmd.stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() });
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
 
-        let stdout = out_thread.join().unwrap_or_default();
-        let stderr = err_thread.join().unwrap_or_default();
-        Ok(HostOutput {
-            stdout,
-            stderr,
-            exit_code: status.code(),
-            timed_out,
-        })
+        let child = cmd.spawn().with_context(|| format!("spawn {program}"))?;
+        drive_child(child, stdin.map(|b| b.to_vec()), timeout)
     }
 }
 
@@ -236,6 +216,14 @@ impl JailBackend {
     /// Backend talking to `host` over SSH with the default namespace layout.
     pub fn ssh(host: impl Into<String>) -> Self {
         JailBackend::with_runner(Box::new(SshRunner::new(host)))
+    }
+
+    /// Backend running directly on the FreeBSD jail host itself (server-side
+    /// hosting): same commands, no ssh hop. Requires non-interactive root via
+    /// `sudo -n` for the invoking user (or running as root, where `sudo -n`
+    /// is a pass-through).
+    pub fn local() -> Self {
+        JailBackend::with_runner(Box::new(LocalRunner))
     }
 
     /// Backend over an explicit runner (tests inject a mock here).
@@ -459,9 +447,10 @@ impl SandboxBackend for JailBackend {
             // Mirror LimaBackend: timeouts surface as exit 124 + error text.
             result.exit_code = Some(124);
             result.error = Some(format!("command timed out after {timeout:?}"));
-        } else if out.exit_code == Some(255) {
-            // ssh transport failure (not the remote command's own exit code).
-            result.error = Some(format!("ssh transport error: {}",
+        } else if out.exit_code.is_some() && out.exit_code == self.runner.transport_error_exit() {
+            // Transport failure (e.g. ssh's reserved exit 255), not the host
+            // command's own exit code. Never fires for LocalRunner.
+            result.error = Some(format!("transport error: {}",
                 String::from_utf8_lossy(&result.stderr).trim()));
         }
         Ok(result)
@@ -600,6 +589,60 @@ mod tests {
         assert_eq!(shell_quote("plain"), "'plain'");
         assert_eq!(shell_quote("it's"), "'it'\\''s'");
         assert_eq!(shell_quote(""), "''");
+    }
+
+    /// LocalRunner really spawns the argv on this machine: argv reaches the
+    /// process verbatim (no shell re-parse), stdin is fed, both output
+    /// streams and the exit code come back. (Pipe-buffer-sized payloads and
+    /// timeout kills are covered by `super::super::proc`'s own tests.)
+    #[test]
+    fn local_runner_spawns_argv_directly() {
+        let runner = LocalRunner;
+        let argv: Vec<String> = ["/bin/sh", "-c", "cat; printf err >&2; exit 3"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let out = runner
+            .run(&argv, Some(b"space out"), Duration::from_secs(10))
+            .expect("run");
+        assert!(!out.timed_out);
+        assert_eq!(out.exit_code, Some(3));
+        // "space out" arrives as one argv element / one stdin write — a shell
+        // re-parse (the ssh path) would have needed quoting.
+        assert_eq!(out.stdout, b"space out");
+        assert_eq!(out.stderr_lossy(), "err");
+        // A local spawn has no transport that can fail separately.
+        assert_eq!(runner.transport_error_exit(), None);
+    }
+
+    /// Exit 255 is a *transport* error only where a transport exists (ssh).
+    /// For a runner without one (LocalRunner, and this mock via the trait
+    /// default) it is an ordinary exit code and must not grow an error.
+    #[test]
+    fn exec_maps_exit_255_per_runner_transport() {
+        assert_eq!(LocalRunner.transport_error_exit(), None);
+        assert_eq!(SshRunner::new("h").transport_error_exit(), Some(255));
+
+        let (backend, _mock) = MockRunner::default()
+            .reply(
+                &["sudo", "-n", "timeout"],
+                HostOutput {
+                    exit_code: Some(255),
+                    ..Default::default()
+                },
+            )
+            .into_backend();
+        let req = ExecRequest {
+            command: "exit 255".to_string(),
+            cwd: None,
+            stdin: None,
+            timeout: None,
+        };
+        let result = backend
+            .exec(&SessionId::new("playground-alice"), &req)
+            .expect("exec");
+        assert_eq!(result.exit_code, Some(255));
+        assert!(result.error.is_none(), "no transport, no transport error");
     }
 
     #[test]
