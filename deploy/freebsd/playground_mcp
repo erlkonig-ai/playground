@@ -1,0 +1,56 @@
+#!/bin/sh
+#
+# PROVIDE: playground_mcp
+# REQUIRE: NETWORKING FILESYSTEMS zfs
+# KEYWORD: shutdown
+#
+# playground sandbox-MCP provider: Streamable-HTTP MCP on loopback, FreeBSD
+# jail backend run locally on this host (`--backend jail --jail-local`).
+# See deploy/freebsd/README.md for the full build/install/verify recipe.
+#
+# Install:
+#   install -o root -g wheel -m 0555 playground_mcp /usr/local/etc/rc.d/playground_mcp
+#   sysrc playground_mcp_enable=YES
+#   service playground_mcp start
+#
+# rc.conf knobs (defaults below):
+#   playground_mcp_enable  : YES to run at boot
+#   playground_mcp_bind    : listen address. KEEP THIS LOOPBACK unless a
+#                            TLS-terminating reverse proxy fronts the server
+#                            (the daemon speaks plain HTTP; exposure is a
+#                            deliberate, separate decision).
+#   playground_mcp_tokens  : bearer-token store, minted with
+#                            `playground token mint --backend jail` (0600).
+#   playground_mcp_binary  : path to the playground binary.
+#   playground_mcp_logfile : server stdout/stderr.
+#   playground_mcp_flags   : extra args appended to `playground mcp-http`
+#                            (e.g. --jail-dataset-parent, --idle-timeout-secs).
+
+. /etc/rc.subr
+
+name=playground_mcp
+rcvar=playground_mcp_enable
+
+load_rc_config $name
+
+: ${playground_mcp_enable:="NO"}
+: ${playground_mcp_bind:="127.0.0.1:8377"}
+: ${playground_mcp_tokens:="/usr/local/etc/playground/tokens.json"}
+: ${playground_mcp_binary:="/usr/local/bin/playground"}
+: ${playground_mcp_logfile:="/var/log/playground_mcp.log"}
+: ${playground_mcp_flags:=""}
+
+# The jail backend shells out to `sudo -n zfs/jail/jexec ...`; sudo is a
+# package binary (/usr/local/bin), which the rc environment's PATH lacks.
+export PATH="/usr/local/sbin:/usr/local/bin:${PATH}"
+
+pidfile="/var/run/${name}.pid"
+command="/usr/sbin/daemon"
+command_args="-f -R 5 -P ${pidfile} -o ${playground_mcp_logfile} \
+    ${playground_mcp_binary} mcp-http \
+    --backend jail --jail-local \
+    --bind ${playground_mcp_bind} \
+    --tokens ${playground_mcp_tokens} \
+    ${playground_mcp_flags}"
+
+run_rc_command "$1"
