@@ -21,13 +21,15 @@
 //!     [`McpServer::handle_request`] directly and does tenant authorization
 //!     *before* dispatch.
 //!
-//! ## No MCP crate dependency (deliberate)
+//! ## Hand-rolled JSON-RPC (deliberate)
 //!
-//! The official Rust SDK [`rmcp`](https://crates.io/crates/rmcp) is
-//! tokio/async and large. The JSON-RPC surface here is small enough to
-//! hand-roll over `serde_json` (already a dependency); the HTTP transport
-//! bridges to this blocking core with `tokio::task::spawn_blocking` rather
-//! than rewriting the provider async.
+//! The MCP surface this provider exposes is three tools and a handful of
+//! lifecycle methods — small enough to hand-roll over `serde_json` (already a
+//! dependency) instead of pulling the official Rust SDK
+//! [`rmcp`](https://crates.io/crates/rmcp). Keeping the surface tiny and
+//! explicit is worth more here than SDK conformance machinery we would not use.
+//! The HTTP transport bridges to this blocking core with
+//! `tokio::task::spawn_blocking` rather than rewriting the provider async.
 
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
@@ -120,6 +122,37 @@ impl SandboxProvider {
             .expect("sessions poisoned")
             .remove(session);
         Ok(())
+    }
+
+    /// Tear down every session this provider still has open, best-effort.
+    ///
+    /// This is the leak backstop: when a connection ends (stdio EOF/disconnect)
+    /// or the process is asked to stop, every sandbox the connection opened must
+    /// be released so a crashed or disconnected client can never orphan a VM or
+    /// jail. Failures to close an individual session are logged to stderr and do
+    /// not abort the sweep — a backend hiccup on one session must not strand the
+    /// rest. The session registry is left empty regardless.
+    ///
+    /// Returns the number of sessions that failed to close cleanly (0 on a full
+    /// teardown).
+    pub fn close_all_sessions(&self) -> usize {
+        // Drain the registry under the lock, then close each entry without
+        // holding it (backend close can block on limactl/ssh).
+        let sessions: Vec<SessionId> = {
+            let mut guard = self.sessions.lock().expect("sessions poisoned");
+            guard.drain().map(|(id, _)| id).collect()
+        };
+        let mut failed = 0usize;
+        for id in &sessions {
+            if let Err(e) = self.backend.close_session(id) {
+                failed += 1;
+                eprintln!(
+                    "playground mcp: failed to close session {} on teardown: {e:#}",
+                    id.as_str()
+                );
+            }
+        }
+        failed
     }
 
     /// The tenant label a live session belongs to, or `None` if this provider
@@ -263,14 +296,53 @@ impl McpServer {
         &self.provider
     }
 
-    /// Run the request/response loop until the transport reports EOF.
-    pub fn serve(&self, transport: &mut dyn McpTransport) -> Result<()> {
+    /// Run the request/response loop until the transport reports EOF or errors.
+    ///
+    /// On *any* exit — clean EOF, a read/write error, or the loop unwinding —
+    /// every session this server opened is torn down (best-effort). This is the
+    /// leak backstop: a client that disconnects mid-session (or crashes) must
+    /// not orphan a VM/jail. See [`SandboxProvider::close_all_sessions`].
+    pub fn serve_loop(&self, transport: &mut dyn McpTransport) -> Result<()> {
+        let outcome = self.serve_inner(transport);
+        // Teardown runs on both the happy path and the error path.
+        self.provider.close_all_sessions();
+        outcome
+    }
+
+    fn serve_inner(&self, transport: &mut dyn McpTransport) -> Result<()> {
         while let Some(request) = transport.read_message()? {
             if let Some(response) = self.handle_request(&request) {
                 transport.write_message(&response)?;
             }
         }
         Ok(())
+    }
+
+    /// Serve the stdio transport with signal-safe teardown.
+    ///
+    /// Beyond [`serve_loop`](Self::serve_loop)'s EOF/error teardown, this
+    /// installs a SIGINT/SIGTERM handler that tears down all open sessions and
+    /// exits the process — so `Ctrl+C` or a `kill` on the server never leaks a
+    /// sandbox either. The signal handler needs `'static` access to the
+    /// provider, hence the `Arc<Self>`.
+    pub fn serve_stdio(
+        self,
+        transport: &mut StdioTransport<
+            std::io::BufReader<std::io::Stdin>,
+            std::io::Stdout,
+        >,
+    ) -> Result<()> {
+        let server = std::sync::Arc::new(self);
+        let on_signal = server.clone();
+        // On SIGINT/SIGTERM: close every open session, then exit. Best-effort;
+        // the handler runs on ctrlc's own thread, so touching the provider's
+        // Mutex is safe. Exit code mirrors "terminated cleanly".
+        let _ = ctrlc::set_handler(move || {
+            eprintln!("playground mcp: signal received — closing sessions before exit");
+            on_signal.provider.close_all_sessions();
+            std::process::exit(0);
+        });
+        server.serve_loop(transport)
     }
 
     /// Handle a single JSON-RPC message and produce the response, if any.
@@ -550,6 +622,7 @@ pub(crate) mod testing {
     #[derive(Default)]
     pub(crate) struct MockBackend {
         pub(crate) execs: Arc<AtomicUsize>,
+        pub(crate) closes: Arc<AtomicUsize>,
     }
 
     impl SandboxBackend for MockBackend {
@@ -569,6 +642,7 @@ pub(crate) mod testing {
             })
         }
         fn close_session(&self, _session: &SessionId) -> Result<()> {
+            self.closes.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
     }
@@ -600,7 +674,7 @@ mod tests {
         let server = McpServer::new(provider);
         {
             let mut transport = StdioTransport::new(input, &mut output);
-            server.serve(&mut transport).expect("serve");
+            server.serve_loop(&mut transport).expect("serve");
         }
 
         // One response line per request that carried an `id` (5 of 6; the
@@ -639,7 +713,7 @@ mod tests {
         let server = McpServer::new(provider);
         {
             let mut transport = StdioTransport::new(input, &mut output);
-            server.serve(&mut transport).expect("serve");
+            server.serve_loop(&mut transport).expect("serve");
         }
         let line: Value =
             serde_json::from_str(String::from_utf8(output).unwrap().trim()).unwrap();
@@ -648,5 +722,39 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("unknown session"));
+    }
+
+    /// MEDIUM-1 leak fix: when the transport reaches EOF with sessions still
+    /// open (the client opened a session and disconnected without closing it),
+    /// `serve_loop` tears every open session down — the connection can never
+    /// orphan a sandbox.
+    #[test]
+    fn serve_loop_closes_open_sessions_on_eof() {
+        // Two open_sessions, no close_session, then EOF (end of input).
+        let requests = [
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"open_session","arguments":{"tenant":"alice","pile_host_path":"/tmp/alice/self.pile"}}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"open_session","arguments":{"tenant":"bob","pile_host_path":"/tmp/bob/self.pile"}}}"#,
+        ]
+        .join("\n");
+
+        let closes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let backend = MockBackend {
+            closes: closes.clone(),
+            ..Default::default()
+        };
+        let provider = SandboxProvider::new(Box::new(backend));
+        let server = McpServer::new(provider);
+
+        let input = std::io::Cursor::new(requests.into_bytes());
+        let mut output: Vec<u8> = Vec::new();
+        {
+            let mut transport = StdioTransport::new(input, &mut output);
+            server.serve_loop(&mut transport).expect("serve");
+        }
+
+        // Both sessions were torn down on EOF, and the registry is now empty
+        // (a second sweep closes nothing).
+        assert_eq!(closes.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(server.provider.close_all_sessions(), 0);
     }
 }

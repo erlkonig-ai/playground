@@ -6,18 +6,11 @@ license = "Apache-2.0"
 publish = false
 
 [features]
-default = ["diagnostics", "mcp-http"]
-# `faculties` is only consumed by the dashboard (src/diagnostics.rs reads the
-# faculty schemas), so it rides this feature: a `--no-default-features
-# --features mcp-http` build (the FreeBSD server profile, deploy/freebsd/)
-# stays free of the faculties -> mary/Burn stack.
-diagnostics = ["dep:eframe", "dep:GORBIE", "dep:egui_plot", "dep:faculties"]
-# In-process text generation via mary (gemma4 in Burn). Heavy (pulls Burn/Metal/wgpu);
-# off by default. Enables ModelBackend::Local to call mary::local instead of HTTP.
-local-model = ["dep:mary"]
+default = ["mcp-http"]
 # Streamable-HTTP MCP transport (tokio + axum) with per-sandbox bearer-token
 # auth. On by default; feature-gated so `--no-default-features` builds stay
-# free of the async stack (the stdio MCP transport needs neither).
+# free of the async stack (the stdio MCP transport needs neither) — that's the
+# FreeBSD server profile in deploy/freebsd/.
 mcp-http = ["dep:tokio", "dep:axum"]
 
 [dependencies]
@@ -26,37 +19,11 @@ axum = { version = "0.8", optional = true, default-features = false, features = 
 base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
 ctrlc = "3"
-ed25519-dalek = { version = "2", features = ["rand_core"] }
-eframe = { version = "0.34", optional = true, features = ["persistence", "wgpu"] }
-GORBIE = { version = "0.18", path = "../GORBIE", optional = true, features = ["triblespace", "telemetry", "typst"] }
-egui_plot = { version = "0.35", optional = true }
-faculties = { path = "../faculties", optional = true }
-hifitime = "4"
-libc = "0.2"
-mary = { path = "../mary", optional = true, default-features = false, features = ["local-model"] }
 rand = "0.8"
-rand_core = "0.9.5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", optional = true, features = ["rt-multi-thread", "net", "time"] }
-triblespace = { version = "0.47", path = "../triblespace-rs", default-features = false }
-ureq = { version = "3", features = ["json", "rustls"] }
 
 [dev-dependencies]
-tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"] }
-
-# `[patch]` only takes effect from the root crate of a build, so mary's own
-# patch section is ignored when mary is consumed as a path dep here (the
-# `local-model` feature). Mirror it, like faculties does: the zero-copy
-# aliasing path needs the cubecl fork (adds `register_external_aliased`) and
-# the V3 256-byte-aligned local triblespace-core.
-[patch.crates-io]
-cubecl-runtime = { path = "../cubecl-fork/cubecl-runtime" }
-cubecl-wgpu = { path = "../cubecl-fork/cubecl-wgpu" }
-triblespace-core = { path = "../triblespace-rs/triblespace-core" }
-
-[[example]]
-name = "compaction_lsm"
-path = "notebooks/compaction_lsm.rs"
-required-features = ["diagnostics"]
-
+# The mcp-http integration test acts as an HTTP client against the live server.
+ureq = { version = "3", features = ["json", "rustls"] }
