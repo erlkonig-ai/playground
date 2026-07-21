@@ -11,7 +11,7 @@ default = ["mcp-http"]
 # auth. On by default; feature-gated so `--no-default-features` builds stay
 # free of the async stack (the stdio MCP transport needs neither) — that's the
 # FreeBSD server profile in deploy/freebsd/.
-mcp-http = ["dep:tokio", "dep:axum"]
+mcp-http = ["dep:tokio", "dep:axum", "dep:sha2"]
 
 [dependencies]
 anyhow = "1"
@@ -22,6 +22,8 @@ ctrlc = "3"
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# SHA-256 for PKCE S256 verification (feature mcp-http / src/oauth.rs only).
+sha2 = { version = "0.10", optional = true }
 tokio = { version = "1", optional = true, features = ["rt-multi-thread", "net", "time"] }
 
 [dev-dependencies]
