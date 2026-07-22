@@ -363,11 +363,24 @@ fn run_mcp_http(args: McpHttpArgs) -> Result<()> {
     // and a state file; clap's `requires` enforces the pairing, so a lone
     // flag never reaches here. Absent both, the server is byte-for-byte v1.
     let oauth = match (args.public_url, args.oauth_state) {
-        (Some(public_url), Some(state_path)) => Some(oauth::OauthConfig {
-            public_url,
-            state_path,
-            access_ttl: std::time::Duration::from_secs(args.oauth_access_ttl_secs),
-        }),
+        (Some(public_url), Some(state_path)) => {
+            // Cap the access-token lifetime: a misconfigured `--oauth-access-ttl
+            // -secs` must not be able to mint near-immortal bearer tokens (the
+            // long-lived path is refresh rotation, gated by theft-detection).
+            let access_ttl = std::time::Duration::from_secs(args.oauth_access_ttl_secs);
+            if access_ttl > oauth::MAX_ACCESS_TTL {
+                anyhow::bail!(
+                    "--oauth-access-ttl-secs {} exceeds the {}s (24h) maximum",
+                    args.oauth_access_ttl_secs,
+                    oauth::MAX_ACCESS_TTL.as_secs(),
+                );
+            }
+            Some(oauth::OauthConfig {
+                public_url,
+                state_path,
+                access_ttl,
+            })
+        }
         _ => None,
     };
 
@@ -409,13 +422,15 @@ fn run_token_mint(args: TokenMintArgs) -> Result<()> {
 /// whatever backend the redeeming server runs.
 #[cfg(feature = "mcp-http")]
 fn run_token_invite(args: TokenInviteArgs) -> Result<()> {
-    let mut store = oauth::OauthStore::load(&args.oauth_state)?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system clock before 1970")
         .as_secs();
-    let invite = store.mint_invite(&args.tenant, args.reusable, now);
-    store.save(&args.oauth_state)?;
+    // Mint under the shared advisory file lock (M2): a plain load/save here
+    // races the running server's read-modify-write and could roll back a
+    // server mutation (worst case resurrecting a revoked token family). The
+    // locked path re-reads the server's latest state before writing.
+    let invite = oauth::mint_invite_locked(&args.oauth_state, &args.tenant, args.reusable, now)?;
     eprintln!(
         "minted {} invite for tenant '{}' into {} — hand it to the human authorizing a connector:",
         if args.reusable { "reusable" } else { "single-use" },

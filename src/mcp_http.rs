@@ -241,9 +241,17 @@ pub fn serve(server: McpServer, tokens: TokenStore, config: HttpServerConfig) ->
                 oauth.public_url,
             );
         }
-        axum::serve(listener, router(state))
-            .await
-            .context("serve mcp-http")
+        // `into_make_service_with_connect_info` surfaces the peer address to
+        // handlers via `ConnectInfo`, which the OAuth registration rate-limiter
+        // keys on (per-IP token buckets). Behind a reverse proxy the peer is the
+        // proxy, so the bucket is effectively shared — still a bound, just
+        // coarser; a future refinement could read a trusted forwarded header.
+        axum::serve(
+            listener,
+            router(state).into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .context("serve mcp-http")
     })
 }
 
@@ -663,7 +671,16 @@ pub(crate) mod tests {
         let addr = listener.local_addr().expect("local addr");
         std::thread::spawn(move || {
             runtime
-                .block_on(async move { axum::serve(listener, router(state)).await })
+                .block_on(async move {
+                    // Wire ConnectInfo so the OAuth registration handler's
+                    // per-IP rate-limiter has a peer address (all test requests
+                    // share 127.0.0.1, i.e. one bucket).
+                    axum::serve(
+                        listener,
+                        router(state).into_make_service_with_connect_info::<SocketAddr>(),
+                    )
+                    .await
+                })
                 .expect("test server");
         });
         addr

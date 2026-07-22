@@ -43,6 +43,7 @@
 //! headers.
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -64,6 +65,29 @@ use crate::mcp_http::{HttpState, TokenEntry, http_error, random_urlsafe};
 /// at most 10 minutes).
 const AUTH_CODE_TTL: Duration = Duration::from_secs(600);
 
+/// Hard cap on stored client records. `POST /oauth/register` is unauthenticated
+/// (a `client_id` grants nothing without an invite), so the only harm it can do
+/// is fill the state file; this bounds it. Overflow answers 503 until GC or the
+/// operator frees room. A few thousand distinct connectors is already generous.
+const MAX_CLIENTS: usize = 5_000;
+
+/// A registered client that never completed an authorization (never had a code
+/// issued to it) is garbage after this long — abandoned/abusive registrations
+/// self-drain instead of accreting. Clients that *have* authorized are kept.
+const CLIENT_GC_TTL: Duration = Duration::from_secs(24 * 3600);
+
+/// Registration token bucket: at most this many registrations may burst from
+/// one source before the steady refill rate throttles it.
+const REGISTER_BUCKET_CAPACITY: f64 = 20.0;
+/// Steady-state registration allowance, tokens per second (≈1 every 6 s).
+const REGISTER_REFILL_PER_SEC: f64 = 1.0 / 6.0;
+
+/// Upper bound on `--oauth-access-ttl-secs`: a misconfiguration must not be able
+/// to mint near-immortal access tokens (refresh rotation is the long-lived
+/// path, gated by theft-detection; access tokens are the bearer credential and
+/// stay short). 24h is the ceiling.
+pub const MAX_ACCESS_TTL: Duration = Duration::from_secs(24 * 3600);
+
 // ---------------------------------------------------------------------------
 // Persistent store (clients, invites, tokens)
 // ---------------------------------------------------------------------------
@@ -81,6 +105,11 @@ pub struct ClientEntry {
     pub client_name: Option<String>,
     /// Unix seconds at registration.
     pub created_at: u64,
+    /// Unix seconds of the most recent completed authorization (a code issued
+    /// to this client). `None` = registered but never used; such clients are
+    /// GC'd once older than [`CLIENT_GC_TTL`] so the store self-drains.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorized_at: Option<u64>,
 }
 
 /// An invite code: the operator-minted, human-carried credential that maps a
@@ -195,9 +224,23 @@ impl OauthStore {
                 redirect_uris,
                 client_name,
                 created_at: now,
+                authorized_at: None,
             },
         );
         client_id
+    }
+
+    /// Drop clients that registered but never completed an authorization and
+    /// are now older than [`CLIENT_GC_TTL`] — the store's self-drain, run on
+    /// the registration write path so an abandoned/abusive burst evaporates
+    /// on its own. Clients that have authorized (`authorized_at.is_some()`)
+    /// are always kept. Returns the number removed.
+    pub fn gc_stale_clients(&mut self, now: u64) -> usize {
+        let cutoff = now.saturating_sub(CLIENT_GC_TTL.as_secs());
+        let before = self.clients.len();
+        self.clients
+            .retain(|_, c| c.authorized_at.is_some() || c.created_at > cutoff);
+        before - self.clients.len()
     }
 
     /// Mint an invite code bound to `tenant`. Single-use unless `reusable`.
@@ -383,6 +426,39 @@ pub enum CodeTake {
     Unknown,
 }
 
+/// A per-source token bucket (registration rate-limiter). `tokens` refills at
+/// [`REGISTER_REFILL_PER_SEC`] up to [`REGISTER_BUCKET_CAPACITY`]; each attempt
+/// costs one token. Purely in-memory (rate-limiting is best-effort throttling,
+/// not a security boundary — the invite gate is the boundary).
+#[derive(Debug, Clone)]
+struct TokenBucket {
+    tokens: f64,
+    last_refill: u64,
+}
+
+impl TokenBucket {
+    fn new(now: u64) -> Self {
+        TokenBucket {
+            tokens: REGISTER_BUCKET_CAPACITY,
+            last_refill: now,
+        }
+    }
+
+    /// Refill for elapsed time, then try to spend one token. `true` = allowed.
+    fn try_take(&mut self, now: u64) -> bool {
+        let elapsed = now.saturating_sub(self.last_refill) as f64;
+        self.tokens = (self.tokens + elapsed * REGISTER_REFILL_PER_SEC)
+            .min(REGISTER_BUCKET_CAPACITY);
+        self.last_refill = now;
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 /// Live OAuth state hung off `HttpState` when the feature is configured.
 pub struct OauthRuntime {
     /// `OauthConfig::public_url`, normalized (no trailing slash).
@@ -391,6 +467,9 @@ pub struct OauthRuntime {
     pub access_ttl: Duration,
     pub store: Mutex<OauthStore>,
     codes: Mutex<HashMap<String, AuthCode>>,
+    /// Registration rate-limiter, keyed by remote IP (or a single shared bucket
+    /// under the unspecified `0.0.0.0` key when `ConnectInfo` is unavailable).
+    register_buckets: Mutex<HashMap<IpAddr, TokenBucket>>,
 }
 
 impl OauthRuntime {
@@ -415,12 +494,41 @@ impl OauthRuntime {
             access_ttl: config.access_ttl,
             store: Mutex::new(store),
             codes: Mutex::new(HashMap::new()),
+            register_buckets: Mutex::new(HashMap::new()),
         })
     }
 
-    /// Persist the (already locked) store; call after every mutation.
-    fn save(&self, store: &OauthStore) -> Result<()> {
-        store.save(&self.state_path)
+    /// Consult the registration rate-limiter for `source`. `true` = allowed.
+    /// A stale-bucket sweep keeps the map bounded (a bucket at full capacity
+    /// has no memory worth keeping).
+    fn register_allowed(&self, source: IpAddr, now: u64) -> bool {
+        let mut buckets = self.register_buckets.lock().expect("buckets poisoned");
+        let allowed = buckets
+            .entry(source)
+            .or_insert_with(|| TokenBucket::new(now))
+            .try_take(now);
+        buckets.retain(|_, b| {
+            let elapsed = now.saturating_sub(b.last_refill) as f64;
+            (b.tokens + elapsed * REGISTER_REFILL_PER_SEC) < REGISTER_BUCKET_CAPACITY
+        });
+        allowed
+    }
+
+    /// Apply a mutation to the persistent store under the cross-process file
+    /// lock, re-reading the latest on-disk state first so a concurrent
+    /// `token invite` write is never clobbered (and, symmetrically, the CLI
+    /// re-reads our revocations before it writes). The in-memory `store` mirror
+    /// is refreshed with the freshly-written state so the hot-path access-token
+    /// lookups stay consistent. Holds the in-memory `store` mutex for the whole
+    /// critical section, so server-internal callers also serialise.
+    fn with_locked_store<R>(
+        &self,
+        mutate: impl FnOnce(&mut OauthStore) -> R,
+    ) -> Result<R> {
+        let mut mirror = self.store.lock().expect("oauth store poisoned");
+        let (fresh, result) = mutate_state_locked(&self.state_path, mutate)?;
+        *mirror = fresh;
+        Ok(result)
     }
 
     /// Mint and remember an authorization code. Expired leftovers are purged
@@ -463,19 +571,36 @@ impl OauthRuntime {
         }
     }
 
-    /// Resolve a bearer access token (the `authenticate` hook). Saves the
-    /// store when the lookup reaped an expired token.
+    /// Resolve a bearer access token (the `authenticate` hook). The common
+    /// case is a pure read against the in-memory mirror. Reaping an expired
+    /// token is a store mutation, so it goes through the cross-process file lock
+    /// (re-read → reap → write) — removing a dead token can never resurrect a
+    /// family, but funnelling every write through one primitive keeps the race
+    /// impossible by construction rather than by case analysis.
     pub fn lookup_access(&self, token: &str) -> std::result::Result<TokenEntry, &'static str> {
-        let mut store = self.store.lock().expect("oauth store poisoned");
-        match store.lookup_access(token, unix_now()) {
-            Ok(entry) => Ok(entry),
-            Err((message, mutated)) => {
-                if mutated {
-                    if let Err(e) = self.save(&store) {
-                        eprintln!("warning: failed to save oauth state: {e:#}");
-                    }
+        let now = unix_now();
+        {
+            let store = self.store.lock().expect("oauth store poisoned");
+            if let Some(entry) = store.access_tokens.get(token) {
+                if entry.expires_at > now {
+                    let entry = entry.clone();
+                    return Ok(TokenEntry {
+                        tenant: entry.tenant,
+                        backend: entry.backend,
+                    });
                 }
-                Err(message)
+            } else {
+                return Err("unknown token");
+            }
+        }
+        // Fell through: the token is present but expired. Reap it under the lock.
+        let outcome = self.with_locked_store(|store| store.lookup_access(token, now));
+        match outcome {
+            Ok(Ok(entry)) => Ok(entry), // Refreshed on another writer; still valid.
+            Ok(Err((message, _))) => Err(message),
+            Err(e) => {
+                eprintln!("warning: failed to reap expired oauth token: {e:#}");
+                Err("access token expired")
             }
         }
     }
@@ -488,6 +613,116 @@ fn unix_now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .expect("system clock before 1970")
         .as_secs()
+}
+
+// ---------------------------------------------------------------------------
+// Cross-process state serialisation (advisory file lock)
+// ---------------------------------------------------------------------------
+//
+// The server and the `token invite` CLI both read-modify-write the same state
+// file. Without coordination the loser of a race writes a stale snapshot back,
+// worst case *resurrecting* a token family the server just revoked on
+// refresh-theft. An exclusive advisory lock (`flock`) on a sibling `.lock` file
+// serialises every writer; each holds the lock across the whole re-read →
+// mutate → write, so the on-disk state a writer overwrites is always the one it
+// just read — never a stale copy.
+
+/// RAII `flock(LOCK_EX)` on a lock file; released (`LOCK_UN` + close) on drop.
+/// Unix-only, which is the deployment target (the state file is mode 0600 via
+/// the same `#[cfg(unix)]` path). The lock file lives beside the state file and
+/// is never truncated, so holding it never touches the state itself.
+struct FileLock {
+    file: std::fs::File,
+}
+
+impl FileLock {
+    /// Acquire the exclusive lock, blocking until no other writer holds it.
+    fn acquire(state_path: &Path) -> Result<Self> {
+        let lock_path = lock_path_for(state_path);
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            // Never truncate: the lock file's *existence* is the lock target;
+            // its contents are irrelevant and holding it must not touch them.
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .with_context(|| format!("open oauth lock file {}", lock_path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            // flock is advisory but honoured by every writer here; blocks until
+            // the current holder drops it. EINTR is the only expected transient.
+            loop {
+                let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+                if rc == 0 {
+                    break;
+                }
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                return Err(err).with_context(|| {
+                    format!("flock oauth lock file {}", lock_path.display())
+                });
+            }
+        }
+        Ok(FileLock { file })
+    }
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            // Best-effort unlock; closing the fd (on drop of `file`) releases it
+            // regardless, so an error here is not actionable.
+            unsafe {
+                let _ = libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+            }
+        }
+    }
+}
+
+/// The sibling lock file for a state path (`<state>.lock`).
+fn lock_path_for(state_path: &Path) -> PathBuf {
+    let mut name = state_path.file_name().unwrap_or_default().to_os_string();
+    name.push(".lock");
+    state_path.with_file_name(name)
+}
+
+/// Run `mutate` against the *current on-disk* store under the exclusive file
+/// lock, then persist the result: lock → re-read disk → mutate → write →
+/// unlock. This is the one safe read-modify-write primitive; the server and the
+/// CLI both funnel through it so a stale snapshot can never clobber a newer one.
+/// Returns the mutated store (so callers can refresh their in-memory cache) and
+/// the closure's own return value.
+fn mutate_state_locked<R>(
+    state_path: &Path,
+    mutate: impl FnOnce(&mut OauthStore) -> R,
+) -> Result<(OauthStore, R)> {
+    let _lock = FileLock::acquire(state_path)?;
+    let mut store = OauthStore::load(state_path)?;
+    let result = mutate(&mut store);
+    store.save(state_path)?;
+    Ok((store, result))
+}
+
+/// Mint an invite from the `token invite` CLI under the same file lock the
+/// server uses (M2): lock → re-read the server's latest state → mint → write →
+/// unlock. Re-reading under the lock is what stops a stale CLI snapshot from
+/// clobbering (worst case *resurrecting* a revoked family) a mutation the
+/// server made between the CLI's load and write.
+pub fn mint_invite_locked(
+    state_path: &Path,
+    tenant: &str,
+    reusable: bool,
+    now: u64,
+) -> Result<String> {
+    let (_store, code) =
+        mutate_state_locked(state_path, |store| store.mint_invite(tenant, reusable, now))?;
+    Ok(code)
 }
 
 /// PKCE S256 (RFC 7636): `BASE64URL(SHA256(ascii(verifier))) == challenge`.
@@ -561,8 +796,22 @@ async fn authorization_server_metadata(State(state): State<Arc<HttpState>>) -> R
 /// clients. Open is safe here because a `client_id` grants nothing — the
 /// authorize form's invite code is the actual gate. Registration is the
 /// moment redirect URIs get pinned; everything later exact-matches them.
-async fn register(State(state): State<Arc<HttpState>>, body: Bytes) -> Response {
+async fn register(
+    State(state): State<Arc<HttpState>>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    body: Bytes,
+) -> Response {
     let oauth = oauth(&state);
+    let now = unix_now();
+
+    // Resource-bounding (registration is unauthenticated by design — a
+    // client_id grants nothing without an invite — so guard the store, not the
+    // access). Rate-limit per remote IP; behind a reverse proxy the peer is the
+    // proxy, so the bucket is shared — still a bound, just coarser.
+    if !oauth.register_allowed(peer.ip(), now) {
+        return registration_rate_limited();
+    }
+
     let request: Value = match serde_json::from_slice(&body) {
         Ok(value) => value,
         Err(e) => return registration_error(&format!("invalid JSON body: {e}")),
@@ -580,6 +829,13 @@ async fn register(State(state): State<Arc<HttpState>>, body: Bytes) -> Response 
         // fragment — RFC 6749 §3.1.2. Codes travel in the query component.
         match uri.parse::<Uri>() {
             Ok(parsed) if parsed.scheme().is_some() && !uri.contains('#') => {
+                // L4: only https (redirect carries the auth code, so it must be
+                // confidential in transit), plus http loopback for local dev.
+                if !redirect_scheme_allowed(&parsed) {
+                    return registration_error(&format!(
+                        "redirect_uri '{uri}' must use https:// (or http://127.0.0.1 / http://localhost for local dev)"
+                    ));
+                }
                 redirect_uris.push(uri.to_string());
             }
             _ => {
@@ -611,16 +867,26 @@ async fn register(State(state): State<Arc<HttpState>>, body: Bytes) -> Response 
         .and_then(Value::as_str)
         .map(str::to_string);
 
-    let now = unix_now();
-    let mut store = oauth.store.lock().expect("oauth store poisoned");
-    let client_id = store.register_client(redirect_uris.clone(), client_name.clone(), now);
-    if let Err(e) = oauth.save(&store) {
-        return http_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("failed to persist client registration: {e:#}"),
-        );
-    }
-    drop(store);
+    // GC self-drains abandoned registrations, then the hard cap bounds N (which
+    // also bounds the O(N) full-file rewrite this save does). Both run inside
+    // the file lock so the count we check is the count we write.
+    let outcome = oauth.with_locked_store(|store| {
+        store.gc_stale_clients(now);
+        if store.clients.len() >= MAX_CLIENTS {
+            return Err(());
+        }
+        Ok(store.register_client(redirect_uris.clone(), client_name.clone(), now))
+    });
+    let client_id = match outcome {
+        Ok(Ok(client_id)) => client_id,
+        Ok(Err(())) => return registration_store_full(),
+        Err(e) => {
+            return http_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("failed to persist client registration: {e:#}"),
+            );
+        }
+    };
 
     let mut body = json!({
         "client_id": client_id,
@@ -637,6 +903,48 @@ async fn register(State(state): State<Arc<HttpState>>, body: Bytes) -> Response 
         StatusCode::CREATED,
         [(header::CONTENT_TYPE, "application/json")],
         body.to_string(),
+    )
+        .into_response()
+}
+
+/// L4: a redirect URI's scheme must be `https`, or `http` bound to a loopback
+/// host (`127.0.0.1` / `localhost`) for local development. Everything else —
+/// plain-`http` public hosts, custom app schemes — is refused: the redirect
+/// carries the authorization code and must not leak it in cleartext.
+fn redirect_scheme_allowed(uri: &Uri) -> bool {
+    match uri.scheme_str() {
+        Some("https") => true,
+        Some("http") => matches!(uri.host(), Some("127.0.0.1") | Some("localhost")),
+        _ => false,
+    }
+}
+
+/// 429 when a source exceeds the registration rate limit (RFC 6749 §5.2 uses
+/// `slow_down`/`temporarily_unavailable`; we borrow the latter's spirit).
+fn registration_rate_limited() -> Response {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [(header::CONTENT_TYPE, "application/json")],
+        json!({
+            "error": "temporarily_unavailable",
+            "error_description": "registration rate limit exceeded; retry later",
+        })
+        .to_string(),
+    )
+        .into_response()
+}
+
+/// 503 when the client store is at capacity ([`MAX_CLIENTS`]). GC drains
+/// abandoned registrations over time, so this is transient, not a hard wall.
+fn registration_store_full() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(header::CONTENT_TYPE, "application/json")],
+        json!({
+            "error": "temporarily_unavailable",
+            "error_description": "client registration store is full; retry later",
+        })
+        .to_string(),
     )
         .into_response()
 }
@@ -702,27 +1010,21 @@ fn validate_client_and_redirect(
 }
 
 /// Validate the protocol half: `response_type=code`, PKCE challenge present,
-/// method S256. The redirect URI is validated by now, so failures redirect
-/// back to the client with an RFC 6749 error code.
+/// method S256. Failures render a 400 error PAGE, never a redirect: this runs
+/// *before* an invite is consumed, and redirecting to a client-supplied URI at
+/// that point is the open-redirect hole (an attacker registers evil.com, then
+/// hands a victim an authorize URL with a bad grant param to bounce them off
+/// this trusted origin). Only a request that has cleared the invite gate has
+/// earned a redirect — and by then the only remaining outcome is success.
 fn validate_grant_shape(params: &AuthorizeParams) -> std::result::Result<(), Response> {
     if params.response_type != "code" {
-        return Err(error_redirect(
-            params,
-            "unsupported_response_type",
-            "only response_type=code is supported",
-        ));
+        return Err(authorize_error_page("only response_type=code is supported"));
     }
     if params.code_challenge.is_empty() {
-        return Err(error_redirect(
-            params,
-            "invalid_request",
-            "PKCE code_challenge is required",
-        ));
+        return Err(authorize_error_page("PKCE code_challenge is required"));
     }
     if params.code_challenge_method != "S256" {
-        return Err(error_redirect(
-            params,
-            "invalid_request",
+        return Err(authorize_error_page(
             "only code_challenge_method=S256 is supported",
         ));
     }
@@ -767,25 +1069,29 @@ async fn authorize_submit(State(state): State<Arc<HttpState>>, body: Bytes) -> R
         return response;
     }
 
-    // The human gate: a valid invite code names the tenant. Consumption and
-    // code minting happen together — an invalid invite mints nothing.
+    // The human gate: a valid invite code names the tenant. Consumption, the
+    // client's `authorized_at` stamp (so GC keeps it — it has now completed an
+    // authorization) and the write all happen atomically under the file lock.
+    // An invalid invite is a *pre-redirect* failure → 400 page, never a bounce
+    // off this origin (the open-redirect defence: the redirect_uri is only
+    // trusted as a redirect target once a real invite has been presented).
     let invite_code = form.get("invite_code").map(String::as_str).unwrap_or("");
     let now = unix_now();
-    let tenant = {
-        let mut store = oauth.store.lock().expect("oauth store poisoned");
-        match store.consume_invite(invite_code) {
-            Some(tenant) => {
-                if let Err(e) = oauth.save(&store) {
-                    return http_error(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        &format!("failed to persist invite consumption: {e:#}"),
-                    );
-                }
-                tenant
-            }
-            None => {
-                return error_redirect(&params, "access_denied", "invalid invite code");
-            }
+    let consumed = oauth.with_locked_store(|store| {
+        let tenant = store.consume_invite(invite_code)?;
+        if let Some(client) = store.clients.get_mut(&params.client_id) {
+            client.authorized_at = Some(now);
+        }
+        Some(tenant)
+    });
+    let tenant = match consumed {
+        Ok(Some(tenant)) => tenant,
+        Ok(None) => return authorize_error_page("invalid invite code"),
+        Err(e) => {
+            return http_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("failed to persist invite consumption: {e:#}"),
+            );
         }
     };
 
@@ -847,44 +1153,55 @@ async fn token(State(state): State<Arc<HttpState>>, body: Bytes) -> Response {
                 return token_error("invalid_grant", "PKCE verification failed");
             }
 
-            let mut store = oauth.store.lock().expect("oauth store poisoned");
-            let (access, refresh) = store.mint_token_pair(
-                &code.tenant,
-                &state.config.backend_name,
-                &code.client_id,
-                oauth.access_ttl,
-                now,
-            );
-            if let Err(e) = oauth.save(&store) {
-                return http_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    &format!("failed to persist tokens: {e:#}"),
-                );
-            }
+            // Mint under the file lock (re-read → mint → write) so a concurrent
+            // `token invite` write can't roll this token pair back.
+            let minted = oauth.with_locked_store(|store| {
+                store.mint_token_pair(
+                    &code.tenant,
+                    &state.config.backend_name,
+                    &code.client_id,
+                    oauth.access_ttl,
+                    now,
+                )
+            });
+            let (access, refresh) = match minted {
+                Ok(pair) => pair,
+                Err(e) => {
+                    return http_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        &format!("failed to persist tokens: {e:#}"),
+                    );
+                }
+            };
             (access, refresh, code.scope)
         }
         // --- refresh_token rotation -----------------------------------
         "refresh_token" => {
             let client_id = form.get("client_id").map(String::as_str);
-            let mut store = oauth.store.lock().expect("oauth store poisoned");
-            match store.rotate_refresh(get("refresh_token"), client_id, oauth.access_ttl, now) {
+            // The rotation itself (including the family-revoke on reuse) is a
+            // store mutation, so it runs inside the file lock: re-read the
+            // latest on-disk state, rotate, write. This is exactly the path M2
+            // guards — a stale CLI write must never resurrect a family revoked
+            // here.
+            let rotated = oauth.with_locked_store(|store| {
+                store.rotate_refresh(get("refresh_token"), client_id, oauth.access_ttl, now)
+            });
+            let rotation = match rotated {
+                Ok(rotation) => rotation,
+                Err(e) => {
+                    return http_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        &format!("failed to persist tokens: {e:#}"),
+                    );
+                }
+            };
+            match rotation {
                 // The rotated grant keeps its tenant/backend (copied from the
                 // spent entry into the minted ones); scope was recorded at
                 // authorize time and is not re-negotiated on refresh.
-                Ok((access, refresh, _spent)) => {
-                    if let Err(e) = oauth.save(&store) {
-                        return http_error(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            &format!("failed to persist tokens: {e:#}"),
-                        );
-                    }
-                    (access, refresh, String::new())
-                }
+                Ok((access, refresh, _spent)) => (access, refresh, String::new()),
                 Err(RotateError::ReuseRevoked) => {
-                    // The revocation is a store mutation: persist it.
-                    if let Err(e) = oauth.save(&store) {
-                        eprintln!("warning: failed to save oauth state: {e:#}");
-                    }
+                    // The family-revoke was already persisted inside the lock.
                     return token_error(
                         "invalid_grant",
                         "refresh token reuse detected; token family revoked",
@@ -1000,16 +1317,6 @@ fn authorize_error_page(message: &str) -> Response {
         ),
     )
         .into_response()
-}
-
-/// RFC 6749 error redirect back to the (already validated) redirect URI,
-/// with `state` passthrough.
-fn error_redirect(params: &AuthorizeParams, error: &str, description: &str) -> Response {
-    let mut query = vec![("error", error), ("error_description", description)];
-    if !params.state.is_empty() {
-        query.push(("state", params.state.as_str()));
-    }
-    redirect(&append_query(&params.redirect_uri, &query))
 }
 
 /// 302 Found to `location`.
@@ -1458,7 +1765,9 @@ mod tests {
         assert_eq!(bad_client.status().as_u16(), 400);
         let _ = bad_client.body_mut().read_to_string();
 
-        // A plain (non-S256) challenge method is refused by error redirect.
+        // A plain (non-S256) challenge method is a pre-invite failure: a 400
+        // PAGE, never a redirect (open-redirect defence — nothing bounces off
+        // this origin before an invite is presented).
         let mut plain = agent
             .post(format!("http://{addr}/oauth/authorize"))
             .send_form([
@@ -1471,17 +1780,17 @@ mod tests {
                 ("invite_code", "irrelevant"),
             ])
             .expect("plain pkce");
-        assert_eq!(plain.status().as_u16(), 302);
-        let (_, query) = location_query(&plain);
-        assert_eq!(query["error"], "invalid_request");
+        assert_eq!(plain.status().as_u16(), 400, "pre-invite failure is a page, not a redirect");
+        assert!(plain.headers().get("location").is_none(), "no Location off-origin");
         let _ = plain.body_mut().read_to_string();
 
         // --- POST authorize with a minted invite → code redirect.
+        // Invites are minted through the persistent (file-locked) path, the way
+        // the CLI does — the server reads the on-disk store when consuming.
         let oauth = state.oauth.as_ref().expect("oauth configured");
-        let invite = {
-            let mut store = oauth.store.lock().unwrap();
-            store.mint_invite("alice", false, unix_now())
-        };
+        let invite = oauth
+            .with_locked_store(|store| store.mint_invite("alice", false, unix_now()))
+            .expect("mint invite");
         let submit = |invite: &str, challenge: &str| {
             agent
                 .post(format!("http://{addr}/oauth/authorize"))
@@ -1505,18 +1814,16 @@ mod tests {
         let code = query["code"].clone();
         let _ = granted.body_mut().read_to_string();
 
-        // A wrong invite is bounced back as access_denied (state intact).
+        // A wrong invite is a pre-redirect failure → 400 page, not a bounce
+        // off this origin (the invite gate is what earns a redirect).
         let mut denied = submit("not-an-invite", &challenge);
-        assert_eq!(denied.status().as_u16(), 302);
-        let (_, query) = location_query(&denied);
-        assert_eq!(query["error"], "access_denied");
-        assert_eq!(query["state"], "xyz-123");
+        assert_eq!(denied.status().as_u16(), 400);
+        assert!(denied.headers().get("location").is_none(), "bad invite doesn't redirect");
         let _ = denied.body_mut().read_to_string();
 
-        // The single-use invite is spent: replaying it is denied too.
+        // The single-use invite is spent: replaying it is a 400 page too.
         let mut reused_invite = submit(&invite, &challenge);
-        let (_, query) = location_query(&reused_invite);
-        assert_eq!(query["error"], "access_denied", "invite is single-use");
+        assert_eq!(reused_invite.status().as_u16(), 400, "invite is single-use");
         let _ = reused_invite.body_mut().read_to_string();
 
         // --- Token exchange with PKCE.
@@ -1567,10 +1874,9 @@ mod tests {
         assert_eq!(static_init.status, 200);
 
         // --- Wrong verifier burns its (fresh) code and yields invalid_grant.
-        let invite2 = {
-            let mut store = oauth.store.lock().unwrap();
-            store.mint_invite("bob", false, unix_now())
-        };
+        let invite2 = oauth
+            .with_locked_store(|store| store.mint_invite("bob", false, unix_now()))
+            .expect("mint invite2");
         let mut granted2 = submit(&invite2, &challenge);
         let (_, query) = location_query(&granted2);
         let code2 = query["code"].clone();
@@ -1585,13 +1891,15 @@ mod tests {
         assert_eq!(read_json(&mut burned)["error"], "invalid_grant");
 
         // --- Expired access tokens 401 with the discovery challenge.
-        let stale = {
-            let mut store = oauth.store.lock().unwrap();
-            // Minted at now=0, so it expired an hour past the epoch.
-            let (stale, _) =
-                store.mint_token_pair("alice", "mock", &client_id, Duration::from_secs(3600), 0);
-            stale
-        };
+        // Minted at now=0 (expired an hour past the epoch), through the locked
+        // path so it survives the mirror-refresh that every server write does.
+        let stale = oauth
+            .with_locked_store(|store| {
+                store
+                    .mint_token_pair("alice", "mock", &client_id, Duration::from_secs(3600), 0)
+                    .0
+            })
+            .expect("mint stale token");
         let expired = post(&agent, addr, Some(&stale), None, None, &rpc(4, "initialize", json!({})));
         assert_eq!(expired.status, 401);
         let mut expired_raw = agent
@@ -1732,5 +2040,280 @@ mod tests {
         assert!(body.get("client_secret").is_none(), "public client has no secret");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- L4: redirect-URI scheme allowlist ----------------------------------
+
+    /// Registration accepts https and http-loopback redirect URIs and rejects
+    /// plain-http public hosts and custom schemes (the redirect carries the
+    /// authorization code, so it must be confidential in transit).
+    #[test]
+    fn registration_restricts_redirect_scheme() {
+        let dir = scratch_dir("scheme");
+        let state = test_state_with_oauth(
+            "https://mcp.example.test",
+            &dir.join("oauth.json"),
+            Duration::from_secs(3600),
+        );
+        let addr = spawn_server(state);
+        let agent = no_redirect_agent();
+        let register = |uri: &str| {
+            agent
+                .post(format!("http://{addr}/oauth/register"))
+                .send_json(json!({ "redirect_uris": [uri] }))
+                .expect("register")
+                .status()
+                .as_u16()
+        };
+
+        // Allowed: https anywhere, http only on loopback (local dev).
+        assert_eq!(register("https://claude.ai/api/mcp/auth_callback"), 201);
+        assert_eq!(register("http://127.0.0.1:8080/cb"), 201, "loopback dev ok");
+        assert_eq!(register("http://localhost/cb"), 201, "localhost dev ok");
+
+        // Rejected: plain-http public host, and non-http(s) custom schemes.
+        assert_eq!(register("http://evil.example.com/cb"), 400, "plain http public rejected");
+        assert_eq!(register("ftp://a/cb"), 400, "non-http scheme rejected");
+        assert_eq!(register("com.example.app://cb"), 400, "custom app scheme rejected");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- M1: registration resource-bounding ---------------------------------
+
+    /// The client store is capped ([`MAX_CLIENTS`]) — registration answers 503
+    /// at the cap — and GC drains clients that registered but never authorized.
+    #[test]
+    fn registration_cap_and_gc_bound_the_store() {
+        let dir = scratch_dir("cap");
+        let path = dir.join("oauth.json");
+        let runtime = OauthRuntime::new(OauthConfig {
+            public_url: "https://mcp.example.test".to_string(),
+            state_path: path.clone(),
+            access_ttl: Duration::from_secs(3600),
+        })
+        .unwrap();
+
+        // Fill to the cap directly in the store (fast; the HTTP path is
+        // exercised by registration_rate_limits_registration below).
+        runtime
+            .with_locked_store(|store| {
+                for _ in 0..MAX_CLIENTS {
+                    store.register_client(vec!["https://a/cb".to_string()], None, 1_000);
+                }
+            })
+            .unwrap();
+        // At capacity, another registration is refused (the handler checks
+        // `len() >= MAX_CLIENTS`).
+        let refused = runtime.with_locked_store(|store| {
+            store.gc_stale_clients(1_000);
+            store.clients.len() >= MAX_CLIENTS
+        });
+        assert!(refused.unwrap(), "store is at the cap");
+
+        // GC: a never-authorized client older than the TTL is dropped; one that
+        // authorized (or is fresh) is kept.
+        let removed = runtime
+            .with_locked_store(|store| {
+                store.clients.clear();
+                store.register_client(vec!["https://a/cb".to_string()], None, 0); // stale, unused
+                let kept = store.register_client(vec!["https://b/cb".to_string()], None, 0);
+                store.clients.get_mut(&kept).unwrap().authorized_at = Some(1);
+                store.register_client(vec!["https://c/cb".to_string()], None, 1_000_000); // fresh
+                // GC at a time well past CLIENT_GC_TTL from t=0.
+                store.gc_stale_clients(CLIENT_GC_TTL.as_secs() + 10)
+            })
+            .unwrap();
+        assert_eq!(removed, 1, "only the stale, never-authorized client is GC'd");
+        let survivors = runtime.store.lock().unwrap().clients.len();
+        assert_eq!(survivors, 2, "authorized and fresh clients survive GC");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Registration is rate-limited per source: a burst past the bucket
+    /// capacity gets 429s (the store-bounding half is covered above).
+    #[test]
+    fn registration_rate_limits_registration() {
+        let dir = scratch_dir("ratelimit");
+        let state = test_state_with_oauth(
+            "https://mcp.example.test",
+            &dir.join("oauth.json"),
+            Duration::from_secs(3600),
+        );
+        let addr = spawn_server(state);
+        let agent = no_redirect_agent();
+        let register = || {
+            agent
+                .post(format!("http://{addr}/oauth/register"))
+                .send_json(json!({ "redirect_uris": ["https://a/cb"] }))
+                .expect("register")
+                .status()
+                .as_u16()
+        };
+
+        // The bucket starts full (REGISTER_BUCKET_CAPACITY tokens). Draining it
+        // plus one more forces a 429 within the same wall-clock second (refill
+        // is ~1 token / 6 s, far slower than this loop).
+        let mut saw_429 = false;
+        for _ in 0..(REGISTER_BUCKET_CAPACITY as usize + 5) {
+            if register() == 429 {
+                saw_429 = true;
+                break;
+            }
+        }
+        assert!(saw_429, "a burst past the bucket capacity is rate-limited");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- M2: state-file race (the dangerous one) ----------------------------
+
+    /// Interleaved writers serialise through the advisory file lock, and a
+    /// stale snapshot can never resurrect a revoked family. Simulates the exact
+    /// incident: the server revokes a family (refresh-reuse), while a `token
+    /// invite`-style CLI writer holds an *older* in-memory snapshot and writes
+    /// it back — the file-locked re-read means its write starts from the
+    /// server's revoked state, so the family stays dead.
+    #[test]
+    fn state_file_lock_prevents_family_resurrection() {
+        let dir = scratch_dir("race");
+        let path = dir.join("oauth.json");
+
+        // Seed a family (access + refresh) on disk.
+        let (access, refresh, family_id) = {
+            let mut store = OauthStore::default();
+            let (a, r) = store.mint_token_pair("alice", "mock", "client-1", Duration::from_secs(3600), 1_000);
+            let fam = store.refresh_tokens[&r].family_id.clone();
+            store.save(&path).unwrap();
+            (a, r, fam)
+        };
+
+        // The CLI reads an OLD snapshot (family still present) — this is the
+        // stale copy that, written back naively, would resurrect the family.
+        let stale_snapshot = OauthStore::load(&path).unwrap();
+        assert!(stale_snapshot.access_tokens.contains_key(&access));
+
+        // The server revokes the family on refresh-reuse, through the lock.
+        mutate_state_locked(&path, |store| {
+            // Spend then replay: replay revokes the whole family.
+            let _ = store.rotate_refresh(&refresh, Some("client-1"), Duration::from_secs(3600), 2_000);
+            let err = store
+                .rotate_refresh(&refresh, Some("client-1"), Duration::from_secs(3600), 2_100)
+                .err();
+            assert_eq!(err, Some(RotateError::ReuseRevoked));
+        })
+        .unwrap();
+
+        // On-disk, the family is gone.
+        let after_revoke = OauthStore::load(&path).unwrap();
+        assert!(!after_revoke.access_tokens.values().any(|e| e.family_id == family_id));
+
+        // Now the CLI writer commits *its* mutation. Because it goes through the
+        // SAME locked re-read primitive (not a blind write of `stale_snapshot`),
+        // it starts from the server's revoked state and only ADDS an invite —
+        // the revoked family is NOT resurrected.
+        let _invite = mint_invite_locked(&path, "bob", false, 3_000).unwrap();
+
+        let final_state = OauthStore::load(&path).unwrap();
+        assert!(
+            !final_state.access_tokens.values().any(|e| e.family_id == family_id),
+            "revoked family stays dead after a concurrent invite write"
+        );
+        assert!(
+            !final_state.refresh_tokens.values().any(|e| e.family_id == family_id),
+            "revoked refresh family stays dead too"
+        );
+        assert_eq!(final_state.invites.len(), 1, "the invite write did land");
+        // Demonstrate the counterfactual: a BLIND write of the stale snapshot
+        // *would* have resurrected the family — proving the lock is load-bearing.
+        stale_snapshot.save(&path).unwrap();
+        assert!(
+            OauthStore::load(&path).unwrap().access_tokens.contains_key(&access),
+            "control: a naive stale write resurrects — which the locked path prevents"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- M3: open-redirect via the authorize error path ---------------------
+
+    /// A pre-invite bad-parameter authorize request against a client whose
+    /// redirect_uri is attacker-controlled gets a 400 PAGE, never a 302 to that
+    /// URI — the open-redirect the error-redirect path used to allow.
+    #[test]
+    fn authorize_bad_param_is_page_not_open_redirect() {
+        let dir = scratch_dir("openredirect");
+        let state_path = dir.join("oauth.json");
+        let state = test_state_with_oauth("https://mcp.example.test", &state_path, Duration::from_secs(3600));
+        let addr = spawn_server(state.clone());
+        let agent = no_redirect_agent();
+
+        // Attacker registers a client pointing at attacker-controlled evil.com.
+        let mut registered = agent
+            .post(format!("http://{addr}/oauth/register"))
+            .send_json(json!({ "redirect_uris": ["https://evil.example.com/steal"] }))
+            .expect("register");
+        let client_id = read_json(&mut registered)["client_id"].as_str().unwrap().to_string();
+
+        // Victim is handed an authorize URL with a bad grant param (plain PKCE),
+        // BEFORE presenting any invite. It must NOT 302 to evil.com.
+        let bad_param = |query: String| {
+            agent
+                .get(format!("http://{addr}/oauth/authorize?{query}"))
+                .call()
+                .expect("authorize")
+        };
+
+        // Unsupported response_type.
+        let mut r1 = bad_param(format!(
+            "response_type=token&client_id={}&redirect_uri={}&code_challenge=x&code_challenge_method=S256",
+            url_encode(&client_id),
+            url_encode("https://evil.example.com/steal"),
+        ));
+        assert_eq!(r1.status().as_u16(), 400, "bad response_type is a 400 page");
+        assert!(r1.headers().get("location").is_none(), "no Location to evil.com");
+        let _ = r1.body_mut().read_to_string();
+
+        // Non-S256 PKCE method.
+        let mut r2 = bad_param(format!(
+            "response_type=code&client_id={}&redirect_uri={}&code_challenge=x&code_challenge_method=plain",
+            url_encode(&client_id),
+            url_encode("https://evil.example.com/steal"),
+        ));
+        assert_eq!(r2.status().as_u16(), 400, "plain PKCE is a 400 page");
+        assert!(r2.headers().get("location").is_none(), "no Location to evil.com");
+        let _ = r2.body_mut().read_to_string();
+
+        // Also via POST (hidden fields are attacker-editable) with a bad invite:
+        // still a 400 page, no redirect.
+        let mut r3 = agent
+            .post(format!("http://{addr}/oauth/authorize"))
+            .send_form([
+                ("response_type", "code"),
+                ("client_id", client_id.as_str()),
+                ("redirect_uri", "https://evil.example.com/steal"),
+                ("code_challenge", "x"),
+                ("code_challenge_method", "S256"),
+                ("invite_code", "wrong"),
+            ])
+            .expect("post authorize");
+        assert_eq!(r3.status().as_u16(), 400, "bad invite is a 400 page");
+        assert!(r3.headers().get("location").is_none(), "bad invite doesn't redirect off-origin");
+        let _ = r3.body_mut().read_to_string();
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- Access-TTL cap -----------------------------------------------------
+
+    /// The access-TTL ceiling is 24h — the boundary the CLI enforces so a
+    /// misconfiguration can't mint near-immortal tokens.
+    #[test]
+    fn access_ttl_cap_is_24h() {
+        assert_eq!(MAX_ACCESS_TTL, Duration::from_secs(24 * 3600));
+        // A day is allowed; a day-and-a-second is over the ceiling.
+        assert!(Duration::from_secs(24 * 3600) <= MAX_ACCESS_TTL);
+        assert!(Duration::from_secs(24 * 3600 + 1) > MAX_ACCESS_TTL);
     }
 }
