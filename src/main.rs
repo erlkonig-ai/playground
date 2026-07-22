@@ -21,6 +21,8 @@ use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 mod mcp;
 #[cfg(feature = "mcp-http")]
 mod mcp_http;
+#[cfg(feature = "mcp-http")]
+mod oauth;
 mod sandbox;
 
 #[derive(Subcommand, Debug)]
@@ -170,6 +172,18 @@ struct McpHttpArgs {
     /// sandbox sessions survive and are reachable after re-initialize).
     #[arg(long, default_value_t = 3600)]
     idle_timeout_secs: u64,
+    /// Public base URL of this server as clients reach it (through the TLS
+    /// proxy), e.g. `https://mcp.example.org`. Enables OAuth 2.1 for
+    /// browser-based MCP connectors; requires --oauth-state.
+    #[arg(long, requires = "oauth_state")]
+    public_url: Option<String>,
+    /// OAuth persistent state (JSON: clients, invite codes, tokens); created
+    /// if missing, written mode 0600. Requires --public-url.
+    #[arg(long, env = "PLAYGROUND_MCP_OAUTH_STATE", requires = "public_url")]
+    oauth_state: Option<PathBuf>,
+    /// OAuth access-token lifetime in seconds (refresh tokens rotate forever).
+    #[arg(long, default_value_t = 3600)]
+    oauth_access_ttl_secs: u64,
     /// Which sandbox backend provisions sessions.
     #[arg(long, value_enum, default_value_t = McpBackendKind::Lima)]
     backend: McpBackendKind,
@@ -212,6 +226,10 @@ struct McpHttpArgs {
 enum TokenCommand {
     #[command(about = "Mint a bearer token bound to a tenant (printed once, then only in the store)")]
     Mint(TokenMintArgs),
+    #[command(
+        about = "Mint an OAuth invite code bound to a tenant (the human gate of the browser-connector flow)"
+    )]
+    Invite(TokenInviteArgs),
 }
 
 #[cfg(feature = "mcp-http")]
@@ -227,6 +245,23 @@ struct TokenMintArgs {
     /// Backend the token is valid for (must match the serving `mcp-http --backend`).
     #[arg(long, value_enum, default_value_t = McpBackendKind::Lima)]
     backend: McpBackendKind,
+}
+
+#[cfg(feature = "mcp-http")]
+#[derive(Args, Debug, Clone)]
+#[command(about = "OAuth invite-code mint settings")]
+struct TokenInviteArgs {
+    /// Tenant label whoever redeems the invite acts as.
+    #[arg(long)]
+    tenant: String,
+    /// OAuth state file (JSON) to append to; created if missing. Must be the
+    /// same file the server runs with (`mcp-http --oauth-state`).
+    #[arg(long, env = "PLAYGROUND_MCP_OAUTH_STATE")]
+    oauth_state: PathBuf,
+    /// Keep the invite valid after use (default: single-use, consumed on
+    /// first successful authorization).
+    #[arg(long, default_value_t = false)]
+    reusable: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -254,6 +289,7 @@ fn main() -> Result<()> {
         #[cfg(feature = "mcp-http")]
         CommandMode::Token { command } => match command {
             TokenCommand::Mint(args) => run_token_mint(args),
+            TokenCommand::Invite(args) => run_token_invite(args),
         },
     }
 }
@@ -323,6 +359,31 @@ fn run_mcp_http(args: McpHttpArgs) -> Result<()> {
         );
     }
 
+    // OAuth 2.1 (browser-based connectors) needs both the public issuer URL
+    // and a state file; clap's `requires` enforces the pairing, so a lone
+    // flag never reaches here. Absent both, the server is byte-for-byte v1.
+    let oauth = match (args.public_url, args.oauth_state) {
+        (Some(public_url), Some(state_path)) => {
+            // Cap the access-token lifetime: a misconfigured `--oauth-access-ttl
+            // -secs` must not be able to mint near-immortal bearer tokens (the
+            // long-lived path is refresh rotation, gated by theft-detection).
+            let access_ttl = std::time::Duration::from_secs(args.oauth_access_ttl_secs);
+            if access_ttl > oauth::MAX_ACCESS_TTL {
+                anyhow::bail!(
+                    "--oauth-access-ttl-secs {} exceeds the {}s (24h) maximum",
+                    args.oauth_access_ttl_secs,
+                    oauth::MAX_ACCESS_TTL.as_secs(),
+                );
+            }
+            Some(oauth::OauthConfig {
+                public_url,
+                state_path,
+                access_ttl,
+            })
+        }
+        _ => None,
+    };
+
     let provider = mcp::SandboxProvider::new(backend);
     let server = mcp::McpServer::new(provider);
     mcp_http::serve(
@@ -333,6 +394,7 @@ fn run_mcp_http(args: McpHttpArgs) -> Result<()> {
             backend_name: args.backend.name().to_string(),
             allowed_origins: args.allow_origin,
             idle_timeout: std::time::Duration::from_secs(args.idle_timeout_secs),
+            oauth,
         },
     )
 }
@@ -351,5 +413,30 @@ fn run_token_mint(args: TokenMintArgs) -> Result<()> {
         args.tokens.display(),
     );
     println!("{token}");
+    Ok(())
+}
+
+/// Mint an OAuth invite code into the OAuth state file. The invite is what a
+/// human pastes into the `/oauth/authorize` form; it binds the resulting
+/// tokens to the tenant. No backend argument — OAuth tokens are minted for
+/// whatever backend the redeeming server runs.
+#[cfg(feature = "mcp-http")]
+fn run_token_invite(args: TokenInviteArgs) -> Result<()> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before 1970")
+        .as_secs();
+    // Mint under the shared advisory file lock (M2): a plain load/save here
+    // races the running server's read-modify-write and could roll back a
+    // server mutation (worst case resurrecting a revoked token family). The
+    // locked path re-reads the server's latest state before writing.
+    let invite = oauth::mint_invite_locked(&args.oauth_state, &args.tenant, args.reusable, now)?;
+    eprintln!(
+        "minted {} invite for tenant '{}' into {} — hand it to the human authorizing a connector:",
+        if args.reusable { "reusable" } else { "single-use" },
+        args.tenant,
+        args.oauth_state.display(),
+    );
+    println!("{invite}");
     Ok(())
 }
