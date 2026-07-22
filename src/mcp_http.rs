@@ -45,7 +45,15 @@
 //! passed via `--allow-origin`; requests without one (normal MCP clients,
 //! curl) pass. Default bind is loopback; internet exposure is expected to go
 //! through a TLS-terminating reverse proxy — this server speaks plain HTTP
-//! only, TLS/OAuth are deliberately out of scope.
+//! only, TLS is deliberately out of scope.
+//!
+//! Static tokens require handing a secret out of band, which browser-based
+//! MCP connectors (claude.ai, ChatGPT web) can't do — for those, an optional
+//! OAuth 2.1 layer ([`crate::oauth`]) mounts discovery/registration/authorize
+//! /token endpoints when `--public-url` + `--oauth-state` are given. OAuth
+//! access tokens resolve to the same [`TokenEntry`] shape in [`authenticate`],
+//! so every downstream check (backend, session, tenant scope) is shared.
+//! Without those flags this file's behavior is unchanged.
 //!
 //! ## Concurrency design
 //!
@@ -149,7 +157,7 @@ impl TokenStore {
 }
 
 /// `n` bytes of OS randomness as URL-safe base64 (no padding).
-fn random_urlsafe(n: usize) -> String {
+pub(crate) fn random_urlsafe(n: usize) -> String {
     let mut bytes = vec![0u8; n];
     rand::rngs::OsRng.fill_bytes(&mut bytes);
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&bytes)
@@ -171,6 +179,9 @@ pub struct HttpServerConfig {
     pub allowed_origins: Vec<String>,
     /// MCP sessions idle longer than this expire (lazily, on next access).
     pub idle_timeout: Duration,
+    /// OAuth 2.1 for browser-based connectors ([`crate::oauth`]); `None` (the
+    /// default posture) leaves this file's static-token behavior untouched.
+    pub oauth: Option<crate::oauth::OauthConfig>,
 }
 
 /// One live MCP session (Streamable-HTTP `Mcp-Session-Id`).
@@ -178,16 +189,19 @@ pub struct HttpServerConfig {
 /// Note this is *transport* state only: sandbox sessions opened through it
 /// belong to the tenant, not to the MCP session, and survive a reconnect —
 /// which is exactly what a client that lost its connection wants.
-struct HttpSession {
+pub(crate) struct HttpSession {
     tenant: String,
     last_seen: Instant,
 }
 
-struct HttpState {
-    server: McpServer,
-    tokens: HashMap<String, TokenEntry>,
-    sessions: Mutex<HashMap<String, HttpSession>>,
-    config: HttpServerConfig,
+pub(crate) struct HttpState {
+    pub(crate) server: McpServer,
+    pub(crate) tokens: HashMap<String, TokenEntry>,
+    pub(crate) sessions: Mutex<HashMap<String, HttpSession>>,
+    /// Present iff OAuth was configured; the oauth routes are mounted exactly
+    /// then, so their handlers may unwrap it.
+    pub(crate) oauth: Option<crate::oauth::OauthRuntime>,
+    pub(crate) config: HttpServerConfig,
 }
 
 /// Serve `server` over Streamable HTTP until the process is killed.
@@ -196,10 +210,18 @@ struct HttpState {
 /// their own.
 pub fn serve(server: McpServer, tokens: TokenStore, config: HttpServerConfig) -> Result<()> {
     let bind = config.bind;
+    // OAuth is opt-in: a runtime (persistent state + in-memory auth codes)
+    // exists exactly when it was configured, and its routes mount exactly then.
+    let oauth = config
+        .oauth
+        .clone()
+        .map(crate::oauth::OauthRuntime::new)
+        .transpose()?;
     let state = Arc::new(HttpState {
         server,
         tokens: tokens.tokens,
         sessions: Mutex::new(HashMap::new()),
+        oauth,
         config,
     });
     let runtime = tokio::runtime::Runtime::new().context("create tokio runtime")?;
@@ -213,19 +235,37 @@ pub fn serve(server: McpServer, tokens: TokenStore, config: HttpServerConfig) ->
             state.config.backend_name,
             state.tokens.len(),
         );
-        axum::serve(listener, router(state))
-            .await
-            .context("serve mcp-http")
+        if let Some(oauth) = &state.oauth {
+            eprintln!(
+                "playground mcp-http: OAuth 2.1 enabled (issuer {}, invite-gated authorize)",
+                oauth.public_url,
+            );
+        }
+        // `into_make_service_with_connect_info` surfaces the peer address to
+        // handlers via `ConnectInfo`, which the OAuth registration rate-limiter
+        // keys on (per-IP token buckets). Behind a reverse proxy the peer is the
+        // proxy, so the bucket is effectively shared — still a bound, just
+        // coarser; a future refinement could read a trusted forwarded header.
+        axum::serve(
+            listener,
+            router(state).into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .context("serve mcp-http")
     })
 }
 
 fn router(state: Arc<HttpState>) -> Router {
-    Router::new()
-        .route(
-            "/mcp",
-            axum::routing::post(post_mcp).get(get_mcp).delete(delete_mcp),
-        )
-        .with_state(state)
+    let mut router = Router::new().route(
+        "/mcp",
+        axum::routing::post(post_mcp).get(get_mcp).delete(delete_mcp),
+    );
+    // Discovery/registration/authorize/token endpoints exist only when OAuth
+    // was configured; without it the route table is exactly the v1 surface.
+    if state.oauth.is_some() {
+        router = router.merge(crate::oauth::routes());
+    }
+    router.with_state(state)
 }
 
 /// `POST /mcp`: one JSON-RPC message in, one JSON-RPC response (or 202) out.
@@ -365,6 +405,11 @@ async fn delete_mcp(State(state): State<Arc<HttpState>>, headers: HeaderMap) -> 
 // ---------------------------------------------------------------------------
 
 /// Origin allowlist + bearer token, in that order. Returns the token's entry.
+///
+/// Bearer resolution is static-store first (unchanged semantics), then — only
+/// when OAuth is configured — the OAuth access-token store, which yields the
+/// same [`TokenEntry`] shape so everything downstream (backend check, session
+/// ownership, tenant scope) treats both token kinds identically.
 fn authenticate(state: &HttpState, headers: &HeaderMap) -> Result<TokenEntry, Response> {
     // Origin check (DNS-rebinding defence): only requests that *carry* an
     // Origin header are candidates for rejection — plain MCP clients send none.
@@ -380,10 +425,17 @@ fn authenticate(state: &HttpState, headers: &HeaderMap) -> Result<TokenEntry, Re
     let bearer = header_str(headers, header::AUTHORIZATION.as_str())
         .and_then(|value| value.strip_prefix("Bearer "));
     let Some(token) = bearer else {
-        return Err(unauthorized("missing Authorization: Bearer <token>"));
+        return Err(unauthorized(state, "missing Authorization: Bearer <token>"));
     };
-    let Some(entry) = state.tokens.get(token) else {
-        return Err(unauthorized("unknown token"));
+    let entry = if let Some(entry) = state.tokens.get(token) {
+        entry.clone()
+    } else if let Some(oauth) = &state.oauth {
+        match oauth.lookup_access(token) {
+            Ok(entry) => entry,
+            Err(message) => return Err(unauthorized(state, message)),
+        }
+    } else {
+        return Err(unauthorized(state, "unknown token"));
     };
     if entry.backend != state.config.backend_name {
         return Err(http_error(
@@ -394,7 +446,7 @@ fn authenticate(state: &HttpState, headers: &HeaderMap) -> Result<TokenEntry, Re
             ),
         ));
     }
-    Ok(entry.clone())
+    Ok(entry)
 }
 
 /// Non-initialize requests must present a live session owned by this tenant.
@@ -514,7 +566,7 @@ fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
 /// Transport-level failure: plain `{"error": ...}` JSON with an HTTP status.
 /// (JSON-RPC error objects are reserved for dispatch-level failures, which
 /// arrive with a request id; these rejections happen before dispatch.)
-fn http_error(status: StatusCode, message: &str) -> Response {
+pub(crate) fn http_error(status: StatusCode, message: &str) -> Response {
     (
         status,
         [(header::CONTENT_TYPE, "application/json")],
@@ -523,23 +575,41 @@ fn http_error(status: StatusCode, message: &str) -> Response {
         .into_response()
 }
 
-fn unauthorized(message: &str) -> Response {
+/// 401 with `WWW-Authenticate`. When OAuth is configured the challenge names
+/// the RFC 9728 metadata URL — this is how browser-based MCP connectors
+/// discover the whole authorization flow (MCP auth spec requirement); without
+/// OAuth it stays the bare `Bearer` of v1.
+fn unauthorized(state: &HttpState, message: &str) -> Response {
     let mut response = http_error(StatusCode::UNAUTHORIZED, message);
+    let challenge = match &state.oauth {
+        Some(oauth) => format!(
+            "Bearer resource_metadata=\"{}/.well-known/oauth-protected-resource\"",
+            oauth.public_url
+        )
+        .parse()
+        .expect("public url came from config and is header-safe"),
+        None => "Bearer".parse().expect("static"),
+    };
     response
         .headers_mut()
-        .insert(header::WWW_AUTHENTICATE, "Bearer".parse().expect("static"));
+        .insert(header::WWW_AUTHENTICATE, challenge);
     response
 }
 
+/// Test support shared with `crate::oauth`'s integration test: state builder,
+/// server spawner and a blocking ureq client.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::mcp::testing::MockBackend;
     use crate::mcp::{McpServer, SandboxProvider};
 
     /// Build a server state over the mock backend with two tenants (alice,
     /// bob) plus one token minted for the wrong backend.
-    fn test_state(allowed_origins: Vec<String>, idle_timeout: Duration) -> Arc<HttpState> {
+    pub(crate) fn test_state(
+        allowed_origins: Vec<String>,
+        idle_timeout: Duration,
+    ) -> Arc<HttpState> {
         let provider = SandboxProvider::new(Box::new(MockBackend::default()));
         let server = McpServer::new(provider);
         let mut tokens = HashMap::new();
@@ -560,18 +630,40 @@ mod tests {
             server,
             tokens,
             sessions: Mutex::new(HashMap::new()),
+            oauth: None,
             config: HttpServerConfig {
                 bind: "127.0.0.1:0".parse().unwrap(),
                 backend_name: "mock".to_string(),
                 allowed_origins,
                 idle_timeout,
+                oauth: None,
             },
         })
     }
 
+    /// Build a server state like [`test_state`] but with OAuth configured
+    /// (fresh persistent store at `state_path`, issuer `public_url`).
+    pub(crate) fn test_state_with_oauth(
+        public_url: &str,
+        state_path: &Path,
+        access_ttl: Duration,
+    ) -> Arc<HttpState> {
+        let state = test_state(vec![], Duration::from_secs(3600));
+        let mut state = Arc::into_inner(state).expect("fresh state has one ref");
+        let oauth_config = crate::oauth::OauthConfig {
+            public_url: public_url.to_string(),
+            state_path: state_path.to_path_buf(),
+            access_ttl,
+        };
+        state.oauth =
+            Some(crate::oauth::OauthRuntime::new(oauth_config.clone()).expect("oauth runtime"));
+        state.config.oauth = Some(oauth_config);
+        Arc::new(state)
+    }
+
     /// Bind an ephemeral port, run axum on a dedicated runtime thread, and
     /// return the address. Tests then use blocking ureq like a real client.
-    fn spawn_server(state: Arc<HttpState>) -> SocketAddr {
+    pub(crate) fn spawn_server(state: Arc<HttpState>) -> SocketAddr {
         let runtime = tokio::runtime::Runtime::new().expect("test runtime");
         let listener = runtime
             .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
@@ -579,13 +671,22 @@ mod tests {
         let addr = listener.local_addr().expect("local addr");
         std::thread::spawn(move || {
             runtime
-                .block_on(async move { axum::serve(listener, router(state)).await })
+                .block_on(async move {
+                    // Wire ConnectInfo so the OAuth registration handler's
+                    // per-IP rate-limiter has a peer address (all test requests
+                    // share 127.0.0.1, i.e. one bucket).
+                    axum::serve(
+                        listener,
+                        router(state).into_make_service_with_connect_info::<SocketAddr>(),
+                    )
+                    .await
+                })
                 .expect("test server");
         });
         addr
     }
 
-    fn agent() -> ureq::Agent {
+    pub(crate) fn agent() -> ureq::Agent {
         // Non-2xx statuses are data for these tests, not errors.
         ureq::Agent::new_with_config(
             ureq::Agent::config_builder()
@@ -594,14 +695,14 @@ mod tests {
         )
     }
 
-    struct Reply {
-        status: u16,
-        session: Option<String>,
-        body: Value,
+    pub(crate) struct Reply {
+        pub(crate) status: u16,
+        pub(crate) session: Option<String>,
+        pub(crate) body: Value,
     }
 
     /// POST one JSON-RPC message with optional token/session/origin headers.
-    fn post(
+    pub(crate) fn post(
         agent: &ureq::Agent,
         addr: SocketAddr,
         token: Option<&str>,
@@ -638,7 +739,7 @@ mod tests {
         }
     }
 
-    fn rpc(id: u64, method: &str, params: Value) -> Value {
+    pub(crate) fn rpc(id: u64, method: &str, params: Value) -> Value {
         json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
     }
 
