@@ -52,18 +52,22 @@ Bind is loopback by default; internet exposure is expected to go behind a
 TLS-terminating reverse proxy (this server speaks plain HTTP only). See
 `src/mcp_http.rs` for the protocol and auth model.
 
-## Tokens (for `mcp-http`)
+## Users & tokens (for `mcp-http`)
 
-Bearer tokens are minted into a JSON store and bound to a tenant + backend. The
-token is printed once, then only lives in the store:
+A **user** is a tenant: its persistent sandbox plus the bearer token that
+authorizes it. `user create` provisions the tenant's sandbox (jail backend) and
+mints its token into a JSON store bound to that tenant + backend. The token is
+printed once, then only lives in the store:
 
 ```bash
 cargo run --manifest-path playground/Cargo.toml -- \
-  token mint --tenant alice --backend lima --tokens ./tokens.json
+  user create alice --backend jail --tokens ./tokens.json
 ```
 
-`PLAYGROUND_MCP_TOKENS` sets the default store path for both `token mint` and
-`mcp-http`.
+Other `user` verbs: `user list` (tenants in the store, annotated live/down),
+`user destroy <name>` (tear the sandbox down + drop its tokens), `user token
+show <name>`, `user token reset <name>` (revoke + re-mint). `PLAYGROUND_MCP_TOKENS`
+sets the default store path for the `user` verbs and `mcp-http`.
 
 ## Deployment
 
@@ -74,7 +78,7 @@ cargo run --manifest-path playground/Cargo.toml -- \
 ## Build profiles
 
 ```bash
-cargo build                       # default: mcp + mcp-http + token
+cargo build                       # default: mcp + mcp-http + user
 cargo build --no-default-features # stdio mcp only (no tokio/axum)
 cargo test
 ```

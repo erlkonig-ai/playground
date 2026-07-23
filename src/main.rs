@@ -11,7 +11,8 @@
 //!   - `mcp`       — serve the provider over stdio (JSON-RPC 2.0), operator-local.
 //!   - `mcp-http`  — serve over Streamable-HTTP with per-sandbox bearer tokens
 //!                   (feature `mcp-http`).
-//!   - `token`     — mint/manage the bearer tokens `mcp-http` checks against.
+//!   - `user`      — provision/list/destroy per-tenant sandboxes and manage the
+//!                   bearer tokens `mcp-http` checks against (feature `mcp-http`).
 
 use std::path::PathBuf;
 
@@ -36,11 +37,14 @@ enum CommandMode {
     )]
     McpHttp(McpHttpArgs),
     #[cfg(feature = "mcp-http")]
-    #[command(about = "Manage MCP access tokens (per-sandbox bearer auth)")]
-    Token {
+    #[command(about = "Provision per-tenant sandboxes and manage their MCP bearer tokens")]
+    User {
         #[command(subcommand)]
-        command: TokenCommand,
+        command: UserCommand,
     },
+    #[cfg(feature = "mcp-http")]
+    #[command(about = "Mint an OAuth invite code (the human gate of the browser-connector flow)")]
+    Invite(TokenInviteArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -160,7 +164,7 @@ struct McpHttpArgs {
     /// go behind a TLS-terminating reverse proxy (this server is plain HTTP).
     #[arg(long, default_value = "127.0.0.1:8377")]
     bind: std::net::SocketAddr,
-    /// Token store (JSON) minted with `playground token mint`.
+    /// Token store (JSON) provisioned with `playground user create`.
     #[arg(long, env = "PLAYGROUND_MCP_TOKENS")]
     tokens: PathBuf,
     /// Origin header values to accept (repeatable). Requests carrying any
@@ -221,30 +225,131 @@ struct McpHttpArgs {
     jail_local: bool,
 }
 
+/// Backend/token configuration shared by every `user` verb: which sandbox
+/// backend owns the tenant (so the CLI can build it and the token records the
+/// right backend name), the token store to read/write, and the jail-backend
+/// connection details. Flattened into each `user` subcommand's args so the flag
+/// surface matches `mcp-http`'s.
+#[cfg(feature = "mcp-http")]
+#[derive(Args, Debug, Clone)]
+struct UserBackendArgs {
+    /// Token store (JSON) — where bearer tokens live; created if missing.
+    #[arg(long, env = "PLAYGROUND_MCP_TOKENS")]
+    tokens: PathBuf,
+    /// Which sandbox backend owns this tenant (must match the serving
+    /// `mcp-http --backend`; the minted token is scoped to it).
+    #[arg(long, value_enum, default_value_t = McpBackendKind::Jail)]
+    backend: McpBackendKind,
+    /// Jail backend: SSH host that runs the jails (needs BatchMode keys +
+    /// non-interactive root via `sudo -n`).
+    #[arg(long, default_value = "<jail-host>")]
+    jail_host: String,
+    /// Jail backend: ZFS template snapshot cloned per session.
+    #[arg(long, default_value = "aitemp/playground/template@base")]
+    jail_template_snapshot: String,
+    /// Jail backend: parent dataset that holds per-session clones.
+    #[arg(long, default_value = "aitemp/playground")]
+    jail_dataset_parent: String,
+    /// Jail backend: jail-name prefix; concrete jail is `<prefix>-<tenant>`.
+    #[arg(long, default_value = "playground")]
+    jail_prefix: String,
+    /// Jail backend: run zfs/jail/jexec directly on this machine instead of
+    /// over SSH (server-side hosting on the FreeBSD jail host itself).
+    #[arg(long, default_value_t = false)]
+    jail_local: bool,
+}
+
+#[cfg(feature = "mcp-http")]
+impl UserBackendArgs {
+    /// Build the concrete jail backend these args select. Only the jail backend
+    /// has real per-tenant provisioning; a Lima tenant has no persistent box, so
+    /// asking to `user create` one is an error (its sandboxes are ephemeral,
+    /// created on `open_session`).
+    fn build_jail_backend(&self) -> Result<sandbox::jail::JailBackend> {
+        if self.backend != McpBackendKind::Jail {
+            anyhow::bail!(
+                "`user` provisioning is only for the jail backend; '{}' sandboxes are ephemeral \
+                 (created on open_session). Use `user token`/`user token reset` to manage tokens \
+                 for a '{}' tenant without provisioning.",
+                self.backend.name(),
+                self.backend.name(),
+            );
+        }
+        let mut backend = if self.jail_local {
+            sandbox::jail::JailBackend::local()
+        } else {
+            sandbox::jail::JailBackend::ssh(self.jail_host.clone())
+        };
+        backend.jail_prefix = self.jail_prefix.clone();
+        backend.template_snapshot = self.jail_template_snapshot.clone();
+        backend.dataset_parent = self.jail_dataset_parent.clone();
+        Ok(backend)
+    }
+}
+
 #[cfg(feature = "mcp-http")]
 #[derive(Subcommand, Debug)]
-enum TokenCommand {
-    #[command(about = "Mint a bearer token bound to a tenant (printed once, then only in the store)")]
-    Mint(TokenMintArgs),
-    #[command(
-        about = "Mint an OAuth invite code bound to a tenant (the human gate of the browser-connector flow)"
-    )]
-    Invite(TokenInviteArgs),
+enum UserCommand {
+    #[command(about = "Provision a tenant's persistent sandbox and mint its bearer token")]
+    Create(UserCreateArgs),
+    #[command(about = "List the tenants known to the token store (and whether their jail is live)")]
+    List(UserListArgs),
+    #[command(about = "Destroy a tenant's sandbox and remove its tokens")]
+    Destroy(UserDestroyArgs),
+    #[command(subcommand, about = "Show or reset a tenant's bearer token")]
+    Token(UserTokenCommand),
+}
+
+#[cfg(feature = "mcp-http")]
+#[derive(Subcommand, Debug)]
+enum UserTokenCommand {
+    #[command(about = "Print the token(s) for a tenant (from the store)")]
+    Show(UserTokenShowArgs),
+    #[command(about = "Revoke a tenant's existing token(s) and mint a fresh one")]
+    Reset(UserTokenResetArgs),
 }
 
 #[cfg(feature = "mcp-http")]
 #[derive(Args, Debug, Clone)]
-#[command(about = "Token mint settings")]
-struct TokenMintArgs {
-    /// Tenant label the token acts as (sessions/sandboxes are scoped to it).
-    #[arg(long)]
-    tenant: String,
-    /// Token store (JSON) to append to; created if missing.
-    #[arg(long, env = "PLAYGROUND_MCP_TOKENS")]
-    tokens: PathBuf,
-    /// Backend the token is valid for (must match the serving `mcp-http --backend`).
-    #[arg(long, value_enum, default_value_t = McpBackendKind::Lima)]
-    backend: McpBackendKind,
+struct UserCreateArgs {
+    /// Tenant label (persona / instance); sandbox + token are scoped to it.
+    name: String,
+    #[command(flatten)]
+    backend: UserBackendArgs,
+}
+
+#[cfg(feature = "mcp-http")]
+#[derive(Args, Debug, Clone)]
+struct UserListArgs {
+    #[command(flatten)]
+    backend: UserBackendArgs,
+}
+
+#[cfg(feature = "mcp-http")]
+#[derive(Args, Debug, Clone)]
+struct UserDestroyArgs {
+    /// Tenant label to destroy (its sandbox is torn down, tokens removed).
+    name: String,
+    #[command(flatten)]
+    backend: UserBackendArgs,
+}
+
+#[cfg(feature = "mcp-http")]
+#[derive(Args, Debug, Clone)]
+struct UserTokenShowArgs {
+    /// Tenant whose token(s) to print.
+    name: String,
+    #[command(flatten)]
+    backend: UserBackendArgs,
+}
+
+#[cfg(feature = "mcp-http")]
+#[derive(Args, Debug, Clone)]
+struct UserTokenResetArgs {
+    /// Tenant whose token(s) to revoke and re-mint.
+    name: String,
+    #[command(flatten)]
+    backend: UserBackendArgs,
 }
 
 #[cfg(feature = "mcp-http")]
@@ -287,10 +392,17 @@ fn main() -> Result<()> {
         #[cfg(feature = "mcp-http")]
         CommandMode::McpHttp(args) => run_mcp_http(args),
         #[cfg(feature = "mcp-http")]
-        CommandMode::Token { command } => match command {
-            TokenCommand::Mint(args) => run_token_mint(args),
-            TokenCommand::Invite(args) => run_token_invite(args),
+        CommandMode::User { command } => match command {
+            UserCommand::Create(args) => run_user_create(args),
+            UserCommand::List(args) => run_user_list(args),
+            UserCommand::Destroy(args) => run_user_destroy(args),
+            UserCommand::Token(command) => match command {
+                UserTokenCommand::Show(args) => run_user_token_show(args),
+                UserTokenCommand::Reset(args) => run_user_token_reset(args),
+            },
         },
+        #[cfg(feature = "mcp-http")]
+        CommandMode::Invite(args) => run_token_invite(args),
     }
 }
 
@@ -351,7 +463,7 @@ fn run_mcp_http(args: McpHttpArgs) -> Result<()> {
     if usable == 0 {
         eprintln!(
             "warning: no tokens for backend '{}' in {} — every request will be rejected; \
-             mint one with `playground token mint --tenant <label> --backend {} --tokens {}`",
+             provision a tenant with `playground user create <label> --backend {} --tokens {}`",
             args.backend.name(),
             args.tokens.display(),
             args.backend.name(),
@@ -384,6 +496,15 @@ fn run_mcp_http(args: McpHttpArgs) -> Result<()> {
         _ => None,
     };
 
+    // Startup reattach sweep: after a host reboot the on-disk session datasets
+    // survive but the in-kernel jail contexts are gone. Bring every provisioned
+    // sandbox back up before serving so a reconnecting tenant finds its box
+    // live. No-op for the Lima backend (ephemeral, created on open_session).
+    match backend.reattach_all() {
+        Ok(n) => eprintln!("playground mcp-http: reattached {n} persistent sandbox(es)"),
+        Err(e) => eprintln!("playground mcp-http: reattach sweep failed: {e:#}"),
+    }
+
     let provider = mcp::SandboxProvider::new(backend);
     let server = mcp::McpServer::new(provider);
     mcp_http::serve(
@@ -399,18 +520,155 @@ fn run_mcp_http(args: McpHttpArgs) -> Result<()> {
     )
 }
 
-/// Mint a bearer token into the store. The token is printed to stdout exactly
-/// once; the store keeps it (mode 0600) for the server to check against.
+/// The `SessionSpec` a `user` verb builds for a tenant. The jail backend is
+/// pile-less by design (see src/sandbox/jail.rs), so the pile mount is a
+/// placeholder that lines up with how `mcp.rs::parse_tenant` synthesises one
+/// (host path `.../<name>/self.pile`, default guest path `/pile/self.pile`);
+/// the backend logs it and never mounts it. Default cwd/env (empty) match the
+/// server's `open_session` defaults.
 #[cfg(feature = "mcp-http")]
-fn run_token_mint(args: TokenMintArgs) -> Result<()> {
-    let mut store = mcp_http::TokenStore::load(&args.tokens)?;
-    let token = store.mint(&args.tenant, args.backend.name());
-    store.save(&args.tokens)?;
+fn spec_for(name: &str) -> sandbox::SessionSpec {
+    let host_path = PathBuf::from(format!("/pile/{name}/self.pile"));
+    sandbox::SessionSpec {
+        tenant: sandbox::Tenant {
+            label: name.to_string(),
+            pile: sandbox::PileMount {
+                host_path,
+                guest_path: PathBuf::from("/pile/self.pile"),
+                append_only: true,
+            },
+        },
+        cwd: None,
+        env: Vec::new(),
+    }
+}
+
+/// `user create <name>`: provision the tenant's persistent sandbox, then mint a
+/// bearer token for it. The token is printed to stdout exactly once; the store
+/// keeps it (mode 0600) for the server to check against.
+#[cfg(feature = "mcp-http")]
+fn run_user_create(args: UserCreateArgs) -> Result<()> {
+    let backend = args.backend.build_jail_backend()?;
+    let backend_name = args.backend.backend.name();
+    use sandbox::SandboxBackend as _;
+    backend
+        .provision_sandbox(&spec_for(&args.name))
+        .with_context(|| format!("provision sandbox for tenant '{}'", args.name))?;
+
+    let mut store = mcp_http::TokenStore::load(&args.backend.tokens)?;
+    let token = store.mint(&args.name, backend_name);
+    store.save(&args.backend.tokens)?;
     eprintln!(
-        "minted token for tenant '{}' (backend {}) into {} — shown once below, store it now:",
-        args.tenant,
-        args.backend.name(),
-        args.tokens.display(),
+        "provisioned sandbox and minted token for tenant '{}' (backend {}) into {} — \
+         shown once below, store it now:",
+        args.name,
+        backend_name,
+        args.backend.tokens.display(),
+    );
+    println!("{token}");
+    Ok(())
+}
+
+/// `user list`: the distinct tenants named in the token store, annotated with
+/// whether their jail is currently live (best-effort; only meaningful for the
+/// jail backend, so the probe is skipped for others).
+#[cfg(feature = "mcp-http")]
+fn run_user_list(args: UserListArgs) -> Result<()> {
+    let store = mcp_http::TokenStore::load(&args.backend.tokens)?;
+    // Distinct tenants, sorted for stable output.
+    let mut tenants: Vec<String> = store
+        .tokens
+        .values()
+        .map(|entry| entry.tenant.clone())
+        .collect();
+    tenants.sort();
+    tenants.dedup();
+
+    if tenants.is_empty() {
+        eprintln!("no tenants in {}", args.backend.tokens.display());
+        return Ok(());
+    }
+
+    // Live-jail annotation only makes sense for the jail backend; build it once
+    // if that's the selected backend, otherwise print names alone.
+    let backend = if args.backend.backend == McpBackendKind::Jail {
+        Some(args.backend.build_jail_backend()?)
+    } else {
+        None
+    };
+    for tenant in &tenants {
+        match &backend {
+            Some(backend) => {
+                let live = backend.jail_running_for_label(tenant);
+                println!("{tenant}\t{}", if live { "live" } else { "down" });
+            }
+            None => println!("{tenant}"),
+        }
+    }
+    Ok(())
+}
+
+/// `user destroy <name>`: tear the tenant's sandbox down (permanent — `jail -r`
+/// + devfs unmount + `zfs destroy`) and remove every token bound to it.
+#[cfg(feature = "mcp-http")]
+fn run_user_destroy(args: UserDestroyArgs) -> Result<()> {
+    let backend = args.backend.build_jail_backend()?;
+    use sandbox::SandboxBackend as _;
+    let session = sandbox::SessionId::new(backend.jail_name(&args.name));
+    backend
+        .destroy_session(&session)
+        .with_context(|| format!("destroy sandbox for tenant '{}'", args.name))?;
+
+    let mut store = mcp_http::TokenStore::load(&args.backend.tokens)?;
+    let before = store.tokens.len();
+    store.tokens.retain(|_, entry| entry.tenant != args.name);
+    let removed = before - store.tokens.len();
+    store.save(&args.backend.tokens)?;
+    eprintln!(
+        "destroyed sandbox '{}' and removed {removed} token(s) for tenant '{}' from {}",
+        session.as_str(),
+        args.name,
+        args.backend.tokens.display(),
+    );
+    Ok(())
+}
+
+/// `user token <name>`: print the token(s) bound to a tenant (or a notice that
+/// there are none). This reads the store — the secret is already on disk, this
+/// just surfaces it.
+#[cfg(feature = "mcp-http")]
+fn run_user_token_show(args: UserTokenShowArgs) -> Result<()> {
+    let store = mcp_http::TokenStore::load(&args.backend.tokens)?;
+    let mut found = false;
+    for (token, entry) in &store.tokens {
+        if entry.tenant == args.name {
+            println!("{token}");
+            found = true;
+        }
+    }
+    if !found {
+        eprintln!("no token for '{}' in {}", args.name, args.backend.tokens.display());
+    }
+    Ok(())
+}
+
+/// `user token reset <name>`: revoke every existing token for a tenant and mint
+/// a fresh one, printed once.
+#[cfg(feature = "mcp-http")]
+fn run_user_token_reset(args: UserTokenResetArgs) -> Result<()> {
+    let backend_name = args.backend.backend.name();
+    let mut store = mcp_http::TokenStore::load(&args.backend.tokens)?;
+    let before = store.tokens.len();
+    store.tokens.retain(|_, entry| entry.tenant != args.name);
+    let revoked = before - store.tokens.len();
+    let token = store.mint(&args.name, backend_name);
+    store.save(&args.backend.tokens)?;
+    eprintln!(
+        "revoked {revoked} token(s) and minted a fresh one for tenant '{}' (backend {}) into {} — \
+         shown once below, store it now:",
+        args.name,
+        backend_name,
+        args.backend.tokens.display(),
     );
     println!("{token}");
     Ok(())

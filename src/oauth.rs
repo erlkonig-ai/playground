@@ -15,7 +15,7 @@
 //! 6. exchanges the code at `POST /oauth/token` with PKCE (RFC 7636, S256
 //!    only) for an access token + rotating refresh token.
 //!
-//! The human gate is an **invite code**, minted with `playground token invite
+//! The human gate is an **invite code**, minted with `playground invite
 //! --tenant <label>`: client registration is deliberately open (any connector
 //! may register), but the authorize form demands an invite, and the invite
 //! carries the tenant the resulting tokens act as. Downstream, an
@@ -1296,7 +1296,7 @@ fn authorize_page(params: &AuthorizeParams) -> String {
          <label for=\"invite_code\">Invite code</label>\n\
          <input type=\"text\" id=\"invite_code\" name=\"invite_code\" autofocus \
          autocomplete=\"off\" spellcheck=\"false\">\n\
-         <p class=\"hint\">Ask the operator for an invite code (<code>playground token invite</code>).</p>\n\
+         <p class=\"hint\">Ask the operator for an invite code (<code>playground invite</code>).</p>\n\
          <button type=\"submit\">Authorize</button>\n\
          </form>\n</body>\n</html>\n",
     )

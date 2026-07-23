@@ -138,6 +138,19 @@ pub trait SandboxBackend: Send + Sync {
     /// Provision a new isolated shell and return its session id.
     fn open_session(&self, spec: &SessionSpec) -> Result<SessionId>;
 
+    /// Explicitly create a tenant's sandbox (persistent backends). Ephemeral
+    /// backends that create on open should leave the default (no-op).
+    fn provision_sandbox(&self, _spec: &SessionSpec) -> Result<()> {
+        Ok(())
+    }
+
+    /// Bring up every already-provisioned sandbox this backend owns (e.g. after a
+    /// host reboot wiped the in-kernel jail records but the on-disk datasets remain).
+    /// Returns how many were (re)attached. Default: none.
+    fn reattach_all(&self) -> Result<usize> {
+        Ok(0)
+    }
+
     /// Run one command inside an open session. Blocks until the command exits,
     /// times out, or is killed.
     fn exec(&self, session: &SessionId, request: &ExecRequest) -> Result<ExecResult>;

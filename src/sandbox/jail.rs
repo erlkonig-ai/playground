@@ -3,14 +3,23 @@
 //! Drives a remote FreeBSD host (default `<jail-host>`) over SSH and maps
 //! the [`SandboxBackend`] verbs onto base `jail(8)` + ZFS:
 //!
-//!   - `open_session`  = idempotent reuse-or-create of a PERSISTENT per-tenant
-//!     box. A running jail context is reused as-is; a persisted dataset whose
-//!     jail is gone (host reboot / playground restart) is re-attached (devfs
-//!     re-mount + `jail -c`, no clone/re-seed); a brand-new tenant is `zfs
-//!     clone`d from the template snapshot (`aitemp/playground/template@base`)
-//!     into a per-tenant dataset (`aitemp/playground/<session>`), given a manual
-//!     `devfs` mount, then `jail -c name=playground-<session> path=<mountpoint>
-//!     persist ...`.
+//!   - `provision_sandbox` = explicit CREATE of a PERSISTENT per-tenant box: a
+//!     brand-new tenant is `zfs clone`d from the template snapshot
+//!     (`aitemp/playground/template@base`) into a per-tenant dataset
+//!     (`aitemp/playground/<session>`), given a manual `devfs` mount, seeded
+//!     `/etc/profile`, then `jail -c name=playground-<session> path=<mountpoint>
+//!     persist ...`. Idempotent: a tenant whose dataset already exists is
+//!     treated as already-provisioned (skip the clone, just ensure the jail is
+//!     up). This is what `playground user create <name>` calls.
+//!   - `open_session`  = pure reuse-or-reattach of an ALREADY-provisioned box —
+//!     it NEVER clones. A running jail context is reused as-is; a persisted
+//!     dataset whose jail is gone (host reboot / playground restart) is
+//!     re-attached (devfs re-mount + `jail -c`, no clone/re-seed); a tenant with
+//!     no dataset at all is an error ("not provisioned — run `playground user
+//!     create <name>`").
+//!   - `reattach_all` = the startup sweep: enumerate every provisioned dataset
+//!     under `dataset_parent` and `jail -c` each one whose jail context is gone
+//!     (host reboot wiped the in-kernel jail records but the datasets remain).
 //!   - `exec`          = `jexec <jail> /bin/sh -lc <command>`, wrapped in
 //!     FreeBSD `timeout(1)` server-side so a runaway command is killed *on the
 //!     server* (exit 124), with a local wall-clock backstop mirroring
@@ -271,7 +280,10 @@ impl JailBackend {
     /// Deterministic jail name for a tenant label. Jail names and ZFS dataset
     /// components share the safe alphabet `[A-Za-z0-9-]` here; anything else
     /// in the label is mapped to `-` (mirrors Lima's instance sanitisation).
-    fn jail_name(&self, label: &str) -> String {
+    ///
+    /// Public so the `user` CLI derives the same `<prefix>-<sanitised>` name the
+    /// backend uses — the two must agree on session ids (destroy, reattach).
+    pub fn jail_name(&self, label: &str) -> String {
         let safe: String = label
             .chars()
             .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
@@ -281,6 +293,13 @@ impl JailBackend {
 
     fn dataset(&self, jail: &str) -> String {
         format!("{}/{}", self.dataset_parent, jail)
+    }
+
+    /// Public liveness probe for the `user list` CLI: true iff the tenant's jail
+    /// context is currently running. Sanitises the label the same way
+    /// [`JailBackend::jail_name`] does, so the CLI and backend agree.
+    pub fn jail_running_for_label(&self, label: &str) -> bool {
+        self.jail_running(&self.jail_name(label))
     }
 
     fn run(&self, argv: &[&str], stdin: Option<&[u8]>, timeout: Duration) -> Result<HostOutput> {
@@ -338,6 +357,49 @@ impl JailBackend {
             .map(|o| o.success())
             .unwrap_or(false)
     }
+
+    /// Re-establish a jail context over an EXISTING persistent dataset: the
+    /// ephemeral devfs mount (does not survive a reboot) plus `jail -c`. The
+    /// dataset and its `/etc/profile` are left exactly as they are — this
+    /// clones nothing and re-seeds nothing. Shared by `open_session`'s reattach
+    /// arm, `provision_sandbox`'s already-provisioned arm, and `reattach_all`.
+    ///
+    /// The devfs re-mount's own status is deliberately ignored: if /dev is
+    /// already mounted from a still-live mount, the mount fails with "already
+    /// mounted" and that is fine; any other failure leaves /dev broken, which
+    /// the first `jexec` surfaces loudly (a broken /dev shows up at exec time,
+    /// not attach time — cleaner than brittle stderr matching here).
+    fn reattach(&self, jail: &str, dataset: &str) -> Result<()> {
+        let root = self.mountpoint(dataset)?;
+        let _ = self.run(
+            &[
+                "sudo", "-n", "mount", "-t", "devfs", "-o", "ruleset=4", "devfs",
+                &format!("{root}/dev"),
+            ],
+            None,
+            ADMIN_TIMEOUT,
+        );
+        let created = self.run(
+            &[
+                "sudo",
+                "-n",
+                "jail",
+                "-c",
+                &format!("name={jail}"),
+                &format!("path={root}"),
+                &format!("host.hostname={jail}"),
+                "persist",
+                "ip4=disable",
+                "ip6=disable",
+            ],
+            None,
+            ADMIN_TIMEOUT,
+        )?;
+        if !created.success() {
+            bail!("jail -c {jail} failed: {}", created.stderr_lossy());
+        }
+        Ok(())
+    }
 }
 
 impl SandboxBackend for JailBackend {
@@ -363,120 +425,133 @@ impl SandboxBackend for JailBackend {
             spec.tenant.pile.host_path.display()
         );
 
-        // Persistent per-tenant box: reuse-or-create, never blindly tear down.
-        // (The old unconditional `cleanup_leftovers` is gone — it would destroy
-        // the very box we mean to keep alive across reconnects.)
+        // Pure reuse-or-reattach: the box must already be provisioned (via
+        // `provision_sandbox` / `playground user create`). open NEVER clones.
 
         // 1. Already up? The tenant's jail context is running over its dataset;
-        //    just hand back the same id — no clone, no `jail -c`, no re-seed.
+        //    just hand back the same id — no `jail -c`, no re-seed.
         if self.jail_running(&jail) {
             eprintln!("[{}] reusing persistent sandbox '{}'", self.name(), jail);
             return Ok(SessionId::new(jail));
         }
 
-        // 2. Not running. Converge to "a jail context over the persistent
-        //    dataset". `first_create` distinguishes a brand-new tenant (no
-        //    dataset yet) from one whose dataset persisted but whose jail
-        //    context is gone (host reboot / playground restart).
-        let first_create = !self.dataset_exists(&dataset);
+        // 2. Not running, but the persistent dataset exists (host reboot /
+        //    playground restart wiped the jail context). Re-attach it: devfs
+        //    re-mount + `jail -c`, keeping the dataset and its /etc/profile as
+        //    they are. Never destroy the dataset on a transient failure — it is
+        //    the tenant's PERSISTENT storage.
+        if self.dataset_exists(&dataset) {
+            eprintln!("[{}] reattaching persistent sandbox '{}'", self.name(), jail);
+            self.reattach(&jail, &dataset)
+                .with_context(|| format!("reattach jail '{jail}'"))?;
+            return Ok(SessionId::new(jail));
+        }
 
-        let provision = (|| -> Result<String> {
-            let root = if first_create {
-                // Brand-new tenant: clone the template, then set up /dev, cwd,
-                // and /etc/profile from scratch.
-                let clone = self.run(
-                    &["sudo", "-n", "zfs", "clone", &self.template_snapshot, &dataset],
-                    None,
-                    ADMIN_TIMEOUT,
-                )?;
-                if !clone.success() {
-                    bail!(
-                        "zfs clone {} -> {dataset} failed: {}",
-                        self.template_snapshot,
-                        clone.stderr_lossy()
-                    );
-                }
+        // 3. No dataset at all: the tenant was never provisioned.
+        bail!(
+            "sandbox for tenant '{}' is not provisioned — run `playground user create {}`",
+            spec.tenant.label,
+            spec.tenant.label
+        )
+    }
 
-                let root = self.mountpoint(&dataset)?;
+    fn provision_sandbox(&self, spec: &SessionSpec) -> Result<()> {
+        let jail = self.jail_name(&spec.tenant.label);
+        let dataset = self.dataset(&jail);
 
-                // devfs, mounted manually (not via jail(8) params) so lifecycle
-                // stays explicit and destroy_session can unmount symmetrically.
-                // Ruleset 4 = devfsrules_jail: the standard, minimal jail /dev.
-                let devfs = self.run(
-                    &[
-                        "sudo", "-n", "mount", "-t", "devfs", "-o", "ruleset=4", "devfs",
-                        &format!("{root}/dev"),
-                    ],
-                    None,
-                    ADMIN_TIMEOUT,
-                )?;
-                if !devfs.success() {
-                    bail!("mount devfs failed: {}", devfs.stderr_lossy());
-                }
+        // Idempotent: a tenant whose dataset already exists is already
+        // provisioned. Don't clone or re-seed; just ensure the jail is up so
+        // `provision` doubles as "converge to running" (reattach if the jail
+        // context is gone).
+        if self.dataset_exists(&dataset) {
+            eprintln!(
+                "[{}] sandbox '{}' already provisioned; ensuring it is up",
+                self.name(),
+                jail
+            );
+            if !self.jail_running(&jail) {
+                self.reattach(&jail, &dataset)
+                    .with_context(|| format!("reattach existing jail '{jail}'"))?;
+            }
+            return Ok(());
+        }
 
-                // The session workdir (guest path), default /workspace.
-                let cwd = spec
-                    .cwd
-                    .as_deref()
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "/workspace".to_string());
-                let mkdir = self.run(
-                    &["sudo", "-n", "mkdir", "-p", &format!("{root}{cwd}")],
-                    None,
-                    ADMIN_TIMEOUT,
-                )?;
-                if !mkdir.success() {
-                    bail!("mkdir session cwd failed: {}", mkdir.stderr_lossy());
-                }
+        eprintln!(
+            "[{}] provisioning new persistent sandbox '{}' (dataset {})",
+            self.name(),
+            jail,
+            dataset
+        );
 
-                // Seed session env + default cwd via /etc/profile, which
-                // `sh -l` sources on every exec (same mechanism as the Lima
-                // template's __SESSION_ENV__). Only on first create — the
-                // persisted dataset already carries its profile.
-                let mut profile = String::new();
-                profile.push_str("\n# playground session seed\n");
-                profile.push_str(&format!("cd {} 2>/dev/null || true\n", shell_quote(&cwd)));
-                for (k, v) in &spec.env {
-                    profile.push_str(&format!("export {}={}\n", k, shell_quote(v)));
-                }
-                let seed = self.run(
-                    &["sudo", "-n", "tee", "-a", &format!("{root}/etc/profile")],
-                    Some(profile.as_bytes()),
-                    ADMIN_TIMEOUT,
-                )?;
-                if !seed.success() {
-                    bail!("seed /etc/profile failed: {}", seed.stderr_lossy());
-                }
-                root
-            } else {
-                // Dataset persisted but the jail context is gone (host reboot /
-                // playground restart). Keep the dataset and its /etc/profile as
-                // they are — do NOT clone, do NOT re-seed. Only re-establish the
-                // ephemeral devfs mount, which does not survive a reboot.
-                let root = self.mountpoint(&dataset)?;
-
-                // Best-effort devfs re-mount: if /dev is already mounted from a
-                // still-live mount, the mount fails with "already mounted" and
-                // that is fine; any other failure (bad ruleset, missing
-                // mountpoint) leaves /dev broken, which the first jexec will
-                // surface loudly. We deliberately ignore the mount's own status
-                // here rather than trying to distinguish "already mounted" from
-                // a genuine error via brittle stderr matching — a broken /dev
-                // shows up at exec time, not open time.
-                let _ = self.run(
-                    &[
-                        "sudo", "-n", "mount", "-t", "devfs", "-o", "ruleset=4", "devfs",
-                        &format!("{root}/dev"),
-                    ],
-                    None,
-                    ADMIN_TIMEOUT,
+        // Brand-new tenant: clone the template, then set up /dev, cwd, and
+        // /etc/profile from scratch, then `jail -c`.
+        let provision = (|| -> Result<()> {
+            let clone = self.run(
+                &["sudo", "-n", "zfs", "clone", &self.template_snapshot, &dataset],
+                None,
+                ADMIN_TIMEOUT,
+            )?;
+            if !clone.success() {
+                bail!(
+                    "zfs clone {} -> {dataset} failed: {}",
+                    self.template_snapshot,
+                    clone.stderr_lossy()
                 );
-                root
-            };
+            }
+
+            let root = self.mountpoint(&dataset)?;
+
+            // devfs, mounted manually (not via jail(8) params) so lifecycle
+            // stays explicit and destroy_session can unmount symmetrically.
+            // Ruleset 4 = devfsrules_jail: the standard, minimal jail /dev.
+            let devfs = self.run(
+                &[
+                    "sudo", "-n", "mount", "-t", "devfs", "-o", "ruleset=4", "devfs",
+                    &format!("{root}/dev"),
+                ],
+                None,
+                ADMIN_TIMEOUT,
+            )?;
+            if !devfs.success() {
+                bail!("mount devfs failed: {}", devfs.stderr_lossy());
+            }
+
+            // The session workdir (guest path), default /workspace.
+            let cwd = spec
+                .cwd
+                .as_deref()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "/workspace".to_string());
+            let mkdir = self.run(
+                &["sudo", "-n", "mkdir", "-p", &format!("{root}{cwd}")],
+                None,
+                ADMIN_TIMEOUT,
+            )?;
+            if !mkdir.success() {
+                bail!("mkdir session cwd failed: {}", mkdir.stderr_lossy());
+            }
+
+            // Seed session env + default cwd via /etc/profile, which `sh -l`
+            // sources on every exec (same mechanism as the Lima template's
+            // __SESSION_ENV__). Only on first create — the persisted dataset
+            // already carries its profile.
+            let mut profile = String::new();
+            profile.push_str("\n# playground session seed\n");
+            profile.push_str(&format!("cd {} 2>/dev/null || true\n", shell_quote(&cwd)));
+            for (k, v) in &spec.env {
+                profile.push_str(&format!("export {}={}\n", k, shell_quote(v)));
+            }
+            let seed = self.run(
+                &["sudo", "-n", "tee", "-a", &format!("{root}/etc/profile")],
+                Some(profile.as_bytes()),
+                ADMIN_TIMEOUT,
+            )?;
+            if !seed.success() {
+                bail!("seed /etc/profile failed: {}", seed.stderr_lossy());
+            }
 
             // Create the jail context: persistent (no processes yet), no
-            // network at all (default-deny v1), minimal params. Same for both
-            // first-create and reattach paths.
+            // network at all (default-deny v1), minimal params.
             let created = self.run(
                 &[
                     "sudo",
@@ -496,20 +571,69 @@ impl SandboxBackend for JailBackend {
             if !created.success() {
                 bail!("jail -c {jail} failed: {}", created.stderr_lossy());
             }
-            Ok(root)
+            Ok(())
         })();
 
         if let Err(e) = provision {
-            if first_create {
-                // A brand-new box that failed to provision must not leak a
-                // half-made dataset.
-                self.cleanup_leftovers(&jail);
-            }
-            // A pre-existing dataset is the tenant's PERSISTENT storage — never
-            // destroy it on a transient reattach failure; surface the error.
+            // A brand-new box that failed to provision must not leak a
+            // half-made dataset.
+            self.cleanup_leftovers(&jail);
             return Err(e.context(format!("provision jail '{jail}'")));
         }
-        Ok(SessionId::new(jail))
+        Ok(())
+    }
+
+    fn reattach_all(&self) -> Result<usize> {
+        // Enumerate the direct children of the parent dataset (`-d 1`), so a
+        // session's own child datasets (if any) don't masquerade as sessions.
+        let out = self.run(
+            &[
+                "sudo", "-n", "zfs", "list", "-H", "-o", "name", "-d", "1", "-r",
+                &self.dataset_parent,
+            ],
+            None,
+            ADMIN_TIMEOUT,
+        )?;
+        if !out.success() {
+            bail!(
+                "zfs list -r {} failed: {}",
+                self.dataset_parent,
+                out.stderr_lossy()
+            );
+        }
+
+        let prefix = format!("{}-", self.jail_prefix);
+        let mut reattached = 0usize;
+        for dataset in String::from_utf8_lossy(&out.stdout).lines() {
+            let dataset = dataset.trim();
+            // Skip the parent dataset itself and any leaf whose name isn't a
+            // `<prefix>-…` session (e.g. the `template` dataset).
+            if dataset.is_empty() || dataset == self.dataset_parent {
+                continue;
+            }
+            let Some(leaf) = dataset.strip_prefix(&format!("{}/", self.dataset_parent)) else {
+                continue;
+            };
+            // A session dataset's leaf IS its jail name (`<prefix>-<label>`).
+            if !leaf.starts_with(&prefix) {
+                continue;
+            }
+            let jail = leaf;
+            if self.jail_running(jail) {
+                continue; // already up — nothing to do
+            }
+            match self.reattach(jail, dataset) {
+                Ok(()) => {
+                    eprintln!("[{}] reattached persistent sandbox '{}'", self.name(), jail);
+                    reattached += 1;
+                }
+                Err(e) => {
+                    // Log and keep sweeping — one bad box must not strand the rest.
+                    eprintln!("[{}] reattach '{}' failed: {e:#}", self.name(), jail);
+                }
+            }
+        }
+        Ok(reattached)
     }
 
     fn exec(&self, session: &SessionId, request: &ExecRequest) -> Result<ExecResult> {
@@ -766,15 +890,16 @@ mod tests {
     }
 
     #[test]
-    fn open_session_clones_and_creates_namespaced_jail() {
-        // First-create path: no running jail and no existing dataset, so open
-        // must clone the template and create a fresh jail.
+    fn provision_sandbox_clones_and_creates() {
+        // First-create path: no existing dataset (zfs list fails), so provision
+        // must clone the template and create a fresh jail. (jls also fails so
+        // the already-provisioned "ensure up" arm is never reached — but
+        // provision keys off dataset existence, not the jail.)
         let (backend, mock) = mock_with_mountpoint()
             .reply(&["sudo", "-n", "jls", "-j"], fail())
             .reply(&["sudo", "-n", "zfs", "list"], fail())
             .into_backend();
-        let id = backend.open_session(&spec("alice")).expect("open");
-        assert_eq!(id.as_str(), "playground-alice");
+        backend.provision_sandbox(&spec("alice")).expect("provision");
 
         let calls = mock.calls();
 
@@ -801,12 +926,72 @@ mod tests {
         assert!(calls.iter().flatten().all(|a| !a.contains("self.pile")));
     }
 
+    /// A tenant with no dataset yet cannot be opened — open never clones. The
+    /// error names `playground user create` and NO clone is issued.
     #[test]
-    fn open_session_sanitises_label() {
-        let (backend, _mock) = mock_with_mountpoint().into_backend();
-        let s = spec("li ora/x");
-        let id = backend.open_session(&s).expect("open");
-        assert_eq!(id.as_str(), "playground-li-ora-x");
+    fn open_session_errors_when_unprovisioned() {
+        let (backend, mock) = mock_with_mountpoint()
+            .reply(&["sudo", "-n", "jls", "-j"], fail())
+            .reply(&["sudo", "-n", "zfs", "list"], fail())
+            .into_backend();
+        let err = backend.open_session(&spec("alice")).expect_err("must bail");
+        assert!(
+            err.to_string().contains("not provisioned"),
+            "err: {err}"
+        );
+        assert!(err.to_string().contains("playground user create alice"));
+        // Crucially: no clone was attempted.
+        assert!(
+            !mock.calls().iter().any(|c| c.get(2).map(String::as_str) == Some("zfs")
+                && c.get(3).map(String::as_str) == Some("clone")),
+            "open must not zfs clone"
+        );
+    }
+
+    /// A tenant whose jail context is gone but whose dataset persists is
+    /// reattached on open (devfs re-mount + `jail -c`), WITHOUT cloning.
+    #[test]
+    fn open_session_reattaches_existing_dataset() {
+        let (backend, mock) = mock_with_mountpoint()
+            .reply(&["sudo", "-n", "jls", "-j"], fail())
+            // dataset present: zfs list succeeds (default success from the mock).
+            .into_backend();
+        let id = backend.open_session(&spec("alice")).expect("open");
+        assert_eq!(id.as_str(), "playground-alice");
+
+        let calls = mock.calls();
+        // jail -c must be issued (reattach)...
+        assert!(
+            calls.iter().any(|c| {
+                c.get(2).map(String::as_str) == Some("jail")
+                    && c.get(3).map(String::as_str) == Some("-c")
+            }),
+            "reattach must jail -c"
+        );
+        // ...but nothing was cloned or re-seeded.
+        assert!(
+            !calls.iter().any(|c| c.get(2).map(String::as_str) == Some("zfs")
+                && c.get(3).map(String::as_str) == Some("clone")),
+            "reattach must not zfs clone"
+        );
+        assert!(
+            !calls.iter().any(|c| c.get(3).map(String::as_str) == Some("tee")
+                || c.get(2).map(String::as_str) == Some("tee")),
+            "reattach must not re-seed /etc/profile"
+        );
+    }
+
+    #[test]
+    fn provision_sandbox_sanitises_label() {
+        // No dataset yet: provision the fresh box; its id is the sanitised name.
+        let (backend, mock) = mock_with_mountpoint()
+            .reply(&["sudo", "-n", "zfs", "list"], fail())
+            .into_backend();
+        backend.provision_sandbox(&spec("li ora/x")).expect("provision");
+        let calls = mock.calls();
+        // The jail -c call carries the sanitised name.
+        assert!(calls.iter().any(|c| c.contains(&"name=playground-li-ora-x".to_string())));
+        assert_eq!(backend.jail_name("li ora/x"), "playground-li-ora-x");
     }
 
     #[test]
@@ -897,6 +1082,55 @@ mod tests {
                     && c.get(3).map(String::as_str) == Some("-c")
             }),
             "reuse must not jail -c"
+        );
+    }
+
+    /// The startup sweep: two provisioned datasets under the parent, one whose
+    /// jail is already up and one whose jail is gone. Exactly one `jail -c` is
+    /// issued (for the down one), the count is 1, and the `template` dataset +
+    /// the parent itself are skipped.
+    #[test]
+    fn reattach_all_reattaches_only_down_jails() {
+        let listing = "aitemp/playground\n\
+                       aitemp/playground/template\n\
+                       aitemp/playground/playground-alice\n\
+                       aitemp/playground/playground-bob\n";
+        let (backend, mock) = MockRunner::default()
+            // The enumeration query (more specific than a bare `zfs list`).
+            .reply(&["sudo", "-n", "zfs", "list", "-H"], ok_with_stdout(listing))
+            // alice's jail is up; bob's (and everything else) defaults to down.
+            .reply(
+                &["sudo", "-n", "jls", "-j", "playground-alice"],
+                ok_with_stdout("1\n"),
+            )
+            .reply(&["sudo", "-n", "jls", "-j"], fail())
+            // Mountpoint for bob (the one being reattached).
+            .reply(
+                &["zfs", "get", "-H", "-o", "value", "mountpoint"],
+                ok_with_stdout("/aitemp/playground/playground-bob\n"),
+            )
+            .into_backend();
+
+        let n = backend.reattach_all().expect("sweep");
+        assert_eq!(n, 1, "only the down jail is reattached");
+
+        let calls = mock.calls();
+        let jail_creates: Vec<_> = calls
+            .iter()
+            .filter(|c| {
+                c.get(2).map(String::as_str) == Some("jail")
+                    && c.get(3).map(String::as_str) == Some("-c")
+            })
+            .collect();
+        assert_eq!(jail_creates.len(), 1, "exactly one jail -c");
+        assert!(jail_creates[0].contains(&"name=playground-bob".to_string()));
+        // The template dataset and the parent are never touched (no jail -c for
+        // them, and no zfs clone anywhere — reattach never clones).
+        assert!(!jail_creates[0].contains(&"name=aitemp/playground/template".to_string()));
+        assert!(
+            !calls.iter().any(|c| c.get(2).map(String::as_str) == Some("zfs")
+                && c.get(3).map(String::as_str) == Some("clone")),
+            "sweep must not clone"
         );
     }
 

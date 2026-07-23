@@ -68,7 +68,9 @@ sudo install -o root -g wheel -m 0555 deploy/freebsd/playground_mcp /usr/local/e
 
 # token store: root-only directory, 0600 file (mint writes it 0600 itself)
 sudo mkdir -p -m 0700 /usr/local/etc/playground
-sudo playground token mint --tenant <label> --backend jail \
+# `user create` provisions the tenant's persistent jail AND mints its token.
+# --jail-local runs zfs/jail directly on this host (no ssh hop).
+sudo playground user create <label> --backend jail --jail-local \
   --tokens /usr/local/etc/playground/tokens.json
 # the token is printed exactly once — hand it to the tenant out of band
 

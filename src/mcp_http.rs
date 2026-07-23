@@ -23,7 +23,7 @@
 //! ## Auth model (the product feature)
 //!
 //! Every request must carry `Authorization: Bearer <token>`. Tokens live in a
-//! JSON [`TokenStore`] on disk (minted with `playground token mint`) and map
+//! JSON [`TokenStore`] on disk (minted with `playground user create`) and map
 //! to a **tenant** (label + allowed backend). Enforcement, all *before*
 //! dispatch, at this layer:
 //!
@@ -1060,5 +1060,51 @@ pub(crate) mod tests {
         assert_eq!(reloaded.tokens.len(), 2);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The token-store operations that back the `user` CLI verbs, exercised
+    /// directly (the CLI handlers themselves build a jail backend + do IO, so
+    /// the testable seam is the store): `user create`/`user token reset` mint
+    /// by tenant, `user token show` looks up by tenant, and `user destroy` /
+    /// `user token reset` remove by tenant.
+    #[test]
+    fn user_verb_token_semantics() {
+        let mut store = TokenStore::default();
+
+        // `user create alice` -> mint a jail token for alice.
+        let alice = store.mint("alice", "jail");
+        // `user create bob` -> mint one for bob.
+        let bob = store.mint("bob", "jail");
+        assert_eq!(store.tokens.len(), 2);
+
+        // `user token show alice` -> exactly alice's token, looked up by tenant.
+        let alices: Vec<&String> = store
+            .tokens
+            .iter()
+            .filter(|(_, e)| e.tenant == "alice")
+            .map(|(t, _)| t)
+            .collect();
+        assert_eq!(alices, vec![&alice]);
+
+        // `user token reset alice` -> remove alice's, mint a fresh one; bob's
+        // token is untouched.
+        let before = store.tokens.len();
+        store.tokens.retain(|_, e| e.tenant != "alice");
+        let revoked = before - store.tokens.len();
+        assert_eq!(revoked, 1);
+        let alice2 = store.mint("alice", "jail");
+        assert_ne!(alice, alice2);
+        assert!(store.tokens.contains_key(&bob), "reset must not touch bob");
+        assert_eq!(store.tokens.len(), 2);
+
+        // `user destroy alice` -> remove every alice token (here: the fresh one).
+        let before = store.tokens.len();
+        store.tokens.retain(|_, e| e.tenant != "alice");
+        assert_eq!(before - store.tokens.len(), 1);
+        assert!(!store.tokens.values().any(|e| e.tenant == "alice"));
+        assert!(store.tokens.contains_key(&bob), "destroy alice keeps bob");
+
+        // `user token show alice` now finds nothing.
+        assert!(!store.tokens.values().any(|e| e.tenant == "alice"));
     }
 }

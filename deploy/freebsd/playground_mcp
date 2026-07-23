@@ -19,8 +19,8 @@
 #                            TLS-terminating reverse proxy fronts the server
 #                            (the daemon speaks plain HTTP; exposure is a
 #                            deliberate, separate decision).
-#   playground_mcp_tokens  : bearer-token store, minted with
-#                            `playground token mint --backend jail` (0600).
+#   playground_mcp_tokens  : bearer-token store, provisioned with
+#                            `playground user create --backend jail` (0600).
 #   playground_mcp_binary  : path to the playground binary.
 #   playground_mcp_logfile : server stdout/stderr.
 #   playground_mcp_flags   : extra args appended to `playground mcp-http`
