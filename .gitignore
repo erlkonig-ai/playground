@@ -2,3 +2,8 @@ target
 .DS_Store
 *.mm_profdata
 *.pile
+__pycache__/
+*.pyc
+# playground is a Rust crate; scripts/ holds .rs helpers + .tmpl templates.
+# Any .py here is a stray from another workspace — never track it.
+scripts/*.py

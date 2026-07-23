@@ -24,9 +24,10 @@ disconnected client can never leak a VM or jail.
 
 - **Lima** (`--backend lima`, default): a local Lima VM per session on a macOS
   host. The pile is mounted append-only into the session.
-- **Jail** (`--backend jail`): a FreeBSD jail per session on a remote host over
-  SSH (or locally with `--jail-local`). Pile-less v1 — see the trust boundary
-  in `src/sandbox/jail.rs`.
+- **Jail** (`--backend jail`): a FreeBSD jail per tenant on a remote host over
+  SSH (or locally with `--jail-local`). Host-owned per-tenant piles (a seeded
+  `self.pile` + a shared `shared.pile`) are mounted in append-only (Model B) —
+  see the pile-provisioning section in `src/sandbox/jail.rs`.
 
 ## Serving
 

@@ -603,9 +603,10 @@ impl SandboxBackend for LimaBackend {
 /// mount FS ever gains inode-flag support. The durable append-only guarantee
 /// must come from elsewhere — candidates for the follow-on: host-side
 /// `chflags uappnd/sappnd` on the pile file (the macOS analogue, applied before
-/// the mount), a FUSE/virtiofsd policy that rejects `O_TRUNC`, or keeping the
-/// pile off the guest entirely (the jail backend's pile-less model). Until one
-/// lands, a Lima session is trusted not to truncate its own pile, not prevented.
+/// the mount) — which is exactly what the jail backend does (`chflags sappnd` on
+/// its host-owned piles) — or a FUSE/virtiofsd policy that rejects `O_TRUNC`.
+/// Until one lands, a Lima session is trusted not to truncate its own pile, not
+/// prevented.
 ///
 /// Returned as shell fragments so the caller controls when they run and the code
 /// stays inert until rendered into the provision script.

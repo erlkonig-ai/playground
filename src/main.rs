@@ -103,8 +103,9 @@ struct McpArgs {
 enum McpBackendKind {
     /// Local Lima VM per session (macOS host).
     Lima,
-    /// FreeBSD jail per session on a remote host over SSH (pile-less v1;
-    /// see src/sandbox/jail.rs for the trust boundary).
+    /// FreeBSD jail per tenant on a remote host over SSH (or locally with
+    /// `--jail-local`), with host-owned per-tenant piles mounted in (Model B —
+    /// see src/sandbox/jail.rs).
     Jail,
 }
 
@@ -633,12 +634,13 @@ fn run_mcp_http(args: McpHttpArgs) -> Result<()> {
 /// default guest path `/pile/self.pile`). Default cwd/env (empty) match the
 /// server's `open_session` defaults.
 ///
-/// Backend nuance: the jail backend is pile-less by design (see
-/// src/sandbox/jail.rs) — it logs this mount and never realises it. The lima
-/// backend DOES mount the pile, and because provisioning renders the instance
-/// config once (open no longer re-renders), this host path is the mount that
-/// persists for the box; point `--state-root`/`--template` and the pile parent
-/// directory accordingly before `user create --backend lima`.
+/// Backend nuance: the jail backend does NOT use this caller-supplied pile path
+/// (Model B — see src/sandbox/jail.rs): it logs it and instead gives the tenant
+/// its own host-owned `self.pile` + shared `shared.pile` under `pile_root`. The
+/// lima backend DOES mount this pile, and because provisioning renders the
+/// instance config once (open no longer re-renders), this host path is the mount
+/// that persists for the box; point `--state-root`/`--template` and the pile
+/// parent directory accordingly before `user create --backend lima`.
 #[cfg(feature = "mcp-http")]
 fn spec_for(name: &str) -> sandbox::SessionSpec {
     let host_path = PathBuf::from(format!("/pile/{name}/self.pile"));

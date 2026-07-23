@@ -55,17 +55,20 @@ impl SessionId {
 /// (macOS `chflags uappend` / `uappnd`, a read-only virtiofs mount plus an
 /// append-only overlay in the guest, a jail with `sappnd`, ...).
 ///
-/// ## TRUST BOUNDARY (which backends may realise this at all)
+/// ## TRUST BOUNDARY (which backends realise this, and how)
 ///
-/// A pile may only be exposed to a session whose substrate is a
-/// **operator-controlled surface**. Local backends (Lima on the Mac) qualify.
-/// Remote backends on shared machines do NOT: [`jail::JailBackend`] runs on
-/// `<jail-host>`, which other people can access, so it deliberately ignores
-/// this mount — its sessions are pile-less and exec results come back to the
-/// caller over MCP. Pile access from
-/// server jails is deferred until either an encrypted / capability-gated
-/// replica design or a `shared.pile`-only policy is decided (see the trust
-/// boundary section in [`jail`]'s module docs).
+/// A pile may only be exposed to a session whose substrate is an
+/// **operator-controlled surface**. Local backends (Lima on the Mac) qualify and
+/// mount the caller-supplied pile directly. The jail backend
+/// ([`jail::JailBackend`]) runs on a shared host, so it does NOT expose the
+/// caller-supplied pile — `host_path` is logged and ignored. Instead (Model B)
+/// each tenant jail gets its OWN host-owned, server-born piles under the
+/// backend's `pile_root`: a per-tenant `self.pile` seeded from a generic
+/// bootstrap plus one shared `shared.pile`, both append-only (`chflags sappnd`)
+/// and decoupled from the jail lifecycle. A stolen jail token thus reaches only
+/// that tenant's own seeded pile — never the caller-supplied pile, and never any
+/// other pile on the host. See the pile-provisioning section in [`jail`]'s
+/// module docs.
 #[derive(Debug, Clone)]
 pub struct PileMount {
     /// Absolute path to the pile on the host.

@@ -14,16 +14,29 @@ Two hosting modes exist and stay interchangeable:
 | Mac-driven (default) | operator's machine | `SshRunner` (`ssh` + `sudo -n`) |
 | server-side (this doc) | the jail host itself | `LocalRunner` (direct spawn) |
 
-## TRUST BOUNDARY (do not relitigate casually)
+## TRUST BOUNDARY (Model B — host-owned per-tenant piles)
 
-- **No pile ever goes to this server.** It is a shared machine; jail
-  sessions are pile-less by design (`src/sandbox/jail.rs` module docs).
-  The `pile_host_path` tool argument is logged and ignored.
-- The server only ever touches `playground-*` jails and datasets under
-  `aitemp/playground`. The `repo-*`/`trible*` jails and datasets on the
-  same box are out of bounds.
-- The HTTP server binds `127.0.0.1` and speaks plain HTTP. Anything
-  beyond loopback is a deferred decision (see the end of this doc).
+- **The caller-supplied pile never goes to this server.** The
+  `pile_host_path` tool argument is logged and ignored. Instead each tenant
+  jail gets its OWN host-owned, server-born piles, provisioned on this box
+  under `--jail-pile-root` (default `/aitemp/playground/piles`): a per-tenant
+  `self.pile` (seeded from a generic `bootstrap.pile` — no operator memory)
+  mounted at guest `/pile`, plus one org-wide `shared.pile` mounted at guest
+  `/shared`. Both are `chflags sappnd` append-only and decoupled from the jail
+  lifecycle (`destroy_session` never deletes them). A stolen tenant token thus
+  reaches only that tenant's own seeded pile and the shared org pile — never the
+  caller-supplied pile, and never any other pile on the host.
+- **Append-only is enforced by the host, not trusted to the guest.** `chflags
+  sappnd` lets a jailed process `O_APPEND` but not `O_TRUNC`/unlink/rename, so a
+  buggy or stale tool cannot truncate a pile (the 2026-07-03 truncation class).
+  At the current `kern.securelevel=-1` this blocks ACCIDENTAL truncation only; a
+  deliberate jail-root truncation still needs `securelevel>=1` (then the same
+  flag is malicious-proof with no code change — the deploy-hardening step).
+- The server only ever touches `<prefix>-*` jails and datasets under its
+  configured `--jail-dataset-parent` (default `aitemp/playground`). The
+  `repo-*`/`trible*` jails and datasets on the same box are out of bounds.
+- The HTTP server binds `127.0.0.1` and speaks plain HTTP. Anything beyond
+  loopback is a deferred decision (see the end of this doc).
 
 ## Build (on the server)
 
@@ -84,8 +97,12 @@ pass-through for root). It binds `127.0.0.1:8377` and logs to
 
 Note the trade-off this mode makes on a shared machine: the token store
 now lives on the server (root-readable only, but root includes anyone
-with root there). Tolerable precisely because sessions are pile-less —
-a stolen token buys an empty jail, not memory.
+with root there). Under Model B a stolen tenant token reaches that
+tenant's own server-born `self.pile` (seeded, append-only) and the shared
+`shared.pile` — its own data and the org-shared pile, never the caller's
+pile or any other pile on the host. Append-only (`chflags sappnd`,
+malicious-proof once `securelevel>=1`) bounds the damage to appends, not
+truncation.
 
 ## Verify (loopback round-trip)
 
@@ -98,18 +115,21 @@ A="Authorization: Bearer $TOK"
 SID=$(curl -si -H "$A" -H "$H" -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}' \
   http://127.0.0.1:8377/mcp | tr -d '\r' | awk 'tolower($1)=="mcp-session-id:"{print $2}')
 
-# open a jail session (pile path is ignored on this backend — pile-less)
-curl -s -H "$A" -H "$H" -H "Mcp-Session-Id: $SID" -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"open_session","arguments":{"pile_host_path":"/nonexistent/pile-less"}}}' http://127.0.0.1:8377/mcp
+# open a jail session (the caller pile_host_path is logged + ignored; the jail
+# uses its own server-born self.pile at guest /pile, seeded on `user create`)
+curl -s -H "$A" -H "$H" -H "Mcp-Session-Id: $SID" -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"open_session","arguments":{"pile_host_path":"/ignored/by/jail-backend"}}}' http://127.0.0.1:8377/mcp
 
-# run something in the jail (session id = playground-<tenant>)
-curl -s -H "$A" -H "$H" -H "Mcp-Session-Id: $SID" -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"exec","arguments":{"session":"playground-<label>","command":"uname -a; id; pwd"}}}' http://127.0.0.1:8377/mcp
+# run something in the jail (session id = playground-<tenant>); also prove the
+# pile mounts are live and append-only (append lands, truncate is refused)
+curl -s -H "$A" -H "$H" -H "Mcp-Session-Id: $SID" -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"exec","arguments":{"session":"playground-<label>","command":"uname -a; id; ls -la /pile /shared; echo APPEND-OK >> /pile/self.pile && echo appended; (: > /pile/self.pile) 2>/dev/null || echo truncate-blocked"}}}' http://127.0.0.1:8377/mcp
 
 # tear it down
 curl -s -H "$A" -H "$H" -H "Mcp-Session-Id: $SID" -d '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"close_session","arguments":{"session":"playground-<label>"}}}' http://127.0.0.1:8377/mcp
 
-# leftovers must be zero:
+# leftovers must be zero (jail + clone), but host piles SURVIVE (Model B):
 jls name | grep '^playground-' || echo "no playground jails"
 zfs list -r aitemp/playground   # only the parent + template must remain
+ls /aitemp/playground/piles     # per-tenant self.pile dirs + shared/ persist
 ```
 
 Interim remote use without any exposure decision: an SSH port-forward
@@ -138,7 +158,10 @@ ssh account the full service on their own loopback.
    snapshot), never destroy `@base` while clones may exist.
 4. **Jail resource limits.** Sessions currently have no rctl/zfs-quota
    caps.
-5. **Piles.** Permanently out of scope for this server until the
-   encrypted-replica or shared.pile-only design is decided
-   (`src/sandbox/jail.rs` trust-boundary docs). Nothing in this
-   deployment may move a pile toward the machine.
+5. **Bootstrap seed contents.** Model B seeds each tenant `self.pile` and
+   the `shared.pile` from `--jail-bootstrap-pile`. That seed MUST be a
+   generic bootstrap with no operator memory — the shipped
+   `faculties/bootstrap.pile` is the workspace onboarding tour and is NOT
+   generic (it still carries persona references), so it needs scrubbing
+   before it can be the seed here. Who curates the seed, and how the
+   `shared.pile` is synced to/from the org, are open.
