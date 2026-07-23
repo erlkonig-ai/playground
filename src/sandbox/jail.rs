@@ -329,7 +329,7 @@ impl SandboxBackend for JailBackend {
             dataset
         );
         // TRUST BOUNDARY (see module docs): the pile is NOT mounted on the
-        // shared server. v1 sessions are pile-less; memory stays home.
+        // shared server. v1 sessions are pile-less; the pile stays on the local host.
         eprintln!(
             "[{}] note: pile '{}' stays on the local host; session is pile-less by design",
             self.name(),
