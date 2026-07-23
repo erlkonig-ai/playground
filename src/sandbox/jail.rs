@@ -6,11 +6,14 @@
 //!   - `provision_sandbox` = explicit CREATE of a PERSISTENT per-tenant box: a
 //!     brand-new tenant is `zfs clone`d from the template snapshot
 //!     (`aitemp/playground/template@base`) into a per-tenant dataset
-//!     (`aitemp/playground/<session>`), given a manual `devfs` mount, seeded
-//!     `/etc/profile`, then `jail -c name=playground-<session> path=<mountpoint>
-//!     persist ...`. Idempotent: a tenant whose dataset already exists is
-//!     treated as already-provisioned (skip the clone, just ensure the jail is
-//!     up). This is what `playground user create <name>` calls.
+//!     (`aitemp/playground/<session>`), given a manual `devfs` mount, its two
+//!     host-owned piles (per-coworker `self.pile` + the shared `shared.pile`)
+//!     nullfs-mounted rw at guest `/pile` and `/shared`, seeded `/etc/profile`
+//!     (PATH=/opt/faculties + PILE=/pile/self.pile), then `jail -c
+//!     name=playground-<session> path=<mountpoint> persist ...`. Idempotent: a
+//!     tenant whose dataset already exists is treated as already-provisioned
+//!     (skip the clone, just ensure the jail is up). This is what `playground
+//!     user create <name>` calls.
 //!   - `open_session`  = pure reuse-or-reattach of an ALREADY-provisioned box —
 //!     it NEVER clones. A running jail context is reused as-is; a persisted
 //!     dataset whose jail is gone (host reboot / playground restart) is
@@ -27,9 +30,12 @@
 //!   - `close_session` = DETACH only: the box persists across disconnects and
 //!     reconnects so the same tenant returns to the same box (one box per
 //!     tenant). No teardown.
-//!   - `destroy_session` = the explicit teardown: `jail -r` + devfs unmount +
-//!     `zfs destroy` of the dataset. ZFS clones are cheap copy-on-write children
-//!     of the template snapshot, so a tenant box costs ~nothing until destroyed.
+//!   - `destroy_session` = the explicit teardown: `jail -r` + unmount (both
+//!     nullfs pile mounts AND devfs) + `zfs destroy` of the dataset. The
+//!     host-owned piles (self + shared) are NEVER deleted — Model B keeps them
+//!     decoupled from the jail lifecycle. ZFS clones are cheap copy-on-write
+//!     children of the template snapshot, so a tenant box costs ~nothing until
+//!     destroyed.
 //!
 //! Everything the backend creates on the server is namespaced: jail names are
 //! `<prefix>-<label>` (default prefix `playground`) and datasets live under
@@ -59,51 +65,44 @@
 //! This is deliberate default-deny; host-only or NAT networking is a later,
 //! explicit decision.
 //!
-//! ## TRUST BOUNDARY: no pile on the server (v1 is PILE-LESS by design)
+//! ## TRUST BOUNDARY + pile provisioning (Model B: host-owned server-born piles)
 //!
 //! `ai.bultmann.eu` is a **shared machine** (JP's coworker has access), so it
-//! is not a trusted destination for private pile content — `self.pile` never
-//! lands on non-Liora-controlled surfaces. Therefore this backend deliberately
-//! does **not** realise [`super::PileMount`]: the [`SessionSpec`]'s pile is
-//! ignored (logged, not mounted), sessions get a plain `/workspace` workdir,
-//! exec results return over MCP, and the drive appends observations to the
-//! pile AT HOME on the Mac. That is the v1 architecture, not a gap: the shell
-//! runs remotely, the memory stays home.
+//! is not a trusted destination for Liora's private pile content — the
+//! `self.pile` on JP's Mac (named by [`SessionSpec`]'s `tenant.pile.host_path`)
+//! **NEVER** lands here. That invariant is load-bearing and unchanged.
 //!
-//! TODO(sandbox-provider, deferred): pile access from server jails waits until
-//! either (a) an encrypted / capability-gated replica design (triblespace-net
-//! sync to a cyphertext-at-rest replica the coworker cannot read), or (b) a
-//! `shared.pile`-only policy is decided. When that lands, the mount seam is
-//! here: clone-time provisioning would place the replica inside the session
-//! dataset and enforce append-only with `chflags sappnd` (the FreeBSD
-//! system-append flag, un-clearable inside a jail at securelevel >= 1), the
-//! jail analogue of the Lima template's `guest_pile_setup`. Do NOT wire a pile
-//! path to the server before that decision.
+//! What the jail DOES carry is the **coworker's own, server-born pile** — a
+//! distinct artifact. Every coworker jail is given two host-owned piles under
+//! `pile_root`, mounted in via `nullfs` (which mounts DIRECTORIES, not single
+//! files, so the layout is a dir-per-coworker + one shared dir):
 //!
-//! ## FACULTY PROVISIONING (follow-on, not yet implemented here)
+//!   - **`self.pile`** — per-coworker, host <pile_root>/<jail>/self.pile,
+//!     nullfs-mounted **rw** at guest `/pile` (so `PILE=/pile/self.pile`).
+//!     Seeded by copying `bootstrap_pile` at provision if absent. **Model B:
+//!     DECOUPLED from the jail lifecycle** — destroying the jail unmounts but
+//!     never deletes it, and a re-provision reattaches the same accumulated
+//!     pile.
+//!   - **`shared.pile`** — a SINGLE host file shared by ALL coworker jails,
+//!     host <pile_root>/shared/shared.pile, nullfs-mounted **rw** at guest
+//!     `/shared` (same append-only semantics as self.pile — the colony already
+//!     concurrently appends one pile). Seeded once, race-safely; never deleted
+//!     by a single-coworker teardown.
 //!
-//! The Lima backend stages faculty CLIs into each session (a prebuilt
-//! Linux-aarch64 bundle mounted at `/opt/faculties` + on PATH, with `PILE` set;
-//! see [`super::faculties`] and `render_config` in [`super::lima`]). The jail
-//! backend does NOT do this yet — and until the pile lands on the server it is
-//! only half-useful (a faculty with no pile can print `--help` but not operate).
-//! The clean equivalent, to implement alongside (a)/(b) above:
+//! Both mounts are re-established on every attach (they do not survive a jail
+//! restart, exactly like the devfs mount) and torn down before `zfs destroy`
+//! (a dataset with mounts under its tree cannot be destroyed).
 //!
-//!   1. Build the faculties for **FreeBSD/aarch64** (or amd64 to match the jail
-//!      host) once — `cargo build --release --no-default-features` for the same
-//!      allow-list ([`super::faculties::SESSION_FACULTIES`]) — and **bake the
-//!      resulting binaries into the ZFS template** (`template@base`), e.g. under
-//!      `/opt/faculties`, so every `zfs clone` inherits them for free (no
-//!      per-session copy; copy-on-write shares the blocks). Re-snapshot the
-//!      template when the faculties change.
-//!   2. Seed PATH + `PILE` in the session's `/etc/profile` exactly as the Lima
-//!      template does (the `open_session` `/etc/profile` seed already writes the
-//!      env block — add `export PATH=/opt/faculties:$PATH` and, once the pile is
-//!      mounted, `export PILE=<guest pile path>` there).
+//! ## FACULTY PROVISIONING (faculties on PATH)
 //!
-//! This is a template-baking change plus two profile lines, not new backend
-//! surface — deliberately deferred to keep it paired with the pile-mount
-//! decision, since a pile-less faculty is not yet worth staging.
+//! The full faculty CLI bin set is **baked into the ZFS template** at
+//! `/opt/faculties` server-side (a template-baking step, not this backend's
+//! job — every `zfs clone` inherits it copy-on-write). This backend's part is
+//! two `/etc/profile` lines seeded at provision alongside the session env
+//! block: `export PATH=/opt/faculties:$PATH` and `export PILE=/pile/self.pile`,
+//! so a faculty run in the jail resolves and operates on the coworker's own
+//! mounted pile (the jail analogue of the Lima template's faculties staging in
+//! `render_config`).
 
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -251,6 +250,17 @@ pub struct JailBackend {
     pub template_snapshot: String,
     /// Parent dataset for per-session clones, e.g. `aitemp/playground`.
     pub dataset_parent: String,
+    /// Host directory root that holds the per-coworker pile dirs and the shared
+    /// pile dir (Model B: host-owned, DECOUPLED from the jail lifecycle). The
+    /// per-coworker `self.pile` lives at `<pile_root>/<jail-name>/self.pile` and
+    /// is nullfs-mounted rw at guest `/pile`; the single shared pile lives at
+    /// `<pile_root>/shared/shared.pile` and is nullfs-mounted rw at guest
+    /// `/shared`. Destroying a jail never deletes anything under this root.
+    pub pile_root: String,
+    /// Host path to the `bootstrap.pile` seed copied into a brand-new
+    /// coworker's `self.pile` (and used to seed the shared pile the first time).
+    /// This is the COWORKER's server-side seed — NEVER Liora's private pile.
+    pub bootstrap_pile: String,
 }
 
 impl JailBackend {
@@ -274,6 +284,8 @@ impl JailBackend {
             jail_prefix: "playground".to_string(),
             template_snapshot: "aitemp/playground/template@base".to_string(),
             dataset_parent: "aitemp/playground".to_string(),
+            pile_root: "/aitemp/playground/piles".to_string(),
+            bootstrap_pile: "/aitemp/playground/bootstrap.pile".to_string(),
         }
     }
 
@@ -293,6 +305,53 @@ impl JailBackend {
 
     fn dataset(&self, jail: &str) -> String {
         format!("{}/{}", self.dataset_parent, jail)
+    }
+
+    /// Host directory that holds this coworker's `self.pile` (Model B: owned by
+    /// the host, decoupled from the jail dataset — surviving jail teardown). It
+    /// is nullfs-mounted rw at the jail's `/pile`.
+    fn self_pile_dir(&self, jail: &str) -> String {
+        format!("{}/{}", self.pile_root, jail)
+    }
+
+    /// Host directory that holds the single `shared.pile` all coworker jails
+    /// append to concurrently. Nullfs-mounted rw at every jail's `/shared`.
+    fn shared_pile_dir(&self) -> String {
+        format!("{}/shared", self.pile_root)
+    }
+
+    /// Guest mountpoint (absolute path under the jail root) for the per-coworker
+    /// pile dir. `self.pile` therefore lands at guest `/pile/self.pile`.
+    const GUEST_PILE_DIR: &'static str = "/pile";
+    /// Guest mountpoint for the shared pile dir. `shared.pile` lands at guest
+    /// `/shared/shared.pile`.
+    const GUEST_SHARED_DIR: &'static str = "/shared";
+
+    /// Nullfs-mount `host_dir` read-write onto `<root><guest_dir>`. Idempotent
+    /// like the devfs re-mount in [`JailBackend::reattach`]: the mount's own
+    /// status is deliberately ignored, because a still-live mount fails with
+    /// "already mounted" and that is the correct no-op on reattach. A genuine
+    /// mount failure surfaces loudly at first pile access, not here.
+    ///
+    /// nullfs mounts DIRECTORIES (not single files), which is why the layout is
+    /// dir-per-coworker + a shared dir, with the pile files living inside.
+    fn nullfs_mount(&self, host_dir: &str, root: &str, guest_dir: &str) {
+        let _ = self.run(
+            &[
+                "sudo", "-n", "mount", "-t", "nullfs", host_dir,
+                &format!("{root}{guest_dir}"),
+            ],
+            None,
+            ADMIN_TIMEOUT,
+        );
+    }
+
+    /// Re-establish BOTH nullfs pile mounts (self + shared) over a jail root.
+    /// Used on every attach/reattach path — the mounts do NOT survive a jail
+    /// restart, exactly like the devfs mount. Idempotent (see `nullfs_mount`).
+    fn mount_piles(&self, jail: &str, root: &str) {
+        self.nullfs_mount(&self.self_pile_dir(jail), root, Self::GUEST_PILE_DIR);
+        self.nullfs_mount(&self.shared_pile_dir(), root, Self::GUEST_SHARED_DIR);
     }
 
     /// Public liveness probe for the `user list` CLI: true iff the tenant's jail
@@ -331,11 +390,16 @@ impl JailBackend {
         let dataset = self.dataset(jail);
         let _ = self.run(&["sudo", "-n", "jail", "-r", jail], None, ADMIN_TIMEOUT);
         if let Ok(mp) = self.mountpoint(&dataset) {
-            let _ = self.run(
-                &["sudo", "-n", "umount", "-f", &format!("{mp}/dev")],
-                None,
-                ADMIN_TIMEOUT,
-            );
+            // Unmount everything mounted under the (possibly half-made) clone —
+            // the two nullfs pile mounts plus devfs — so the zfs destroy below
+            // is not blocked. Host pile dirs themselves are never removed.
+            for guest in [Self::GUEST_PILE_DIR, Self::GUEST_SHARED_DIR, "/dev"] {
+                let _ = self.run(
+                    &["sudo", "-n", "umount", "-f", &format!("{mp}{guest}")],
+                    None,
+                    ADMIN_TIMEOUT,
+                );
+            }
         }
         let _ = self.run(&["sudo", "-n", "zfs", "destroy", &dataset], None, ADMIN_TIMEOUT);
     }
@@ -369,6 +433,9 @@ impl JailBackend {
     /// mounted" and that is fine; any other failure leaves /dev broken, which
     /// the first `jexec` surfaces loudly (a broken /dev shows up at exec time,
     /// not attach time — cleaner than brittle stderr matching here).
+    ///
+    /// The two nullfs pile mounts (self + shared) are re-established the same
+    /// way: they too do not survive a jail restart, and are idempotent.
     fn reattach(&self, jail: &str, dataset: &str) -> Result<()> {
         let root = self.mountpoint(dataset)?;
         let _ = self.run(
@@ -379,6 +446,8 @@ impl JailBackend {
             None,
             ADMIN_TIMEOUT,
         );
+        // Pile mounts do not survive a jail restart either — re-establish both.
+        self.mount_piles(jail, &root);
         let created = self.run(
             &[
                 "sudo",
@@ -417,10 +486,15 @@ impl SandboxBackend for JailBackend {
             jail,
             dataset
         );
-        // TRUST BOUNDARY (see module docs): the pile is NOT mounted on the
-        // shared server. v1 sessions are pile-less; memory stays home.
+        // TRUST BOUNDARY (see module docs): the session carries its OWN
+        // host-owned, server-born pile (mounted at /pile/self.pile by
+        // provision_sandbox), NOT the pile in `spec.tenant.pile`. Liora's
+        // private self.pile — the one on JP's Mac, named by
+        // `spec.tenant.pile.host_path` — NEVER lands on the shared server; the
+        // mounted pile is the COWORKER's distinct artifact under `pile_root`.
         eprintln!(
-            "[{}] note: pile '{}' stays on the local host; session is pile-less by design",
+            "[{}] note: Liora's private pile '{}' stays on the local host; the \
+             session operates on its own server-born self.pile",
             self.name(),
             spec.tenant.pile.host_path.display()
         );
@@ -531,13 +605,94 @@ impl SandboxBackend for JailBackend {
                 bail!("mkdir session cwd failed: {}", mkdir.stderr_lossy());
             }
 
+            // Model-B pile provisioning: two HOST-OWNED piles mounted into the
+            // jail, decoupled from the dataset lifecycle.
+            //
+            //   host <pile_root>/<jail>/self.pile  -> nullfs rw -> guest /pile
+            //   host <pile_root>/shared/shared.pile -> nullfs rw -> guest /shared
+            //
+            // These live OUTSIDE the ZFS clone tree, so destroy_session (which
+            // destroys the dataset) never touches them. The `self.pile` is this
+            // coworker's SERVER-BORN pile — distinct from Liora's private pile,
+            // which never lands here.
+            let self_dir = self.self_pile_dir(&jail);
+            let self_pile = format!("{self_dir}/self.pile");
+            let shared_dir = self.shared_pile_dir();
+            let shared_pile = format!("{shared_dir}/shared.pile");
+
+            // Per-coworker pile dir + seed self.pile from bootstrap if absent.
+            let mkdir_self = self.run(
+                &["sudo", "-n", "mkdir", "-p", &self_dir],
+                None,
+                ADMIN_TIMEOUT,
+            )?;
+            if !mkdir_self.success() {
+                bail!("mkdir self pile dir failed: {}", mkdir_self.stderr_lossy());
+            }
+            // Copy-if-absent: `cp -n` never clobbers an existing self.pile, so a
+            // reprovision keeps the coworker's accumulated pile.
+            let seed_self = self.run(
+                &["sudo", "-n", "cp", "-n", &self.bootstrap_pile, &self_pile],
+                None,
+                ADMIN_TIMEOUT,
+            )?;
+            if !seed_self.success() {
+                bail!("seed self.pile from bootstrap failed: {}", seed_self.stderr_lossy());
+            }
+
+            // Shared pile dir + shared.pile: a SINGLE file shared by ALL jails.
+            // Create-if-absent and race-safe against concurrent provisions:
+            // `mkdir -p` is idempotent, and `cp -n` will not clobber a shared
+            // pile another provision seeded first (same append-only semantics as
+            // self.pile — the colony already concurrently appends one pile).
+            let mkdir_shared = self.run(
+                &["sudo", "-n", "mkdir", "-p", &shared_dir],
+                None,
+                ADMIN_TIMEOUT,
+            )?;
+            if !mkdir_shared.success() {
+                bail!("mkdir shared pile dir failed: {}", mkdir_shared.stderr_lossy());
+            }
+            let seed_shared = self.run(
+                &["sudo", "-n", "cp", "-n", &self.bootstrap_pile, &shared_pile],
+                None,
+                ADMIN_TIMEOUT,
+            )?;
+            if !seed_shared.success() {
+                bail!("seed shared.pile from bootstrap failed: {}", seed_shared.stderr_lossy());
+            }
+
+            // Guest mountpoints, then nullfs-mount BOTH pile dirs rw. The mounts
+            // themselves do not survive a jail restart (re-established by
+            // `reattach`), but they must be live for this first `jail -c`.
+            let mkdir_mp = self.run(
+                &[
+                    "sudo", "-n", "mkdir", "-p",
+                    &format!("{root}{}", Self::GUEST_PILE_DIR),
+                    &format!("{root}{}", Self::GUEST_SHARED_DIR),
+                ],
+                None,
+                ADMIN_TIMEOUT,
+            )?;
+            if !mkdir_mp.success() {
+                bail!("mkdir guest pile mountpoints failed: {}", mkdir_mp.stderr_lossy());
+            }
+            self.mount_piles(&jail, &root);
+
             // Seed session env + default cwd via /etc/profile, which `sh -l`
             // sources on every exec (same mechanism as the Lima template's
             // __SESSION_ENV__). Only on first create — the persisted dataset
-            // already carries its profile.
+            // already carries its profile. PATH picks up the baked
+            // /opt/faculties bins; PILE points at the mounted self.pile so a
+            // faculty run in the jail operates on the coworker's own pile.
             let mut profile = String::new();
             profile.push_str("\n# playground session seed\n");
             profile.push_str(&format!("cd {} 2>/dev/null || true\n", shell_quote(&cwd)));
+            profile.push_str("export PATH=/opt/faculties:$PATH\n");
+            profile.push_str(&format!(
+                "export PILE={}\n",
+                shell_quote(&format!("{}/self.pile", Self::GUEST_PILE_DIR))
+            ));
             for (k, v) in &spec.env {
                 profile.push_str(&format!("export {}={}\n", k, shell_quote(v)));
             }
@@ -713,13 +868,19 @@ impl SandboxBackend for JailBackend {
             );
         }
 
-        // Unmount devfs (must precede zfs destroy or the dataset is busy).
+        // Unmount devfs AND the two nullfs pile mounts (must precede zfs
+        // destroy: a dataset with mounts anywhere under its tree cannot be
+        // destroyed — enforce_statfs). Model B: we unmount the piles but NEVER
+        // delete the host self.pile or shared.pile — they are host-owned and
+        // outlive the jail (a re-provision reattaches the same self.pile).
         if let Ok(root) = self.mountpoint(&dataset) {
-            let _ = self.run(
-                &["sudo", "-n", "umount", "-f", &format!("{root}/dev")],
-                None,
-                ADMIN_TIMEOUT,
-            );
+            for guest in [Self::GUEST_PILE_DIR, Self::GUEST_SHARED_DIR, "/dev"] {
+                let _ = self.run(
+                    &["sudo", "-n", "umount", "-f", &format!("{root}{guest}")],
+                    None,
+                    ADMIN_TIMEOUT,
+                );
+            }
         }
 
         // Destroy the dataset. This MUST succeed or we leak the session dataset;
@@ -922,8 +1083,105 @@ mod tests {
         assert!(jail_call.contains(&"ip4=disable".to_string()));
         assert!(jail_call.contains(&"ip6=disable".to_string()));
         assert!(jail_call.contains(&"persist".to_string()));
-        // No call anywhere references the pile (pile-less by design).
-        assert!(calls.iter().flatten().all(|a| !a.contains("self.pile")));
+    }
+
+    /// Model-B pile provisioning: a brand-new tenant gets BOTH host-owned piles
+    /// nullfs-mounted rw (self at guest /pile, shared at guest /shared), the
+    /// bootstrap.pile copied into an absent self.pile (and the shared pile), the
+    /// guest mountpoints made, and /etc/profile seeded with the faculties PATH +
+    /// PILE=/pile/self.pile. The piles derive from `pile_root`+jail name, NOT
+    /// from the caller's (Liora-private) spec pile.
+    #[test]
+    fn provision_mounts_both_piles_seeds_path_and_pile() {
+        let (backend, mock) = mock_with_mountpoint()
+            .reply(&["sudo", "-n", "zfs", "list"], fail())
+            .into_backend();
+        backend.provision_sandbox(&spec("alice")).expect("provision");
+        let calls = mock.calls();
+        let root = "/aitemp/playground/playground-alice";
+
+        // Default pile-root derived paths.
+        let self_dir = "/aitemp/playground/piles/playground-alice";
+        let self_pile = format!("{self_dir}/self.pile");
+        let shared_dir = "/aitemp/playground/piles/shared";
+        let shared_pile = format!("{shared_dir}/shared.pile");
+
+        // Host per-coworker pile dir is created.
+        assert!(
+            calls.iter().any(|c| c.ends_with(&[
+                "mkdir".into(), "-p".into(), self_dir.into()
+            ] as &[String])),
+            "must mkdir the per-coworker pile dir: {calls:?}"
+        );
+        // self.pile seeded from bootstrap.pile, copy-if-absent (`cp -n`), from
+        // the configured bootstrap path — NOT the caller's private pile.
+        assert!(
+            calls.iter().any(|c| c.ends_with(&[
+                "cp".into(), "-n".into(),
+                "/aitemp/playground/bootstrap.pile".into(),
+                self_pile.clone(),
+            ] as &[String])),
+            "must cp -n bootstrap.pile into self.pile: {calls:?}"
+        );
+        // Shared dir + shared.pile seeded create-if-absent (idempotent).
+        assert!(
+            calls.iter().any(|c| c.ends_with(&[
+                "mkdir".into(), "-p".into(), shared_dir.into()
+            ] as &[String])),
+            "must mkdir the shared pile dir: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c.ends_with(&[
+                "cp".into(), "-n".into(),
+                "/aitemp/playground/bootstrap.pile".into(),
+                shared_pile.clone(),
+            ] as &[String])),
+            "must cp -n bootstrap.pile into shared.pile: {calls:?}"
+        );
+
+        // BOTH nullfs mounts, rw, host-dir -> guest-mountpoint.
+        assert!(
+            calls.iter().any(|c| c == &[
+                "sudo".to_string(), "-n".into(), "mount".into(), "-t".into(),
+                "nullfs".into(), self_dir.to_string(), format!("{root}/pile"),
+            ]),
+            "must nullfs-mount self pile dir at /pile: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c == &[
+                "sudo".to_string(), "-n".into(), "mount".into(), "-t".into(),
+                "nullfs".into(), shared_dir.to_string(), format!("{root}/shared"),
+            ]),
+            "must nullfs-mount shared pile dir at /shared: {calls:?}"
+        );
+
+        // /etc/profile seed carries the faculties PATH + PILE at the mounted
+        // self.pile guest path.
+        let (_, seed_stdin) = mock
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(argv, _)| argv.iter().any(|a| a == "tee"))
+            .cloned()
+            .expect("profile seed issued");
+        let seed = String::from_utf8(seed_stdin.expect("seed body")).unwrap();
+        assert!(
+            seed.contains("export PATH=/opt/faculties:$PATH"),
+            "profile must put /opt/faculties on PATH: {seed}"
+        );
+        assert!(
+            seed.contains("export PILE='/pile/self.pile'"),
+            "profile must export PILE at the mounted self.pile: {seed}"
+        );
+
+        // The caller's private pile path is NEVER referenced by any host
+        // command (only logged): the mounted pile is the coworker's server-born
+        // artifact under pile_root.
+        assert!(
+            calls.iter().flatten().all(|a| !a.contains("/Users/x/self.pile")),
+            "must never reference the caller's private pile: {calls:?}"
+        );
     }
 
     /// A tenant with no dataset yet cannot be opened — open never clones. The
@@ -979,6 +1237,162 @@ mod tests {
                 || c.get(2).map(String::as_str) == Some("tee")),
             "reattach must not re-seed /etc/profile"
         );
+    }
+
+    /// Reattach re-establishes BOTH nullfs pile mounts (self + shared) — they do
+    /// not survive a jail restart, exactly like the devfs re-mount — without
+    /// re-seeding self.pile or the profile (the persisted host piles carry
+    /// their accumulated content).
+    #[test]
+    fn reattach_remounts_both_piles() {
+        let (backend, mock) = mock_with_mountpoint()
+            .reply(&["sudo", "-n", "jls", "-j"], fail())
+            // dataset present (default success) -> reattach on open.
+            .into_backend();
+        backend.open_session(&spec("alice")).expect("open");
+        let calls = mock.calls();
+        let root = "/aitemp/playground/playground-alice";
+
+        assert!(
+            calls.iter().any(|c| c == &[
+                "sudo".to_string(), "-n".into(), "mount".into(), "-t".into(),
+                "nullfs".into(),
+                "/aitemp/playground/piles/playground-alice".into(),
+                format!("{root}/pile"),
+            ]),
+            "reattach must re-mount the self pile at /pile: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c == &[
+                "sudo".to_string(), "-n".into(), "mount".into(), "-t".into(),
+                "nullfs".into(),
+                "/aitemp/playground/piles/shared".into(),
+                format!("{root}/shared"),
+            ]),
+            "reattach must re-mount the shared pile at /shared: {calls:?}"
+        );
+        // Reattach seeds nothing: no bootstrap copy.
+        assert!(
+            !calls.iter().any(|c| c.get(2).map(String::as_str) == Some("cp")),
+            "reattach must not re-seed a pile: {calls:?}"
+        );
+    }
+
+    /// destroy_session unmounts BOTH nullfs pile mounts (self AND shared) plus
+    /// devfs BEFORE `zfs destroy` (a dataset with mounts under its tree cannot
+    /// be destroyed), and — Model B — issues NO delete of the host pile dirs or
+    /// pile files: they are host-owned and outlive the jail.
+    #[test]
+    fn destroy_unmounts_both_piles_and_never_deletes_host_piles() {
+        let (backend, mock) = mock_with_mountpoint().into_backend();
+        backend
+            .destroy_session(&SessionId::new("playground-alice"))
+            .expect("destroy");
+        let calls = mock.calls();
+        let root = "/aitemp/playground/playground-alice";
+
+        let idx_of = |suffix: &str| -> usize {
+            calls
+                .iter()
+                .position(|c| c.last().map(String::as_str) == Some(suffix))
+                .unwrap_or_else(|| panic!("missing umount of {suffix} in {calls:?}"))
+        };
+        let self_umount = idx_of(&format!("{root}/pile"));
+        let shared_umount = idx_of(&format!("{root}/shared"));
+        let dev_umount = idx_of(&format!("{root}/dev"));
+
+        // All three unmounts happen...
+        for i in [self_umount, shared_umount, dev_umount] {
+            assert_eq!(
+                calls[i].get(2).map(String::as_str),
+                Some("umount"),
+                "expected an umount: {:?}",
+                calls[i]
+            );
+        }
+        // ...and all precede the zfs destroy.
+        let destroy_idx = calls
+            .iter()
+            .position(|c| {
+                c.get(2).map(String::as_str) == Some("zfs")
+                    && c.get(3).map(String::as_str) == Some("destroy")
+            })
+            .expect("zfs destroy issued");
+        assert!(
+            self_umount < destroy_idx
+                && shared_umount < destroy_idx
+                && dev_umount < destroy_idx,
+            "all pile/devfs unmounts must precede zfs destroy: {calls:?}"
+        );
+
+        // Model-B guarantee: the host pile dirs and files are NEVER removed.
+        assert!(
+            !calls.iter().any(|c| {
+                let rm = c.iter().any(|a| a == "rm");
+                let touches_piles = c.iter().any(|a| {
+                    a.contains("/piles/") || a.ends_with("self.pile") || a.ends_with("shared.pile")
+                });
+                rm && touches_piles
+            }),
+            "destroy must never delete the host self/shared pile: {calls:?}"
+        );
+        // And it must not zfs-destroy the pile-root either (piles live outside
+        // the dataset tree). The only zfs destroy is the session dataset.
+        let destroys: Vec<_> = calls
+            .iter()
+            .filter(|c| {
+                c.get(2).map(String::as_str) == Some("zfs")
+                    && c.get(3).map(String::as_str) == Some("destroy")
+            })
+            .collect();
+        assert!(
+            destroys.iter().all(|c| c.last().map(String::as_str)
+                == Some("aitemp/playground/playground-alice")),
+            "only the session dataset may be destroyed: {destroys:?}"
+        );
+    }
+
+    /// The shared-pile seed is create-if-absent and race-safe: it always uses
+    /// `cp -n` (never clobbers a shared pile another concurrent provision seeded
+    /// first) and `mkdir -p` (idempotent). Two back-to-back provisions of
+    /// different tenants each seed the SAME shared pile path with `cp -n`, so a
+    /// concurrent race is a harmless no-op on the loser.
+    #[test]
+    fn shared_pile_seed_is_idempotent_create_if_absent() {
+        for label in ["alice", "bob"] {
+            let (backend, mock) = mock_with_mountpoint()
+                .reply(&["sudo", "-n", "zfs", "list"], fail())
+                .into_backend();
+            backend.provision_sandbox(&spec(label)).expect("provision");
+            let calls = mock.calls();
+            let shared_pile = "/aitemp/playground/piles/shared/shared.pile";
+            // Shared dir mkdir is idempotent (`-p`).
+            assert!(
+                calls.iter().any(|c| c
+                    == &[
+                        "sudo".to_string(), "-n".into(), "mkdir".into(), "-p".into(),
+                        "/aitemp/playground/piles/shared".into(),
+                    ]),
+                "shared dir mkdir must be idempotent (-p): {calls:?}"
+            );
+            // Shared pile seed is copy-if-absent — never a clobbering `cp`.
+            let shared_cps: Vec<_> = calls
+                .iter()
+                .filter(|c| c.last().map(String::as_str) == Some(shared_pile))
+                .collect();
+            assert_eq!(shared_cps.len(), 1, "one shared-pile seed: {calls:?}");
+            assert_eq!(
+                shared_cps[0].get(2).map(String::as_str),
+                Some("cp"),
+                "shared seed must be a cp: {:?}",
+                shared_cps[0]
+            );
+            assert!(
+                shared_cps[0].iter().any(|a| a == "-n"),
+                "shared seed must be create-if-absent (cp -n), never clobber: {:?}",
+                shared_cps[0]
+            );
+        }
     }
 
     #[test]
