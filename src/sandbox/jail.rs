@@ -632,6 +632,24 @@ impl SandboxBackend for JailBackend {
             if !seed_self.success() {
                 bail!("seed self.pile from bootstrap failed: {}", seed_self.stderr_lossy());
             }
+            // Make the host self.pile APPEND-ONLY (`chflags sappnd`): a process
+            // inside the jail can O_APPEND but not O_TRUNC/unlink/rename it, so a
+            // buggy or stale tool cannot truncate the pile (the 2026-07-03
+            // truncation incident class). Idempotent — sappnd on an already-flagged
+            // file is a no-op — and only set on first provision (reattach skips
+            // the seed). NOTE: at the current `securelevel=-1` this blocks
+            // ACCIDENTAL truncation; deliberate truncation by a jail-root would
+            // still need `securelevel>=1` (then the same flag becomes malicious-
+            // proof with no code change). A rare crash-torn tail is repaired
+            // host-side: `chflags nosappnd` -> amputate -> re-flag.
+            let protect_self = self.run(
+                &["sudo", "-n", "chflags", "sappnd", &self_pile],
+                None,
+                ADMIN_TIMEOUT,
+            )?;
+            if !protect_self.success() {
+                bail!("chflags sappnd self.pile failed: {}", protect_self.stderr_lossy());
+            }
 
             // Shared pile dir + shared.pile: a SINGLE file shared by ALL jails.
             // Create-if-absent and race-safe against concurrent provisions:
@@ -653,6 +671,17 @@ impl SandboxBackend for JailBackend {
             )?;
             if !seed_shared.success() {
                 bail!("seed shared.pile from bootstrap failed: {}", seed_shared.stderr_lossy());
+            }
+            // Same append-only protection on the SHARED pile — the higher-stakes
+            // one, since a truncation here would corrupt org-wide data for every
+            // coworker, not just the one who did it.
+            let protect_shared = self.run(
+                &["sudo", "-n", "chflags", "sappnd", &shared_pile],
+                None,
+                ADMIN_TIMEOUT,
+            )?;
+            if !protect_shared.success() {
+                bail!("chflags sappnd shared.pile failed: {}", protect_shared.stderr_lossy());
             }
 
             // Guest mountpoints, then nullfs-mount BOTH pile dirs rw. The mounts
@@ -1116,6 +1145,18 @@ mod tests {
             ] as &[String])),
             "must cp -n bootstrap.pile into self.pile: {calls:?}"
         );
+        // Both piles are made append-only (`chflags sappnd`) after seeding: an
+        // in-jail process can append but not truncate them.
+        for pile in [&self_pile, &shared_pile] {
+            assert!(
+                calls.iter().any(|c| c.ends_with(&[
+                    "chflags".into(),
+                    "sappnd".into(),
+                    pile.clone(),
+                ] as &[String])),
+                "must chflags sappnd {pile}: {calls:?}"
+            );
+        }
         // Shared dir + shared.pile seeded create-if-absent (idempotent).
         assert!(
             calls.iter().any(|c| c.ends_with(&[
@@ -1371,7 +1412,10 @@ mod tests {
             // Shared pile seed is copy-if-absent — never a clobbering `cp`.
             let shared_cps: Vec<_> = calls
                 .iter()
-                .filter(|c| c.last().map(String::as_str) == Some(shared_pile))
+                .filter(|c| {
+                    c.last().map(String::as_str) == Some(shared_pile)
+                        && c.iter().any(|a| a == "cp")
+                })
                 .collect();
             assert_eq!(shared_cps.len(), 1, "one shared-pile seed: {calls:?}");
             assert_eq!(
