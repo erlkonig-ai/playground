@@ -113,10 +113,28 @@ impl SandboxProvider {
         self.backend.exec(&params.session, &request)
     }
 
-    /// MCP `close_session`: tear down a sandbox and deregister it.
+    /// MCP `close_session`: release a sandbox and deregister it. Both shipped
+    /// backends (jail, lima) are persistent, so this only DETACHES — the box
+    /// lives on and the same tenant can reconnect; use `destroy_session` to
+    /// remove it for good.
     pub fn close_session(&self, session: &SessionId) -> Result<()> {
         self.ensure_known(session)?;
         self.backend.close_session(session)?;
+        self.sessions
+            .lock()
+            .expect("sessions poisoned")
+            .remove(session);
+        Ok(())
+    }
+
+    /// MCP `destroy_session`: permanently tear a sandbox down and deregister it.
+    /// Both shipped backends (jail, lima) are persistent, so this is the real
+    /// teardown that removes the box for good (jail: `jail -r` + `zfs destroy`;
+    /// lima: `limactl stop` + `limactl delete`), as opposed to `close_session`'s
+    /// detach.
+    pub fn destroy_session(&self, session: &SessionId) -> Result<()> {
+        self.ensure_known(session)?;
+        self.backend.destroy_session(session)?;
         self.sessions
             .lock()
             .expect("sessions poisoned")
@@ -153,6 +171,24 @@ impl SandboxProvider {
             }
         }
         failed
+    }
+
+    /// Process-shutdown hook: detach every open session, then spin DOWN every
+    /// owned sandbox that must not outlive the process (Lima VMs; jail is a
+    /// no-op by design — its kernel records are free and persist). The inverse
+    /// of the startup `reattach_all` sweep. Returns how many sandboxes were spun
+    /// down. Best-effort: session-close failures are logged by
+    /// `close_all_sessions` and do not block the spin-down.
+    #[cfg(feature = "mcp-http")]
+    pub fn shutdown(&self) -> usize {
+        self.close_all_sessions();
+        match self.backend.shutdown() {
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("playground mcp: sandbox spin-down on shutdown failed: {e:#}");
+                0
+            }
+        }
     }
 
     /// The tenant label a live session belongs to, or `None` if this provider
@@ -195,11 +231,11 @@ impl SandboxProvider {
 //   - `initialize`                -> capabilities + serverInfo
 //   - `notifications/initialized` -> acknowledged (no response, per JSON-RPC
 //                                    notification semantics)
-//   - `tools/list`                -> the three sandbox tools
+//   - `tools/list`                -> the sandbox tools
 //   - `tools/call`                -> dispatch to SandboxProvider
 //
-// The three tools mirror the provider verbs: `open_session`, `exec`,
-// `close_session`.
+// The tools mirror the provider verbs: `open_session`, `exec`,
+// `close_session`, `destroy_session`.
 
 /// The newest MCP protocol version this server speaks (and the one it
 /// advertises when the client requests something it doesn't know).
@@ -416,6 +452,7 @@ impl McpServer {
             "open_session" => self.tool_open_session(args),
             "exec" => self.tool_exec(args),
             "close_session" => self.tool_close_session(args),
+            "destroy_session" => self.tool_destroy_session(args),
             other => Err(anyhow!("unknown tool: {other}")),
         };
 
@@ -477,6 +514,16 @@ impl McpServer {
         self.provider.close_session(&session)?;
         Ok(format!("closed {}", session.as_str()))
     }
+
+    fn tool_destroy_session(&self, args: Value) -> Result<String> {
+        let session = SessionId::new(
+            args.get("session")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("destroy_session missing 'session'"))?,
+        );
+        self.provider.destroy_session(&session)?;
+        Ok(format!("destroyed {}", session.as_str()))
+    }
 }
 
 /// Internal dispatch result: a JSON-RPC result, error, or a notification that
@@ -487,7 +534,7 @@ enum DispatchOutcome {
     Error { code: i64, message: String },
 }
 
-/// The MCP `tools/list` schema for the three sandbox tools.
+/// The MCP `tools/list` schema for the sandbox tools.
 fn tool_schemas() -> Value {
     json!([
         {
@@ -522,7 +569,18 @@ fn tool_schemas() -> Value {
         },
         {
             "name": "close_session",
-            "description": "Tear down a sandbox session and release its resources.",
+            "description": "Release a sandbox session. Sandboxes are persistent (both the jail and lima backends): close_session only detaches, so the box stays alive and the same tenant can reconnect. Use destroy_session to remove it for good.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session": { "type": "string", "description": "Session id from open_session." }
+                },
+                "required": ["session"]
+            }
+        },
+        {
+            "name": "destroy_session",
+            "description": "Permanently tear down a sandbox session and free its storage. Both backends' sandboxes are persistent (close_session only detaches); this removes the box for good.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -623,6 +681,7 @@ pub(crate) mod testing {
     pub(crate) struct MockBackend {
         pub(crate) execs: Arc<AtomicUsize>,
         pub(crate) closes: Arc<AtomicUsize>,
+        pub(crate) destroys: Arc<AtomicUsize>,
     }
 
     impl SandboxBackend for MockBackend {
@@ -643,6 +702,10 @@ pub(crate) mod testing {
         }
         fn close_session(&self, _session: &SessionId) -> Result<()> {
             self.closes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn destroy_session(&self, _session: &SessionId) -> Result<()> {
+            self.destroys.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
     }
@@ -688,8 +751,8 @@ mod tests {
 
         // initialize
         assert_eq!(lines[0]["result"]["protocolVersion"], MCP_PROTOCOL_VERSION);
-        // tools/list has three tools
-        assert_eq!(lines[1]["result"]["tools"].as_array().unwrap().len(), 3);
+        // tools/list has the four sandbox tools
+        assert_eq!(lines[1]["result"]["tools"].as_array().unwrap().len(), 4);
         // open_session returned the mock session id
         assert_eq!(lines[2]["result"]["content"][0]["text"], "mock-alice");
         assert_eq!(lines[2]["result"]["isError"], false);
@@ -719,6 +782,58 @@ mod tests {
             serde_json::from_str(String::from_utf8(output).unwrap().trim()).unwrap();
         assert_eq!(line["result"]["isError"], true);
         assert!(line["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("unknown session"));
+    }
+
+    /// The `destroy_session` tool routes to the backend's `destroy_session`
+    /// (permanent teardown), distinct from `close_session`'s detach, and
+    /// deregisters the session so a follow-up is refused.
+    #[test]
+    fn destroy_session_tool_calls_backend_destroy() {
+        let requests = [
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"open_session","arguments":{"tenant":"alice","pile_host_path":"/tmp/alice/self.pile"}}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"destroy_session","arguments":{"session":"mock-alice"}}}"#,
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"exec","arguments":{"session":"mock-alice","command":"echo hi"}}}"#,
+        ]
+        .join("\n");
+
+        let closes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let destroys = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let backend = MockBackend {
+            closes: closes.clone(),
+            destroys: destroys.clone(),
+            ..Default::default()
+        };
+        let provider = SandboxProvider::new(Box::new(backend));
+        let server = McpServer::new(provider);
+
+        let input = std::io::Cursor::new(requests.into_bytes());
+        let mut output: Vec<u8> = Vec::new();
+        {
+            let mut transport = StdioTransport::new(input, &mut output);
+            server.serve_loop(&mut transport).expect("serve");
+        }
+
+        // destroy_session went to the backend's destroy path, not close.
+        assert_eq!(destroys.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(closes.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        let lines: Vec<Value> = String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        // destroy_session succeeded...
+        assert_eq!(lines[1]["result"]["isError"], false);
+        assert!(lines[1]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("destroyed mock-alice"));
+        // ...and deregistered the session: the later exec is now unknown.
+        assert_eq!(lines[2]["result"]["isError"], true);
+        assert!(lines[2]["result"]["content"][0]["text"]
             .as_str()
             .unwrap()
             .contains("unknown session"));

@@ -28,7 +28,7 @@ sha2 = { version = "0.10", optional = true }
 # CLI serialise their read-modify-write of the OAuth state file — no new crate
 # in the tree, libc is already resolved transitively via sha2/cpufeatures.
 libc = { version = "0.2", optional = true }
-tokio = { version = "1", optional = true, features = ["rt-multi-thread", "net", "time"] }
+tokio = { version = "1", optional = true, features = ["rt-multi-thread", "net", "time", "signal"] }
 
 [dev-dependencies]
 # The mcp-http integration test acts as an HTTP client against the live server.

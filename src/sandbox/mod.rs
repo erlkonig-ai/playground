@@ -61,7 +61,8 @@ impl SessionId {
 /// **operator-controlled surface**. Local backends (Lima on the Mac) qualify.
 /// Remote backends on shared machines do NOT: [`jail::JailBackend`] runs on
 /// `<jail-host>`, which other people can access, so it deliberately ignores
-/// this mount — its sessions are pile-less, exec results come back over MCP. Pile access from
+/// this mount — its sessions are pile-less and exec results come back to the
+/// caller over MCP. Pile access from
 /// server jails is deferred until either an encrypted / capability-gated
 /// replica design or a `shared.pile`-only policy is decided (see the trust
 /// boundary section in [`jail`]'s module docs).
@@ -134,13 +135,67 @@ pub trait SandboxBackend: Send + Sync {
     /// Human-readable backend name for diagnostics ("lima", "seatbelt", ...).
     fn name(&self) -> &'static str;
 
-    /// Provision a new isolated shell and return its session id.
+    /// Open a session on an ALREADY-provisioned sandbox and return its session
+    /// id. On the shipped persistent backends (jail, lima) this is pure
+    /// reuse-or-reattach — it NEVER creates: a running box is reused, a
+    /// down/stopped box is brought back up, and an unprovisioned tenant is an
+    /// error (run `playground user create`). Explicit creation is
+    /// `provision_sandbox`.
     fn open_session(&self, spec: &SessionSpec) -> Result<SessionId>;
+
+    /// Explicitly create a tenant's PERSISTENT sandbox (idempotent: an existing
+    /// box is just brought up, not recreated). Both shipped backends — jail and
+    /// lima — are persistent/provision-based and implement this; the default
+    /// no-op exists only for a hypothetical ephemeral (create-on-open) backend.
+    fn provision_sandbox(&self, _spec: &SessionSpec) -> Result<()> {
+        Ok(())
+    }
+
+    /// Bring up every already-provisioned sandbox this backend owns (e.g. after a
+    /// host reboot wiped the in-kernel jail records / stopped the Lima VMs, while
+    /// the on-disk datasets / instances remain). Returns how many were
+    /// (re)attached. Both jail and lima implement this; default: none.
+    fn reattach_all(&self) -> Result<usize> {
+        Ok(0)
+    }
 
     /// Run one command inside an open session. Blocks until the command exits,
     /// times out, or is killed.
     fn exec(&self, session: &SessionId, request: &ExecRequest) -> Result<ExecResult>;
 
-    /// Tear down a session and release its resources.
+    /// Release a session. On the shipped persistent backends (jail, lima) this
+    /// only DETACHES — the box stays alive so the same tenant can reconnect. Use
+    /// `destroy_session` to remove it for good. (A hypothetical ephemeral backend
+    /// would tear the sandbox down here.)
     fn close_session(&self, session: &SessionId) -> Result<()>;
+
+    /// Permanently tear a sandbox down and free its storage, even for backends
+    /// whose `close_session` only detaches (the persistent sandboxes). Both
+    /// shipped backends (jail, lima) override this with real teardown; the
+    /// default delegates to `close_session`, correct only for a hypothetical
+    /// ephemeral backend where closing already destroys.
+    fn destroy_session(&self, session: &SessionId) -> Result<()> {
+        self.close_session(session)
+    }
+
+    /// Spin DOWN every owned sandbox that must not outlive the playground
+    /// process — the inverse of `reattach_all`'s startup spin-up, but WITHOUT
+    /// destroying anything (the on-disk dataset / instance stays, so the next
+    /// `reattach_all` brings it back). Returns how many were spun down.
+    ///
+    /// The two shipped backends differ by how costly an idle-but-live sandbox
+    /// is:
+    /// - **jail** (default no-op): a jail is an in-kernel `prison` record with
+    ///   zero processes — essentially free — so jails PERSIST across playground
+    ///   restarts and there is nothing to spin down.
+    /// - **lima** (override): a VM holds real host RAM/CPU even when idle, so a
+    ///   Lima instance is tied to the playground process lifetime — `limactl
+    ///   stop` each owned running instance here.
+    ///
+    /// Called on graceful shutdown and, crucially, by `playground clean` — the
+    /// reliable sweep after a hard kill, since a killed process cannot run its
+    /// own cleanup.
+    fn shutdown(&self) -> Result<usize> {
+        Ok(0)
+    }
 }

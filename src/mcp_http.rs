@@ -23,7 +23,7 @@
 //! ## Auth model (the product feature)
 //!
 //! Every request must carry `Authorization: Bearer <token>`. Tokens live in a
-//! JSON [`TokenStore`] on disk (minted with `playground token mint`) and map
+//! JSON [`TokenStore`] on disk (minted with `playground user create`) and map
 //! to a **tenant** (label + allowed backend). Enforcement, all *before*
 //! dispatch, at this layer:
 //!
@@ -32,8 +32,8 @@
 //! - `open_session` for a tenant other than the token's → `403` (a missing
 //!   `tenant` argument is filled in from the token, so clients need not know
 //!   their own label);
-//! - `exec`/`close_session` against a sandbox session owned by another tenant
-//!   → `403` (via [`SandboxProvider::session_tenant`]);
+//! - `exec`/`close_session`/`destroy_session` against a sandbox session owned by
+//!   another tenant → `403` (via [`SandboxProvider::session_tenant`]);
 //! - an `Mcp-Session-Id` issued to another tenant's token → `403`.
 //!
 //! The stdio transport (`playground mcp`) stays unauthenticated by design: it
@@ -246,13 +246,50 @@ pub fn serve(server: McpServer, tokens: TokenStore, config: HttpServerConfig) ->
         // keys on (per-IP token buckets). Behind a reverse proxy the peer is the
         // proxy, so the bucket is effectively shared — still a bound, just
         // coarser; a future refinement could read a trusted forwarded header.
-        axum::serve(
+        // `state` is cloned into the router so the original Arc survives the
+        // serve to drive the post-shutdown spin-down below.
+        let serve_result = axum::serve(
             listener,
-            router(state).into_make_service_with_connect_info::<SocketAddr>(),
+            router(state.clone()).into_make_service_with_connect_info::<SocketAddr>(),
         )
+        .with_graceful_shutdown(shutdown_signal())
         .await
-        .context("serve mcp-http")
+        .context("serve mcp-http");
+
+        // Graceful shutdown reached (SIGINT/SIGTERM), or serve errored out:
+        // spin DOWN every owned sandbox that must not outlive this process
+        // (Lima VMs; jail is a no-op). A HARD kill skips this path entirely —
+        // `playground clean` is the backstop for that case.
+        let spun = state.server.provider().shutdown();
+        eprintln!("playground mcp-http: spun down {spun} owned sandbox(es) on shutdown");
+        serve_result
     })
+}
+
+/// Resolves when the process is asked to stop — SIGINT (Ctrl-C) or, on unix,
+/// SIGTERM — so axum drains in-flight requests before `serve` returns and we
+/// spin down owned sandboxes. A hard SIGKILL cannot be caught; `playground
+/// clean` recovers that case.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+    eprintln!("playground mcp-http: shutdown signal received — draining, then spinning down");
 }
 
 fn router(state: Arc<HttpState>) -> Router {
@@ -491,7 +528,7 @@ fn validate_session(
 ///
 /// - `open_session`: an explicit `tenant` argument must match the token's; a
 ///   missing one is filled in from it (clients need not know their label).
-/// - `exec`/`close_session`: the sandbox session named in `arguments.session`
+/// - `exec`/`close_session`/`destroy_session`: the sandbox session named in `arguments.session`
 ///   must belong to the token's tenant. Unknown sessions fall through — the
 ///   provider reports those as tool errors itself, and telling a prober
 ///   "forbidden" vs "unknown" for other tenants' ids would leak liveness.
@@ -530,7 +567,7 @@ fn enforce_tenant_scope(
                 }
             }
         }
-        "exec" | "close_session" => {
+        "exec" | "close_session" | "destroy_session" => {
             let session = request
                 .get("params")
                 .and_then(|p| p.get("arguments"))
@@ -776,10 +813,10 @@ pub(crate) mod tests {
         assert_eq!(notified.status, 202);
         assert_eq!(notified.body, Value::Null);
 
-        // tools/list: the three sandbox tools.
+        // tools/list: the four sandbox tools.
         let tools = post(&agent, addr, tok, Some(&session), None, &rpc(2, "tools/list", json!({})));
         assert_eq!(tools.status, 200);
-        assert_eq!(tools.body["result"]["tools"].as_array().unwrap().len(), 3);
+        assert_eq!(tools.body["result"]["tools"].as_array().unwrap().len(), 4);
 
         // open_session without a tenant argument: filled in from the token.
         let opened = post(
@@ -1060,5 +1097,51 @@ pub(crate) mod tests {
         assert_eq!(reloaded.tokens.len(), 2);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The token-store operations that back the `user` CLI verbs, exercised
+    /// directly (the CLI handlers themselves build a jail backend + do IO, so
+    /// the testable seam is the store): `user create`/`user token reset` mint
+    /// by tenant, `user token show` looks up by tenant, and `user destroy` /
+    /// `user token reset` remove by tenant.
+    #[test]
+    fn user_verb_token_semantics() {
+        let mut store = TokenStore::default();
+
+        // `user create alice` -> mint a jail token for alice.
+        let alice = store.mint("alice", "jail");
+        // `user create bob` -> mint one for bob.
+        let bob = store.mint("bob", "jail");
+        assert_eq!(store.tokens.len(), 2);
+
+        // `user token show alice` -> exactly alice's token, looked up by tenant.
+        let alices: Vec<&String> = store
+            .tokens
+            .iter()
+            .filter(|(_, e)| e.tenant == "alice")
+            .map(|(t, _)| t)
+            .collect();
+        assert_eq!(alices, vec![&alice]);
+
+        // `user token reset alice` -> remove alice's, mint a fresh one; bob's
+        // token is untouched.
+        let before = store.tokens.len();
+        store.tokens.retain(|_, e| e.tenant != "alice");
+        let revoked = before - store.tokens.len();
+        assert_eq!(revoked, 1);
+        let alice2 = store.mint("alice", "jail");
+        assert_ne!(alice, alice2);
+        assert!(store.tokens.contains_key(&bob), "reset must not touch bob");
+        assert_eq!(store.tokens.len(), 2);
+
+        // `user destroy alice` -> remove every alice token (here: the fresh one).
+        let before = store.tokens.len();
+        store.tokens.retain(|_, e| e.tenant != "alice");
+        assert_eq!(before - store.tokens.len(), 1);
+        assert!(!store.tokens.values().any(|e| e.tenant == "alice"));
+        assert!(store.tokens.contains_key(&bob), "destroy alice keeps bob");
+
+        // `user token show alice` now finds nothing.
+        assert!(!store.tokens.values().any(|e| e.tenant == "alice"));
     }
 }
