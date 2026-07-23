@@ -142,6 +142,16 @@ pub trait SandboxBackend: Send + Sync {
     /// times out, or is killed.
     fn exec(&self, session: &SessionId, request: &ExecRequest) -> Result<ExecResult>;
 
-    /// Tear down a session and release its resources.
+    /// Release a session. Ephemeral backends tear the sandbox down; PERSISTENT
+    /// backends (the jail backend) leave it alive so the same tenant can
+    /// reconnect — use `destroy_session` to remove it for good.
     fn close_session(&self, session: &SessionId) -> Result<()>;
+
+    /// Permanently tear a sandbox down and free its storage, even for backends
+    /// whose `close_session` only detaches (persistent sandboxes). Default is
+    /// `close_session` — correct for ephemeral backends where closing already
+    /// destroys; persistent backends (the jail backend) override this.
+    fn destroy_session(&self, session: &SessionId) -> Result<()> {
+        self.close_session(session)
+    }
 }

@@ -32,8 +32,8 @@
 //! - `open_session` for a tenant other than the token's → `403` (a missing
 //!   `tenant` argument is filled in from the token, so clients need not know
 //!   their own label);
-//! - `exec`/`close_session` against a sandbox session owned by another tenant
-//!   → `403` (via [`SandboxProvider::session_tenant`]);
+//! - `exec`/`close_session`/`destroy_session` against a sandbox session owned by
+//!   another tenant → `403` (via [`SandboxProvider::session_tenant`]);
 //! - an `Mcp-Session-Id` issued to another tenant's token → `403`.
 //!
 //! The stdio transport (`playground mcp`) stays unauthenticated by design: it
@@ -491,7 +491,7 @@ fn validate_session(
 ///
 /// - `open_session`: an explicit `tenant` argument must match the token's; a
 ///   missing one is filled in from it (clients need not know their label).
-/// - `exec`/`close_session`: the sandbox session named in `arguments.session`
+/// - `exec`/`close_session`/`destroy_session`: the sandbox session named in `arguments.session`
 ///   must belong to the token's tenant. Unknown sessions fall through — the
 ///   provider reports those as tool errors itself, and telling a prober
 ///   "forbidden" vs "unknown" for other tenants' ids would leak liveness.
@@ -530,7 +530,7 @@ fn enforce_tenant_scope(
                 }
             }
         }
-        "exec" | "close_session" => {
+        "exec" | "close_session" | "destroy_session" => {
             let session = request
                 .get("params")
                 .and_then(|p| p.get("arguments"))
@@ -776,10 +776,10 @@ pub(crate) mod tests {
         assert_eq!(notified.status, 202);
         assert_eq!(notified.body, Value::Null);
 
-        // tools/list: the three sandbox tools.
+        // tools/list: the four sandbox tools.
         let tools = post(&agent, addr, tok, Some(&session), None, &rpc(2, "tools/list", json!({})));
         assert_eq!(tools.status, 200);
-        assert_eq!(tools.body["result"]["tools"].as_array().unwrap().len(), 3);
+        assert_eq!(tools.body["result"]["tools"].as_array().unwrap().len(), 4);
 
         // open_session without a tenant argument: filled in from the token.
         let opened = post(

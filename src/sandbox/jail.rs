@@ -3,17 +3,24 @@
 //! Drives a remote FreeBSD host (default `<jail-host>`) over SSH and maps
 //! the [`SandboxBackend`] verbs onto base `jail(8)` + ZFS:
 //!
-//!   - `open_session`  = `zfs clone` of a pre-provisioned template snapshot
-//!     (`aitemp/playground/template@base`) into a per-session dataset
-//!     (`aitemp/playground/<session>`), a manual `devfs` mount, then
-//!     `jail -c name=playground-<session> path=<clone mountpoint> persist ...`.
+//!   - `open_session`  = idempotent reuse-or-create of a PERSISTENT per-tenant
+//!     box. A running jail context is reused as-is; a persisted dataset whose
+//!     jail is gone (host reboot / playground restart) is re-attached (devfs
+//!     re-mount + `jail -c`, no clone/re-seed); a brand-new tenant is `zfs
+//!     clone`d from the template snapshot (`aitemp/playground/template@base`)
+//!     into a per-tenant dataset (`aitemp/playground/<session>`), given a manual
+//!     `devfs` mount, then `jail -c name=playground-<session> path=<mountpoint>
+//!     persist ...`.
 //!   - `exec`          = `jexec <jail> /bin/sh -lc <command>`, wrapped in
 //!     FreeBSD `timeout(1)` server-side so a runaway command is killed *on the
 //!     server* (exit 124), with a local wall-clock backstop mirroring
 //!     [`super::lima::LimaBackend`]'s timeout/exit-124 semantics.
-//!   - `close_session` = `jail -r` + devfs unmount + `zfs destroy` of the
-//!     clone. ZFS clones are cheap copy-on-write children of the template
-//!     snapshot, so sessions cost ~nothing to open and destroy cleanly.
+//!   - `close_session` = DETACH only: the box persists across disconnects and
+//!     reconnects so the same tenant returns to the same box (one box per
+//!     tenant). No teardown.
+//!   - `destroy_session` = the explicit teardown: `jail -r` + devfs unmount +
+//!     `zfs destroy` of the dataset. ZFS clones are cheap copy-on-write children
+//!     of the template snapshot, so a tenant box costs ~nothing until destroyed.
 //!
 //! Everything the backend creates on the server is namespaced: jail names are
 //! `<prefix>-<label>` (default prefix `playground`) and datasets live under
@@ -313,6 +320,24 @@ impl JailBackend {
         }
         let _ = self.run(&["sudo", "-n", "zfs", "destroy", &dataset], None, ADMIN_TIMEOUT);
     }
+
+    /// True iff a jail with this name currently exists (a running jail context).
+    /// `jls -j <name>` exits 0 when the jail is present, non-zero otherwise.
+    /// Prefixed with `sudo -n` to match the file's privileged-command pattern
+    /// and stay robust to hosts that restrict `jls` to root.
+    fn jail_running(&self, jail: &str) -> bool {
+        self.run(&["sudo", "-n", "jls", "-j", jail], None, ADMIN_TIMEOUT)
+            .map(|o| o.success())
+            .unwrap_or(false)
+    }
+
+    /// True iff the ZFS dataset exists. `zfs list <dataset>` exits 0 when the
+    /// dataset is present, non-zero otherwise.
+    fn dataset_exists(&self, dataset: &str) -> bool {
+        self.run(&["sudo", "-n", "zfs", "list", dataset], None, ADMIN_TIMEOUT)
+            .map(|o| o.success())
+            .unwrap_or(false)
+    }
 }
 
 impl SandboxBackend for JailBackend {
@@ -338,76 +363,120 @@ impl SandboxBackend for JailBackend {
             spec.tenant.pile.host_path.display()
         );
 
-        self.cleanup_leftovers(&jail);
+        // Persistent per-tenant box: reuse-or-create, never blindly tear down.
+        // (The old unconditional `cleanup_leftovers` is gone — it would destroy
+        // the very box we mean to keep alive across reconnects.)
 
-        let clone = self.run(
-            &["sudo", "-n", "zfs", "clone", &self.template_snapshot, &dataset],
-            None,
-            ADMIN_TIMEOUT,
-        )?;
-        if !clone.success() {
-            bail!(
-                "zfs clone {} -> {dataset} failed: {}",
-                self.template_snapshot,
-                clone.stderr_lossy()
-            );
+        // 1. Already up? The tenant's jail context is running over its dataset;
+        //    just hand back the same id — no clone, no `jail -c`, no re-seed.
+        if self.jail_running(&jail) {
+            eprintln!("[{}] reusing persistent sandbox '{}'", self.name(), jail);
+            return Ok(SessionId::new(jail));
         }
 
-        // Everything after the clone must tear the clone down on failure, or
-        // we leak a dataset per failed open.
+        // 2. Not running. Converge to "a jail context over the persistent
+        //    dataset". `first_create` distinguishes a brand-new tenant (no
+        //    dataset yet) from one whose dataset persisted but whose jail
+        //    context is gone (host reboot / playground restart).
+        let first_create = !self.dataset_exists(&dataset);
+
         let provision = (|| -> Result<String> {
-            let root = self.mountpoint(&dataset)?;
+            let root = if first_create {
+                // Brand-new tenant: clone the template, then set up /dev, cwd,
+                // and /etc/profile from scratch.
+                let clone = self.run(
+                    &["sudo", "-n", "zfs", "clone", &self.template_snapshot, &dataset],
+                    None,
+                    ADMIN_TIMEOUT,
+                )?;
+                if !clone.success() {
+                    bail!(
+                        "zfs clone {} -> {dataset} failed: {}",
+                        self.template_snapshot,
+                        clone.stderr_lossy()
+                    );
+                }
 
-            // devfs, mounted manually (not via jail(8) params) so lifecycle
-            // stays explicit and close_session can unmount symmetrically.
-            // Ruleset 4 = devfsrules_jail: the standard, minimal jail /dev.
-            let devfs = self.run(
-                &[
-                    "sudo", "-n", "mount", "-t", "devfs", "-o", "ruleset=4", "devfs",
-                    &format!("{root}/dev"),
-                ],
-                None,
-                ADMIN_TIMEOUT,
-            )?;
-            if !devfs.success() {
-                bail!("mount devfs failed: {}", devfs.stderr_lossy());
-            }
+                let root = self.mountpoint(&dataset)?;
 
-            // The session workdir (guest path), default /workspace.
-            let cwd = spec
-                .cwd
-                .as_deref()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "/workspace".to_string());
-            let mkdir = self.run(
-                &["sudo", "-n", "mkdir", "-p", &format!("{root}{cwd}")],
-                None,
-                ADMIN_TIMEOUT,
-            )?;
-            if !mkdir.success() {
-                bail!("mkdir session cwd failed: {}", mkdir.stderr_lossy());
-            }
+                // devfs, mounted manually (not via jail(8) params) so lifecycle
+                // stays explicit and destroy_session can unmount symmetrically.
+                // Ruleset 4 = devfsrules_jail: the standard, minimal jail /dev.
+                let devfs = self.run(
+                    &[
+                        "sudo", "-n", "mount", "-t", "devfs", "-o", "ruleset=4", "devfs",
+                        &format!("{root}/dev"),
+                    ],
+                    None,
+                    ADMIN_TIMEOUT,
+                )?;
+                if !devfs.success() {
+                    bail!("mount devfs failed: {}", devfs.stderr_lossy());
+                }
 
-            // Seed session env + default cwd via /etc/profile, which
-            // `sh -l` sources on every exec (same mechanism as the Lima
-            // template's __SESSION_ENV__).
-            let mut profile = String::new();
-            profile.push_str("\n# playground session seed\n");
-            profile.push_str(&format!("cd {} 2>/dev/null || true\n", shell_quote(&cwd)));
-            for (k, v) in &spec.env {
-                profile.push_str(&format!("export {}={}\n", k, shell_quote(v)));
-            }
-            let seed = self.run(
-                &["sudo", "-n", "tee", "-a", &format!("{root}/etc/profile")],
-                Some(profile.as_bytes()),
-                ADMIN_TIMEOUT,
-            )?;
-            if !seed.success() {
-                bail!("seed /etc/profile failed: {}", seed.stderr_lossy());
-            }
+                // The session workdir (guest path), default /workspace.
+                let cwd = spec
+                    .cwd
+                    .as_deref()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "/workspace".to_string());
+                let mkdir = self.run(
+                    &["sudo", "-n", "mkdir", "-p", &format!("{root}{cwd}")],
+                    None,
+                    ADMIN_TIMEOUT,
+                )?;
+                if !mkdir.success() {
+                    bail!("mkdir session cwd failed: {}", mkdir.stderr_lossy());
+                }
 
-            // Create the jail: persistent (no processes yet), no network at
-            // all (default-deny v1), minimal params.
+                // Seed session env + default cwd via /etc/profile, which
+                // `sh -l` sources on every exec (same mechanism as the Lima
+                // template's __SESSION_ENV__). Only on first create — the
+                // persisted dataset already carries its profile.
+                let mut profile = String::new();
+                profile.push_str("\n# playground session seed\n");
+                profile.push_str(&format!("cd {} 2>/dev/null || true\n", shell_quote(&cwd)));
+                for (k, v) in &spec.env {
+                    profile.push_str(&format!("export {}={}\n", k, shell_quote(v)));
+                }
+                let seed = self.run(
+                    &["sudo", "-n", "tee", "-a", &format!("{root}/etc/profile")],
+                    Some(profile.as_bytes()),
+                    ADMIN_TIMEOUT,
+                )?;
+                if !seed.success() {
+                    bail!("seed /etc/profile failed: {}", seed.stderr_lossy());
+                }
+                root
+            } else {
+                // Dataset persisted but the jail context is gone (host reboot /
+                // playground restart). Keep the dataset and its /etc/profile as
+                // they are — do NOT clone, do NOT re-seed. Only re-establish the
+                // ephemeral devfs mount, which does not survive a reboot.
+                let root = self.mountpoint(&dataset)?;
+
+                // Best-effort devfs re-mount: if /dev is already mounted from a
+                // still-live mount, the mount fails with "already mounted" and
+                // that is fine; any other failure (bad ruleset, missing
+                // mountpoint) leaves /dev broken, which the first jexec will
+                // surface loudly. We deliberately ignore the mount's own status
+                // here rather than trying to distinguish "already mounted" from
+                // a genuine error via brittle stderr matching — a broken /dev
+                // shows up at exec time, not open time.
+                let _ = self.run(
+                    &[
+                        "sudo", "-n", "mount", "-t", "devfs", "-o", "ruleset=4", "devfs",
+                        &format!("{root}/dev"),
+                    ],
+                    None,
+                    ADMIN_TIMEOUT,
+                );
+                root
+            };
+
+            // Create the jail context: persistent (no processes yet), no
+            // network at all (default-deny v1), minimal params. Same for both
+            // first-create and reattach paths.
             let created = self.run(
                 &[
                     "sudo",
@@ -431,7 +500,13 @@ impl SandboxBackend for JailBackend {
         })();
 
         if let Err(e) = provision {
-            self.cleanup_leftovers(&jail);
+            if first_create {
+                // A brand-new box that failed to provision must not leak a
+                // half-made dataset.
+                self.cleanup_leftovers(&jail);
+            }
+            // A pre-existing dataset is the tenant's PERSISTENT storage — never
+            // destroy it on a transient reattach failure; surface the error.
             return Err(e.context(format!("provision jail '{jail}'")));
         }
         Ok(SessionId::new(jail))
@@ -482,10 +557,22 @@ impl SandboxBackend for JailBackend {
     }
 
     fn close_session(&self, session: &SessionId) -> Result<()> {
+        // Persistent backend: closing a session only DETACHES — the jail and its
+        // dataset stay alive so the same tenant can reconnect to the same box.
+        // Use `destroy_session` to remove it for good.
+        eprintln!(
+            "[{}] detach: sandbox '{}' persists (use destroy_session to remove)",
+            self.name(),
+            session.as_str()
+        );
+        Ok(())
+    }
+
+    fn destroy_session(&self, session: &SessionId) -> Result<()> {
         let jail = session.as_str();
         if !jail.starts_with(&format!("{}-", self.jail_prefix)) {
             bail!(
-                "refusing to close '{jail}': outside the '{}-' namespace",
+                "refusing to destroy '{jail}': outside the '{}-' namespace",
                 self.jail_prefix
             );
         }
@@ -511,7 +598,7 @@ impl SandboxBackend for JailBackend {
             );
         }
 
-        // Destroy the clone. This MUST succeed or we leak the session dataset;
+        // Destroy the dataset. This MUST succeed or we leak the session dataset;
         // one retry covers transient "dataset is busy" races after jail -r.
         let mut destroy = self.run(&["sudo", "-n", "zfs", "destroy", &dataset], None, ADMIN_TIMEOUT)?;
         if !destroy.success() {
@@ -582,6 +669,14 @@ mod tests {
         HostOutput {
             stdout: s.as_bytes().to_vec(),
             exit_code: Some(0),
+            ..Default::default()
+        }
+    }
+
+    /// A non-zero exit: used to script "jail not running" / "dataset absent".
+    fn fail() -> HostOutput {
+        HostOutput {
+            exit_code: Some(1),
             ..Default::default()
         }
     }
@@ -672,7 +767,12 @@ mod tests {
 
     #[test]
     fn open_session_clones_and_creates_namespaced_jail() {
-        let (backend, mock) = mock_with_mountpoint().into_backend();
+        // First-create path: no running jail and no existing dataset, so open
+        // must clone the template and create a fresh jail.
+        let (backend, mock) = mock_with_mountpoint()
+            .reply(&["sudo", "-n", "jls", "-j"], fail())
+            .reply(&["sudo", "-n", "zfs", "list"], fail())
+            .into_backend();
         let id = backend.open_session(&spec("alice")).expect("open");
         assert_eq!(id.as_str(), "playground-alice");
 
@@ -774,12 +874,38 @@ mod tests {
         assert!(script.ends_with("pwd"));
     }
 
+    /// A tenant whose jail context is already up: open must hand back the same
+    /// id WITHOUT re-cloning or re-creating the jail (persistent reuse).
     #[test]
-    fn close_session_removes_jail_and_destroys_clone() {
+    fn open_session_reuses_running_jail() {
+        let (backend, mock) = MockRunner::default()
+            .reply(&["sudo", "-n", "jls", "-j", "playground-alice"], ok_with_stdout("1\n"))
+            .into_backend();
+        let id = backend.open_session(&spec("alice")).expect("open");
+        assert_eq!(id.as_str(), "playground-alice");
+
+        let calls = mock.calls();
+        // Reuse must not provision anything: no clone, no jail -c.
+        assert!(
+            !calls.iter().any(|c| c.get(2).map(String::as_str) == Some("zfs")
+                && c.get(3).map(String::as_str) == Some("clone")),
+            "reuse must not zfs clone"
+        );
+        assert!(
+            !calls.iter().any(|c| {
+                c.get(2).map(String::as_str) == Some("jail")
+                    && c.get(3).map(String::as_str) == Some("-c")
+            }),
+            "reuse must not jail -c"
+        );
+    }
+
+    #[test]
+    fn destroy_session_removes_jail_and_destroys_clone() {
         let (backend, mock) = mock_with_mountpoint().into_backend();
         backend
-            .close_session(&SessionId::new("playground-alice"))
-            .expect("close");
+            .destroy_session(&SessionId::new("playground-alice"))
+            .expect("destroy");
         let calls = mock.calls();
         assert!(calls.iter().any(|c| c.ends_with(&[
             "jail".into(), "-r".into(), "playground-alice".into()
@@ -789,11 +915,33 @@ mod tests {
         ] as &[String])));
     }
 
+    /// close_session on the persistent jail backend DETACHES: the box lives on,
+    /// so no `jail -r` and no `zfs destroy` are issued.
     #[test]
-    fn close_session_refuses_foreign_jail_names() {
+    fn close_session_detaches_without_teardown() {
+        let (backend, mock) = mock_with_mountpoint().into_backend();
+        backend
+            .close_session(&SessionId::new("playground-alice"))
+            .expect("close");
+        let calls = mock.calls();
+        assert!(
+            !calls.iter().any(|c| c.ends_with(&[
+                "jail".into(), "-r".into(), "playground-alice".into()
+            ] as &[String])),
+            "detach must not jail -r"
+        );
+        assert!(
+            !calls.iter().any(|c| c.get(2).map(String::as_str) == Some("zfs")
+                && c.get(3).map(String::as_str) == Some("destroy")),
+            "detach must not zfs destroy"
+        );
+    }
+
+    #[test]
+    fn destroy_session_refuses_foreign_jail_names() {
         let (backend, mock) = MockRunner::default().into_backend();
         let err = backend
-            .close_session(&SessionId::new("trible.bultmann.eu"))
+            .destroy_session(&SessionId::new("trible.bultmann.eu"))
             .expect_err("must refuse");
         assert!(err.to_string().contains("outside the 'playground-' namespace"));
         // And crucially: no host command was issued at all.
@@ -801,7 +949,7 @@ mod tests {
     }
 
     #[test]
-    fn close_session_fails_loud_when_destroy_fails() {
+    fn destroy_session_fails_loud_when_destroy_fails() {
         let (backend, _mock) = mock_with_mountpoint()
             .reply(
                 &["sudo", "-n", "zfs", "destroy"],
@@ -813,7 +961,7 @@ mod tests {
             )
             .into_backend();
         let err = backend
-            .close_session(&SessionId::new("playground-alice"))
+            .destroy_session(&SessionId::new("playground-alice"))
             .expect_err("destroy failure must surface");
         assert!(err.to_string().contains("zfs destroy"));
     }
