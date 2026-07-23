@@ -3,7 +3,7 @@
 `playground` provisions isolated, stateful shells and exposes them over the
 [Model Context Protocol](https://modelcontextprotocol.io/). It is the **sandbox
 layer** (layer 3 of 4: Substrate / Verbs / **Sandbox** / Drive) — the exec
-transport a driver (the `drive` crate, the being's realtime cognition loop, or
+transport a driver (the `drive` crate, a realtime cognition loop, or
 any MCP client) calls to run shell commands in a sandbox.
 
 The cognition machinery — the model loop, context assembly, memory — lives in

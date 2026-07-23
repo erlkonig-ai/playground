@@ -47,12 +47,10 @@
 //!
 //! `ai.bultmann.eu` is a **shared machine** (JP's coworker has access), so it
 //! is not a trusted destination for private pile content — `self.pile` never
-//! lands on non-Liora-controlled surfaces. Therefore this backend deliberately
+//! lands on non-operator-controlled surfaces. Therefore this backend deliberately
 //! does **not** realise [`super::PileMount`]: the [`SessionSpec`]'s pile is
 //! ignored (logged, not mounted), sessions get a plain `/workspace` workdir,
-//! exec results return over MCP, and the drive appends observations to the
-//! pile AT HOME on the Mac. That is the v1 architecture, not a gap: the shell
-//! runs remotely, the memory stays home.
+//! exec results return over MCP. That is the v1 architecture, not a gap: the shell runs remotely.
 //!
 //! TODO(sandbox-provider, deferred): pile access from server jails waits until
 //! either (a) an encrypted / capability-gated replica design (triblespace-net

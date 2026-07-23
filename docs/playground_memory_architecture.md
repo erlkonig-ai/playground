@@ -149,7 +149,7 @@ This loose coupling means:
 This is the [coordinate-and-cursor pattern][cc] applied to memory
 provenance — facts indexed by time, relationships computed by overlap.
 
-[cc]: # "wiki:b72c62851e4e4989138a2a45d75c813b in the Liora pile"
+[cc]: # "wiki:b72c62851e4e4989138a2a45d75c813b in the pile"
 
 ### Legacy: `about_exec_result` / `about_archive_message`
 

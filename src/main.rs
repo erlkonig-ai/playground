@@ -3,7 +3,7 @@
 //! playground provisions isolated, stateful shells (Lima VMs on macOS, FreeBSD
 //! jails over SSH) and exposes them over the Model Context Protocol. It is the
 //! *sandbox layer* (layer 3 of 4: Substrate / Verbs / **Sandbox** / Drive) — the
-//! exec transport the drive (the being's realtime cognition loop) calls to run
+//! exec transport the drive (a realtime cognition loop) calls to run
 //! its shell commands. The cognition machinery lives in the `drive` crate now;
 //! playground is only the provider.
 //!
