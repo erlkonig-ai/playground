@@ -86,6 +86,14 @@ struct McpArgs {
     /// Jail backend: jail-name prefix; concrete jail is `<prefix>-<tenant>`.
     #[arg(long, default_value = "playground")]
     jail_prefix: String,
+    /// Jail backend: host directory root holding per-coworker pile dirs and the
+    /// shared pile dir (Model B: host-owned, decoupled from the jail lifecycle).
+    #[arg(long, default_value = "/aitemp/playground/piles")]
+    jail_pile_root: String,
+    /// Jail backend: host path to the `bootstrap.pile` seed copied into a new
+    /// coworker's `self.pile` (and the shared pile) when absent.
+    #[arg(long, default_value = "/aitemp/playground/bootstrap.pile")]
+    jail_bootstrap_pile: String,
     /// Jail backend: run zfs/jail/jexec directly on this machine instead of
     /// over SSH (server-side hosting on the FreeBSD jail host itself;
     /// `--jail-host` is ignored).
@@ -126,6 +134,8 @@ impl McpBackendKind {
         jail_prefix: String,
         jail_template_snapshot: String,
         jail_dataset_parent: String,
+        jail_pile_root: String,
+        jail_bootstrap_pile: String,
     ) -> Result<Box<dyn sandbox::SandboxBackend>> {
         match self {
             McpBackendKind::Lima => {
@@ -155,6 +165,8 @@ impl McpBackendKind {
                 backend.jail_prefix = jail_prefix;
                 backend.template_snapshot = jail_template_snapshot;
                 backend.dataset_parent = jail_dataset_parent;
+                backend.pile_root = jail_pile_root;
+                backend.bootstrap_pile = jail_bootstrap_pile;
                 Ok(Box::new(backend))
             }
         }
@@ -223,6 +235,14 @@ struct McpHttpArgs {
     /// Jail backend: jail-name prefix; concrete jail is `<prefix>-<tenant>`.
     #[arg(long, default_value = "playground")]
     jail_prefix: String,
+    /// Jail backend: host directory root holding per-coworker pile dirs and the
+    /// shared pile dir (Model B: host-owned, decoupled from the jail lifecycle).
+    #[arg(long, default_value = "/aitemp/playground/piles")]
+    jail_pile_root: String,
+    /// Jail backend: host path to the `bootstrap.pile` seed copied into a new
+    /// coworker's `self.pile` (and the shared pile) when absent.
+    #[arg(long, default_value = "/aitemp/playground/bootstrap.pile")]
+    jail_bootstrap_pile: String,
     /// Jail backend: run zfs/jail/jexec directly on this machine instead of
     /// over SSH (server-side hosting on the FreeBSD jail host itself;
     /// `--jail-host` is ignored).
@@ -273,6 +293,14 @@ struct UserBackendArgs {
     /// Jail backend: jail-name prefix; concrete jail is `<prefix>-<tenant>`.
     #[arg(long, default_value = "playground")]
     jail_prefix: String,
+    /// Jail backend: host directory root holding per-coworker pile dirs and the
+    /// shared pile dir (Model B: host-owned, decoupled from the jail lifecycle).
+    #[arg(long, default_value = "/aitemp/playground/piles")]
+    jail_pile_root: String,
+    /// Jail backend: host path to the `bootstrap.pile` seed copied into a new
+    /// coworker's `self.pile` (and the shared pile) when absent.
+    #[arg(long, default_value = "/aitemp/playground/bootstrap.pile")]
+    jail_bootstrap_pile: String,
     /// Jail backend: run zfs/jail/jexec directly on this machine instead of
     /// over SSH (server-side hosting on the FreeBSD jail host itself).
     #[arg(long, default_value_t = false)]
@@ -296,6 +324,8 @@ impl UserBackendArgs {
                 backend.jail_prefix = self.jail_prefix.clone();
                 backend.template_snapshot = self.jail_template_snapshot.clone();
                 backend.dataset_parent = self.jail_dataset_parent.clone();
+                backend.pile_root = self.jail_pile_root.clone();
+                backend.bootstrap_pile = self.jail_bootstrap_pile.clone();
                 Ok(Box::new(backend))
             }
             McpBackendKind::Lima => {
@@ -504,6 +534,8 @@ fn run_mcp(args: McpArgs) -> Result<()> {
         args.jail_prefix,
         args.jail_template_snapshot,
         args.jail_dataset_parent,
+        args.jail_pile_root,
+        args.jail_bootstrap_pile,
     )?;
 
     let provider = mcp::SandboxProvider::new(backend);
@@ -528,6 +560,8 @@ fn run_mcp_http(args: McpHttpArgs) -> Result<()> {
         args.jail_prefix,
         args.jail_template_snapshot,
         args.jail_dataset_parent,
+        args.jail_pile_root,
+        args.jail_bootstrap_pile,
     )?;
 
     let tokens = mcp_http::TokenStore::load(&args.tokens)?;
