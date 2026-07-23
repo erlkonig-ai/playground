@@ -246,13 +246,50 @@ pub fn serve(server: McpServer, tokens: TokenStore, config: HttpServerConfig) ->
         // keys on (per-IP token buckets). Behind a reverse proxy the peer is the
         // proxy, so the bucket is effectively shared — still a bound, just
         // coarser; a future refinement could read a trusted forwarded header.
-        axum::serve(
+        // `state` is cloned into the router so the original Arc survives the
+        // serve to drive the post-shutdown spin-down below.
+        let serve_result = axum::serve(
             listener,
-            router(state).into_make_service_with_connect_info::<SocketAddr>(),
+            router(state.clone()).into_make_service_with_connect_info::<SocketAddr>(),
         )
+        .with_graceful_shutdown(shutdown_signal())
         .await
-        .context("serve mcp-http")
+        .context("serve mcp-http");
+
+        // Graceful shutdown reached (SIGINT/SIGTERM), or serve errored out:
+        // spin DOWN every owned sandbox that must not outlive this process
+        // (Lima VMs; jail is a no-op). A HARD kill skips this path entirely —
+        // `playground clean` is the backstop for that case.
+        let spun = state.server.provider().shutdown();
+        eprintln!("playground mcp-http: spun down {spun} owned sandbox(es) on shutdown");
+        serve_result
     })
+}
+
+/// Resolves when the process is asked to stop — SIGINT (Ctrl-C) or, on unix,
+/// SIGTERM — so axum drains in-flight requests before `serve` returns and we
+/// spin down owned sandboxes. A hard SIGKILL cannot be caught; `playground
+/// clean` recovers that case.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+    eprintln!("playground mcp-http: shutdown signal received — draining, then spinning down");
 }
 
 fn router(state: Arc<HttpState>) -> Router {

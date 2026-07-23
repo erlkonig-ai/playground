@@ -177,4 +177,25 @@ pub trait SandboxBackend: Send + Sync {
     fn destroy_session(&self, session: &SessionId) -> Result<()> {
         self.close_session(session)
     }
+
+    /// Spin DOWN every owned sandbox that must not outlive the playground
+    /// process — the inverse of `reattach_all`'s startup spin-up, but WITHOUT
+    /// destroying anything (the on-disk dataset / instance stays, so the next
+    /// `reattach_all` brings it back). Returns how many were spun down.
+    ///
+    /// The two shipped backends differ by how costly an idle-but-live sandbox
+    /// is:
+    /// - **jail** (default no-op): a jail is an in-kernel `prison` record with
+    ///   zero processes — essentially free — so jails PERSIST across playground
+    ///   restarts and there is nothing to spin down.
+    /// - **lima** (override): a VM holds real host RAM/CPU even when idle, so a
+    ///   Lima instance is tied to the playground process lifetime — `limactl
+    ///   stop` each owned running instance here.
+    ///
+    /// Called on graceful shutdown and, crucially, by `playground clean` — the
+    /// reliable sweep after a hard kill, since a killed process cannot run its
+    /// own cleanup.
+    fn shutdown(&self) -> Result<usize> {
+        Ok(0)
+    }
 }

@@ -45,6 +45,11 @@ enum CommandMode {
     #[cfg(feature = "mcp-http")]
     #[command(about = "Mint an OAuth invite code (the human gate of the browser-connector flow)")]
     Invite(TokenInviteArgs),
+    #[cfg(feature = "mcp-http")]
+    #[command(
+        about = "Spin down orphaned sandbox VMs left running after a hard kill (Lima; jail is a no-op)"
+    )]
+    Clean(CleanArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -416,6 +421,13 @@ struct UserTokenResetArgs {
 
 #[cfg(feature = "mcp-http")]
 #[derive(Args, Debug, Clone)]
+struct CleanArgs {
+    #[command(flatten)]
+    backend: UserBackendArgs,
+}
+
+#[cfg(feature = "mcp-http")]
+#[derive(Args, Debug, Clone)]
 #[command(about = "OAuth invite-code mint settings")]
 struct TokenInviteArgs {
     /// Tenant label whoever redeems the invite acts as.
@@ -465,6 +477,8 @@ fn main() -> Result<()> {
         },
         #[cfg(feature = "mcp-http")]
         CommandMode::Invite(args) => run_token_invite(args),
+        #[cfg(feature = "mcp-http")]
+        CommandMode::Clean(args) => run_clean(args),
     }
 }
 
@@ -725,6 +739,23 @@ fn run_user_token_reset(args: UserTokenResetArgs) -> Result<()> {
         args.backend.tokens.display(),
     );
     println!("{token}");
+    Ok(())
+}
+
+/// `playground clean`: spin down every owned sandbox that must not outlive the
+/// playground process (Lima VMs), for use after a hard kill left them running.
+/// A killed process cannot run its own shutdown, so this is the reliable sweep.
+/// Idempotent and safe to run anytime — the jail backend is a no-op (jails are
+/// free in-kernel records that persist by design; there is nothing to spin
+/// down), so this only does real work under `--backend lima`.
+#[cfg(feature = "mcp-http")]
+fn run_clean(args: CleanArgs) -> Result<()> {
+    let backend = args.backend.build_backend()?;
+    let n = backend.shutdown()?;
+    eprintln!(
+        "playground clean: spun down {n} orphaned sandbox(es) [backend: {}]",
+        backend.name()
+    );
     Ok(())
 }
 

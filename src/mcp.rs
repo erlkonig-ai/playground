@@ -173,6 +173,24 @@ impl SandboxProvider {
         failed
     }
 
+    /// Process-shutdown hook: detach every open session, then spin DOWN every
+    /// owned sandbox that must not outlive the process (Lima VMs; jail is a
+    /// no-op by design — its kernel records are free and persist). The inverse
+    /// of the startup `reattach_all` sweep. Returns how many sandboxes were spun
+    /// down. Best-effort: session-close failures are logged by
+    /// `close_all_sessions` and do not block the spin-down.
+    #[cfg(feature = "mcp-http")]
+    pub fn shutdown(&self) -> usize {
+        self.close_all_sessions();
+        match self.backend.shutdown() {
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("playground mcp: sandbox spin-down on shutdown failed: {e:#}");
+                0
+            }
+        }
+    }
+
     /// The tenant label a live session belongs to, or `None` if this provider
     /// never opened it (or already closed it).
     ///

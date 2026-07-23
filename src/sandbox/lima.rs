@@ -456,6 +456,38 @@ impl SandboxBackend for LimaBackend {
         Ok(reattached)
     }
 
+    fn shutdown(&self) -> Result<usize> {
+        // Spin DOWN (graceful `limactl stop`, never delete) every owned RUNNING
+        // instance so no VM outlives the playground process. The disk + config
+        // stay, so the next `reattach_all` brings each box back. Unlike a jail
+        // (a free kernel record that persists), a Lima VM holds real host RAM.
+        let prefix = format!("{}-", self.instance_prefix);
+        let rows = self.list_instances()?;
+        let mut stopped = 0usize;
+        for (name, status) in rows {
+            if !name.starts_with(&prefix) {
+                continue; // not ours
+            }
+            if status != "Running" {
+                continue; // already down
+            }
+            let out = self.limactl(&["stop", &name], ADMIN_TIMEOUT)?;
+            if out.success() {
+                eprintln!("[{}] spun down persistent sandbox '{}'", self.name(), name);
+                stopped += 1;
+            } else {
+                // Log and keep sweeping — one stuck box must not strand the rest.
+                eprintln!(
+                    "[{}] stop '{}' failed: {} (continuing)",
+                    self.name(),
+                    name,
+                    out.stderr_lossy()
+                );
+            }
+        }
+        Ok(stopped)
+    }
+
     fn exec(&self, session: &SessionId, request: &ExecRequest) -> Result<ExecResult> {
         let instance = session.as_str();
 
@@ -1063,6 +1095,47 @@ mod tests {
         assert!(
             !starts.iter().any(|c| c.contains(&"bulti".to_string())),
             "foreign instance must not be started"
+        );
+    }
+
+    #[test]
+    fn shutdown_stops_only_owned_running_instances() {
+        // The mirror of reattach: spin DOWN owned RUNNING instances (stop, never
+        // delete), leaving stopped ones and foreign namespaces alone.
+        let (backend, mock) = MockRunner::default()
+            .reply(
+                &["list"],
+                list_reply(&[
+                    ("t-alice", "Running"), // ours, up   -> stop
+                    ("t-bob", "Stopped"),   // ours, down -> skip
+                    ("bulti", "Running"),   // foreign    -> skip
+                ]),
+            )
+            .into_backend("t");
+        let n = backend.shutdown().expect("spin-down");
+        assert_eq!(n, 1, "only the running owned instance is spun down");
+        let calls = mock.calls();
+        let stops: Vec<_> = calls
+            .iter()
+            .filter(|c| c.first().map(String::as_str) == Some("stop"))
+            .collect();
+        assert_eq!(stops.len(), 1, "exactly one spin-down: {calls:?}");
+        assert!(
+            stops[0].last().map(String::as_str) == Some("t-alice"),
+            "the running owned instance is stopped: {:?}",
+            stops[0]
+        );
+        // Spin-down never deletes — the box must survive for the next reattach.
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c.first().map(String::as_str) == Some("delete")),
+            "shutdown must never delete an instance"
+        );
+        // The foreign running instance is left alone.
+        assert!(
+            !stops.iter().any(|c| c.contains(&"bulti".to_string())),
+            "foreign instance must not be stopped"
         );
     }
 }
