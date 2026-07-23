@@ -113,9 +113,10 @@ impl SandboxProvider {
         self.backend.exec(&params.session, &request)
     }
 
-    /// MCP `close_session`: release a sandbox and deregister it. For persistent
-    /// backends (the jail backend) this only DETACHES — the box lives on and the
-    /// same tenant can reconnect; for ephemeral backends (Lima) it tears down.
+    /// MCP `close_session`: release a sandbox and deregister it. Both shipped
+    /// backends (jail, lima) are persistent, so this only DETACHES — the box
+    /// lives on and the same tenant can reconnect; use `destroy_session` to
+    /// remove it for good.
     pub fn close_session(&self, session: &SessionId) -> Result<()> {
         self.ensure_known(session)?;
         self.backend.close_session(session)?;
@@ -126,9 +127,11 @@ impl SandboxProvider {
         Ok(())
     }
 
-    /// MCP `destroy_session`: permanently tear a sandbox down (even a persistent
-    /// one) and deregister it. On ephemeral backends this is identical to
-    /// `close_session`; on the jail backend it removes the box for good.
+    /// MCP `destroy_session`: permanently tear a sandbox down and deregister it.
+    /// Both shipped backends (jail, lima) are persistent, so this is the real
+    /// teardown that removes the box for good (jail: `jail -r` + `zfs destroy`;
+    /// lima: `limactl stop` + `limactl delete`), as opposed to `close_session`'s
+    /// detach.
     pub fn destroy_session(&self, session: &SessionId) -> Result<()> {
         self.ensure_known(session)?;
         self.backend.destroy_session(session)?;
@@ -548,7 +551,7 @@ fn tool_schemas() -> Value {
         },
         {
             "name": "close_session",
-            "description": "Release a sandbox session. Persistent sandboxes (the jail backend) detach and stay alive so the same tenant can reconnect; ephemeral ones are torn down. Use destroy_session to remove a persistent sandbox for good.",
+            "description": "Release a sandbox session. Sandboxes are persistent (both the jail and lima backends): close_session only detaches, so the box stays alive and the same tenant can reconnect. Use destroy_session to remove it for good.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -559,7 +562,7 @@ fn tool_schemas() -> Value {
         },
         {
             "name": "destroy_session",
-            "description": "Permanently tear down a sandbox session and free its storage, even for persistent sandboxes (the jail backend) that close_session only detaches.",
+            "description": "Permanently tear down a sandbox session and free its storage. Both backends' sandboxes are persistent (close_session only detaches); this removes the box for good.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

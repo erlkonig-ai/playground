@@ -240,6 +240,21 @@ struct UserBackendArgs {
     /// `mcp-http --backend`; the minted token is scoped to it).
     #[arg(long, value_enum, default_value_t = McpBackendKind::Jail)]
     backend: McpBackendKind,
+    /// Lima backend: instance-name prefix; concrete instance is
+    /// `<prefix>-<tenant>`. Must match the serving `mcp-http --instance-prefix`.
+    #[arg(long, default_value = "playground-sbx")]
+    instance_prefix: String,
+    /// Lima backend: directory for rendered per-session Lima configs.
+    #[arg(long)]
+    state_root: Option<PathBuf>,
+    /// Lima backend: session template (defaults to scripts/lima-session.yaml.tmpl).
+    #[arg(long)]
+    template: Option<PathBuf>,
+    /// Lima backend: host path to the `faculties` crate. When set, its CLI
+    /// binaries are built for Linux-aarch64 (once, cached) and staged into the
+    /// provisioned sandbox on PATH with `PILE` set to the mounted pile.
+    #[arg(long, env = "PLAYGROUND_FACULTIES_SRC")]
+    faculties_src: Option<PathBuf>,
     /// Jail backend: SSH host that runs the jails (needs BatchMode keys +
     /// non-interactive root via `sudo -n`).
     #[arg(long, default_value = "<jail-host>")]
@@ -261,29 +276,76 @@ struct UserBackendArgs {
 
 #[cfg(feature = "mcp-http")]
 impl UserBackendArgs {
-    /// Build the concrete jail backend these args select. Only the jail backend
-    /// has real per-tenant provisioning; a Lima tenant has no persistent box, so
-    /// asking to `user create` one is an error (its sandboxes are ephemeral,
-    /// created on `open_session`).
-    fn build_jail_backend(&self) -> Result<sandbox::jail::JailBackend> {
-        if self.backend != McpBackendKind::Jail {
-            anyhow::bail!(
-                "`user` provisioning is only for the jail backend; '{}' sandboxes are ephemeral \
-                 (created on open_session). Use `user token`/`user token reset` to manage tokens \
-                 for a '{}' tenant without provisioning.",
-                self.backend.name(),
-                self.backend.name(),
-            );
+    /// Build the concrete backend these args select as a boxed trait object.
+    /// Both shipped backends (jail, lima) are persistent/provision-based, so
+    /// `user create`/`user destroy` work for either. The token verbs never call
+    /// this — they only touch the token store.
+    fn build_backend(&self) -> Result<Box<dyn sandbox::SandboxBackend>> {
+        match self.backend {
+            McpBackendKind::Jail => {
+                let mut backend = if self.jail_local {
+                    sandbox::jail::JailBackend::local()
+                } else {
+                    sandbox::jail::JailBackend::ssh(self.jail_host.clone())
+                };
+                backend.jail_prefix = self.jail_prefix.clone();
+                backend.template_snapshot = self.jail_template_snapshot.clone();
+                backend.dataset_parent = self.jail_dataset_parent.clone();
+                Ok(Box::new(backend))
+            }
+            McpBackendKind::Lima => {
+                let mut backend = sandbox::lima::LimaBackend::new(self.instance_prefix.clone());
+                if let Some(root) = &self.state_root {
+                    backend.state_root = root.clone();
+                }
+                backend.template = self.template.clone();
+                // Stage faculties into the provisioned box (same as the server),
+                // so a provisioned Lima sandbox comes up with faculties on PATH.
+                if let Some(src) = &self.faculties_src {
+                    let builder = format!("{}-faculties-builder", backend.instance_prefix);
+                    let bundle = sandbox::faculties::ensure_faculties_bundle(src, &builder)
+                        .context("provision faculties bundle for sandbox sessions")?;
+                    backend.faculties_bundle = Some(bundle);
+                }
+                Ok(Box::new(backend))
+            }
         }
-        let mut backend = if self.jail_local {
-            sandbox::jail::JailBackend::local()
-        } else {
-            sandbox::jail::JailBackend::ssh(self.jail_host.clone())
+    }
+
+    /// The backend-appropriate session id (instance / jail name) for a tenant
+    /// label. Both backends sanitise the same way (`<prefix>-<sanitised>`), so
+    /// the CLI's `destroy` targets the exact box the backend provisioned.
+    fn session_id_for(&self, label: &str) -> sandbox::SessionId {
+        let name = match self.backend {
+            McpBackendKind::Jail => {
+                // Reuse the backend's own derivation so prefixes/sanitisation agree.
+                let mut b = sandbox::jail::JailBackend::local();
+                b.jail_prefix = self.jail_prefix.clone();
+                b.jail_name(label)
+            }
+            McpBackendKind::Lima => {
+                sandbox::lima::LimaBackend::new(self.instance_prefix.clone()).instance_name(label)
+            }
         };
-        backend.jail_prefix = self.jail_prefix.clone();
-        backend.template_snapshot = self.jail_template_snapshot.clone();
-        backend.dataset_parent = self.jail_dataset_parent.clone();
-        Ok(backend)
+        sandbox::SessionId::new(name)
+    }
+
+    /// Best-effort liveness probe for `user list`: is the tenant's box currently
+    /// running? Both persistent backends can answer.
+    fn running_for_label(&self, label: &str) -> bool {
+        match self.backend {
+            McpBackendKind::Jail => {
+                let mut b = if self.jail_local {
+                    sandbox::jail::JailBackend::local()
+                } else {
+                    sandbox::jail::JailBackend::ssh(self.jail_host.clone())
+                };
+                b.jail_prefix = self.jail_prefix.clone();
+                b.jail_running_for_label(label)
+            }
+            McpBackendKind::Lima => sandbox::lima::LimaBackend::new(self.instance_prefix.clone())
+                .instance_running_for_label(label),
+        }
     }
 }
 
@@ -496,10 +558,10 @@ fn run_mcp_http(args: McpHttpArgs) -> Result<()> {
         _ => None,
     };
 
-    // Startup reattach sweep: after a host reboot the on-disk session datasets
-    // survive but the in-kernel jail contexts are gone. Bring every provisioned
-    // sandbox back up before serving so a reconnecting tenant finds its box
-    // live. No-op for the Lima backend (ephemeral, created on open_session).
+    // Startup reattach sweep: after a host reboot the on-disk state survives but
+    // the running contexts are gone (jail: in-kernel jail records; lima: the VMs
+    // are stopped). Bring every provisioned sandbox back up before serving so a
+    // reconnecting tenant finds its box live. Both backends implement this.
     match backend.reattach_all() {
         Ok(n) => eprintln!("playground mcp-http: reattached {n} persistent sandbox(es)"),
         Err(e) => eprintln!("playground mcp-http: reattach sweep failed: {e:#}"),
@@ -520,12 +582,17 @@ fn run_mcp_http(args: McpHttpArgs) -> Result<()> {
     )
 }
 
-/// The `SessionSpec` a `user` verb builds for a tenant. The jail backend is
-/// pile-less by design (see src/sandbox/jail.rs), so the pile mount is a
-/// placeholder that lines up with how `mcp.rs::parse_tenant` synthesises one
-/// (host path `.../<name>/self.pile`, default guest path `/pile/self.pile`);
-/// the backend logs it and never mounts it. Default cwd/env (empty) match the
+/// The `SessionSpec` a `user` verb builds for a tenant. It lines up with how
+/// `mcp.rs::parse_tenant` synthesises one (host path `.../<name>/self.pile`,
+/// default guest path `/pile/self.pile`). Default cwd/env (empty) match the
 /// server's `open_session` defaults.
+///
+/// Backend nuance: the jail backend is pile-less by design (see
+/// src/sandbox/jail.rs) — it logs this mount and never realises it. The lima
+/// backend DOES mount the pile, and because provisioning renders the instance
+/// config once (open no longer re-renders), this host path is the mount that
+/// persists for the box; point `--state-root`/`--template` and the pile parent
+/// directory accordingly before `user create --backend lima`.
 #[cfg(feature = "mcp-http")]
 fn spec_for(name: &str) -> sandbox::SessionSpec {
     let host_path = PathBuf::from(format!("/pile/{name}/self.pile"));
@@ -548,9 +615,8 @@ fn spec_for(name: &str) -> sandbox::SessionSpec {
 /// keeps it (mode 0600) for the server to check against.
 #[cfg(feature = "mcp-http")]
 fn run_user_create(args: UserCreateArgs) -> Result<()> {
-    let backend = args.backend.build_jail_backend()?;
+    let backend = args.backend.build_backend()?;
     let backend_name = args.backend.backend.name();
-    use sandbox::SandboxBackend as _;
     backend
         .provision_sandbox(&spec_for(&args.name))
         .with_context(|| format!("provision sandbox for tenant '{}'", args.name))?;
@@ -570,8 +636,8 @@ fn run_user_create(args: UserCreateArgs) -> Result<()> {
 }
 
 /// `user list`: the distinct tenants named in the token store, annotated with
-/// whether their jail is currently live (best-effort; only meaningful for the
-/// jail backend, so the probe is skipped for others).
+/// whether their box is currently live (best-effort). Both persistent backends
+/// (jail, lima) can answer the liveness probe.
 #[cfg(feature = "mcp-http")]
 fn run_user_list(args: UserListArgs) -> Result<()> {
     let store = mcp_http::TokenStore::load(&args.backend.tokens)?;
@@ -589,32 +655,20 @@ fn run_user_list(args: UserListArgs) -> Result<()> {
         return Ok(());
     }
 
-    // Live-jail annotation only makes sense for the jail backend; build it once
-    // if that's the selected backend, otherwise print names alone.
-    let backend = if args.backend.backend == McpBackendKind::Jail {
-        Some(args.backend.build_jail_backend()?)
-    } else {
-        None
-    };
     for tenant in &tenants {
-        match &backend {
-            Some(backend) => {
-                let live = backend.jail_running_for_label(tenant);
-                println!("{tenant}\t{}", if live { "live" } else { "down" });
-            }
-            None => println!("{tenant}"),
-        }
+        let live = args.backend.running_for_label(tenant);
+        println!("{tenant}\t{}", if live { "live" } else { "down" });
     }
     Ok(())
 }
 
-/// `user destroy <name>`: tear the tenant's sandbox down (permanent — `jail -r`
-/// + devfs unmount + `zfs destroy`) and remove every token bound to it.
+/// `user destroy <name>`: tear the tenant's sandbox down (permanent — jail:
+/// `jail -r` + devfs unmount + `zfs destroy`; lima: `limactl stop` +
+/// `limactl delete`) and remove every token bound to it.
 #[cfg(feature = "mcp-http")]
 fn run_user_destroy(args: UserDestroyArgs) -> Result<()> {
-    let backend = args.backend.build_jail_backend()?;
-    use sandbox::SandboxBackend as _;
-    let session = sandbox::SessionId::new(backend.jail_name(&args.name));
+    let backend = args.backend.build_backend()?;
+    let session = args.backend.session_id_for(&args.name);
     backend
         .destroy_session(&session)
         .with_context(|| format!("destroy sandbox for tenant '{}'", args.name))?;

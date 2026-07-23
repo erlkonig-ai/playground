@@ -135,18 +135,26 @@ pub trait SandboxBackend: Send + Sync {
     /// Human-readable backend name for diagnostics ("lima", "seatbelt", ...).
     fn name(&self) -> &'static str;
 
-    /// Provision a new isolated shell and return its session id.
+    /// Open a session on an ALREADY-provisioned sandbox and return its session
+    /// id. On the shipped persistent backends (jail, lima) this is pure
+    /// reuse-or-reattach — it NEVER creates: a running box is reused, a
+    /// down/stopped box is brought back up, and an unprovisioned tenant is an
+    /// error (run `playground user create`). Explicit creation is
+    /// `provision_sandbox`.
     fn open_session(&self, spec: &SessionSpec) -> Result<SessionId>;
 
-    /// Explicitly create a tenant's sandbox (persistent backends). Ephemeral
-    /// backends that create on open should leave the default (no-op).
+    /// Explicitly create a tenant's PERSISTENT sandbox (idempotent: an existing
+    /// box is just brought up, not recreated). Both shipped backends — jail and
+    /// lima — are persistent/provision-based and implement this; the default
+    /// no-op exists only for a hypothetical ephemeral (create-on-open) backend.
     fn provision_sandbox(&self, _spec: &SessionSpec) -> Result<()> {
         Ok(())
     }
 
     /// Bring up every already-provisioned sandbox this backend owns (e.g. after a
-    /// host reboot wiped the in-kernel jail records but the on-disk datasets remain).
-    /// Returns how many were (re)attached. Default: none.
+    /// host reboot wiped the in-kernel jail records / stopped the Lima VMs, while
+    /// the on-disk datasets / instances remain). Returns how many were
+    /// (re)attached. Both jail and lima implement this; default: none.
     fn reattach_all(&self) -> Result<usize> {
         Ok(0)
     }
@@ -155,15 +163,17 @@ pub trait SandboxBackend: Send + Sync {
     /// times out, or is killed.
     fn exec(&self, session: &SessionId, request: &ExecRequest) -> Result<ExecResult>;
 
-    /// Release a session. Ephemeral backends tear the sandbox down; PERSISTENT
-    /// backends (the jail backend) leave it alive so the same tenant can
-    /// reconnect — use `destroy_session` to remove it for good.
+    /// Release a session. On the shipped persistent backends (jail, lima) this
+    /// only DETACHES — the box stays alive so the same tenant can reconnect. Use
+    /// `destroy_session` to remove it for good. (A hypothetical ephemeral backend
+    /// would tear the sandbox down here.)
     fn close_session(&self, session: &SessionId) -> Result<()>;
 
     /// Permanently tear a sandbox down and free its storage, even for backends
-    /// whose `close_session` only detaches (persistent sandboxes). Default is
-    /// `close_session` — correct for ephemeral backends where closing already
-    /// destroys; persistent backends (the jail backend) override this.
+    /// whose `close_session` only detaches (the persistent sandboxes). Both
+    /// shipped backends (jail, lima) override this with real teardown; the
+    /// default delegates to `close_session`, correct only for a hypothetical
+    /// ephemeral backend where closing already destroys.
     fn destroy_session(&self, session: &SessionId) -> Result<()> {
         self.close_session(session)
     }
