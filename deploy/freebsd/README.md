@@ -28,7 +28,7 @@ Two hosting modes exist and stay interchangeable:
 ## Build (on the server)
 
 The crate has path dependencies on sibling repos, so the build tree is
-the liora sibling layout. The server profile skips the GUI/faculties
+the standard sibling-repo layout. The server profile skips the GUI/faculties
 stack entirely:
 
 ```sh

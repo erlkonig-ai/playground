@@ -145,7 +145,7 @@ use two piles and only allow **one-way** flow from the external-comms pile into
 the internal pile. For example:
 
 - Internal pile (Playground): full cognition + private memory.
-- External pile (Bulti or other comms persona): Teams/email/etc. access only.
+- External pile (a comms persona): Teams/email/etc. access only.
 
 Periodically sync the external pile into the internal pile and merge branches
 so the internal loop can absorb new work context. Do not sync in the other

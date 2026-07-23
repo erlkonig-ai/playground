@@ -9,7 +9,7 @@
 //!
 //!   - `provision_sandbox` = explicit CREATE of a PERSISTENT per-tenant VM:
 //!     render the session config (pile mount + faculty staging preserved — Lima
-//!     is a Liora-controlled surface, so it KEEPS mounting the pile), then
+//!     is an operator-controlled surface, so it KEEPS mounting the pile), then
 //!     `limactl start --name <instance> <config>`. Idempotent: a tenant whose
 //!     instance already exists is treated as already-provisioned — no
 //!     re-render, no recreate; it is just brought up (`limactl start
@@ -400,7 +400,7 @@ impl SandboxBackend for LimaBackend {
         );
 
         // Brand-new tenant: render this session's config (pile mount + faculty
-        // staging preserved — Lima is a Liora-controlled surface) and create the
+        // staging preserved — Lima is an operator-controlled surface) and create the
         // VM with `limactl start --name <instance> <config>`.
         let config_path = self.state_root.join(&instance).join("lima.yaml");
         self.render_config(spec, &config_path)?;
@@ -1037,7 +1037,7 @@ mod tests {
     fn destroy_session_refuses_foreign_names() {
         let (backend, mock) = MockRunner::default().into_backend("t");
         let err = backend
-            .destroy_session(&SessionId::new("bulti"))
+            .destroy_session(&SessionId::new("otherbox"))
             .expect_err("must refuse");
         assert!(err.to_string().contains("outside the 't-' namespace"), "err: {err}");
         assert!(mock.calls().is_empty(), "refusal issues no limactl commands");
@@ -1074,7 +1074,7 @@ mod tests {
                 list_reply(&[
                     ("t-alice", "Running"),
                     ("t-bob", "Stopped"),
-                    ("bulti", "Stopped"), // foreign (no `t-` prefix)
+                    ("otherbox", "Stopped"), // foreign (no `t-` prefix)
                 ]),
             )
             .into_backend("t");
@@ -1093,7 +1093,7 @@ mod tests {
         );
         // The foreign stopped instance is never touched.
         assert!(
-            !starts.iter().any(|c| c.contains(&"bulti".to_string())),
+            !starts.iter().any(|c| c.contains(&"otherbox".to_string())),
             "foreign instance must not be started"
         );
     }
@@ -1108,7 +1108,7 @@ mod tests {
                 list_reply(&[
                     ("t-alice", "Running"), // ours, up   -> stop
                     ("t-bob", "Stopped"),   // ours, down -> skip
-                    ("bulti", "Running"),   // foreign    -> skip
+                    ("otherbox", "Running"),   // foreign    -> skip
                 ]),
             )
             .into_backend("t");
@@ -1134,7 +1134,7 @@ mod tests {
         );
         // The foreign running instance is left alone.
         assert!(
-            !stops.iter().any(|c| c.contains(&"bulti".to_string())),
+            !stops.iter().any(|c| c.contains(&"otherbox".to_string())),
             "foreign instance must not be stopped"
         );
     }

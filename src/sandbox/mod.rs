@@ -58,11 +58,11 @@ impl SessionId {
 /// ## TRUST BOUNDARY (which backends may realise this at all)
 ///
 /// A pile may only be exposed to a session whose substrate is a
-/// **Liora-controlled surface**. Local backends (Lima on the Mac) qualify.
+/// **operator-controlled surface**. Local backends (Lima on the Mac) qualify.
 /// Remote backends on shared machines do NOT: [`jail::JailBackend`] runs on
 /// `ai.bultmann.eu`, which other people can access, so it deliberately ignores
-/// this mount — its sessions are pile-less, exec results come back over MCP,
-/// and the drive appends observations to the pile at home. Pile access from
+/// this mount — its sessions are pile-less and exec results come back to the
+/// caller over MCP. Pile access from
 /// server jails is deferred until either an encrypted / capability-gated
 /// replica design or a `shared.pile`-only policy is decided (see the trust
 /// boundary section in [`jail`]'s module docs).

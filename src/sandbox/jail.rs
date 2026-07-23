@@ -65,29 +65,25 @@
 //! This is deliberate default-deny; host-only or NAT networking is a later,
 //! explicit decision.
 //!
-//! ## TRUST BOUNDARY + pile provisioning (Model B: host-owned server-born piles)
+//! ## Pile provisioning (Model B: host-owned, server-born piles)
 //!
-//! `ai.bultmann.eu` is a **shared machine** (JP's coworker has access), so it
-//! is not a trusted destination for Liora's private pile content — the
-//! `self.pile` on JP's Mac (named by [`SessionSpec`]'s `tenant.pile.host_path`)
-//! **NEVER** lands here. That invariant is load-bearing and unchanged.
+//! This backend does NOT use the caller-supplied `tenant.pile.host_path` (that
+//! field is only logged); every tenant jail is given its OWN piles, created on
+//! the server under `pile_root`. Two host-owned piles are mounted in via
+//! `nullfs` (which mounts DIRECTORIES, not single files, so the layout is a
+//! dir-per-tenant + one shared dir):
 //!
-//! What the jail DOES carry is the **coworker's own, server-born pile** — a
-//! distinct artifact. Every coworker jail is given two host-owned piles under
-//! `pile_root`, mounted in via `nullfs` (which mounts DIRECTORIES, not single
-//! files, so the layout is a dir-per-coworker + one shared dir):
-//!
-//!   - **`self.pile`** — per-coworker, host <pile_root>/<jail>/self.pile,
+//!   - **`self.pile`** — per-tenant, host <pile_root>/<jail>/self.pile,
 //!     nullfs-mounted **rw** at guest `/pile` (so `PILE=/pile/self.pile`).
 //!     Seeded by copying `bootstrap_pile` at provision if absent. **Model B:
 //!     DECOUPLED from the jail lifecycle** — destroying the jail unmounts but
 //!     never deletes it, and a re-provision reattaches the same accumulated
 //!     pile.
-//!   - **`shared.pile`** — a SINGLE host file shared by ALL coworker jails,
+//!   - **`shared.pile`** — a SINGLE host file shared by ALL tenant jails,
 //!     host <pile_root>/shared/shared.pile, nullfs-mounted **rw** at guest
-//!     `/shared` (same append-only semantics as self.pile — the colony already
-//!     concurrently appends one pile). Seeded once, race-safely; never deleted
-//!     by a single-coworker teardown.
+//!     `/shared` (same append-only semantics as self.pile; multiple concurrent
+//!     writers appending one pile is supported). Seeded once, race-safely;
+//!     never deleted by a single-tenant teardown.
 //!
 //! Both mounts are re-established on every attach (they do not survive a jail
 //! restart, exactly like the devfs mount) and torn down before `zfs destroy`
@@ -259,7 +255,7 @@ pub struct JailBackend {
     pub pile_root: String,
     /// Host path to the `bootstrap.pile` seed copied into a brand-new
     /// coworker's `self.pile` (and used to seed the shared pile the first time).
-    /// This is the COWORKER's server-side seed — NEVER Liora's private pile.
+    /// This is the server-side bootstrap seed, not any caller-supplied pile.
     pub bootstrap_pile: String,
 }
 
@@ -486,15 +482,12 @@ impl SandboxBackend for JailBackend {
             jail,
             dataset
         );
-        // TRUST BOUNDARY (see module docs): the session carries its OWN
-        // host-owned, server-born pile (mounted at /pile/self.pile by
-        // provision_sandbox), NOT the pile in `spec.tenant.pile`. Liora's
-        // private self.pile — the one on JP's Mac, named by
-        // `spec.tenant.pile.host_path` — NEVER lands on the shared server; the
-        // mounted pile is the COWORKER's distinct artifact under `pile_root`.
+        // This backend does not use the caller-supplied `spec.tenant.pile`
+        // path: the session operates on its own server-born pile, provisioned
+        // under `pile_root` and mounted at /pile/self.pile by provision_sandbox.
         eprintln!(
-            "[{}] note: Liora's private pile '{}' stays on the local host; the \
-             session operates on its own server-born self.pile",
+            "[{}] session operates on its server-born pile under pile_root \
+             (caller pile_host_path '{}' is not used by this backend)",
             self.name(),
             spec.tenant.pile.host_path.display()
         );
@@ -612,9 +605,9 @@ impl SandboxBackend for JailBackend {
             //   host <pile_root>/shared/shared.pile -> nullfs rw -> guest /shared
             //
             // These live OUTSIDE the ZFS clone tree, so destroy_session (which
-            // destroys the dataset) never touches them. The `self.pile` is this
-            // coworker's SERVER-BORN pile — distinct from Liora's private pile,
-            // which never lands here.
+            // destroys the dataset) never touches them. The `self.pile` is the
+            // tenant's server-born pile under `pile_root`, distinct from the
+            // caller-supplied `spec.tenant.pile` path (not used by this backend).
             let self_dir = self.self_pile_dir(&jail);
             let self_pile = format!("{self_dir}/self.pile");
             let shared_dir = self.shared_pile_dir();
@@ -644,7 +637,7 @@ impl SandboxBackend for JailBackend {
             // Create-if-absent and race-safe against concurrent provisions:
             // `mkdir -p` is idempotent, and `cp -n` will not clobber a shared
             // pile another provision seeded first (same append-only semantics as
-            // self.pile — the colony already concurrently appends one pile).
+            // self.pile; multiple concurrent writers appending one pile is fine).
             let mkdir_shared = self.run(
                 &["sudo", "-n", "mkdir", "-p", &shared_dir],
                 None,
@@ -971,7 +964,7 @@ mod tests {
             tenant: Tenant {
                 label: label.to_string(),
                 pile: PileMount {
-                    host_path: PathBuf::from("/Users/x/self.pile"),
+                    host_path: PathBuf::from("/caller/supplied/arbitrary.pile"),
                     guest_path: PathBuf::from("/pile/self.pile"),
                     append_only: true,
                 },
@@ -1090,7 +1083,7 @@ mod tests {
     /// bootstrap.pile copied into an absent self.pile (and the shared pile), the
     /// guest mountpoints made, and /etc/profile seeded with the faculties PATH +
     /// PILE=/pile/self.pile. The piles derive from `pile_root`+jail name, NOT
-    /// from the caller's (Liora-private) spec pile.
+    /// from the caller-supplied `spec.tenant.pile` path.
     #[test]
     fn provision_mounts_both_piles_seeds_path_and_pile() {
         let (backend, mock) = mock_with_mountpoint()
@@ -1114,7 +1107,7 @@ mod tests {
             "must mkdir the per-coworker pile dir: {calls:?}"
         );
         // self.pile seeded from bootstrap.pile, copy-if-absent (`cp -n`), from
-        // the configured bootstrap path — NOT the caller's private pile.
+        // the configured bootstrap path — NOT the caller-supplied pile path.
         assert!(
             calls.iter().any(|c| c.ends_with(&[
                 "cp".into(), "-n".into(),
@@ -1175,12 +1168,12 @@ mod tests {
             "profile must export PILE at the mounted self.pile: {seed}"
         );
 
-        // The caller's private pile path is NEVER referenced by any host
+        // The caller-supplied pile path is NEVER referenced by any host
         // command (only logged): the mounted pile is the coworker's server-born
         // artifact under pile_root.
         assert!(
-            calls.iter().flatten().all(|a| !a.contains("/Users/x/self.pile")),
-            "must never reference the caller's private pile: {calls:?}"
+            calls.iter().flatten().all(|a| !a.contains("/caller/supplied/arbitrary.pile")),
+            "must never reference the caller-supplied pile path: {calls:?}"
         );
     }
 

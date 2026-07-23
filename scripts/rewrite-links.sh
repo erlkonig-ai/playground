@@ -5,7 +5,7 @@ set -euo pipefail
 # Uses wiki.rs fix-truncated for batch expansion (one pile open per fragment).
 # Ambiguous prefixes are left unchanged and collected for manual review.
 
-PILE="${PILE:-../personas/liora/pile/self.pile}"
+PILE="${PILE:-./self.pile}"
 WIKI="PILE=$PILE rust-script faculties/wiki.rs"
 
 echo "Collecting fragment IDs..."
