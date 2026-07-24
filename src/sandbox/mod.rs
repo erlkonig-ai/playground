@@ -131,9 +131,11 @@ pub struct ExecResult {
 /// Implementors: `lima::LimaBackend` (now), a future `seatbelt::SeatbeltBackend`
 /// (macOS `sandbox-exec`), and a future `jail::JailBackend` (FreeBSD).
 ///
-/// The trait is intentionally synchronous and blocking to match the rest of the
-/// crate (no tokio anywhere today). The MCP server layer is where an async
-/// runtime, if adopted, will bridge to these calls (see `crate::mcp`).
+/// The trait is deliberately synchronous and blocking: backends drive
+/// `ssh`/`limactl`/`jexec` as blocking subprocesses, and a sync provider core
+/// stays simple. The async boundary lives in the `mcp-http` transport (feature
+/// `mcp-http` = tokio + axum), which bridges to these blocking calls via
+/// `tokio::task::spawn_blocking` (see `crate::mcp_http`).
 pub trait SandboxBackend: Send + Sync {
     /// Human-readable backend name for diagnostics ("lima", "seatbelt", ...).
     fn name(&self) -> &'static str;
