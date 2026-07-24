@@ -479,13 +479,17 @@ impl JailBackend {
     /// The `<safe>` part is the human-readable sanitisation (label mapped onto
     /// `[A-Za-z0-9-]`, `-` for anything else) TRUNCATED to
     /// [`Self::SAFE_NAME_LEN`] bytes for operator legibility only — it is NOT
-    /// what distinguishes tenants. The `<digest>` part is the first
-    /// [`Self::DIGEST_HEX_LEN`] hex chars of SHA-256 over the ORIGINAL full
-    /// label, and THAT is what guarantees injectivity: two labels that collapse
-    /// to the same `<safe>` (e.g. `a/b`, `a?b`, `a-b`) still differ in the
-    /// digest, so they get distinct jail names / ZFS datasets / private piles —
-    /// no cross-tenant hijack. Same label → same name (deterministic, so
-    /// reattach/destroy find the exact box).
+    /// what distinguishes tenants. The `<digest>` part is the FULL SHA-256 (64
+    /// hex chars) over the ORIGINAL full label, and THAT is what guarantees
+    /// injectivity: two labels that collapse to the same `<safe>` (e.g. `a/b`,
+    /// `a?b`, `a-b`) still differ in the digest, so they get distinct jail names
+    /// / ZFS datasets / private piles — no cross-tenant hijack. The full digest
+    /// (not a truncated 80-bit prefix) removes any residual birthday-collision
+    /// surface (sol's reopened review, 2026-07-24). Same label → same name
+    /// (deterministic, so reattach/destroy find the exact box). The resulting
+    /// name (`playground-<≤32>-<64>` ≈ 108 bytes) stays well under the 255-byte
+    /// ZFS/jail component limit, and no on-host tenant state exists to migrate
+    /// (all prior on-host testing used scratch tenants, torn down).
     ///
     /// Public so the `user` CLI derives the same name the backend uses via this
     /// one function — the two must never drift on session ids (destroy,
@@ -502,22 +506,16 @@ impl JailBackend {
         let mut hasher = Sha256::new();
         hasher.update(label.as_bytes());
         let digest = hasher.finalize();
-        let hex: String = digest
-            .iter()
-            .take(Self::DIGEST_HEX_LEN / 2)
-            .map(|b| format!("{b:02x}"))
-            .collect();
+        // FULL SHA-256 (all 32 bytes -> 64 hex): no truncation, no birthday
+        // surface. `format!("{digest:x}")` is the lowercase-hex Display of the
+        // GenericArray digest.
+        let hex = format!("{digest:x}");
         format!("{}-{}-{}", self.jail_prefix, safe, hex)
     }
 
     /// Truncation bound for the human-readable `<safe>` part of a jail name
     /// (operator legibility only; injectivity comes from the digest).
     const SAFE_NAME_LEN: usize = 32;
-    /// Number of hex chars of the SHA-256 label digest carried in a jail name.
-    /// 20 hex chars = 80 bits: collision-resistant well past any realistic
-    /// tenant count, and the ZFS `playground:tenant` property is the
-    /// authoritative backstop even if it ever collided.
-    const DIGEST_HEX_LEN: usize = 20;
 
     /// ZFS user property that records the ORIGINAL tenant label on a session's
     /// dataset. Set right after `zfs clone` and verified on every reuse /
@@ -576,6 +574,19 @@ impl JailBackend {
         format!("{}/self.pile", self.self_pile_dir(jail))
     }
 
+    /// Host-PRIVATE tenant-provenance marker for this coworker's persistent pile
+    /// dir (`<pile_root>/<jail>/.tenant`). Written 0600 root-owned at provision,
+    /// containing the canonical tenant label, and verified on every reuse /
+    /// reattach (sol's reopened review of repair #1, 2026-07-24). This gives the
+    /// host-owned persistent `self.pile` — which DECOUPLES from the ZFS dataset
+    /// (Model B: it survives `zfs destroy`) — its OWN independent provenance, so
+    /// reuse no longer trusts SOLELY the dataset's `playground:tenant` property.
+    /// The pile DIR is never mounted into any jail (only the `self.pile` FILE is),
+    /// so this marker is unreachable from inside the sandbox.
+    fn self_pile_tenant_marker(&self, jail: &str) -> String {
+        format!("{}/.tenant", self.self_pile_dir(jail))
+    }
+
     /// Host directory that holds the single `shared.pile` all coworker jails
     /// append to concurrently. It is NOT mounted into any jail; only the
     /// `shared.pile` FILE inside it is (single-file nullfs).
@@ -630,6 +641,18 @@ impl JailBackend {
         if !mkdir.success() {
             bail!("mkdir staging root {staging_root} failed: {}", mkdir.stderr_lossy());
         }
+        // Force the intended ownership + mode explicitly (root-owned, 0700):
+        // `chown` closes a pre-existing dir that mkdir -p left with foreign
+        // ownership; `chmod` narrows the mode. Both precede the verification
+        // below, which is the actual gate.
+        let chown = self.run(
+            &["sudo", "-n", "chown", "root:wheel", &staging_root],
+            None,
+            ADMIN_TIMEOUT,
+        )?;
+        if !chown.success() {
+            bail!("chown root:wheel staging root {staging_root} failed: {}", chown.stderr_lossy());
+        }
         let chmod = self.run(
             &["sudo", "-n", "chmod", "700", &staging_root],
             None,
@@ -637,6 +660,71 @@ impl JailBackend {
         )?;
         if !chmod.success() {
             bail!("chmod 700 staging root {staging_root} failed: {}", chmod.stderr_lossy());
+        }
+        // STAGING PROVENANCE (sol's reopened review of repair #2, 2026-07-24):
+        // before trusting the private staging dir, PROVE two things about it —
+        //   (a) NO component of the staging path is a symlink (a symlinked
+        //       ancestor could redirect the whole private dir out from under us,
+        //       reintroducing the confused-deputy the single-file topology
+        //       closed); and
+        //   (b) the staging root itself is root-owned (uid 0) and mode 0700 (no
+        //       group/other access, no non-root owner who could plant entries).
+        // Fail CLOSED on any breach; a staging dir we cannot vouch for must not
+        // receive a privileged bootstrap `cp`.
+        self.assert_staging_provenance(&staging_root)?;
+        Ok(())
+    }
+
+    /// Prove the staging root is safe to stage into: no symlink anywhere on its
+    /// path, and the dir itself root-owned + mode 0700. One privileged shell
+    /// walk (component-by-component `test -L`, then a `stat` of the leaf) so the
+    /// whole check is a single host round-trip; any failure `bail!`s.
+    fn assert_staging_provenance(&self, staging_root: &str) -> Result<()> {
+        // The path is always absolute (derived from `pile_root`), so the walk
+        // starts at `/` and appends each component, refusing a symlink at ANY
+        // step. Then `stat` the leaf for uid 0 and octal mode 700. FreeBSD
+        // `stat -f`: `%u` = uid, `%Lp` = the low (permission) bits in octal.
+        // The path is interpolated as a single-quoted `sh` positional (`"$1"`),
+        // never re-split, and `staging_root` is a server-derived path (no tenant
+        // input), so this is not an injection surface.
+        let script = r#"
+set -eu
+p="$1"
+# Walk every ancestor component and refuse a symlink at any of them.
+acc=""
+IFS=/
+for comp in $p; do
+  [ -z "$comp" ] && continue
+  acc="$acc/$comp"
+  if [ -L "$acc" ]; then
+    echo "SYMLINK-COMPONENT $acc" >&2
+    exit 3
+  fi
+done
+unset IFS
+# The leaf must be root-owned (uid 0) and mode 0700.
+uid=$(stat -f '%u' "$p")
+mode=$(stat -f '%Lp' "$p")
+if [ "$uid" != "0" ]; then
+  echo "BAD-OWNER uid=$uid" >&2
+  exit 4
+fi
+if [ "$mode" != "700" ]; then
+  echo "BAD-MODE mode=$mode" >&2
+  exit 5
+fi
+"#;
+        let out = self.run(
+            &["sudo", "-n", "sh", "-c", script, "sh", staging_root],
+            None,
+            ADMIN_TIMEOUT,
+        )?;
+        if !out.success() {
+            bail!(
+                "staging root {staging_root} failed the provenance check \
+                 (symlinked component, non-root owner, or mode != 0700): {}",
+                out.stderr_lossy()
+            );
         }
         Ok(())
     }
@@ -700,10 +788,33 @@ impl JailBackend {
             None,
             ADMIN_TIMEOUT,
         )?;
-        // Clean up the staging temp regardless: on success it is a redundant
-        // second name for the published inode; on a no-op it is our leftover.
-        let _ = self.run(&["sudo", "-n", "rm", "-f", &staging_tmp], None, ADMIN_TIMEOUT);
         if link.success() {
+            // FRESH-INODE VALIDATION (sol's reopened review of repair #2,
+            // 2026-07-24): a successful `ln -h` hardlinks `dest` to `staging_tmp`,
+            // so — if `dest` truly is the file WE just created — the two names
+            // share ONE inode. Capture BOTH inode numbers BEFORE the `rm -f`
+            // removes the staging name, and require them equal. This proves the
+            // published `dest` is the freshly-created inode from THIS operation,
+            // not a pre-existing or raced file silently trusted as ours (a create-
+            // only `ln` fails EEXIST on a pre-existing dest, so a SUCCESS with a
+            // MISMATCHED inode would mean the kernel/link semantics regressed —
+            // refuse loudly rather than mount a foreign file).
+            let staging_ino = self.inode_of(&staging_tmp).with_context(|| {
+                format!("stat staging temp {staging_tmp} for fresh-inode validation")
+            })?;
+            let dest_ino = self.inode_of(dest).with_context(|| {
+                format!("stat published dest {dest} for fresh-inode validation")
+            })?;
+            // Clean up the staging temp now that both inodes are captured: on the
+            // success path it is the redundant second name of the published inode.
+            let _ = self.run(&["sudo", "-n", "rm", "-f", &staging_tmp], None, ADMIN_TIMEOUT);
+            if staging_ino != dest_ino {
+                bail!(
+                    "publish pile -> {dest} succeeded but the dest inode ({dest_ino}) does not \
+                     match the just-linked staging inode ({staging_ino}) — dest is not the file \
+                     we created (refusing)"
+                );
+            }
             // Post-link verification on the SUCCESS path too. Even a successful
             // `ln -h` must land the dest as a REGULAR, NON-SYMLINK file at the
             // EXACT expected path — no follow, no misplacement. Defence in depth:
@@ -715,6 +826,8 @@ impl JailBackend {
                      regular non-symlink file at the expected path (refusing)")
             })?;
         } else {
+            // Clean up the staging temp: on this no-op path it is our leftover copy.
+            let _ = self.run(&["sudo", "-n", "rm", "-f", &staging_tmp], None, ADMIN_TIMEOUT);
             // `ln -h` failed. The ONLY acceptable reason is "destination already
             // exists as a regular, non-symlink file" — the create-if-absent
             // no-op. Verify that with a no-follow test; anything else (symlink,
@@ -728,6 +841,24 @@ impl JailBackend {
             })?;
         }
         Ok(())
+    }
+
+    /// The inode number of `path` (FreeBSD `stat -f '%i'`), for the fresh-inode
+    /// validation in [`stage_and_publish_pile`]. `bail!`s if the stat fails or
+    /// returns a non-numeric value (a path that vanished, or an unexpected
+    /// `stat` output — either way we cannot vouch for the inode identity).
+    fn inode_of(&self, path: &str) -> Result<u64> {
+        let out = self.run(
+            &["sudo", "-n", "stat", "-f", "%i", path],
+            None,
+            ADMIN_TIMEOUT,
+        )?;
+        if !out.success() {
+            bail!("stat -f %i {path} failed: {}", out.stderr_lossy());
+        }
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        s.parse::<u64>()
+            .map_err(|_| anyhow::anyhow!("stat -f %i {path} returned non-numeric inode '{s}'"))
     }
 
     /// Verify `path` exists as a REGULAR, NON-SYMLINK file, `bail!`-ing otherwise.
@@ -761,6 +892,16 @@ impl JailBackend {
     /// is single-file-nullfs-mounted directly onto this path. `/shared` is the
     /// jail's OWN clone directory — never a writable host directory.
     const GUEST_SHARED_PILE: &'static str = "/shared/shared.pile";
+
+    /// The OLD (pre-repair-#2) guest mount TARGETS: the writable host pile
+    /// PARENT DIRECTORIES were nullfs-mounted rw here (`<pile_root>/<jail>` at
+    /// `/pile`, `<pile_root>/shared` at `/shared`). This is the confused-deputy
+    /// topology repair #2 removed; reattach detects and MANDATORILY unmounts any
+    /// mount at these targets before re-establishing the single-file mounts, so
+    /// a legacy jail never comes up with a writable pile parent dir. (The
+    /// single-file targets `/pile/self.pile` and `/shared/shared.pile` live
+    /// INSIDE these dirs; the dir mount must be cleared first.)
+    const LEGACY_GUEST_PILE_DIRS: &'static [&'static str] = &["/pile", "/shared"];
 
     /// The nullfs filesystem type — the one `(fstype)` a pile mount is ever
     /// allowed to be. Used to validate the exact `(source, target, fstype)`
@@ -1103,11 +1244,14 @@ impl JailBackend {
         }
     }
 
-    /// Read back the recorded tenant label and VERIFY it equals `expected`. A
-    /// mismatch means a digest collision or tampering — the caller must refuse
-    /// to hand this box to the requester. This makes tenant identity
-    /// authoritative even if the jail-name digest ever collided.
-    fn verify_tenant_property(&self, dataset: &str, expected: &str) -> Result<()> {
+    /// Read the recorded tenant label off `dataset`'s `playground:tenant` ZFS
+    /// property, failing CLOSED if the property is unreadable, unset, or empty.
+    /// A ZFS user property that has never been set reads back as the literal `-`
+    /// (the "no value" sentinel), which we reject: a dataset with no recorded
+    /// provenance must never be trusted as some tenant's. Shared by both the
+    /// label-known check ([`verify_tenant_property`]) and the leaf-re-derivation
+    /// check ([`verify_tenant_property_derives_leaf`]).
+    fn read_tenant_property(&self, dataset: &str) -> Result<String> {
         let out = self.run(
             &["sudo", "-n", "zfs", "get", "-H", "-o", "value", Self::TENANT_PROPERTY, dataset],
             None,
@@ -1121,11 +1265,186 @@ impl JailBackend {
             );
         }
         let stored = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if stored.is_empty() || stored == "-" {
+            bail!(
+                "dataset {dataset} carries no {} provenance (unset) — refusing",
+                Self::TENANT_PROPERTY
+            );
+        }
+        Ok(stored)
+    }
+
+    /// Read back the recorded tenant label and VERIFY it equals `expected`. A
+    /// mismatch means a digest collision or tampering — the caller must refuse
+    /// to hand this box to the requester. This makes tenant identity
+    /// authoritative even if the jail-name digest ever collided.
+    fn verify_tenant_property(&self, dataset: &str, expected: &str) -> Result<()> {
+        let stored = self.read_tenant_property(dataset)?;
         if stored != expected {
             bail!(
                 "tenant mismatch on {dataset}: stored '{stored}' != requested '{expected}' \
                  (hash collision or tampering — refusing)"
             );
+        }
+        Ok(())
+    }
+
+    /// Prove the dataset's recorded tenant label actually RE-DERIVES this exact
+    /// jail leaf — i.e. `jail_name(stored_label) == jail`. This is the
+    /// provenance check for the paths that hold a jail NAME but not the raw
+    /// requester label (`destroy_session`, `reattach`): reading the stored label
+    /// and confirming it hashes back to the very leaf we are about to
+    /// destroy/reattach proves the property belongs to THIS box, not a foreign
+    /// or tampered `playground:tenant` value copied onto an unrelated dataset
+    /// (sol's reopened review, 2026-07-24). A mismatch — the stored label
+    /// derives a DIFFERENT jail — is refused loudly. `jail` is the injective
+    /// name derived from the caller-trusted session id; `dataset` is
+    /// `self.dataset(jail)`.
+    fn verify_tenant_property_derives_leaf(&self, dataset: &str, jail: &str) -> Result<()> {
+        let stored = self.read_tenant_property(dataset)?;
+        let derived = self.jail_name(&stored);
+        if derived != jail {
+            bail!(
+                "tenant provenance on {dataset} does not derive this leaf: stored label \
+                 '{stored}' -> jail '{derived}', expected '{jail}' (foreign/tampered \
+                 {} — refusing)",
+                Self::TENANT_PROPERTY
+            );
+        }
+        Ok(())
+    }
+
+    /// Write the host-private persistent-pile provenance marker
+    /// (`<pile_root>/<jail>/.tenant`) with the canonical `label`, mode 0600,
+    /// root-owned (sol's reopened review of repair #1, 2026-07-24). This is the
+    /// persistent pile's OWN provenance — independent of the ZFS
+    /// `playground:tenant` property — so a host-owned pile that survives a
+    /// dataset destroy still carries who it belongs to. Written atomically via
+    /// the same host-private staging + no-follow publish disciplines are overkill
+    /// here (the pile DIR is never tenant-reachable), so a direct privileged
+    /// `tee` + `chmod 600` + `chown` is sufficient and clearer. Called at
+    /// provision, and idempotently re-asserted when an existing pile has no
+    /// marker yet (a pile dir created before this repair).
+    fn write_tenant_marker(&self, jail: &str, label: &str) -> Result<()> {
+        let marker = self.self_pile_tenant_marker(jail);
+        // Write the canonical label (no trailing newline concerns: the reader
+        // trims). `tee` runs under sudo so the file is root-owned already; the
+        // explicit chmod/chown make the 0600 root:wheel invariant unconditional.
+        let tee = self.run(
+            &["sudo", "-n", "tee", &marker],
+            Some(label.as_bytes()),
+            ADMIN_TIMEOUT,
+        )?;
+        if !tee.success() {
+            bail!("write tenant marker {marker} failed: {}", tee.stderr_lossy());
+        }
+        let chmod = self.run(&["sudo", "-n", "chmod", "600", &marker], None, ADMIN_TIMEOUT)?;
+        if !chmod.success() {
+            bail!("chmod 600 tenant marker {marker} failed: {}", chmod.stderr_lossy());
+        }
+        let chown = self.run(
+            &["sudo", "-n", "chown", "root:wheel", &marker],
+            None,
+            ADMIN_TIMEOUT,
+        )?;
+        if !chown.success() {
+            bail!("chown tenant marker {marker} failed: {}", chown.stderr_lossy());
+        }
+        Ok(())
+    }
+
+    /// Read the persistent-pile `.tenant` marker, returning `Ok(Some(label))` if
+    /// it is present and non-empty, `Ok(None)` if it is genuinely absent, or an
+    /// `Err` if the read failed for any OTHER reason (which must fail closed).
+    /// The absent case is distinguished by the canonical `No such file` stderr —
+    /// exactly parallel to the tri-state ZFS probe.
+    fn read_tenant_marker(&self, jail: &str) -> Result<Option<String>> {
+        let marker = self.self_pile_tenant_marker(jail);
+        let out = self.run(&["sudo", "-n", "cat", &marker], None, ADMIN_TIMEOUT)?;
+        if out.success() {
+            let stored = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if stored.is_empty() {
+                bail!("tenant marker {marker} is present but empty (refusing)");
+            }
+            return Ok(Some(stored));
+        }
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if stderr.contains("No such file") {
+            return Ok(None);
+        }
+        bail!("read tenant marker {marker} failed: {}", stderr.trim());
+    }
+
+    /// Verify the persistent pile's independent provenance against the requester
+    /// `label` (sol's reopened review of repair #1). For an EXISTING pile the
+    /// marker MUST be present and match; a missing or mismatched marker is
+    /// refused — the pile survives dataset destroy, so trusting only the (fresh)
+    /// ZFS property of a re-provisioned dataset would let a new tenant inherit an
+    /// old tenant's pile. If the marker is absent AND the pile FILE itself does
+    /// not yet exist (a brand-new pile dir), there is nothing to protect and we
+    /// return `Ok` so provision can create it and write the marker. If the marker
+    /// is absent but the pile FILE exists (a pre-repair pile), we ADOPT it by
+    /// writing the marker now IFF the dataset's ZFS provenance already vouches
+    /// for this label (checked by the caller before this point) — otherwise we
+    /// would be unable to ever reattach a legitimately pre-existing pile. The
+    /// adoption path is logged.
+    fn verify_persistent_pile_provenance(&self, jail: &str, label: &str) -> Result<()> {
+        match self.read_tenant_marker(jail)? {
+            Some(stored) => {
+                if stored != label {
+                    bail!(
+                        "persistent pile provenance mismatch for jail '{jail}': marker records \
+                         '{stored}' != requester '{label}' (a foreign pile survived a dataset \
+                         destroy — refusing to hand it over)"
+                    );
+                }
+                Ok(())
+            }
+            None => {
+                // No marker. If the pile FILE already exists this is a pre-repair
+                // pile: adopt it (the caller has already proven this tenant owns
+                // the box via the dataset's ZFS property) by writing the marker
+                // now, so subsequent reuses are gated. If the pile file does not
+                // exist either, this is a brand-new pile and provision will write
+                // the marker after seeding.
+                let pile_file = self.self_pile_file(jail);
+                let exists = self
+                    .run(
+                        &["sudo", "-n", "test", "-f", &pile_file],
+                        None,
+                        ADMIN_TIMEOUT,
+                    )
+                    .map(|o| o.success())
+                    .unwrap_or(false);
+                if exists {
+                    eprintln!(
+                        "[{}] adopting pre-repair pile for jail '{jail}': writing .tenant marker",
+                        self.name()
+                    );
+                    self.write_tenant_marker(jail, label)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Prove the persistent-pile `.tenant` marker (if present) re-derives THIS
+    /// leaf — the label-UNKNOWN counterpart of [`verify_persistent_pile_provenance`],
+    /// used by [`reattach`] so the boot sweep ([`reattach_all`], which holds a
+    /// jail name but no requester label) also gates the pile's independent
+    /// provenance. An absent marker is tolerated (a pre-repair pile adopted on the
+    /// next labelled reuse); a PRESENT marker whose label derives a DIFFERENT jail
+    /// is refused.
+    fn verify_pile_marker_derives_leaf(&self, jail: &str) -> Result<()> {
+        if let Some(stored) = self.read_tenant_marker(jail)? {
+            let derived = self.jail_name(&stored);
+            if derived != jail {
+                bail!(
+                    "persistent pile marker for jail '{jail}' does not derive this leaf: \
+                     recorded label '{stored}' -> jail '{derived}' (foreign/tampered marker — \
+                     refusing)"
+                );
+            }
         }
         Ok(())
     }
@@ -1224,6 +1543,75 @@ impl JailBackend {
         }
     }
 
+    /// Detect and MANDATORILY unmount any LEGACY directory-style pile mount over
+    /// this jail root, failing CLOSED if one cannot be cleared (sol's reopened
+    /// review of repair #2, 2026-07-24).
+    ///
+    /// A jail provisioned under the pre-#2 code nullfs-mounted the writable host
+    /// pile PARENT DIRECTORIES at guest `/pile` and `/shared`
+    /// ([`Self::LEGACY_GUEST_PILE_DIRS`]) — the confused-deputy topology. On
+    /// reattach we must not reuse it: a legacy nullfs mount at `{root}/pile` or
+    /// `{root}/shared` is force-unmounted so the subsequent single-file
+    /// [`mount_piles`] establishes the safe `/pile/self.pile` + `/shared/shared.pile`
+    /// mounts instead. If the umount does not clear the mount (still present in a
+    /// fresh listing), we BAIL rather than start the jail — the vulnerable
+    /// topology must never survive the upgrade. A jail already on the new
+    /// single-file topology has no mount at these DIRECTORY targets, so this is a
+    /// no-op there (the single-file targets are `/pile/self.pile` and
+    /// `/shared/shared.pile`, which are longer whole-token paths and never match).
+    ///
+    /// `listing` is the mount table already read by the caller (reattach reads it
+    /// once for the devfs check); we re-read only after an actual unmount to
+    /// confirm it cleared.
+    fn migrate_legacy_pile_mounts(&self, jail: &str, root: &str, listing: &str) -> Result<()> {
+        let mut unmounted_any = false;
+        for guest_dir in Self::LEGACY_GUEST_PILE_DIRS {
+            let target = format!("{root}{guest_dir}");
+            // A legacy mount is any mount whose whole-token TARGET is exactly the
+            // pile PARENT DIR (`/pile` or `/shared`) — never the single-file
+            // targets under them. `line_target_is` matches the whole target
+            // token, so `/pile` does not match `/pile/self.pile`.
+            let present = listing
+                .lines()
+                .any(|line| Self::line_target_is(line, &target));
+            if !present {
+                continue;
+            }
+            eprintln!(
+                "[{}] reattach {jail}: force-unmounting LEGACY directory pile mount at \
+                 {target} (pre-#2 writable-parent topology; migrating to single-file)",
+                self.name()
+            );
+            let _ = self.run(
+                &["sudo", "-n", "umount", "-f", &target],
+                None,
+                ADMIN_TIMEOUT,
+            );
+            unmounted_any = true;
+        }
+        if !unmounted_any {
+            // Nothing legacy present — already on the single-file topology.
+            return Ok(());
+        }
+        // Re-read the table and CONFIRM every legacy directory mount is gone. If
+        // any survives the force-unmount we refuse to start the jail: a
+        // pre-repair jail must not come up with the old writable-dir mounts.
+        let after = self.mount_listing()?;
+        for guest_dir in Self::LEGACY_GUEST_PILE_DIRS {
+            let target = format!("{root}{guest_dir}");
+            if after
+                .lines()
+                .any(|line| Self::line_target_is(line, &target))
+            {
+                bail!(
+                    "reattach {jail}: legacy directory pile mount at {target} could not be \
+                     unmounted (refusing to start jail on the pre-repair writable-parent topology)"
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Re-establish a jail context over an EXISTING persistent dataset: the
     /// ephemeral devfs mount (does not survive a reboot) plus the two pile mounts
     /// plus `jail -c`. The dataset and its `/etc/profile` are left exactly as
@@ -1241,7 +1629,29 @@ impl JailBackend {
     /// establishing every mount BEFORE `jail -c`, so a jail is never started with
     /// a missing or redirected mount. Fresh provision and reattach share this one
     /// primitive; reattach is no longer the weak path.
+    ///
+    /// PROVENANCE (sol's reopened review, 2026-07-24): reattach now proves the
+    /// dataset's stored `playground:tenant` re-derives THIS leaf
+    /// (`jail_name(stored) == jail`) BEFORE touching any mount or starting the
+    /// jail. The label-known callers (open/provision) already
+    /// [`verify_tenant_property`] against the requester's label; this closes the
+    /// label-UNKNOWN path (`reattach_all`, the boot sweep) where nothing proved
+    /// the recorded provenance actually belongs to the leaf it is mounted on — a
+    /// foreign/tampered property copied onto an unrelated dataset would otherwise
+    /// be reattached and its pile handed out under the wrong name. It is also
+    /// belt-and-suspenders on the label-known paths (the leaf must derive from
+    /// its own provenance regardless of who asked).
     fn reattach(&self, jail: &str, dataset: &str) -> Result<()> {
+        // Prove ownership before ANY mount / `jail -c`: the stored provenance
+        // must hash back to this exact leaf. Fails closed (unset/unreadable
+        // property, or a stored label that derives a different jail).
+        self.verify_tenant_property_derives_leaf(dataset, jail)
+            .with_context(|| format!("verify tenant provenance before reattaching '{jail}'"))?;
+        // Independent persistent-pile provenance (repair #1 reopened): the
+        // host-owned pile's OWN marker must also derive this leaf. Covers the
+        // boot sweep, which has no requester label to check the marker against.
+        self.verify_pile_marker_derives_leaf(jail)
+            .with_context(|| format!("verify persistent pile marker before reattaching '{jail}'"))?;
         let root = self.mountpoint(dataset)?;
         // devfs: re-mount and VERIFY it is live. A re-mount over a still-live
         // devfs fails "already mounted", so we do not gate on the mount's own
@@ -1270,6 +1680,16 @@ impl JailBackend {
         if !devfs_live {
             bail!("reattach {jail}: devfs not mounted at {dev_target} (refusing to start jail)");
         }
+        // LEGACY-MOUNT MIGRATION (sol's reopened review of repair #2,
+        // 2026-07-24): a jail provisioned under the OLD (pre-#2) code has the
+        // writable-parent-DIRECTORY nullfs topology (`<pile_root>/<jail>` at
+        // guest `/pile`, `<pile_root>/shared` at guest `/shared` — the
+        // confused-deputy vector). Reattaching it must NOT reuse that topology,
+        // or the vulnerability survives the upgrade. Detect any legacy
+        // directory-style pile mount and MANDATORILY unmount it (fail closed if
+        // it cannot be cleared) BEFORE re-establishing the single-file mounts —
+        // a pre-repair jail must never come up with the old writable-dir mounts.
+        self.migrate_legacy_pile_mounts(jail, &root, &listing)?;
         // Pile mounts do not survive a jail restart either — re-establish both,
         // FAIL-CLOSED (exact-tuple validated). A failure aborts before `jail -c`.
         self.mount_piles(jail, &root)?;
@@ -1345,6 +1765,11 @@ impl SandboxBackend for JailBackend {
             if self.jail_running(&jail) {
                 self.verify_tenant_property(&dataset, &spec.tenant.label)
                     .with_context(|| format!("verify tenant provenance for jail '{jail}'"))?;
+                // Independent persistent-pile provenance (repair #1 reopened):
+                // the host-owned pile survives dataset destroy, so it must prove
+                // its OWN tenant, not just trust the dataset's ZFS property.
+                self.verify_persistent_pile_provenance(&jail, &spec.tenant.label)
+                    .with_context(|| format!("verify persistent pile provenance for jail '{jail}'"))?;
                 eprintln!("[{}] reusing persistent sandbox '{}'", self.name(), jail);
                 return Ok(SessionId::new(jail.clone()));
             }
@@ -1364,6 +1789,9 @@ impl SandboxBackend for JailBackend {
                 DatasetState::Exists => {
                     self.verify_tenant_property(&dataset, &spec.tenant.label)
                         .with_context(|| format!("verify tenant provenance for jail '{jail}'"))?;
+                    // Independent persistent-pile provenance (repair #1 reopened).
+                    self.verify_persistent_pile_provenance(&jail, &spec.tenant.label)
+                        .with_context(|| format!("verify persistent pile provenance for jail '{jail}'"))?;
                     eprintln!("[{}] reattaching persistent sandbox '{}'", self.name(), jail);
                     self.reattach(&jail, &dataset)
                         .with_context(|| format!("reattach jail '{jail}'"))?;
@@ -1415,6 +1843,9 @@ impl SandboxBackend for JailBackend {
             DatasetState::Exists => {
                 self.verify_tenant_property(&dataset, &spec.tenant.label)
                     .with_context(|| format!("verify tenant provenance for jail '{jail}'"))?;
+                // Independent persistent-pile provenance (repair #1 reopened).
+                self.verify_persistent_pile_provenance(&jail, &spec.tenant.label)
+                    .with_context(|| format!("verify persistent pile provenance for jail '{jail}'"))?;
                 eprintln!(
                     "[{}] sandbox '{}' already provisioned; ensuring it is up",
                     self.name(),
@@ -1551,12 +1982,30 @@ impl SandboxBackend for JailBackend {
             if !mkdir_self.success() {
                 bail!("mkdir self pile dir failed: {}", mkdir_self.stderr_lossy());
             }
+            // PERSISTENT-PILE PROVENANCE (repair #1 reopened, 2026-07-24): the
+            // host pile dir DECOUPLES from the ZFS dataset (Model B), so a fresh
+            // clone can land on a pile dir that SURVIVED a previous tenant's
+            // dataset destroy. Verify the persistent-pile marker BEFORE seeding:
+            // a marker recording a DIFFERENT label means a foreign pile is about
+            // to be handed to this new tenant — refuse. (A brand-new pile dir has
+            // no marker and no pile file yet, so this is a clean pass and the
+            // marker is written just below.)
+            self.verify_persistent_pile_provenance(&jail, &spec.tenant.label)
+                .with_context(|| {
+                    format!("verify persistent pile provenance before seeding jail '{jail}'")
+                })?;
             // Seed self.pile create-if-absent via host-private staging + a
             // no-follow / create-only publish (see `stage_and_publish_pile`): a
             // reprovision keeps the coworker's accumulated pile, and the
             // privileged copy never follows a symlink at the destination.
             self.stage_and_publish_pile(&jail, &self_pile)
                 .context("seed self.pile from bootstrap")?;
+            // Write the host-private tenant marker (0600 root-owned) recording
+            // this pile's canonical owner — the persistent pile's OWN provenance,
+            // verified on every future reuse/reattach independent of the dataset's
+            // ZFS property.
+            self.write_tenant_marker(&jail, &spec.tenant.label)
+                .context("write persistent-pile .tenant marker")?;
             // Make the host self.pile APPEND-ONLY (`chflags sappnd`): a process
             // inside the jail can O_APPEND but not O_TRUNC/unlink/rename it, so a
             // buggy or stale tool cannot truncate the pile (the 2026-07-03
@@ -1891,6 +2340,20 @@ impl SandboxBackend for JailBackend {
         // (blocker #3): a concurrent provision/open of the SAME box cannot
         // interleave with this destroy.
         self.lifecycle.with_lock(jail, || {
+            // PROVENANCE GATE (sol's reopened review, 2026-07-24): prove the
+            // dataset's recorded tenant re-derives THIS leaf before we tear
+            // anything down. The namespace guard above only proves the id LOOKS
+            // like ours; this proves the requesting principal (whose session id
+            // IS this jail) actually OWNS the dataset — a destroy must never
+            // succeed against a box whose `playground:tenant` does not hash back
+            // to this exact jail (foreign/tampered property, digest collision).
+            // Read-only; runs before `jail -r`, so a failed check destroys
+            // nothing. If the dataset is genuinely absent the get fails and we
+            // bail — a destroy of a non-existent dataset is a caller error, not
+            // something to paper over.
+            self.verify_tenant_property_derives_leaf(&dataset, jail)
+                .with_context(|| format!("verify tenant provenance before destroying '{jail}'"))?;
+
             // Remove the jail (kills its processes). Failure is tolerated — the
             // jail may already be gone — but is surfaced on stderr.
             let removed = self.run(&["sudo", "-n", "jail", "-r", jail], None, ADMIN_TIMEOUT)?;
@@ -1977,6 +2440,33 @@ mod tests {
         script: Vec<(Vec<&'static str>, HostOutput)>,
         /// Stateful mount table: `(source, target, fstype)`, newest last.
         mounts: Mutex<Vec<(String, String, String)>>,
+        /// Stateful filesystem: path -> inode number. `cp DEST` and `tee DEST`
+        /// mint a FRESH inode; `ln -h SRC DEST` gives DEST the SAME inode as SRC
+        /// (a hardlink), which is what the fresh-inode validation checks; `stat
+        /// -f %i PATH` reads it. A path absent from the table does not exist.
+        inodes: Mutex<std::collections::HashMap<String, u64>>,
+        /// Monotonic inode counter so every freshly-minted file gets a distinct
+        /// inode (a `cp`/`tee` create).
+        next_inode: Mutex<u64>,
+        /// Stateful small-file contents: path -> bytes. Backs the `.tenant`
+        /// marker (`tee` writes, `cat` reads) so the persistent-pile provenance
+        /// round-trips against the mock exactly as against a real host.
+        files: Mutex<std::collections::HashMap<String, Vec<u8>>>,
+        /// Stateful ZFS `playground:tenant` user property: dataset -> label.
+        /// `zfs set playground:tenant=<label> <dataset>` records it; `zfs get`
+        /// reads it (returning the `-` "unset" sentinel when absent, exactly like
+        /// real ZFS). This lets a test model several datasets each with their own
+        /// recorded tenant — the derives-leaf provenance gate reads it per-leaf.
+        zfs_props: Mutex<std::collections::HashMap<String, String>>,
+        /// Stateful set of RUNNING jail names (`jls -j <name>` exits 0 iff a name
+        /// is present). Seeded via [`with_running_jail`]; empty means every jail
+        /// is down (the common provision case). Only consulted when a `jls`
+        /// prefix is not explicitly scripted.
+        running_jails: Mutex<std::collections::HashSet<String>>,
+        /// When true, the staging-provenance `sh -c` walk (recognised by its
+        /// `SYMLINK-COMPONENT` marker) returns a failure — models a symlinked
+        /// staging component / bad owner without hardcoding the whole script.
+        fail_staging_provenance: bool,
     }
 
     impl MockRunner {
@@ -1995,6 +2485,44 @@ mod tests {
                 target.to_string(),
                 fstype.to_string(),
             ));
+            self
+        }
+        /// Seed a small-file's contents (e.g. a pre-existing `.tenant` marker for
+        /// a reuse/reattach test). Also mints an inode for it so `stat`/`test -f`
+        /// see it as present.
+        fn with_file(self, path: &str, contents: &[u8]) -> Self {
+            self.files
+                .lock()
+                .unwrap()
+                .insert(path.to_string(), contents.to_vec());
+            let ino = self.mint_inode();
+            self.inodes.lock().unwrap().insert(path.to_string(), ino);
+            self
+        }
+        /// Mint the next distinct inode number.
+        fn mint_inode(&self) -> u64 {
+            let mut n = self.next_inode.lock().unwrap();
+            *n += 1;
+            *n
+        }
+        /// Seed the `playground:tenant` ZFS property for a dataset (e.g. to model
+        /// a provisioned box the reattach/destroy provenance gate reads back).
+        fn with_tenant_prop(self, dataset: &str, label: &str) -> Self {
+            self.zfs_props
+                .lock()
+                .unwrap()
+                .insert(dataset.to_string(), label.to_string());
+            self
+        }
+        /// Mark a jail name as RUNNING (so `jls -j <name>` succeeds for it).
+        fn with_running_jail(self, jail: &str) -> Self {
+            self.running_jails.lock().unwrap().insert(jail.to_string());
+            self
+        }
+        /// Force the staging-provenance walk to FAIL (a symlinked component / bad
+        /// owner) so the provision fails closed before any bootstrap `cp`.
+        fn failing_staging_provenance(mut self) -> Self {
+            self.fail_staging_provenance = true;
             self
         }
         /// Render the stateful mount table in FreeBSD `mount(8)` output shape.
@@ -2056,6 +2584,137 @@ mod tests {
                 ["sudo", "-n", "umount", "-f", target] | ["umount", "-f", target] => {
                     self.mounts.lock().unwrap().retain(|(_, t, _)| t != target);
                     return Ok(HostOutput { exit_code: Some(0), ..Default::default() });
+                }
+                // Staging-provenance walk (`sh -c <script> sh <staging_root>`):
+                // recognised by its SYMLINK-COMPONENT marker. Fails iff the test
+                // asked for it; otherwise the default success below applies.
+                ["sudo", "-n", "sh", "-c", script, ..]
+                    if script.contains("SYMLINK-COMPONENT") =>
+                {
+                    return Ok(if self.fail_staging_provenance {
+                        HostOutput {
+                            exit_code: Some(3),
+                            stderr: b"SYMLINK-COMPONENT /aitemp/playground\n".to_vec(),
+                            ..Default::default()
+                        }
+                    } else {
+                        HostOutput { exit_code: Some(0), ..Default::default() }
+                    });
+                }
+                // `cp <src> <dest>`: model a fresh file at dest (mint a new inode).
+                // The staging copy in `stage_and_publish_pile`.
+                ["sudo", "-n", "cp", _src, dest] => {
+                    let ino = self.mint_inode();
+                    self.inodes.lock().unwrap().insert(dest.to_string(), ino);
+                    return Ok(HostOutput { exit_code: Some(0), ..Default::default() });
+                }
+                // `ln -h <src> <dest>`: create-only hardlink. If dest already
+                // exists, fail (EEXIST) — the create-if-absent no-op. Otherwise
+                // dest gets the SAME inode as src (a real hardlink), which is what
+                // the fresh-inode validation confirms.
+                ["sudo", "-n", "ln", "-h", src, dest] => {
+                    // Resolve/mint the src inode WITHOUT holding the lock across
+                    // `mint_inode` (which takes its own lock).
+                    let existing_src = self.inodes.lock().unwrap().get(*src).copied();
+                    let src_ino = existing_src.unwrap_or_else(|| self.mint_inode());
+                    let mut inodes = self.inodes.lock().unwrap();
+                    if existing_src.is_none() {
+                        inodes.insert(src.to_string(), src_ino);
+                    }
+                    if inodes.contains_key(*dest) {
+                        return Ok(fail()); // EEXIST: dest already present
+                    }
+                    inodes.insert(dest.to_string(), src_ino);
+                    return Ok(HostOutput { exit_code: Some(0), ..Default::default() });
+                }
+                // `stat -f %i <path>`: the inode number, or ENOENT if absent.
+                ["sudo", "-n", "stat", "-f", "%i", path] => {
+                    return Ok(match self.inodes.lock().unwrap().get(*path) {
+                        Some(ino) => ok_with_stdout(&format!("{ino}\n")),
+                        None => HostOutput {
+                            exit_code: Some(1),
+                            stderr: b"stat: No such file or directory\n".to_vec(),
+                            ..Default::default()
+                        },
+                    });
+                }
+                // `rm -f <path>`: drop the file + its inode.
+                ["sudo", "-n", "rm", "-f", path] => {
+                    self.inodes.lock().unwrap().remove(*path);
+                    self.files.lock().unwrap().remove(*path);
+                    return Ok(HostOutput { exit_code: Some(0), ..Default::default() });
+                }
+                // `tee <marker>` (no `-a`): write stdin as the file's contents +
+                // mint an inode. This backs the `.tenant` marker write. The
+                // `-a`-appended /etc/profile seed is left to the default success.
+                ["sudo", "-n", "tee", marker] => {
+                    let contents = stdin.map(|b| b.to_vec()).unwrap_or_default();
+                    self.files.lock().unwrap().insert(marker.to_string(), contents);
+                    if !self.inodes.lock().unwrap().contains_key(*marker) {
+                        let ino = self.mint_inode();
+                        self.inodes.lock().unwrap().insert(marker.to_string(), ino);
+                    }
+                    return Ok(HostOutput { exit_code: Some(0), ..Default::default() });
+                }
+                // `cat <path>`: return the file's contents, or ENOENT if absent.
+                ["sudo", "-n", "cat", path] => {
+                    return Ok(match self.files.lock().unwrap().get(*path) {
+                        Some(bytes) => HostOutput {
+                            stdout: bytes.clone(),
+                            exit_code: Some(0),
+                            ..Default::default()
+                        },
+                        None => HostOutput {
+                            exit_code: Some(1),
+                            stderr: b"cat: No such file or directory\n".to_vec(),
+                            ..Default::default()
+                        },
+                    });
+                }
+                // `test -f <path>`: present iff we have an inode for it.
+                ["sudo", "-n", "test", "-f", path] => {
+                    let present = self.inodes.lock().unwrap().contains_key(*path);
+                    return Ok(if present {
+                        HostOutput { exit_code: Some(0), ..Default::default() }
+                    } else {
+                        fail()
+                    });
+                }
+                // `zfs set playground:tenant=<label> <dataset>`: record the
+                // property statefully (the assignment is one argv token).
+                ["sudo", "-n", "zfs", "set", assignment, dataset]
+                    if assignment.starts_with("playground:tenant=") =>
+                {
+                    let label = assignment
+                        .strip_prefix("playground:tenant=")
+                        .unwrap_or_default()
+                        .to_string();
+                    self.zfs_props
+                        .lock()
+                        .unwrap()
+                        .insert(dataset.to_string(), label);
+                    return Ok(HostOutput { exit_code: Some(0), ..Default::default() });
+                }
+                // `zfs get -H -o value playground:tenant <dataset>`: read the
+                // recorded property, or the `-` "unset" sentinel if none.
+                ["sudo", "-n", "zfs", "get", "-H", "-o", "value", "playground:tenant", dataset] => {
+                    let val = self
+                        .zfs_props
+                        .lock()
+                        .unwrap()
+                        .get(*dataset)
+                        .cloned()
+                        .unwrap_or_else(|| "-".to_string());
+                    return Ok(ok_with_stdout(&format!("{val}\n")));
+                }
+                // `jls -j <jail>`: exit 0 iff the name is in the running set.
+                ["sudo", "-n", "jls", "-j", jail] => {
+                    let running = self.running_jails.lock().unwrap().contains(*jail);
+                    return Ok(if running {
+                        ok_with_stdout("1\n")
+                    } else {
+                        fail()
+                    });
                 }
                 _ => {}
             }
@@ -2925,13 +3584,18 @@ mod tests {
         );
 
         // /etc/profile seed carries the faculties PATH + PILE at the mounted
-        // self.pile guest path.
+        // self.pile guest path. Match the `tee -a <…/etc/profile>` APPEND (not the
+        // `.tenant` marker write, which is a plain `tee <marker>`).
         let (_, seed_stdin) = mock
             .calls
             .lock()
             .unwrap()
             .iter()
-            .find(|(argv, _)| argv.iter().any(|a| a == "tee"))
+            .find(|(argv, _)| {
+                argv.iter().any(|a| a == "tee")
+                    && argv.iter().any(|a| a == "-a")
+                    && argv.iter().any(|a| a.ends_with("/etc/profile"))
+            })
             .cloned()
             .expect("profile seed issued");
         let seed = String::from_utf8(seed_stdin.expect("seed body")).unwrap();
@@ -3309,10 +3973,15 @@ mod tests {
         // `ln` fails (destination exists) AND the no-follow validator FAILS
         // (destination is a symlink / special file) -> provision must bail, not
         // silently proceed to mount a tenant-planted target.
+        // Fail ONLY the no-follow regular-file validator (its exact script), so
+        // the staging-provenance `sh -c` walk (a DIFFERENT script) still passes.
         let (backend, mock) = mock_provision_ready()
             .reply(&["sudo", "-n", "zfs", "list"], dataset_absent())
             .reply(&["sudo", "-n", "ln"], fail())
-            .reply(&["sudo", "-n", "sh", "-c"], fail())
+            .reply(
+                &["sudo", "-n", "sh", "-c", "test -f \"$1\" && test ! -L \"$1\""],
+                fail(),
+            )
             .into_backend();
         let err = backend
             .provision_sandbox(&spec("alice"))
@@ -3324,13 +3993,17 @@ mod tests {
             "error must name the no-follow refusal: {msg}"
         );
         // The no-follow validator uses `test -f` AND `test ! -L` (the latter
-        // closes the "symlink -> regular file" case that `test -f` alone would
-        // follow through).
+        // closes the "symlink -> symlink -> regular file" case that `test -f`
+        // alone would follow through). Find the validator by its script content
+        // (a DIFFERENT `sh -c` from the staging-provenance walk).
         let calls = mock.calls();
         let validator = calls
             .iter()
-            .find(|c| c.get(2).map(String::as_str) == Some("sh")
-                && c.get(3).map(String::as_str) == Some("-c"))
+            .find(|c| {
+                c.get(2).map(String::as_str) == Some("sh")
+                    && c.get(3).map(String::as_str) == Some("-c")
+                    && c.get(4).map(|s| s.contains("test -f")).unwrap_or(false)
+            })
             .expect("no-follow validator issued");
         let script = validator.get(4).map(String::as_str).unwrap_or("");
         assert!(
@@ -3359,7 +4032,12 @@ mod tests {
         let (backend, mock) = mock_provision_ready()
             .reply(&["sudo", "-n", "zfs", "list"], dataset_absent())
             .reply(&["sudo", "-n", "ln", "-h"], fail())
-            .reply(&["sudo", "-n", "sh", "-c"], fail())
+            // Fail ONLY the no-follow regular-file validator (its exact script);
+            // the staging-provenance walk (a different `sh -c`) still passes.
+            .reply(
+                &["sudo", "-n", "sh", "-c", "test -f \"$1\" && test ! -L \"$1\""],
+                fail(),
+            )
             .into_backend();
         let err = backend
             .provision_sandbox(&spec("alice"))
@@ -3754,6 +4432,130 @@ echo "INFO: kern.racct.enable=$RACCT"
         );
     }
 
+    /// LIVE, env-gated — grounds the FreeBSD/ZFS SEMANTICS behind sol's REOPENED
+    /// repair-#1/#2 fixes against the real kernel (the unit tests above pin the
+    /// argv + classification against the mock; this pins the actual behaviour):
+    ///
+    ///   1. FRESH-INODE (#2 gap 5): a `ln -h` hardlink makes `dest` and the
+    ///      staging temp share ONE inode (`stat -f %i` equal), so the fresh-inode
+    ///      validation is grounded; a create-only `ln -h` onto a PRE-EXISTING dest
+    ///      fails EEXIST (never silently trusts a foreign file).
+    ///   2. STAGING PROVENANCE (#2 gap 6): `stat -f '%u'`/`'%Lp'` report uid 0 and
+    ///      octal mode 700 for a `mkdir -p` + `chown root:wheel` + `chmod 700`
+    ///      dir, and `test -L` detects a symlinked path component — the exact
+    ///      primitives `assert_staging_provenance` relies on.
+    ///   3. LEGACY MIGRATION (#2 gap 7): a nullfs DIRECTORY mount at a `/pile`
+    ///      target is force-unmountable, and a `mount` listing shows the whole
+    ///      target token — the basis for detecting + clearing the legacy topology.
+    ///   4. PROVENANCE (#1 gaps 2/3): a ZFS `playground:tenant` user property
+    ///      round-trips through `zfs set`/`zfs get -H -o value` (the authoritative
+    ///      provenance the destroy/reattach re-derivation gate reads).
+    ///
+    /// Everything runs under a `mktemp -d` + scratch ZFS dataset and is torn
+    /// down: `SANDBOX_JAIL_LIVE_TESTS=1 cargo test --bins jail_live_reopened_repairs`.
+    #[test]
+    fn jail_live_reopened_repairs() {
+        if std::env::var("SANDBOX_JAIL_LIVE_TESTS").as_deref() != Ok("1") {
+            eprintln!(
+                "skipping: set SANDBOX_JAIL_LIVE_TESTS=1 to run (mutates a scratch \
+                 dir + dataset on the FreeBSD deploy host)"
+            );
+            return;
+        }
+        let host = std::env::var("SANDBOX_JAIL_LIVE_HOST")
+            .unwrap_or_else(|_| "ai.bultmann.eu".to_string());
+        let pool = std::env::var("SANDBOX_JAIL_LIVE_POOL").unwrap_or_else(|_| "aitemp".to_string());
+
+        let script = format!(
+            r#"
+set -eu
+POOL="{pool}"
+SCRATCH="$POOL/pg-live-reopened-$$"
+WORK=$(mktemp -d /tmp/jail-live-reopened.XXXXXX)
+cleanup() {{
+  sudo -n umount "$WORK/root/pile" 2>/dev/null || true
+  sudo -n zfs destroy -r "$SCRATCH" 2>/dev/null || true
+  sudo -n rm -rf "$WORK" 2>/dev/null || true
+}}
+trap cleanup EXIT
+
+# ---- Proof 1: fresh-inode via ln -h hardlink (shared inode; EEXIST on reuse) --
+echo "BOOTSTRAP" | sudo -n tee "$WORK/staging.tmp" >/dev/null
+sudo -n ln -h "$WORK/staging.tmp" "$WORK/dest"
+SI=$(sudo -n stat -f '%i' "$WORK/staging.tmp")
+DI=$(sudo -n stat -f '%i' "$WORK/dest")
+if [ "$SI" != "$DI" ]; then
+  echo "FAIL: ln -h dest inode ($DI) != staging inode ($SI)"; exit 1
+fi
+# A create-only ln -h onto the now-existing dest must fail EEXIST.
+if sudo -n ln -h "$WORK/staging.tmp" "$WORK/dest" 2>/dev/null; then
+  echo "FAIL: ln -h onto an existing dest SUCCEEDED (not create-only)"; exit 1
+fi
+echo "PASS: ln -h shares one inode and refuses a pre-existing dest"
+
+# ---- Proof 2: staging provenance stat format + symlink component detection ----
+sudo -n mkdir -p "$WORK/staging"
+sudo -n chown root:wheel "$WORK/staging"
+sudo -n chmod 700 "$WORK/staging"
+UID0=$(sudo -n stat -f '%u' "$WORK/staging")
+MODE=$(sudo -n stat -f '%Lp' "$WORK/staging")
+if [ "$UID0" != "0" ] || [ "$MODE" != "700" ]; then
+  echo "FAIL: staging stat uid=$UID0 mode=$MODE (want 0/700)"; exit 1
+fi
+# A symlinked component is detectable with test -L.
+sudo -n ln -s "$WORK/staging" "$WORK/staging-link"
+if ! sudo -n sh -c 'test -L "$1"' sh "$WORK/staging-link"; then
+  echo "FAIL: test -L did not detect a symlinked component"; exit 1
+fi
+echo "PASS: staging stat reports uid 0 / mode 700 and test -L flags a symlink"
+
+# ---- Proof 3: legacy nullfs DIRECTORY mount is force-unmountable, target token -
+sudo -n zfs create "$SCRATCH"
+ROOT=$(sudo -n zfs get -H -o value mountpoint "$SCRATCH")
+sudo -n mkdir -p "$ROOT/pile" "$WORK/hostdir"
+sudo -n mount -t nullfs "$WORK/hostdir" "$ROOT/pile"
+if ! sudo -n mount | grep -q " on $ROOT/pile (nullfs"; then
+  echo "FAIL: legacy dir mount not visible with whole-token target"; exit 1
+fi
+sudo -n umount -f "$ROOT/pile"
+if sudo -n mount | grep -q " on $ROOT/pile (nullfs"; then
+  echo "FAIL: legacy dir mount survived umount -f"; exit 1
+fi
+echo "PASS: legacy nullfs dir mount force-unmounted, target token exact"
+
+# ---- Proof 4: playground:tenant provenance property round-trips ----
+sudo -n zfs set playground:tenant=alice@example.com "$SCRATCH"
+GOT=$(sudo -n zfs get -H -o value playground:tenant "$SCRATCH")
+if [ "$GOT" != "alice@example.com" ]; then
+  echo "FAIL: playground:tenant round-trip got '$GOT'"; exit 1
+fi
+echo "PASS: playground:tenant provenance property round-trips"
+"#,
+        );
+
+        let out = Command::new("ssh")
+            .arg("-o")
+            .arg("BatchMode=yes")
+            .arg("-o")
+            .arg("ConnectTimeout=10")
+            .arg(&host)
+            .arg(&script)
+            .output()
+            .expect("spawn ssh to the live host");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        eprintln!("live-host stdout:\n{stdout}\nlive-host stderr:\n{stderr}");
+        assert!(out.status.success(), "live host script failed: {stderr}");
+        for marker in [
+            "PASS: ln -h shares one inode and refuses a pre-existing dest",
+            "PASS: staging stat reports uid 0 / mode 700 and test -L flags a symlink",
+            "PASS: legacy nullfs dir mount force-unmounted, target token exact",
+            "PASS: playground:tenant provenance property round-trips",
+        ] {
+            assert!(stdout.contains(marker), "missing live proof '{marker}': {stdout}");
+        }
+    }
+
     #[test]
     fn provision_sandbox_sanitises_label() {
         // No dataset yet: provision the fresh box; its id is the injective name
@@ -3767,14 +4569,14 @@ echo "INFO: kern.racct.enable=$RACCT"
         let jail = backend.jail_name("li ora/x");
         // The jail -c call carries the injective name...
         assert!(calls.iter().any(|c| c.contains(&format!("name={jail}"))));
-        // ...whose human-readable prefix is the sanitisation, followed by a
-        // 20-hex-char digest.
+        // ...whose human-readable prefix is the sanitisation, followed by the
+        // FULL 64-hex-char SHA-256 digest (sol's reopened review: no truncation).
         assert!(
             jail.starts_with("playground-li-ora-x-"),
             "name must keep the readable sanitisation: {jail}"
         );
         let digest = jail.strip_prefix("playground-li-ora-x-").unwrap();
-        assert_eq!(digest.len(), 20, "digest is 20 hex chars: {jail}");
+        assert_eq!(digest.len(), 64, "digest is the full 64-hex SHA-256: {jail}");
         assert!(digest.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
@@ -3933,9 +4735,11 @@ echo "INFO: kern.racct.enable=$RACCT"
     /// id WITHOUT re-cloning or re-creating the jail (persistent reuse).
     #[test]
     fn open_session_reuses_running_jail() {
-        // jail is up (jls succeeds by default) and the recorded tenant matches;
-        // mock_with_mountpoint scripts the `playground:tenant` read-back.
-        let (backend, mock) = mock_with_mountpoint().into_backend();
+        // alice's jail is UP (stateful running set) and the recorded tenant
+        // matches; mock_with_mountpoint scripts the `playground:tenant` read-back.
+        let (backend, mock) = mock_with_mountpoint()
+            .with_running_jail(&alice_jail())
+            .into_backend();
         let id = backend.open_session(&spec("alice")).expect("open");
         assert_eq!(id.as_str(), alice_jail());
 
@@ -3972,24 +4776,32 @@ echo "INFO: kern.racct.enable=$RACCT"
     /// on all three attach arms (open-reattach, provision-reattach, sweep).
     #[test]
     fn reattach_all_reattaches_only_down_jails() {
-        let listing = "aitemp/playground\n\
-                       aitemp/playground/template\n\
-                       aitemp/playground/playground-alice\n\
-                       aitemp/playground/playground-bob\n";
+        // Real injective leaves so the reattach provenance gate (the stored
+        // `playground:tenant` must re-derive THIS leaf) passes for the down jail.
+        let alice = JailBackend::local().jail_name("alice");
+        let bob = JailBackend::local().jail_name("bob");
+        let bob_dataset = format!("aitemp/playground/{bob}");
+        let bob_root = format!("/aitemp/playground/{bob}");
+        let listing = format!(
+            "aitemp/playground\n\
+             aitemp/playground/template\n\
+             aitemp/playground/{alice}\n\
+             aitemp/playground/{bob}\n"
+        );
         let (backend, mock) = MockRunner::default()
             // The enumeration query (more specific than a bare `zfs list`).
-            .reply(&["sudo", "-n", "zfs", "list", "-H"], ok_with_stdout(listing))
-            // alice's jail is up; bob's (and everything else) defaults to down.
-            .reply(
-                &["sudo", "-n", "jls", "-j", "playground-alice"],
-                ok_with_stdout("1\n"),
-            )
-            .reply(&["sudo", "-n", "jls", "-j"], fail())
+            .reply(&["sudo", "-n", "zfs", "list", "-H"], ok_with_stdout(&listing))
             // Mountpoint for bob (the one being reattached).
             .reply(
                 &["zfs", "get", "-H", "-o", "value", "mountpoint"],
-                ok_with_stdout("/aitemp/playground/playground-bob\n"),
+                ok_with_stdout(&format!("{bob_root}\n")),
             )
+            // alice's jail is up (stateful running set); bob's is down, so bob is
+            // the only one reattached.
+            .with_running_jail(&alice)
+            // bob's dataset records "bob" as its tenant — jail_name("bob")
+            // re-derives THIS leaf, so the provenance gate passes.
+            .with_tenant_prop(&bob_dataset, "bob")
             .into_backend();
 
         let n = backend.reattach_all().expect("sweep");
@@ -4004,7 +4816,7 @@ echo "INFO: kern.racct.enable=$RACCT"
             })
             .collect();
         assert_eq!(jail_creates.len(), 1, "exactly one jail -c");
-        assert!(jail_creates[0].contains(&"name=playground-bob".to_string()));
+        assert!(jail_creates[0].contains(&format!("name={bob}")));
         // The template dataset and the parent are never touched (no jail -c for
         // them, and no zfs clone anywhere — reattach never clones).
         assert!(!jail_creates[0].contains(&"name=aitemp/playground/template".to_string()));
@@ -4017,12 +4829,11 @@ echo "INFO: kern.racct.enable=$RACCT"
         // The sweep re-establishes BOTH single-file pile mounts for the down
         // jail (bob), mirroring the open-reattach mount assertions — mount
         // coverage is now pinned on the sweep arm too.
-        let bob_root = "/aitemp/playground/playground-bob";
         assert!(
             calls.iter().any(|c| c == &[
                 "sudo".to_string(), "-n".into(), "mount".into(), "-t".into(),
                 "nullfs".into(),
-                "/aitemp/playground/piles/playground-bob/self.pile".into(),
+                format!("/aitemp/playground/piles/{bob}/self.pile"),
                 format!("{bob_root}/pile/self.pile"),
             ]),
             "sweep must single-file-nullfs-mount the self.pile at /pile/self.pile for the down jail: {calls:?}"
@@ -4040,16 +4851,21 @@ echo "INFO: kern.racct.enable=$RACCT"
 
     #[test]
     fn destroy_session_removes_jail_and_destroys_clone() {
+        // The session id is alice's REAL injective jail name so the destroy's
+        // provenance gate (`playground:tenant` re-derives THIS leaf) passes: the
+        // mock records the property as "alice", and `jail_name("alice")` is
+        // exactly this leaf.
         let (backend, mock) = mock_with_mountpoint().into_backend();
+        let jail = alice_jail();
         backend
-            .destroy_session(&SessionId::new("playground-alice"))
+            .destroy_session(&SessionId::new(jail.clone()))
             .expect("destroy");
         let calls = mock.calls();
         assert!(calls.iter().any(|c| c.ends_with(&[
-            "jail".into(), "-r".into(), "playground-alice".into()
+            "jail".into(), "-r".into(), jail.clone()
         ] as &[String])));
         assert!(calls.iter().any(|c| c.ends_with(&[
-            "zfs".into(), "destroy".into(), "aitemp/playground/playground-alice".into()
+            "zfs".into(), "destroy".into(), alice_dataset()
         ] as &[String])));
     }
 
@@ -4099,8 +4915,357 @@ echo "INFO: kern.racct.enable=$RACCT"
             )
             .into_backend();
         let err = backend
-            .destroy_session(&SessionId::new("playground-alice"))
+            .destroy_session(&SessionId::new(alice_jail()))
             .expect_err("destroy failure must surface");
         assert!(err.to_string().contains("zfs destroy"));
+    }
+
+    // ==== sol's REOPENED review (2026-07-24): repairs #1 and #2 gaps ==========
+
+    /// Repair #1 gap 1 — the jail name carries the FULL 64-hex SHA-256 digest
+    /// (no 80-bit truncation), stays injective across colliding `<safe>` parts,
+    /// and lands the documented `<prefix>-<safe>-<64hex>` shape well under the
+    /// 255-byte ZFS component limit.
+    #[test]
+    fn jail_name_uses_full_sha256_digest_and_stays_injective() {
+        let b = JailBackend::local();
+        for label in ["alice", "a/b", "a?b", "a-b", "user@example.com"] {
+            let name = b.jail_name(label);
+            let digest = name.rsplit_once('-').expect("has a digest").1;
+            assert_eq!(digest.len(), 64, "full SHA-256 digest for {label}: {name}");
+            assert!(digest.chars().all(|c| c.is_ascii_hexdigit()));
+            assert!(name.len() < 255, "under the ZFS component limit: {name}");
+        }
+        // Injectivity across the three colliding labels survives the full digest.
+        let distinct: std::collections::HashSet<_> =
+            ["a/b", "a?b", "a-b"].into_iter().map(|l| b.jail_name(l)).collect();
+        assert_eq!(distinct.len(), 3, "three colliding labels -> three names");
+        // Determinism (reattach/destroy re-find the box).
+        assert_eq!(b.jail_name("alice"), b.jail_name("alice"));
+    }
+
+    /// Repair #1 gap 2 — `destroy_session` PROVES the dataset's recorded tenant
+    /// re-derives THIS leaf before any teardown. A `playground:tenant` that does
+    /// not hash back to the jail (foreign/tampered property, or a stored label
+    /// that derives a different leaf) is refused, and NO destructive host command
+    /// (`jail -r`, `zfs destroy`) runs.
+    #[test]
+    fn destroy_refuses_on_tenant_property_mismatch() {
+        let jail = alice_jail();
+        let dataset = alice_dataset();
+        // The dataset records a DIFFERENT tenant ("mallory") that derives a
+        // different leaf, so the provenance gate must refuse the destroy.
+        let (backend, mock) = MockRunner::default()
+            .with_tenant_prop(&dataset, "mallory")
+            .into_backend();
+        let err = backend
+            .destroy_session(&SessionId::new(jail))
+            .expect_err("destroy must refuse a tenant-property mismatch");
+        assert!(
+            format!("{err:#}").contains("does not derive this leaf"),
+            "must name the provenance failure: {err:#}"
+        );
+        let calls = mock.calls();
+        assert!(
+            !calls.iter().any(|c| c.get(2).map(String::as_str) == Some("jail")
+                && c.get(3).map(String::as_str) == Some("-r")),
+            "a refused destroy must not `jail -r`: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.get(2).map(String::as_str) == Some("zfs")
+                && c.get(3).map(String::as_str) == Some("destroy")),
+            "a refused destroy must not `zfs destroy`: {calls:?}"
+        );
+    }
+
+    /// Repair #1 gap 2 (corollary) — an UNSET provenance property is refused too
+    /// (a dataset with no recorded tenant must never be destroyed on request).
+    #[test]
+    fn destroy_refuses_when_tenant_property_unset() {
+        let (backend, _mock) = MockRunner::default().into_backend();
+        let err = backend
+            .destroy_session(&SessionId::new(alice_jail()))
+            .expect_err("destroy must refuse an unset provenance");
+        assert!(
+            format!("{err:#}").contains("carries no playground:tenant provenance"),
+            "must name the unset provenance: {err:#}"
+        );
+    }
+
+    /// Repair #1 gap 3 — reattach PROVES the stored label re-derives THIS leaf.
+    /// A dataset whose `playground:tenant` records a label that hashes to a
+    /// DIFFERENT jail is refused, and NO mount / `jail -c` is issued (the boot
+    /// sweep path, which has no requester label, is covered here via reattach).
+    #[test]
+    fn reattach_refuses_when_stored_label_does_not_rederive_leaf() {
+        let jail = alice_jail();
+        let dataset = alice_dataset();
+        // The dataset records "mallory" — jail_name("mallory") != this leaf.
+        let (backend, mock) = MockRunner::default()
+            .with_tenant_prop(&dataset, "mallory")
+            .into_backend();
+        let err = backend
+            .reattach(&jail, &dataset)
+            .expect_err("reattach must refuse a non-re-deriving provenance");
+        assert!(
+            format!("{err:#}").contains("does not derive this leaf"),
+            "must name the provenance failure: {err:#}"
+        );
+        let calls = mock.calls();
+        assert!(
+            !calls.iter().any(|c| c.iter().any(|a| a == "nullfs")),
+            "a refused reattach must not mount any pile: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.get(2).map(String::as_str) == Some("jail")
+                && c.get(3).map(String::as_str) == Some("-c")),
+            "a refused reattach must not `jail -c`: {calls:?}"
+        );
+    }
+
+    /// Repair #1 gap 4 — the persistent pile carries its OWN provenance marker,
+    /// written 0600 at provision, and reuse/reattach verify it. Here the marker
+    /// records a DIFFERENT tenant than the requester (a foreign pile that
+    /// survived a dataset destroy and was re-cloned under a new tenant) — reuse
+    /// must refuse rather than hand it over.
+    #[test]
+    fn persistent_pile_provenance_refuses_marker_mismatch() {
+        let jail = alice_jail();
+        let dataset = alice_dataset();
+        let marker = format!("/aitemp/playground/piles/{jail}/.tenant");
+        // Jail up + dataset provenance matches alice, but the pile MARKER records
+        // "mallory" — the independent pile provenance check must catch it.
+        let (backend, _mock) = MockRunner::default()
+            .with_running_jail(&jail)
+            .with_tenant_prop(&dataset, "alice")
+            .with_file(&marker, b"mallory")
+            .into_backend();
+        let err = backend
+            .open_session(&spec("alice"))
+            .expect_err("reuse must refuse a foreign pile marker");
+        assert!(
+            format!("{err:#}").contains("persistent pile provenance mismatch"),
+            "must name the pile-provenance failure: {err:#}"
+        );
+    }
+
+    /// Repair #1 gap 4 (happy path) — a fresh provision WRITES the `.tenant`
+    /// marker (0600, root-owned) with the canonical label, and a subsequent reuse
+    /// with a MATCHING marker is accepted.
+    #[test]
+    fn persistent_pile_provenance_writes_marker_and_accepts_match() {
+        let jail = alice_jail();
+        // Fresh provision: no dataset yet. The mock is stateful, so the `tee`
+        // marker write persists and a later `cat` reads it back.
+        let (backend, mock) = mock_provision_ready()
+            .reply(&["sudo", "-n", "zfs", "list"], dataset_absent())
+            .into_backend();
+        backend.provision_sandbox(&spec("alice")).expect("provision");
+        let marker = format!("/aitemp/playground/piles/{jail}/.tenant");
+        let calls = mock.calls();
+        // The marker was written (plain `tee <marker>` with the label as stdin)
+        // and chmod 600 / chown root:wheel.
+        let (_, stdin) = mock
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(argv, _)| argv.last().map(String::as_str) == Some(marker.as_str())
+                && argv.iter().any(|a| a == "tee"))
+            .cloned()
+            .expect("marker tee issued");
+        assert_eq!(stdin.as_deref(), Some(b"alice".as_slice()), "marker records the label");
+        assert!(
+            calls.iter().any(|c| c == &[
+                "sudo".to_string(), "-n".into(), "chmod".into(), "600".into(), marker.clone()
+            ]),
+            "marker must be chmod 600: {calls:?}"
+        );
+        // Now the stored marker is "alice"; a matching reuse passes.
+        backend
+            .verify_persistent_pile_provenance(&jail, "alice")
+            .expect("matching marker accepted");
+    }
+
+    /// Repair #2 gap 5 — FRESH-INODE VALIDATION: after `ln -h` succeeds, the
+    /// published dest inode must equal the just-linked staging inode. If a
+    /// pre-existing/raced file sits at the dest with a DIFFERENT inode, the
+    /// publish is refused (never silently trusted as ours). We model that by
+    /// scripting `ln -h` to "succeed" while a pre-placed dest inode differs from
+    /// the staging inode.
+    #[test]
+    fn fresh_inode_validation_refuses_a_preplaced_dest() {
+        let jail = alice_jail();
+        let self_pile = format!("/aitemp/playground/piles/{jail}/self.pile");
+        // Seed a PRE-EXISTING dest file (its own inode) BEFORE provision, then
+        // script `ln -h` to falsely "succeed" without hardlinking — so the dest
+        // keeps its foreign inode and the staging copy has a different one.
+        let (backend, _mock) = mock_provision_ready()
+            .reply(&["sudo", "-n", "zfs", "list"], dataset_absent())
+            .reply(
+                &["sudo", "-n", "ln", "-h"],
+                HostOutput { exit_code: Some(0), ..Default::default() },
+            )
+            .with_file(&self_pile, b"pre-existing foreign pile")
+            .into_backend();
+        let err = backend
+            .provision_sandbox(&spec("alice"))
+            .expect_err("a mismatched dest inode must fail the publish");
+        assert!(
+            format!("{err:#}").contains("does not match the just-linked staging inode"),
+            "must name the fresh-inode failure: {err:#}"
+        );
+    }
+
+    /// Repair #2 gap 5 (happy path) — a genuine `ln -h` hardlink makes the dest
+    /// and staging inodes EQUAL, so the fresh-inode validation passes and the
+    /// provision succeeds. (The default stateful mock models the hardlink.)
+    #[test]
+    fn fresh_inode_validation_accepts_a_genuine_hardlink() {
+        let (backend, _mock) = mock_provision_ready()
+            .reply(&["sudo", "-n", "zfs", "list"], dataset_absent())
+            .into_backend();
+        backend
+            .provision_sandbox(&spec("alice"))
+            .expect("a genuine hardlink publish passes fresh-inode validation");
+    }
+
+    /// Repair #2 gap 6 — STAGING PROVENANCE: before staging, the private staging
+    /// root's ownership/mode + no-symlink-component walk is validated. A failure
+    /// of that check (modelled by failing the staging-provenance `sh -c` walk —
+    /// exit 3, a symlinked component) refuses the provision before any bootstrap
+    /// `cp`.
+    #[test]
+    fn staging_provenance_refuses_a_symlinked_component() {
+        let (backend, mock) = mock_provision_ready()
+            .reply(&["sudo", "-n", "zfs", "list"], dataset_absent())
+            // Model a symlinked ancestor / bad owner: the provenance walk fails.
+            .failing_staging_provenance()
+            .into_backend();
+        let err = backend
+            .provision_sandbox(&spec("alice"))
+            .expect_err("a symlinked staging component must fail closed");
+        assert!(
+            format!("{err:#}").contains("failed the provenance check"),
+            "must name the staging-provenance failure: {err:#}"
+        );
+        // The refusal happens BEFORE any bootstrap `cp` into staging.
+        let calls = mock.calls();
+        let cp_before = calls.iter().position(|c| c.get(2).map(String::as_str) == Some("cp"));
+        assert!(cp_before.is_none(), "no bootstrap cp before the provenance gate: {calls:?}");
+    }
+
+    /// Repair #2 gap 6 — the staging root is forced root:wheel + 0700 and its
+    /// provenance is CHECKED (chown/chmod/`sh -c` walk all issued) before staging.
+    #[test]
+    fn staging_root_ownership_and_mode_are_enforced() {
+        let (backend, mock) = mock_provision_ready()
+            .reply(&["sudo", "-n", "zfs", "list"], dataset_absent())
+            .into_backend();
+        backend.provision_sandbox(&spec("alice")).expect("provision");
+        let calls = mock.calls();
+        let staging_root = "/aitemp/playground/staging";
+        assert!(
+            calls.iter().any(|c| c == &[
+                "sudo".to_string(), "-n".into(), "chown".into(), "root:wheel".into(),
+                staging_root.to_string()
+            ]),
+            "staging root must be chown root:wheel: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c == &[
+                "sudo".to_string(), "-n".into(), "chmod".into(), "700".into(),
+                staging_root.to_string()
+            ]),
+            "staging root must be chmod 700: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c.get(2).map(String::as_str) == Some("sh")
+                && c.get(3).map(String::as_str) == Some("-c")
+                && c.get(4).map(|s| s.contains("SYMLINK-COMPONENT")).unwrap_or(false)),
+            "staging provenance walk (no-symlink + owner/mode) must run: {calls:?}"
+        );
+    }
+
+    /// Repair #2 gap 7 — LEGACY-MOUNT MIGRATION: a jail carrying the OLD pre-#2
+    /// writable-parent-DIRECTORY nullfs mounts (at guest `/pile` and `/shared`)
+    /// is force-unmounted on reattach and migrated to the single-file topology.
+    /// The legacy dir mounts are gone and the safe single-file mounts are made.
+    #[test]
+    fn reattach_migrates_legacy_directory_pile_mounts() {
+        let jail = alice_jail();
+        let dataset = alice_dataset();
+        let root = alice_root();
+        // A LEGACY jail: devfs live + the OLD directory-style pile mounts at
+        // `/pile` and `/shared` (host DIRS mounted), plus a valid tenant prop.
+        let (backend, mock) = mock_with_mountpoint()
+            .with_tenant_prop(&dataset, "alice")
+            .with_mount("devfs", &format!("{root}/dev"), "devfs")
+            .with_mount(
+                &format!("/aitemp/playground/piles/{jail}"),
+                &format!("{root}/pile"),
+                "nullfs",
+            )
+            .with_mount(
+                "/aitemp/playground/piles/shared",
+                &format!("{root}/shared"),
+                "nullfs",
+            )
+            .into_backend();
+        backend.reattach(&jail, &dataset).expect("legacy reattach migrates");
+        let calls = mock.calls();
+        // The legacy DIRECTORY mounts were force-unmounted.
+        assert!(
+            calls.iter().any(|c| c == &[
+                "sudo".to_string(), "-n".into(), "umount".into(), "-f".into(),
+                format!("{root}/pile")
+            ]),
+            "must force-unmount the legacy /pile dir mount: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c == &[
+                "sudo".to_string(), "-n".into(), "umount".into(), "-f".into(),
+                format!("{root}/shared")
+            ]),
+            "must force-unmount the legacy /shared dir mount: {calls:?}"
+        );
+        // And the safe SINGLE-FILE mounts were established.
+        assert!(
+            calls.iter().any(|c| c == &[
+                "sudo".to_string(), "-n".into(), "mount".into(), "-t".into(),
+                "nullfs".into(),
+                format!("/aitemp/playground/piles/{jail}/self.pile"),
+                format!("{root}/pile/self.pile"),
+            ]),
+            "must establish the single-file self.pile mount after migration: {calls:?}"
+        );
+    }
+
+    /// Repair #2 gap 7 (fail-closed) — if a legacy directory mount CANNOT be
+    /// cleared (the umount does not remove it), reattach BAILS rather than start
+    /// the jail on the vulnerable writable-parent topology.
+    #[test]
+    fn reattach_fails_closed_when_legacy_mount_cannot_be_cleared() {
+        let jail = alice_jail();
+        let dataset = alice_dataset();
+        let root = alice_root();
+        let (backend, _mock) = mock_with_mountpoint()
+            .with_tenant_prop(&dataset, "alice")
+            .with_mount("devfs", &format!("{root}/dev"), "devfs")
+            .with_mount(
+                &format!("/aitemp/playground/piles/{jail}"),
+                &format!("{root}/pile"),
+                "nullfs",
+            )
+            // Script `umount -f` to a no-op FAILURE so the legacy mount survives.
+            .reply(&["sudo", "-n", "umount", "-f"], fail())
+            .into_backend();
+        let err = backend
+            .reattach(&jail, &dataset)
+            .expect_err("an unclearable legacy mount must fail the reattach closed");
+        assert!(
+            format!("{err:#}").contains("could not be unmounted"),
+            "must name the fail-closed legacy migration: {err:#}"
+        );
     }
 }
