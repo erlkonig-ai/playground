@@ -69,21 +69,41 @@
 //!
 //! This backend does NOT use the caller-supplied `tenant.pile.host_path` (that
 //! field is only logged); every tenant jail is given its OWN piles, created on
-//! the server under `pile_root`. Two host-owned piles are mounted in via
-//! `nullfs` (which mounts DIRECTORIES, not single files, so the layout is a
-//! dir-per-tenant + one shared dir):
+//! the server under `pile_root`. Two host-owned pile FILES are mounted in via
+//! single-FILE `nullfs` (FreeBSD nullfs mounts a plain file onto a plain file,
+//! verified on 15.1 — NOT only directories). Each pile file is mounted directly
+//! onto a pre-created empty target file that lives INSIDE the jail's own ZFS
+//! clone, so **no host directory is ever nullfs-mounted rw into a jail**:
 //!
 //!   - **`self.pile`** — per-tenant, host <pile_root>/<jail>/self.pile,
-//!     nullfs-mounted **rw** at guest `/pile` (so `PILE=/pile/self.pile`).
-//!     Seeded by copying `bootstrap_pile` at provision if absent. **Model B:
-//!     DECOUPLED from the jail lifecycle** — destroying the jail unmounts but
-//!     never deletes it, and a re-provision reattaches the same accumulated
-//!     pile.
+//!     nullfs-mounted **rw** onto guest `/pile/self.pile` (so
+//!     `PILE=/pile/self.pile`). Seeded by copying `bootstrap_pile` at provision
+//!     if absent. **Model B: DECOUPLED from the jail lifecycle** — destroying
+//!     the jail unmounts but never deletes it, and a re-provision reattaches the
+//!     same accumulated pile.
 //!   - **`shared.pile`** — a SINGLE host file shared by ALL tenant jails,
-//!     host <pile_root>/shared/shared.pile, nullfs-mounted **rw** at guest
-//!     `/shared` (same append-only semantics as self.pile; multiple concurrent
-//!     writers appending one pile is supported). Seeded once, race-safely;
-//!     never deleted by a single-tenant teardown.
+//!     host <pile_root>/shared/shared.pile, nullfs-mounted **rw** onto guest
+//!     `/shared/shared.pile` (same append-only semantics as self.pile; multiple
+//!     concurrent writers appending the one pile file is supported and was
+//!     verified on 15.1 — two jail views appended 50 lines each, all 100
+//!     landed). Seeded once, race-safely; never deleted by a single-tenant
+//!     teardown.
+//!
+//! ### Why single-FILE mounts (symlink confused-deputy fix, 2026-07-24)
+//!
+//! An earlier layout nullfs-mounted the host per-jail dir and the host shared
+//! DIRECTORY rw into each jail (guest `/pile`, `/shared`). That handed a tenant
+//! (root in its jail) a WRITABLE HOST DIRECTORY: it could create arbitrary
+//! sibling entries — e.g. pre-place `shared.pile.<jail>.tmp` as an absolute
+//! symlink — and the next privileged host-side provision `cp` would FOLLOW that
+//! symlink and overwrite the chosen host file with bootstrap bytes (a symlink
+//! confused deputy; needed no `chflags`, since the tenant was appending/creating
+//! a sibling, not clearing a flag). Mounting only the individual FILES removes
+//! the writable host directory entirely: the jail's `/shared` (and `/pile`) is
+//! now the jail's OWN clone directory, so a sibling a tenant creates there stays
+//! in the throwaway clone and never reaches the host pile dir. Combined with
+//! host-private `0700` staging for the bootstrap `cp` (below), the deputy is
+//! gone structurally, not just defended.
 //!
 //! Both mounts are re-established on every attach (they do not survive a jail
 //! restart, exactly like the devfs mount) and torn down before `zfs destroy`
@@ -378,109 +398,280 @@ impl JailBackend {
 
     /// Host directory that holds this coworker's `self.pile` (Model B: owned by
     /// the host, decoupled from the jail dataset — surviving jail teardown). It
-    /// is nullfs-mounted rw at the jail's `/pile`.
+    /// is NOT mounted into the jail; only the `self.pile` FILE inside it is.
     fn self_pile_dir(&self, jail: &str) -> String {
         format!("{}/{}", self.pile_root, jail)
     }
 
+    /// Host path of this coworker's `self.pile` FILE — the single-file nullfs
+    /// mount SOURCE (mounted onto guest `/pile/self.pile`).
+    fn self_pile_file(&self, jail: &str) -> String {
+        format!("{}/self.pile", self.self_pile_dir(jail))
+    }
+
     /// Host directory that holds the single `shared.pile` all coworker jails
-    /// append to concurrently. Nullfs-mounted rw at every jail's `/shared`.
+    /// append to concurrently. It is NOT mounted into any jail; only the
+    /// `shared.pile` FILE inside it is (single-file nullfs).
     fn shared_pile_dir(&self) -> String {
         format!("{}/shared", self.pile_root)
     }
 
-    /// Guest mountpoint (absolute path under the jail root) for the per-coworker
-    /// pile dir. `self.pile` therefore lands at guest `/pile/self.pile`.
-    const GUEST_PILE_DIR: &'static str = "/pile";
-    /// Guest mountpoint for the shared pile dir. `shared.pile` lands at guest
-    /// `/shared/shared.pile`.
-    const GUEST_SHARED_DIR: &'static str = "/shared";
+    /// Host path of the single shared `shared.pile` FILE — the single-file
+    /// nullfs mount SOURCE (mounted onto every jail's guest `/shared/shared.pile`).
+    fn shared_pile_file(&self) -> String {
+        format!("{}/shared.pile", self.shared_pile_dir())
+    }
 
-    /// Nullfs-mount `host_dir` read-write onto `<root><guest_dir>`, first
-    /// `mkdir -p`-ing the guest mountpoint so an attach never fails for a
-    /// missing target (harmless no-op when it already exists, e.g. the
-    /// fresh-provision path already made it).
+    /// Host-PRIVATE staging directory (mode 0700, root-owned) where the bootstrap
+    /// `cp` writes the pile temp before it is published into place. DERIVED as a
+    /// sibling of `pile_root` (`<pile_root>/../staging`) so it stays on the SAME
+    /// ZFS filesystem — the publish is a hardlink, which requires same-FS — and
+    /// automatically tracks a `--jail-pile-root` override instead of diverging
+    /// from it. It is NEVER nullfs-mounted into any jail, so no tenant can
+    /// pre-place a symlink at the temp path and trick the privileged `cp` into
+    /// following it (the 2026-07-24 symlink confused-deputy class).
+    fn staging_root(&self) -> String {
+        // Sibling of pile_root: strip the last path component and append
+        // `/staging`. `pile_root` is always an absolute path with at least one
+        // component (default `/aitemp/playground/piles`), so `rfind('/')`
+        // succeeds; a degenerate root falls back to a `.staging` suffix.
+        match self.pile_root.rfind('/') {
+            Some(i) if i > 0 => format!("{}/staging", &self.pile_root[..i]),
+            _ => format!("{}.staging", self.pile_root),
+        }
+    }
+
+    /// Per-provision staging path inside the host-PRIVATE staging dir. Namespaced
+    /// by jail name so two concurrent provisions never collide. This dir is
+    /// created 0700 and is NEVER nullfs-mounted into a jail, so no tenant can
+    /// pre-place anything at this path.
+    fn staging_pile_tmp(&self, jail: &str) -> String {
+        format!("{}/{}.pile.tmp", self.staging_root(), jail)
+    }
+
+    /// Ensure the host-private staging dir exists and is mode 0700 (root-owned).
+    /// Called before any bootstrap `cp`. Mode 0700 is belt-and-suspenders: the
+    /// real guarantee is that this dir is never mounted into a jail, so no tenant
+    /// process can reach it at all.
+    fn ensure_staging_root(&self) -> Result<()> {
+        let staging_root = self.staging_root();
+        let mkdir = self.run(
+            &["sudo", "-n", "mkdir", "-p", &staging_root],
+            None,
+            ADMIN_TIMEOUT,
+        )?;
+        if !mkdir.success() {
+            bail!("mkdir staging root {staging_root} failed: {}", mkdir.stderr_lossy());
+        }
+        let chmod = self.run(
+            &["sudo", "-n", "chmod", "700", &staging_root],
+            None,
+            ADMIN_TIMEOUT,
+        )?;
+        if !chmod.success() {
+            bail!("chmod 700 staging root {staging_root} failed: {}", chmod.stderr_lossy());
+        }
+        Ok(())
+    }
+
+    /// Seed a host pile file from `bootstrap_pile`, create-if-absent, with a
+    /// tenant-unreachable staging copy and a no-follow / create-only atomic
+    /// publish. This is the symlink confused-deputy fix (2026-07-24):
     ///
-    /// The mount's own status is deliberately IGNORED, and this is safe for a
-    /// specific FreeBSD nullfs reason (NOT the devfs "already mounted" one):
-    /// FreeBSD nullfs REFUSES a duplicate mount of the same source at the same
-    /// mountpoint with EDEADLK ("Resource deadlock avoided") — the mount does
-    /// NOT stack. Empirically (FreeBSD 15.1) exactly one mount remains after a
-    /// re-mount over a still-live mount, and a single `umount` clears it. So a
-    /// re-mount on reattach over a mount that never went away is a genuine
-    /// no-op, and ignoring the status is correct. This is the reattach path;
-    /// the fresh-provision path uses [`JailBackend::nullfs_mount_verified`],
-    /// which does NOT ignore the status (a first-mount failure there is fatal —
-    /// see that method).
+    ///   1. `cp bootstrap` -> `<staging_root>/<jail>.pile.tmp` (a host-PRIVATE
+    ///      0700 dir that is never mounted into any jail, so no tenant can
+    ///      pre-place a symlink there and redirect the privileged copy).
+    ///   2. Publish with `ln <staging_tmp> <dest>` — a hardlink, which is ATOMIC,
+    ///      CREATE-ONLY (fails `EEXIST` if `<dest>` already exists), and NEVER
+    ///      follows a symlink at `<dest>` (verified on FreeBSD 15.1: `ln` onto a
+    ///      symlink pointing at a victim file fails EEXIST and leaves the victim
+    ///      untouched). So the privileged copy can never be tricked into
+    ///      overwriting a chosen host file. `staging_root` and the pile dirs share
+    ///      one ZFS filesystem, so the hardlink is valid.
+    ///   3. `rm -f` the staging temp (on success it is just the second name of
+    ///      the now-published inode; on the create-if-absent no-op it is our
+    ///      leftover copy).
     ///
-    /// nullfs mounts DIRECTORIES (not single files), which is why the layout is
-    /// dir-per-coworker + a shared dir, with the pile files living inside.
-    fn nullfs_mount(&self, host_dir: &str, root: &str, guest_dir: &str) {
-        let target = format!("{root}{guest_dir}");
-        // mkdir the mountpoint on EVERY attach — reattach doesn't run the
-        // fresh-provision arm that first made it, and `mkdir -p` is a no-op
-        // when it already exists.
-        let _ = self.run(&["sudo", "-n", "mkdir", "-p", &target], None, ADMIN_TIMEOUT);
+    /// On an `ln` failure we distinguish "destination already a regular file"
+    /// (the benign create-if-absent no-op: a reprovision kept the accumulated
+    /// pile, or a concurrent provision won the publish) from a genuine error
+    /// (e.g. destination is a symlink or special file — refuse loudly rather than
+    /// mount something a tenant may have planted).
+    fn stage_and_publish_pile(&self, jail: &str, dest: &str) -> Result<()> {
+        self.ensure_staging_root()?;
+        let staging_tmp = self.staging_pile_tmp(jail);
+        // Fresh staging copy every time (clobber any stale leftover in the
+        // private dir): `cp` into the host-private path, never near the dest.
+        let cp = self.run(
+            &["sudo", "-n", "cp", &self.bootstrap_pile, &staging_tmp],
+            None,
+            ADMIN_TIMEOUT,
+        )?;
+        if !cp.success() {
+            bail!(
+                "stage bootstrap -> {staging_tmp} failed: {}",
+                cp.stderr_lossy()
+            );
+        }
+        // Atomic create-only, no-follow publish via hardlink.
+        let link = self.run(
+            &["sudo", "-n", "ln", &staging_tmp, dest],
+            None,
+            ADMIN_TIMEOUT,
+        )?;
+        // Clean up the staging temp regardless: on success it is a redundant
+        // second name for the published inode; on a no-op it is our leftover.
+        let _ = self.run(&["sudo", "-n", "rm", "-f", &staging_tmp], None, ADMIN_TIMEOUT);
+        if !link.success() {
+            // `ln` failed. The ONLY acceptable reason is "destination already
+            // exists as a regular, non-symlink file" — the create-if-absent
+            // no-op. Verify that with a no-follow test; anything else (symlink,
+            // special file, or a real link error) is refused loudly.
+            self.assert_regular_nonsymlink(dest).with_context(|| {
+                format!(
+                    "publish pile -> {dest} failed and destination is not a safe \
+                     regular file: {}",
+                    link.stderr_lossy()
+                )
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Verify `path` exists as a REGULAR, NON-SYMLINK file, `bail!`-ing otherwise.
+    /// Uses `test -f` (regular file) AND `test ! -L` (not a symlink); `test -f`
+    /// follows symlinks, so the explicit `! -L` closes the "symlink -> regular
+    /// file" case. This gates the create-if-absent no-op: we only tolerate a
+    /// failed publish when the destination is a genuine regular file, never a
+    /// tenant-planted symlink or special file.
+    fn assert_regular_nonsymlink(&self, path: &str) -> Result<()> {
+        let out = self.run(
+            &[
+                "sudo", "-n", "sh", "-c",
+                "test -f \"$1\" && test ! -L \"$1\"", "sh", path,
+            ],
+            None,
+            ADMIN_TIMEOUT,
+        )?;
+        if !out.success() {
+            bail!("{path} is not a regular non-symlink file (refusing)");
+        }
+        Ok(())
+    }
+
+    /// Guest mount TARGET (absolute path under the jail root) for the per-coworker
+    /// self.pile FILE. The host `self.pile` file is single-file-nullfs-mounted
+    /// directly onto this path, so `PILE=/pile/self.pile` resolves to the mounted
+    /// file. `/pile` itself is the jail's OWN clone directory (not a host mount),
+    /// so a tenant creating siblings there only dirties the throwaway clone.
+    const GUEST_SELF_PILE: &'static str = "/pile/self.pile";
+    /// Guest mount TARGET for the shared.pile FILE. The single host `shared.pile`
+    /// is single-file-nullfs-mounted directly onto this path. `/shared` is the
+    /// jail's OWN clone directory — never a writable host directory.
+    const GUEST_SHARED_PILE: &'static str = "/shared/shared.pile";
+
+    /// Ensure the guest single-file mount TARGET exists: `mkdir -p` its parent
+    /// dir (which is the jail's OWN clone directory — `/pile` or `/shared`) then
+    /// `touch` the empty target file the pile is mounted onto. Both live inside
+    /// the throwaway clone, so a tenant tampering with them (or with siblings
+    /// next to them) only dirties its own box, never a host directory.
+    fn ensure_mount_target(&self, target: &str) {
+        // `dirname` without an extra host round-trip: the guest file paths are
+        // fixed constants (`/pile/self.pile`, `/shared/shared.pile`), so the
+        // parent is the substring before the final '/'.
+        let parent = match target.rfind('/') {
+            Some(i) => &target[..i],
+            None => target,
+        };
+        let _ = self.run(&["sudo", "-n", "mkdir", "-p", parent], None, ADMIN_TIMEOUT);
+        let _ = self.run(&["sudo", "-n", "touch", target], None, ADMIN_TIMEOUT);
+    }
+
+    /// Single-file-nullfs-mount `host_file` read-write onto `<root><guest_file>`,
+    /// first ensuring the guest target file exists. Mounting the FILE (not its
+    /// parent directory) is the symlink-confused-deputy fix: the jail's `/pile`
+    /// and `/shared` are the jail's OWN clone dirs, never writable host dirs.
+    ///
+    /// The mount's own status is deliberately IGNORED — this is the REATTACH
+    /// path. A re-mount of the same source file at the same live target FAILS
+    /// (FreeBSD 15.1: EBUSY, "Device busy") but crucially does NOT stack: exactly
+    /// one mount remains and a single `umount` clears it (verified 2026-07-24).
+    /// So a re-mount over a mount that never went away is a safe no-op. The
+    /// fresh-provision path uses [`JailBackend::nullfs_mount_verified`], which
+    /// does NOT ignore the status (a first-mount failure there is fatal).
+    fn nullfs_mount(&self, host_file: &str, root: &str, guest_file: &str) {
+        let target = format!("{root}{guest_file}");
+        // Ensure the target file exists on EVERY attach — reattach doesn't run
+        // the fresh-provision arm that first made it.
+        self.ensure_mount_target(&target);
         let _ = self.run(
-            &["sudo", "-n", "mount", "-t", "nullfs", host_dir, &target],
+            &["sudo", "-n", "mount", "-t", "nullfs", host_file, &target],
             None,
             ADMIN_TIMEOUT,
         );
     }
 
-    /// Nullfs-mount `host_dir` rw onto `<root><guest_dir>` and VERIFY the mount
-    /// actually took, `bail!`-ing on a real failure. Used ONLY on the
-    /// fresh-provision path, where ignoring the status is dangerous: a silently
-    /// failed mount leaves guest `/pile` pointing at the EMPTY dir baked into
-    /// the ZFS clone, so a faculty writes into the clone — which
+    /// Single-file-nullfs-mount `host_file` rw onto `<root><guest_file>` and
+    /// VERIFY the mount actually took, `bail!`-ing on a real failure. Used ONLY
+    /// on the fresh-provision path, where ignoring the status is dangerous: a
+    /// silently failed mount leaves guest `/pile/self.pile` on the EMPTY file
+    /// baked into the ZFS clone, so a faculty writes into the clone — which
     /// `destroy_session` then `zfs destroy`s (silent data loss). We confirm the
     /// mountpoint appears in `mount` output before trusting it. (On reattach the
-    /// nullfs EDEADLK no-op from [`JailBackend::nullfs_mount`] applies instead,
-    /// so verification there would false-positive on the harmless duplicate.)
-    fn nullfs_mount_verified(&self, host_dir: &str, root: &str, guest_dir: &str) -> Result<()> {
-        let target = format!("{root}{guest_dir}");
-        let mkdir = self.run(&["sudo", "-n", "mkdir", "-p", &target], None, ADMIN_TIMEOUT)?;
+    /// EBUSY no-op from [`JailBackend::nullfs_mount`] applies instead, so
+    /// verification there would false-positive on the harmless duplicate.)
+    fn nullfs_mount_verified(&self, host_file: &str, root: &str, guest_file: &str) -> Result<()> {
+        let target = format!("{root}{guest_file}");
+        let parent = match target.rfind('/') {
+            Some(i) => &target[..i],
+            None => target.as_str(),
+        };
+        let mkdir = self.run(&["sudo", "-n", "mkdir", "-p", parent], None, ADMIN_TIMEOUT)?;
         if !mkdir.success() {
-            bail!("mkdir guest mountpoint {target} failed: {}", mkdir.stderr_lossy());
+            bail!("mkdir guest mount parent {parent} failed: {}", mkdir.stderr_lossy());
+        }
+        let touch = self.run(&["sudo", "-n", "touch", &target], None, ADMIN_TIMEOUT)?;
+        if !touch.success() {
+            bail!("touch guest mount target {target} failed: {}", touch.stderr_lossy());
         }
         let mount = self.run(
-            &["sudo", "-n", "mount", "-t", "nullfs", host_dir, &target],
+            &["sudo", "-n", "mount", "-t", "nullfs", host_file, &target],
             None,
             ADMIN_TIMEOUT,
         )?;
         if !mount.success() {
-            bail!("nullfs mount {host_dir} -> {target} failed: {}", mount.stderr_lossy());
+            bail!("nullfs mount {host_file} -> {target} failed: {}", mount.stderr_lossy());
         }
         // Post-condition: the target must actually be a mountpoint now. A
-        // silently-failed mount (exit 0 but nothing mounted) would leave /pile
-        // on the empty clone dir; catch it here, before /etc/profile points
-        // PILE at it.
+        // silently-failed mount (exit 0 but nothing mounted) would leave
+        // /pile/self.pile on the empty clone file; catch it here, before
+        // /etc/profile points PILE at it.
         let check = self.run(&["sudo", "-n", "mount"], None, ADMIN_TIMEOUT)?;
         if !check.success() {
             bail!("verify mount {target}: `mount` failed: {}", check.stderr_lossy());
         }
         let listing = String::from_utf8_lossy(&check.stdout);
         // `mount` prints one line per filesystem as "src on TARGET (type, …)";
-        // require the exact target as a whitespace-delimited token so /pile
-        // does not match /pile2 or a substring.
+        // require the exact target as a whitespace-delimited token so
+        // /pile/self.pile does not match a substring.
         let mounted = listing
             .lines()
             .any(|line| line.split_whitespace().any(|tok| tok == target));
         if !mounted {
-            bail!("nullfs mount {host_dir} -> {target} did not take (not in `mount` output)");
+            bail!("nullfs mount {host_file} -> {target} did not take (not in `mount` output)");
         }
         Ok(())
     }
 
-    /// Re-establish BOTH nullfs pile mounts (self + shared) over a jail root on
-    /// the REATTACH path — the mounts do NOT survive a jail restart, exactly
+    /// Re-establish BOTH single-file pile mounts (self + shared) over a jail root
+    /// on the REATTACH path — the mounts do NOT survive a jail restart, exactly
     /// like the devfs mount. Status is ignored: a re-mount over a still-live
-    /// mount is FreeBSD nullfs's EDEADLK no-op (see `nullfs_mount`). Each mount
-    /// first `mkdir -p`s its guest mountpoint, so reattach works even though it
-    /// never ran the fresh-provision arm that originally made them.
+    /// mount is a safe no-op (see `nullfs_mount`). Each mount first ensures its
+    /// guest target file exists, so reattach works even though it never ran the
+    /// fresh-provision arm that originally made them.
     fn mount_piles(&self, jail: &str, root: &str) {
-        self.nullfs_mount(&self.self_pile_dir(jail), root, Self::GUEST_PILE_DIR);
-        self.nullfs_mount(&self.shared_pile_dir(), root, Self::GUEST_SHARED_DIR);
+        self.nullfs_mount(&self.self_pile_file(jail), root, Self::GUEST_SELF_PILE);
+        self.nullfs_mount(&self.shared_pile_file(), root, Self::GUEST_SHARED_PILE);
     }
 
     /// Fresh-provision variant of [`JailBackend::mount_piles`]: mount BOTH piles
@@ -488,8 +679,8 @@ impl JailBackend {
     /// which on the provision path cleanly triggers `cleanup_leftovers` —
     /// preferable to a silently-empty /pile that later gets `zfs destroy`ed.
     fn mount_piles_verified(&self, jail: &str, root: &str) -> Result<()> {
-        self.nullfs_mount_verified(&self.self_pile_dir(jail), root, Self::GUEST_PILE_DIR)?;
-        self.nullfs_mount_verified(&self.shared_pile_dir(), root, Self::GUEST_SHARED_DIR)?;
+        self.nullfs_mount_verified(&self.self_pile_file(jail), root, Self::GUEST_SELF_PILE)?;
+        self.nullfs_mount_verified(&self.shared_pile_file(), root, Self::GUEST_SHARED_PILE)?;
         Ok(())
     }
 
@@ -577,9 +768,9 @@ impl JailBackend {
         let _ = self.run(&["sudo", "-n", "jail", "-r", jail], None, ADMIN_TIMEOUT);
         if let Ok(mp) = self.mountpoint(&dataset) {
             // Unmount everything mounted under the (possibly half-made) clone —
-            // the two nullfs pile mounts plus devfs — so the zfs destroy below
-            // is not blocked. Host pile dirs themselves are never removed.
-            for guest in [Self::GUEST_PILE_DIR, Self::GUEST_SHARED_DIR, "/dev"] {
+            // the two single-file pile mounts plus devfs — so the zfs destroy
+            // below is not blocked. Host pile files themselves are never removed.
+            for guest in [Self::GUEST_SELF_PILE, Self::GUEST_SHARED_PILE, "/dev"] {
                 let _ = self.run(
                     &["sudo", "-n", "umount", "-f", &format!("{mp}{guest}")],
                     None,
@@ -620,11 +811,11 @@ impl JailBackend {
     /// the first `jexec` surfaces loudly (a broken /dev shows up at exec time,
     /// not attach time — cleaner than brittle stderr matching here).
     ///
-    /// The two nullfs pile mounts (self + shared) are re-established the same
-    /// ignore-status way, but for a DIFFERENT mechanism than devfs's "already
-    /// mounted": FreeBSD nullfs refuses a duplicate mount of the same source at
-    /// the same mountpoint with EDEADLK ("Resource deadlock avoided") and does
-    /// NOT stack (verified on FreeBSD 15.1 — exactly one mount survives a
+    /// The two single-file pile mounts (self + shared) are re-established the
+    /// same ignore-status way, but for a DIFFERENT mechanism than devfs's
+    /// "already mounted": a duplicate single-file nullfs mount of the same source
+    /// at the same live target FAILS with EBUSY ("Device busy") and does NOT
+    /// stack (verified on FreeBSD 15.1, 2026-07-24 — exactly one mount survives a
     /// re-mount over a live one, and a single umount clears it). So a re-mount
     /// over a still-live pile mount is a safe no-op here. Note this is the
     /// reattach path; the first-ever provision uses the VERIFIED mount
@@ -813,20 +1004,29 @@ impl SandboxBackend for JailBackend {
                 bail!("mkdir session cwd failed: {}", mkdir.stderr_lossy());
             }
 
-            // Model-B pile provisioning: two HOST-OWNED piles mounted into the
-            // jail, decoupled from the dataset lifecycle.
+            // Model-B pile provisioning: two HOST-OWNED pile FILES single-file-
+            // mounted into the jail, decoupled from the dataset lifecycle.
             //
-            //   host <pile_root>/<jail>/self.pile  -> nullfs rw -> guest /pile
-            //   host <pile_root>/shared/shared.pile -> nullfs rw -> guest /shared
+            //   host <pile_root>/<jail>/self.pile  -> nullfs rw -> guest /pile/self.pile
+            //   host <pile_root>/shared/shared.pile -> nullfs rw -> guest /shared/shared.pile
             //
             // These live OUTSIDE the ZFS clone tree, so destroy_session (which
             // destroys the dataset) never touches them. The `self.pile` is the
             // tenant's server-born pile under `pile_root`, distinct from the
             // caller-supplied `spec.tenant.pile` path (not used by this backend).
+            //
+            // SYMLINK CONFUSED-DEPUTY FIX (2026-07-24): the bootstrap `cp` NEVER
+            // writes to a tenant-reachable path. Every seed is `cp`'d into a
+            // host-PRIVATE 0700 staging dir (`staging_root`, never mounted into a
+            // jail) and then PUBLISHED into place with a no-follow / create-only
+            // rename that refuses to overwrite through an existing entry or a
+            // symlink (`stage_and_publish_pile`). Even if the destination dir were
+            // somehow tenant-writable, a pre-placed symlink at the destination
+            // cannot redirect the privileged copy onto a chosen host file.
             let self_dir = self.self_pile_dir(&jail);
-            let self_pile = format!("{self_dir}/self.pile");
+            let self_pile = self.self_pile_file(&jail);
             let shared_dir = self.shared_pile_dir();
-            let shared_pile = format!("{shared_dir}/shared.pile");
+            let shared_pile = self.shared_pile_file();
 
             // Per-coworker pile dir + seed self.pile from bootstrap if absent.
             let mkdir_self = self.run(
@@ -837,16 +1037,12 @@ impl SandboxBackend for JailBackend {
             if !mkdir_self.success() {
                 bail!("mkdir self pile dir failed: {}", mkdir_self.stderr_lossy());
             }
-            // Copy-if-absent: `cp -n` never clobbers an existing self.pile, so a
-            // reprovision keeps the coworker's accumulated pile.
-            let seed_self = self.run(
-                &["sudo", "-n", "cp", "-n", &self.bootstrap_pile, &self_pile],
-                None,
-                ADMIN_TIMEOUT,
-            )?;
-            if !seed_self.success() {
-                bail!("seed self.pile from bootstrap failed: {}", seed_self.stderr_lossy());
-            }
+            // Seed self.pile create-if-absent via host-private staging + a
+            // no-follow / create-only publish (see `stage_and_publish_pile`): a
+            // reprovision keeps the coworker's accumulated pile, and the
+            // privileged copy never follows a symlink at the destination.
+            self.stage_and_publish_pile(&jail, &self_pile)
+                .context("seed self.pile from bootstrap")?;
             // Make the host self.pile APPEND-ONLY (`chflags sappnd`): a process
             // inside the jail can O_APPEND but not O_TRUNC/unlink/rename it, so a
             // buggy or stale tool cannot truncate the pile (the 2026-07-03
@@ -867,18 +1063,16 @@ impl SandboxBackend for JailBackend {
             }
 
             // Shared pile dir + shared.pile: a SINGLE file shared by ALL jails.
-            // Create-if-absent and race-safe against concurrent provisions —
-            // but the seed must be ATOMIC. `cp -n bootstrap shared.pile` is
-            // create-if-absent yet NOT atomic: a second provision's `cp -n` can
-            // see the target already exists mid-copy and no-op, then a coworker
-            // mounts and appends to a still-PARTIAL shared.pile (torn tail ->
-            // CorruptPile). So publish atomically: `cp` bootstrap to a
-            // per-provision temp in the same dir, then `mv -n` (atomic same-FS
-            // rename) into place. The loser's `mv -n` no-ops on an existing
-            // target and no reader ever sees a partial file; we clean up the
-            // temp when the mv no-ops. (`mkdir -p` stays idempotent; same
-            // append-only semantics as self.pile — many concurrent appenders on
-            // one pile is fine.)
+            // Create-if-absent and race-safe against concurrent provisions — and
+            // the seed must be ATOMIC (a coworker must never mount a partial
+            // shared.pile). `stage_and_publish_pile` copies bootstrap into the
+            // host-private staging dir, then publishes with a no-follow /
+            // create-only rename: the winner installs a complete file in one
+            // atomic rename; a loser no-ops on the existing target. No reader ever
+            // observes a partial file, and no tenant-reachable path is ever
+            // written through. (`mkdir -p` stays idempotent; same append-only
+            // semantics as self.pile — many concurrent appenders on one pile file
+            // is fine, verified on FreeBSD 15.1.)
             let mkdir_shared = self.run(
                 &["sudo", "-n", "mkdir", "-p", &shared_dir],
                 None,
@@ -887,35 +1081,8 @@ impl SandboxBackend for JailBackend {
             if !mkdir_shared.success() {
                 bail!("mkdir shared pile dir failed: {}", mkdir_shared.stderr_lossy());
             }
-            // Per-provision temp in the SAME dir (so `mv` is a same-FS rename,
-            // hence atomic). Namespaced by jail name so two concurrent
-            // provisions never share a temp path.
-            let shared_tmp = format!("{shared_dir}/shared.pile.{jail}.tmp");
-            let cp_tmp = self.run(
-                &["sudo", "-n", "cp", &self.bootstrap_pile, &shared_tmp],
-                None,
-                ADMIN_TIMEOUT,
-            )?;
-            if !cp_tmp.success() {
-                bail!("stage shared.pile temp from bootstrap failed: {}", cp_tmp.stderr_lossy());
-            }
-            // Atomic publish: `mv -n` renames into shared.pile only if it does
-            // not already exist. The winner installs a complete file in one
-            // rename; a loser no-ops (target exists) and leaves its temp behind,
-            // which we then remove. Either way no reader observes a partial
-            // shared.pile.
-            let mv_shared = self.run(
-                &["sudo", "-n", "mv", "-n", &shared_tmp, &shared_pile],
-                None,
-                ADMIN_TIMEOUT,
-            )?;
-            if !mv_shared.success() {
-                bail!("atomic publish shared.pile failed: {}", mv_shared.stderr_lossy());
-            }
-            // Clean up the temp if the `mv -n` no-op'd (a concurrent provision
-            // won the publish, so our temp still sits in the shared dir).
-            // Best-effort: a leftover temp is harmless clutter, not a hazard.
-            let _ = self.run(&["sudo", "-n", "rm", "-f", &shared_tmp], None, ADMIN_TIMEOUT);
+            self.stage_and_publish_pile(&jail, &shared_pile)
+                .context("seed shared.pile from bootstrap")?;
             // Same append-only protection on the SHARED pile — the higher-stakes
             // one, since a truncation here would corrupt org-wide data for every
             // coworker, not just the one who did it.
@@ -928,8 +1095,8 @@ impl SandboxBackend for JailBackend {
                 bail!("chflags sappnd shared.pile failed: {}", protect_shared.stderr_lossy());
             }
 
-            // nullfs-mount BOTH pile dirs rw (each mkdir's its own guest
-            // mountpoint first). The mounts themselves do not survive a jail
+            // single-file-nullfs-mount BOTH pile files rw (each touches its own
+            // guest target file first). The mounts themselves do not survive a jail
             // restart (re-established by `reattach`), but they must be live for
             // this first `jail -c`. On the fresh-provision path we VERIFY each
             // mount took: a silently-failed mount would leave guest /pile on the
@@ -950,7 +1117,7 @@ impl SandboxBackend for JailBackend {
             profile.push_str("export PATH=/opt/faculties:$PATH\n");
             profile.push_str(&format!(
                 "export PILE={}\n",
-                shell_quote(&format!("{}/self.pile", Self::GUEST_PILE_DIR))
+                shell_quote(Self::GUEST_SELF_PILE)
             ));
             for (k, v) in &spec.env {
                 profile.push_str(&format!("export {}={}\n", k, shell_quote(v)));
@@ -1134,13 +1301,13 @@ impl SandboxBackend for JailBackend {
             );
         }
 
-        // Unmount devfs AND the two nullfs pile mounts (must precede zfs
+        // Unmount devfs AND the two single-file pile mounts (must precede zfs
         // destroy: a dataset with mounts anywhere under its tree cannot be
         // destroyed — enforce_statfs). Model B: we unmount the piles but NEVER
         // delete the host self.pile or shared.pile — they are host-owned and
         // outlive the jail (a re-provision reattaches the same self.pile).
         if let Ok(root) = self.mountpoint(&dataset) {
-            for guest in [Self::GUEST_PILE_DIR, Self::GUEST_SHARED_DIR, "/dev"] {
+            for guest in [Self::GUEST_SELF_PILE, Self::GUEST_SHARED_PILE, "/dev"] {
                 let _ = self.run(
                     &["sudo", "-n", "umount", "-f", &format!("{root}{guest}")],
                     None,
@@ -1281,19 +1448,20 @@ mod tests {
             )
     }
 
-    /// A `mount` listing that shows BOTH pile mounts live under alice's jail
-    /// root, in the `src on TARGET (type, …)` shape FreeBSD `mount` prints. The
-    /// fresh-provision path calls bare `mount` to VERIFY each nullfs mount took;
-    /// scripting this satisfies that post-condition. Keyed on the bare
-    /// `["sudo","-n","mount"]` prefix, which also matches the `mount -t nullfs`
-    /// / `mount -t devfs` calls — harmless, they only need exit 0.
+    /// A `mount` listing that shows BOTH single-file pile mounts live under
+    /// alice's jail root, in the `src on TARGET (type, …)` shape FreeBSD `mount`
+    /// prints. The fresh-provision path calls bare `mount` to VERIFY each nullfs
+    /// mount took (matching the exact guest FILE target token); scripting this
+    /// satisfies that post-condition. Keyed on the bare `["sudo","-n","mount"]`
+    /// prefix, which also matches the `mount -t nullfs` / `mount -t devfs` calls
+    /// — harmless, they only need exit 0.
     fn mount_listing_for_alice() -> HostOutput {
         let jail = alice_jail();
         let root = alice_root();
         ok_with_stdout(&format!(
             "{}/{jail} on {root} (zfs, local, nfsv4acls)\n\
-             /aitemp/playground/piles/{jail} on {root}/pile (nullfs, local)\n\
-             /aitemp/playground/piles/shared on {root}/shared (nullfs, local)\n\
+             /aitemp/playground/piles/{jail}/self.pile on {root}/pile/self.pile (nullfs, local)\n\
+             /aitemp/playground/piles/shared/shared.pile on {root}/shared/shared.pile (nullfs, local)\n\
              devfs on {root}/dev (devfs)\n",
             "aitemp/playground"
         ))
@@ -1410,12 +1578,13 @@ mod tests {
         assert!(jail_call.contains(&"persist".to_string()));
     }
 
-    /// Model-B pile provisioning: a brand-new tenant gets BOTH host-owned piles
-    /// nullfs-mounted rw (self at guest /pile, shared at guest /shared), the
-    /// bootstrap.pile copied into an absent self.pile (and the shared pile), the
-    /// guest mountpoints made, and /etc/profile seeded with the faculties PATH +
-    /// PILE=/pile/self.pile. The piles derive from `pile_root`+jail name, NOT
-    /// from the caller-supplied `spec.tenant.pile` path.
+    /// Model-B pile provisioning: a brand-new tenant gets BOTH host-owned pile
+    /// FILES single-file-nullfs-mounted rw (self at guest /pile/self.pile, shared
+    /// at guest /shared/shared.pile), each seeded from bootstrap.pile via a
+    /// host-PRIVATE staging copy published with a no-follow / create-only
+    /// hardlink, the guest target files touched, and /etc/profile seeded with the
+    /// faculties PATH + PILE=/pile/self.pile. The piles derive from
+    /// `pile_root`+jail name, NOT from the caller-supplied `spec.tenant.pile`.
     #[test]
     fn provision_mounts_both_piles_seeds_path_and_pile() {
         let (backend, mock) = mock_provision_ready()
@@ -1433,6 +1602,8 @@ mod tests {
         let self_pile = format!("{self_dir}/self.pile");
         let shared_dir = "/aitemp/playground/piles/shared";
         let shared_pile = format!("{shared_dir}/shared.pile");
+        let staging_root = "/aitemp/playground/staging";
+        let staging_tmp = format!("{staging_root}/{jail}.pile.tmp");
 
         // Host per-coworker pile dir is created.
         assert!(
@@ -1441,15 +1612,18 @@ mod tests {
             ] as &[String])),
             "must mkdir the per-coworker pile dir: {calls:?}"
         );
-        // self.pile seeded from bootstrap.pile, copy-if-absent (`cp -n`), from
-        // the configured bootstrap path — NOT the caller-supplied pile path.
+        // The host-private staging dir is created AND locked down to 0700.
         assert!(
             calls.iter().any(|c| c.ends_with(&[
-                "cp".into(), "-n".into(),
-                "/aitemp/playground/bootstrap.pile".into(),
-                self_pile.clone(),
+                "mkdir".into(), "-p".into(), staging_root.into()
             ] as &[String])),
-            "must cp -n bootstrap.pile into self.pile: {calls:?}"
+            "must mkdir the host-private staging dir: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c.ends_with(&[
+                "chmod".into(), "700".into(), staging_root.into()
+            ] as &[String])),
+            "must chmod 700 the host-private staging dir: {calls:?}"
         );
         // Both piles are made append-only (`chflags sappnd`) after seeding: an
         // in-jail process can append but not truncate them.
@@ -1463,56 +1637,74 @@ mod tests {
                 "must chflags sappnd {pile}: {calls:?}"
             );
         }
-        // Shared dir + shared.pile seeded create-if-absent (idempotent),
-        // published ATOMICALLY: bootstrap is `cp`'d to a per-provision temp in
-        // the shared dir, then `mv -n`'d into shared.pile (atomic same-FS
-        // rename) so no reader ever sees a partial file.
         assert!(
             calls.iter().any(|c| c.ends_with(&[
                 "mkdir".into(), "-p".into(), shared_dir.into()
             ] as &[String])),
             "must mkdir the shared pile dir: {calls:?}"
         );
-        let shared_tmp = format!("{shared_dir}/shared.pile.{jail}.tmp");
-        // Stage: cp bootstrap -> per-provision temp (NOT directly to shared.pile).
+
+        // BOTH piles are seeded the SAME tenant-safe way: cp bootstrap into the
+        // host-PRIVATE staging temp (never a tenant-reachable path), then publish
+        // with a no-follow / create-only HARDLINK into place.
+        for dest in [&self_pile, &shared_pile] {
+            // Stage: cp bootstrap -> host-private staging temp.
+            assert!(
+                calls.iter().any(|c| c.ends_with(&[
+                    "cp".into(),
+                    "/aitemp/playground/bootstrap.pile".into(),
+                    staging_tmp.clone(),
+                ] as &[String])),
+                "must cp bootstrap.pile into the host-private staging temp: {calls:?}"
+            );
+            // Publish: ln staging_tmp -> dest (atomic, create-only, no-follow).
+            assert!(
+                calls.iter().any(|c| c == &[
+                    "sudo".to_string(), "-n".into(), "ln".into(),
+                    staging_tmp.clone(), dest.clone(),
+                ]),
+                "must publish {dest} via no-follow/create-only `ln` from staging: {calls:?}"
+            );
+        }
+        // The bootstrap `cp` must NEVER write to a tenant-reachable pile path
+        // (the symlink confused-deputy fix): its destination is always the
+        // host-private staging temp.
         assert!(
-            calls.iter().any(|c| c.ends_with(&[
-                "cp".into(),
-                "/aitemp/playground/bootstrap.pile".into(),
-                shared_tmp.clone(),
-            ] as &[String])),
-            "must cp bootstrap.pile into a per-provision temp: {calls:?}"
-        );
-        // Publish: mv -n temp -> shared.pile (atomic, create-if-absent).
-        assert!(
-            calls.iter().any(|c| c.ends_with(&[
-                "mv".into(), "-n".into(),
-                shared_tmp.clone(),
-                shared_pile.clone(),
-            ] as &[String])),
-            "must atomic-publish via mv -n temp -> shared.pile: {calls:?}"
-        );
-        // No non-atomic direct cp into shared.pile.
-        assert!(
-            !calls.iter().any(|c| c.last().map(String::as_str) == Some(shared_pile.as_str())
-                && c.iter().any(|a| a == "cp")),
-            "must NOT cp directly into shared.pile (non-atomic): {calls:?}"
+            !calls.iter().any(|c| {
+                let is_cp = c.iter().any(|a| a == "cp");
+                let dest = c.last().map(String::as_str);
+                is_cp && (dest == Some(self_pile.as_str()) || dest == Some(shared_pile.as_str()))
+            }),
+            "must NOT cp bootstrap directly into a pile path (must stage privately): {calls:?}"
         );
 
-        // BOTH nullfs mounts, rw, host-dir -> guest-mountpoint.
+        // BOTH single-file nullfs mounts: host pile FILE -> guest pile FILE.
         assert!(
             calls.iter().any(|c| c == &[
                 "sudo".to_string(), "-n".into(), "mount".into(), "-t".into(),
-                "nullfs".into(), self_dir.to_string(), format!("{root}/pile"),
+                "nullfs".into(), self_pile.clone(), format!("{root}/pile/self.pile"),
             ]),
-            "must nullfs-mount self pile dir at /pile: {calls:?}"
+            "must single-file-nullfs-mount self.pile at /pile/self.pile: {calls:?}"
         );
         assert!(
             calls.iter().any(|c| c == &[
                 "sudo".to_string(), "-n".into(), "mount".into(), "-t".into(),
-                "nullfs".into(), shared_dir.to_string(), format!("{root}/shared"),
+                "nullfs".into(), shared_pile.clone(), format!("{root}/shared/shared.pile"),
             ]),
-            "must nullfs-mount shared pile dir at /shared: {calls:?}"
+            "must single-file-nullfs-mount shared.pile at /shared/shared.pile: {calls:?}"
+        );
+        // The guest target FILES are touched (created empty) before the mount.
+        assert!(
+            calls.iter().any(|c| c.ends_with(&[
+                "touch".into(), format!("{root}/pile/self.pile"),
+            ] as &[String])),
+            "must touch the guest self.pile target before mounting: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c.ends_with(&[
+                "touch".into(), format!("{root}/shared/shared.pile"),
+            ] as &[String])),
+            "must touch the guest shared.pile target before mounting: {calls:?}"
         );
 
         // /etc/profile seed carries the faculties PATH + PILE at the mounted
@@ -1599,10 +1791,10 @@ mod tests {
         );
     }
 
-    /// Reattach re-establishes BOTH nullfs pile mounts (self + shared) — they do
-    /// not survive a jail restart, exactly like the devfs re-mount — without
-    /// re-seeding self.pile or the profile (the persisted host piles carry
-    /// their accumulated content).
+    /// Reattach re-establishes BOTH single-file pile mounts (self + shared) —
+    /// they do not survive a jail restart, exactly like the devfs re-mount —
+    /// without re-seeding self.pile or the profile (the persisted host piles
+    /// carry their accumulated content).
     #[test]
     fn reattach_remounts_both_piles() {
         let (backend, mock) = mock_with_mountpoint()
@@ -1619,19 +1811,19 @@ mod tests {
             calls.iter().any(|c| c == &[
                 "sudo".to_string(), "-n".into(), "mount".into(), "-t".into(),
                 "nullfs".into(),
-                format!("/aitemp/playground/piles/{jail}"),
-                format!("{root}/pile"),
+                format!("/aitemp/playground/piles/{jail}/self.pile"),
+                format!("{root}/pile/self.pile"),
             ]),
-            "reattach must re-mount the self pile at /pile: {calls:?}"
+            "reattach must re-mount the self.pile at /pile/self.pile: {calls:?}"
         );
         assert!(
             calls.iter().any(|c| c == &[
                 "sudo".to_string(), "-n".into(), "mount".into(), "-t".into(),
                 "nullfs".into(),
-                "/aitemp/playground/piles/shared".into(),
-                format!("{root}/shared"),
+                "/aitemp/playground/piles/shared/shared.pile".into(),
+                format!("{root}/shared/shared.pile"),
             ]),
-            "reattach must re-mount the shared pile at /shared: {calls:?}"
+            "reattach must re-mount the shared.pile at /shared/shared.pile: {calls:?}"
         );
         // Reattach seeds nothing: no bootstrap copy.
         assert!(
@@ -1640,10 +1832,10 @@ mod tests {
         );
     }
 
-    /// destroy_session unmounts BOTH nullfs pile mounts (self AND shared) plus
-    /// devfs BEFORE `zfs destroy` (a dataset with mounts under its tree cannot
-    /// be destroyed), and — Model B — issues NO delete of the host pile dirs or
-    /// pile files: they are host-owned and outlive the jail.
+    /// destroy_session unmounts BOTH single-file pile mounts (self AND shared)
+    /// plus devfs BEFORE `zfs destroy` (a dataset with mounts under its tree
+    /// cannot be destroyed), and — Model B — issues NO delete of the host pile
+    /// dirs or pile files: they are host-owned and outlive the jail.
     #[test]
     fn destroy_unmounts_both_piles_and_never_deletes_host_piles() {
         let (backend, mock) = mock_with_mountpoint().into_backend();
@@ -1660,8 +1852,8 @@ mod tests {
                 .position(|c| c.last().map(String::as_str) == Some(suffix))
                 .unwrap_or_else(|| panic!("missing umount of {suffix} in {calls:?}"))
         };
-        let self_umount = idx_of(&format!("{root}/pile"));
-        let shared_umount = idx_of(&format!("{root}/shared"));
+        let self_umount = idx_of(&format!("{root}/pile/self.pile"));
+        let shared_umount = idx_of(&format!("{root}/shared/shared.pile"));
         let dev_umount = idx_of(&format!("{root}/dev"));
 
         // All three unmounts happen...
@@ -1715,16 +1907,16 @@ mod tests {
         );
     }
 
-    /// The shared-pile seed is create-if-absent and race-safe, and — the fix —
-    /// ATOMIC: bootstrap is staged to a per-provision temp in the shared dir,
-    /// then `mv -n`'d into shared.pile (atomic same-FS rename). It never `cp`s
-    /// directly into shared.pile (that create-if-absent is not atomic — a loser
-    /// `cp -n` could no-op mid-copy of the winner, exposing a torn tail). The
-    /// temp is per-jail-name so two concurrent provisions never collide, and the
-    /// no-op'd loser's temp is cleaned up. `mkdir -p` stays idempotent. Two
-    /// back-to-back provisions of different tenants both publish the SAME
-    /// shared.pile via `mv -n`, so a concurrent race is a harmless no-op on the
-    /// loser.
+    /// The shared-pile seed is create-if-absent, race-safe, ATOMIC, AND
+    /// tenant-unreachable: bootstrap is staged to a per-provision temp in the
+    /// host-PRIVATE staging dir (never a tenant-writable path), then published
+    /// into shared.pile with a no-follow / create-only HARDLINK (`ln`). It never
+    /// `cp`s directly into shared.pile (non-atomic AND, historically, the symlink
+    /// confused-deputy sink). The staging temp is per-jail-name so two concurrent
+    /// provisions never collide, and the leftover is cleaned up. `mkdir -p` stays
+    /// idempotent. Two back-to-back provisions of different tenants both publish
+    /// the SAME shared.pile via create-only `ln`, so a concurrent race is a
+    /// harmless no-op on the loser (the existing regular file is accepted).
     #[test]
     fn shared_pile_seed_is_atomic_and_create_if_absent() {
         for label in ["alice", "bob"] {
@@ -1735,7 +1927,7 @@ mod tests {
             backend.provision_sandbox(&spec(label)).expect("provision");
             let calls = mock.calls();
             let shared_pile = "/aitemp/playground/piles/shared/shared.pile";
-            let shared_tmp = format!("/aitemp/playground/piles/shared/shared.pile.{jail}.tmp");
+            let staging_tmp = format!("/aitemp/playground/staging/{jail}.pile.tmp");
             // Shared dir mkdir is idempotent (`-p`).
             assert!(
                 calls.iter().any(|c| c
@@ -1745,44 +1937,318 @@ mod tests {
                     ]),
                 "shared dir mkdir must be idempotent (-p): {calls:?}"
             );
-            // Stage to a per-provision temp (NOT directly to shared.pile).
+            // Stage to the host-PRIVATE staging temp (NOT a tenant-reachable path).
             assert!(
                 calls.iter().any(|c| c.ends_with(&[
                     "cp".into(),
                     "/aitemp/playground/bootstrap.pile".into(),
-                    shared_tmp.clone(),
+                    staging_tmp.clone(),
                 ] as &[String])),
-                "shared seed must stage to a per-provision temp: {calls:?}"
+                "shared seed must stage to the host-private staging temp: {calls:?}"
             );
-            // Publish atomically via `mv -n` temp -> shared.pile.
-            let shared_mvs: Vec<_> = calls
+            // Publish via a create-only, no-follow HARDLINK temp -> shared.pile.
+            let shared_lns: Vec<_> = calls
                 .iter()
                 .filter(|c| {
                     c.last().map(String::as_str) == Some(shared_pile)
-                        && c.iter().any(|a| a == "mv")
+                        && c.get(2).map(String::as_str) == Some("ln")
                 })
                 .collect();
-            assert_eq!(shared_mvs.len(), 1, "one atomic shared-pile publish: {calls:?}");
+            assert_eq!(shared_lns.len(), 1, "one create-only shared-pile publish: {calls:?}");
             assert!(
-                shared_mvs[0].iter().any(|a| a == "-n"),
-                "publish must be create-if-absent (mv -n), never clobber: {:?}",
-                shared_mvs[0]
+                shared_lns[0].iter().any(|a| a == staging_tmp.as_str()),
+                "publish must hardlink the host-private staging temp: {:?}",
+                shared_lns[0]
             );
+            // The `ln` must be a plain hardlink (no `-s`): a symlink publish would
+            // reintroduce a follow-through, and only a hardlink gives EEXIST
+            // create-only semantics.
             assert!(
-                shared_mvs[0].iter().any(|a| a == shared_tmp.as_str()),
-                "publish must rename the per-provision temp: {:?}",
-                shared_mvs[0]
+                !shared_lns[0].iter().any(|a| a == "-s"),
+                "publish must be a HARDLINK (no -s), for create-only no-follow: {:?}",
+                shared_lns[0]
             );
-            // NEVER a `cp` straight into shared.pile — that is the non-atomic
-            // path this fix removes.
+            // NEVER a `cp` straight into shared.pile — non-atomic AND the
+            // historical symlink confused-deputy sink this fix removes.
             assert!(
                 !calls.iter().any(|c| {
                     c.last().map(String::as_str) == Some(shared_pile)
                         && c.iter().any(|a| a == "cp")
                 }),
-                "must not cp directly into shared.pile (non-atomic): {calls:?}"
+                "must not cp directly into shared.pile (non-atomic + unsafe): {calls:?}"
             );
         }
+    }
+
+    /// Security repair #2: the bootstrap seed `cp` NEVER writes to a
+    /// tenant-reachable path. Its ONLY destination is the host-private staging
+    /// dir (`staging_root`, mode 0700, never mounted into a jail). This is the
+    /// structural half of the symlink confused-deputy fix: a tenant cannot
+    /// pre-place a symlink where the privileged `cp` writes, because the `cp`
+    /// destination is unreachable to every jail.
+    #[test]
+    fn bootstrap_cp_only_targets_host_private_staging() {
+        let (backend, mock) = mock_provision_ready()
+            .reply(&["sudo", "-n", "zfs", "list"], fail())
+            .into_backend();
+        backend.provision_sandbox(&spec("alice")).expect("provision");
+        let calls = mock.calls();
+
+        // Every bootstrap `cp` must land under the staging root and nowhere else.
+        let cps: Vec<_> = calls
+            .iter()
+            .filter(|c| c.iter().any(|a| a == "cp"))
+            .collect();
+        assert!(!cps.is_empty(), "at least one bootstrap cp expected: {calls:?}");
+        for c in &cps {
+            let dest = c.last().map(String::as_str).unwrap_or("");
+            assert!(
+                dest.starts_with("/aitemp/playground/staging/"),
+                "every bootstrap cp must target the host-private staging dir, got {dest:?}: {c:?}"
+            );
+            // And it must be seeded FROM bootstrap.pile (not some other source).
+            assert!(
+                c.iter().any(|a| a == "/aitemp/playground/bootstrap.pile"),
+                "cp source must be bootstrap.pile: {c:?}"
+            );
+        }
+        // The staging dir is locked to 0700 before any cp reaches it.
+        let chmod_idx = calls
+            .iter()
+            .position(|c| c.ends_with(&[
+                "chmod".into(), "700".into(), "/aitemp/playground/staging".into(),
+            ] as &[String]))
+            .expect("staging chmod 700 issued");
+        let first_cp_idx = calls
+            .iter()
+            .position(|c| c.iter().any(|a| a == "cp"))
+            .expect("a cp issued");
+        assert!(
+            chmod_idx < first_cp_idx,
+            "staging must be chmod 700 BEFORE the first bootstrap cp: {calls:?}"
+        );
+    }
+
+    /// Security repair #2: the publish step is NO-FOLLOW and CREATE-ONLY. When
+    /// the create-only hardlink (`ln`) fails AND the destination is a regular,
+    /// non-symlink file, that is the benign create-if-absent no-op (a reprovision
+    /// kept an accumulated pile, or a concurrent provision won the publish) — we
+    /// accept it. The publish never overwrites through the existing entry.
+    #[test]
+    fn publish_accepts_existing_regular_file_as_noop() {
+        // `ln` fails (destination exists) and the no-follow validator
+        // (`sh -c "test -f && test ! -L"`) SUCCEEDS -> destination is a genuine
+        // regular file, so the seed is a create-if-absent no-op, not an error.
+        let (backend, _mock) = mock_provision_ready()
+            .reply(&["sudo", "-n", "zfs", "list"], fail())
+            .reply(&["sudo", "-n", "ln"], fail())
+            // default success for the `sh -c "test ..."` validator (regular file)
+            .into_backend();
+        // Provision must SUCCEED: the existing regular pile file is accepted.
+        backend
+            .provision_sandbox(&spec("alice"))
+            .expect("provision succeeds when destination is an existing regular file");
+    }
+
+    /// Security repair #2: the publish REFUSES to proceed when the create-only
+    /// hardlink fails AND the destination is NOT a safe regular file (a
+    /// tenant-planted symlink or special file). It never mounts something a
+    /// tenant may have swapped in — it fails loudly instead. This is the
+    /// no-follow guard on the create-if-absent no-op path.
+    #[test]
+    fn publish_refuses_symlink_or_special_destination() {
+        // `ln` fails (destination exists) AND the no-follow validator FAILS
+        // (destination is a symlink / special file) -> provision must bail, not
+        // silently proceed to mount a tenant-planted target.
+        let (backend, mock) = mock_provision_ready()
+            .reply(&["sudo", "-n", "zfs", "list"], fail())
+            .reply(&["sudo", "-n", "ln"], fail())
+            .reply(&["sudo", "-n", "sh", "-c"], fail())
+            .into_backend();
+        let err = backend
+            .provision_sandbox(&spec("alice"))
+            .expect_err("provision must refuse a non-regular destination");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("not a regular non-symlink file")
+                || msg.contains("not a safe regular file"),
+            "error must name the no-follow refusal: {msg}"
+        );
+        // The no-follow validator uses `test -f` AND `test ! -L` (the latter
+        // closes the "symlink -> regular file" case that `test -f` alone would
+        // follow through).
+        let calls = mock.calls();
+        let validator = calls
+            .iter()
+            .find(|c| c.get(2).map(String::as_str) == Some("sh")
+                && c.get(3).map(String::as_str) == Some("-c"))
+            .expect("no-follow validator issued");
+        let script = validator.get(4).map(String::as_str).unwrap_or("");
+        assert!(
+            script.contains("test -f") && script.contains("test ! -L"),
+            "validator must be no-follow (test -f && test ! -L): {script:?}"
+        );
+    }
+
+    /// Security repair #2: no HOST DIRECTORY is ever nullfs-mounted into a jail —
+    /// only the individual pile FILES. This is the structural half of the fix:
+    /// with only file mounts, the jail's `/pile` and `/shared` are the jail's OWN
+    /// clone directories (not writable host dirs), so a tenant creating siblings
+    /// there only dirties the throwaway clone and can never plant an entry a
+    /// privileged host operation would traverse.
+    #[test]
+    fn no_host_directory_is_mounted_into_a_jail() {
+        let (backend, mock) = mock_provision_ready()
+            .reply(&["sudo", "-n", "zfs", "list"], fail())
+            .into_backend();
+        backend.provision_sandbox(&spec("alice")).expect("provision");
+        let calls = mock.calls();
+
+        // Every nullfs mount's SOURCE (5th argv token) must be a pile FILE, never
+        // a bare pile DIRECTORY.
+        let nullfs_mounts: Vec<_> = calls
+            .iter()
+            .filter(|c| {
+                c.get(2).map(String::as_str) == Some("mount")
+                    && c.iter().any(|a| a == "nullfs")
+            })
+            .collect();
+        assert!(!nullfs_mounts.is_empty(), "expected nullfs mounts: {calls:?}");
+        for m in &nullfs_mounts {
+            // argv shape: sudo -n mount -t nullfs <source> <target>
+            let source = m.get(5).map(String::as_str).unwrap_or("");
+            let target = m.get(6).map(String::as_str).unwrap_or("");
+            assert!(
+                source.ends_with("/self.pile") || source.ends_with("/shared.pile"),
+                "nullfs SOURCE must be a pile FILE, not a host dir: {source:?} ({m:?})"
+            );
+            assert!(
+                target.ends_with("/self.pile") || target.ends_with("/shared.pile"),
+                "nullfs TARGET must be a pile FILE inside the jail clone: {target:?} ({m:?})"
+            );
+        }
+    }
+
+    /// Security repair #2: the host-private staging dir is DERIVED as a sibling
+    /// of `pile_root`, so a `--jail-pile-root` override moves staging with it
+    /// (same ZFS filesystem — the hardlink publish requires same-FS) instead of
+    /// diverging to a stale hardcoded path. The default lands at
+    /// `/aitemp/playground/staging`, a sibling of the default pile root and NOT
+    /// under it (so it is never mounted into a jail).
+    #[test]
+    fn staging_root_tracks_pile_root_as_a_sibling() {
+        let mut b = JailBackend::local();
+        assert_eq!(b.staging_root(), "/aitemp/playground/staging");
+        // The staging dir must be a SIBLING of pile_root, never under it (under
+        // it would risk being reachable if pile_root's parent were mounted).
+        assert!(
+            !b.staging_root().starts_with(&format!("{}/", b.pile_root)),
+            "staging must not live under pile_root: {}",
+            b.staging_root()
+        );
+        // Override pile_root: staging follows to the same parent.
+        b.pile_root = "/tank/pg/piles".to_string();
+        assert_eq!(b.staging_root(), "/tank/pg/staging");
+        assert_eq!(b.staging_pile_tmp("playground-x"), "/tank/pg/staging/playground-x.pile.tmp");
+    }
+
+    /// Security repair #2 — LIVE on the real FreeBSD host. Proves the two
+    /// FreeBSD-specific properties this repair depends on, against the actual
+    /// kernel (unit tests above pin the argv shape; this pins the SEMANTICS):
+    ///
+    ///   1. No-follow / create-only publish: a `ln` onto a pre-placed absolute
+    ///      symlink at the destination FAILS and leaves the symlink's victim
+    ///      target byte-for-byte untouched (the confused-deputy exploit is dead).
+    ///   2. Single-file nullfs concurrent append: mounting ONE host `shared.pile`
+    ///      file onto target files in two separate "jail" dirs, then appending
+    ///      from both views, lands every line in the one source with no loss —
+    ///      the shared-append feature the repair must preserve.
+    ///
+    /// Gated (talks to and mutates a scratch dir on the deploy host): run with
+    /// `SANDBOX_JAIL_LIVE_TESTS=1 cargo test --bins jail_live_symlink_and_append`.
+    /// Everything happens under a `mktemp -d` scratch dir and is torn down.
+    #[test]
+    fn jail_live_symlink_and_append() {
+        if std::env::var("SANDBOX_JAIL_LIVE_TESTS").as_deref() != Ok("1") {
+            eprintln!(
+                "skipping: set SANDBOX_JAIL_LIVE_TESTS=1 to run (mutates a scratch \
+                 dir on the FreeBSD deploy host)"
+            );
+            return;
+        }
+        let host = std::env::var("SANDBOX_JAIL_LIVE_HOST")
+            .unwrap_or_else(|_| "ai.bultmann.eu".to_string());
+
+        // One self-contained shell script: create a scratch dir, run BOTH proofs,
+        // print PASS/FAIL markers, tear down. Any non-zero `set -e` step or a
+        // FAIL marker fails the test.
+        let script = r#"
+set -eu
+WORK=$(mktemp -d /tmp/jail-live-test.XXXXXX)
+cleanup() {
+  for f in "$WORK"/jailA/shared/shared.pile "$WORK"/jailB/shared/shared.pile; do
+    sudo -n umount "$f" 2>/dev/null || true
+  done
+  sudo -n chflags nosappnd "$WORK/shared.pile" 2>/dev/null || true
+  sudo -n rm -rf "$WORK" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+# ---- Proof 1: no-follow / create-only publish (ln onto a symlink) ----
+echo "SECRET-VICTIM" | sudo -n tee "$WORK/victim" >/dev/null
+echo "BOOTSTRAP-BYTES" | sudo -n tee "$WORK/staging.tmp" >/dev/null
+# A tenant-planted absolute symlink at the publish destination.
+sudo -n ln -s "$WORK/victim" "$WORK/dest"
+# The publish primitive: a plain hardlink. Must FAIL (EEXIST), no follow.
+if sudo -n ln "$WORK/staging.tmp" "$WORK/dest" 2>/dev/null; then
+  echo "FAIL: ln onto a symlink destination SUCCEEDED (followed through)"; exit 1
+fi
+if [ "$(cat "$WORK/victim")" != "SECRET-VICTIM" ]; then
+  echo "FAIL: victim file was overwritten through the symlink"; exit 1
+fi
+echo "PASS: ln refused symlink destination, victim untouched"
+
+# ---- Proof 2: single-file nullfs concurrent shared-append ----
+echo "SEED" | sudo -n tee "$WORK/shared.pile" >/dev/null
+sudo -n chflags sappnd "$WORK/shared.pile"
+for j in jailA jailB; do
+  sudo -n mkdir -p "$WORK/$j/shared"
+  sudo -n touch "$WORK/$j/shared/shared.pile"
+  sudo -n mount -t nullfs "$WORK/shared.pile" "$WORK/$j/shared/shared.pile"
+done
+( for i in $(seq 1 50); do echo "A-$i" | sudo -n tee -a "$WORK/jailA/shared/shared.pile" >/dev/null; done ) &
+( for i in $(seq 1 50); do echo "B-$i" | sudo -n tee -a "$WORK/jailB/shared/shared.pile" >/dev/null; done ) &
+wait
+LINES=$(wc -l < "$WORK/shared.pile" | tr -d ' ')
+AC=$(grep -c '^A-' "$WORK/shared.pile" || true)
+BC=$(grep -c '^B-' "$WORK/shared.pile" || true)
+if [ "$LINES" != "101" ] || [ "$AC" != "50" ] || [ "$BC" != "50" ]; then
+  echo "FAIL: concurrent append lost lines (total=$LINES A=$AC B=$BC, want 101/50/50)"; exit 1
+fi
+echo "PASS: single-file nullfs concurrent append kept all 100 lines"
+"#;
+
+        let out = Command::new("ssh")
+            .arg("-o")
+            .arg("BatchMode=yes")
+            .arg("-o")
+            .arg("ConnectTimeout=10")
+            .arg(&host)
+            .arg(script)
+            .output()
+            .expect("spawn ssh to the live host");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        eprintln!("live-host stdout:\n{stdout}\nlive-host stderr:\n{stderr}");
+        assert!(out.status.success(), "live host script failed: {stderr}");
+        assert!(
+            stdout.contains("PASS: ln refused symlink destination, victim untouched"),
+            "missing no-follow/create-only proof: {stdout}"
+        );
+        assert!(
+            stdout.contains("PASS: single-file nullfs concurrent append kept all 100 lines"),
+            "missing concurrent-append proof: {stdout}"
+        );
     }
 
     #[test]
@@ -2045,27 +2511,27 @@ mod tests {
             "sweep must not clone"
         );
 
-        // The sweep re-establishes BOTH nullfs pile mounts for the down jail
-        // (bob), mirroring the open-reattach mount assertions — mount coverage
-        // is now pinned on the sweep arm too.
+        // The sweep re-establishes BOTH single-file pile mounts for the down
+        // jail (bob), mirroring the open-reattach mount assertions — mount
+        // coverage is now pinned on the sweep arm too.
         let bob_root = "/aitemp/playground/playground-bob";
         assert!(
             calls.iter().any(|c| c == &[
                 "sudo".to_string(), "-n".into(), "mount".into(), "-t".into(),
                 "nullfs".into(),
-                "/aitemp/playground/piles/playground-bob".into(),
-                format!("{bob_root}/pile"),
+                "/aitemp/playground/piles/playground-bob/self.pile".into(),
+                format!("{bob_root}/pile/self.pile"),
             ]),
-            "sweep must nullfs-mount the self pile at /pile for the down jail: {calls:?}"
+            "sweep must single-file-nullfs-mount the self.pile at /pile/self.pile for the down jail: {calls:?}"
         );
         assert!(
             calls.iter().any(|c| c == &[
                 "sudo".to_string(), "-n".into(), "mount".into(), "-t".into(),
                 "nullfs".into(),
-                "/aitemp/playground/piles/shared".into(),
-                format!("{bob_root}/shared"),
+                "/aitemp/playground/piles/shared/shared.pile".into(),
+                format!("{bob_root}/shared/shared.pile"),
             ]),
-            "sweep must nullfs-mount the shared pile at /shared for the down jail: {calls:?}"
+            "sweep must single-file-nullfs-mount the shared.pile at /shared/shared.pile for the down jail: {calls:?}"
         );
     }
 
