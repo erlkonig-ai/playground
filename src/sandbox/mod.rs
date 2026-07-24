@@ -27,10 +27,63 @@ pub mod jail;
 pub mod lima;
 pub mod proc;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use anyhow::Result;
+
+/// Per-canonical-key lifecycle lock manager.
+///
+/// Serializes the create/open/close/destroy lifecycle of a single tenant so two
+/// concurrent operations on the SAME box cannot race (the blocker-#3 concurrent-
+/// create data-loss class, and the mcp.rs refcount close/open orphan window).
+/// The key is the tenant's CANONICAL physical identity — for the jail backend
+/// that is the injective `jail_name` (repair #1), so two labels that map to one
+/// box also map to one lock.
+///
+/// It is a map of key -> `Arc<Mutex<()>>`. [`Self::with_lock`] runs a closure
+/// while holding the per-key mutex, so a lifecycle entry point wraps its whole
+/// body in one call. The map only ever grows (a handful of tenants); an unused
+/// entry is a bare `Arc<Mutex<()>>` that costs nothing.
+///
+/// This is an IN-PROCESS lock: it serializes everything inside one playground
+/// process (the daemon's concurrent open/close, and any in-process concurrent
+/// provision/destroy). It does NOT span the separate `playground user` CLI
+/// process and the daemon — that residual cross-process window is covered
+/// instead by the backend's tri-state probe + operation-owned cleanup (a
+/// concurrent create is non-destructive even unlocked), with a host flock a
+/// noted follow-up.
+#[derive(Default)]
+pub struct LifecycleLocks {
+    locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+}
+
+impl LifecycleLocks {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Look up (creating on first use) the per-key mutex and return its `Arc`.
+    fn mutex_for(&self, key: &str) -> Arc<Mutex<()>> {
+        self.locks
+            .lock()
+            .expect("lifecycle locks poisoned")
+            .entry(key.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    /// Run `body` while holding the lifecycle lock for `key`, blocking until the
+    /// lock is free. The entire lifecycle operation happens under the lock, so a
+    /// same-key operation elsewhere waits its turn.
+    pub fn with_lock<T>(&self, key: &str, body: impl FnOnce() -> T) -> T {
+        let mutex = self.mutex_for(key);
+        let _guard: MutexGuard<'_, ()> = mutex.lock().expect("tenant lifecycle lock poisoned");
+        body()
+    }
+}
 
 /// A logical sandbox session: one isolated, stateful shell.
 ///
@@ -139,6 +192,17 @@ pub struct ExecResult {
 pub trait SandboxBackend: Send + Sync {
     /// Human-readable backend name for diagnostics ("lima", "seatbelt", ...).
     fn name(&self) -> &'static str;
+
+    /// The CANONICAL physical key for a tenant: the stable identity that maps
+    /// two aliasing labels to ONE sandbox. The provider uses it to pick a
+    /// per-tenant lifecycle lock BEFORE it knows the eventual `SessionId`, so
+    /// open and close serialize on the same lock (closing the refcount
+    /// close/open orphan race). For the jail backend this is the injective
+    /// `jail_name` (repair #1); the default is the raw label, correct for
+    /// backends whose session id is a 1:1 function of the label.
+    fn canonical_key(&self, tenant: &Tenant) -> String {
+        tenant.label.clone()
+    }
 
     /// Open a session on an ALREADY-provisioned sandbox and return its session
     /// id. On the shipped persistent backends (jail, lima) this is pure

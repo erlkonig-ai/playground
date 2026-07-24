@@ -127,7 +127,7 @@ use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 
 use super::proc::drive_child;
-use super::{ExecRequest, ExecResult, SandboxBackend, SessionId, SessionSpec};
+use super::{ExecRequest, ExecResult, LifecycleLocks, SandboxBackend, SessionId, SessionSpec};
 
 /// Output of one host command, however it was transported. Local-backstop
 /// timeouts set `timed_out`; server-side `timeout(1)` expiry shows up as
@@ -143,6 +143,31 @@ const ADMIN_TIMEOUT: Duration = Duration::from_secs(120);
 /// server kill is authoritative; the local kill only fires if SSH itself
 /// wedges.
 const LOCAL_TIMEOUT_GRACE: Duration = Duration::from_secs(20);
+
+/// Tri-state, ERROR-PRESERVING result of a "does this ZFS dataset exist?" probe.
+///
+/// A plain `bool` collapses transport failure, permission failure, timeout, and
+/// true absence all into "no", and a lifecycle op that then runs destructive
+/// cleanup (`zfs destroy`) on a merely-transient probe failure can DESTROY a
+/// valid persistent workspace (the 2026-07-24 blocker-#3 data-loss class). This
+/// enum keeps the three cases apart so a caller can fail CLOSED on doubt:
+///
+///   - [`DatasetState::Exists`] — `zfs list` returned success. The dataset is
+///     definitely present.
+///   - [`DatasetState::Absent`] — `zfs list` failed with the CANONICAL
+///     "dataset does not exist" signal (exit non-zero AND the stderr ZFS emits
+///     for a genuinely missing name). Only in this state is it safe to treat a
+///     tenant as un-provisioned / free to clone into.
+///   - [`DatasetState::Unknown`] — anything else: a transport error (ssh 255),
+///     a local timeout, a permission failure, a faulted pool, or any non-zero
+///     exit whose stderr is NOT the not-found signal. The probe simply does not
+///     know, so NO destructive action may run on this state — the caller bails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DatasetState {
+    Exists,
+    Absent,
+    Unknown,
+}
 
 /// Runs one argv on the jail host. The seam that makes [`JailBackend`]
 /// testable without a FreeBSD server (mirror of the mock-backend pattern in
@@ -278,6 +303,13 @@ pub struct JailBackend {
     /// coworker's `self.pile` (and used to seed the shared pile the first time).
     /// This is the server-side bootstrap seed, not any caller-supplied pile.
     pub bootstrap_pile: String,
+    /// Per-canonical-tenant (jail-name-keyed) lifecycle lock. Serializes
+    /// provision / open / destroy for one tenant WITHIN this process, so two
+    /// concurrent lifecycle ops on the same box cannot race (blocker #3). The
+    /// mcp `SandboxProvider` holds its own [`LifecycleLocks`] over open/close to
+    /// serialize the refcount race; this one covers the backend-driven paths
+    /// (notably the `playground user create`/`destroy` CLI).
+    lifecycle: LifecycleLocks,
 }
 
 impl JailBackend {
@@ -303,6 +335,7 @@ impl JailBackend {
             dataset_parent: "aitemp/playground".to_string(),
             pile_root: "/aitemp/playground/piles".to_string(),
             bootstrap_pile: "/aitemp/playground/bootstrap.pile".to_string(),
+            lifecycle: LifecycleLocks::new(),
         }
     }
 
@@ -570,58 +603,109 @@ impl JailBackend {
     /// jail's OWN clone directory — never a writable host directory.
     const GUEST_SHARED_PILE: &'static str = "/shared/shared.pile";
 
-    /// Ensure the guest single-file mount TARGET exists: `mkdir -p` its parent
-    /// dir (which is the jail's OWN clone directory — `/pile` or `/shared`) then
-    /// `touch` the empty target file the pile is mounted onto. Both live inside
-    /// the throwaway clone, so a tenant tampering with them (or with siblings
-    /// next to them) only dirties its own box, never a host directory.
-    fn ensure_mount_target(&self, target: &str) {
-        // `dirname` without an extra host round-trip: the guest file paths are
-        // fixed constants (`/pile/self.pile`, `/shared/shared.pile`), so the
-        // parent is the substring before the final '/'.
-        let parent = match target.rfind('/') {
-            Some(i) => &target[..i],
-            None => target,
-        };
-        let _ = self.run(&["sudo", "-n", "mkdir", "-p", parent], None, ADMIN_TIMEOUT);
-        let _ = self.run(&["sudo", "-n", "touch", target], None, ADMIN_TIMEOUT);
+    /// The nullfs filesystem type — the one `(fstype)` a pile mount is ever
+    /// allowed to be. Used to validate the exact `(source, target, fstype)`
+    /// tuple before trusting a reused mount (never a devfs/procfs/zfs shadowing
+    /// the pile target).
+    const PILE_FSTYPE: &'static str = "nullfs";
+
+    /// True iff a `mount(8)` listing already shows EXACTLY the intended mount:
+    /// `<host_file> on <target> (nullfs, …)`. Parses each line in the FreeBSD
+    /// shape `"<src> on <TARGET> (<fstype>, <opts>)"` and requires all three of
+    /// source, whole-token target, and fstype to match — so a DIFFERENT source
+    /// mounted at `target` (a tenant-planted redirection), or a non-nullfs
+    /// filesystem, is NOT accepted as our mount. This is the exact-mount
+    /// validation the reattach path needs before it trusts a reused jail's pile
+    /// mount instead of blindly starting the jail.
+    fn mount_listing_has_exact(listing: &str, host_file: &str, target: &str) -> bool {
+        listing.lines().any(|line| {
+            // Split on the literal " on " that FreeBSD `mount` prints between
+            // source and target. rsplit-once would misparse a source containing
+            // " on ", but our sources are pile paths, so split_once is safe and
+            // simplest; guard the source match to the exact prefix anyway.
+            let Some((src, rest)) = line.split_once(" on ") else {
+                return false;
+            };
+            if src.trim() != host_file {
+                return false;
+            }
+            // `rest` is "<TARGET> (<fstype>, <opts>)". The target is everything
+            // up to the " (" that opens the fstype group; take it as a whole so
+            // `/pile/self.pile` never matches a substring of another path.
+            let Some((tgt, tail)) = rest.split_once(" (") else {
+                return false;
+            };
+            tgt.trim() == target
+                && tail
+                    .split([',', ')'])
+                    .next()
+                    .map(|fs| fs.trim() == Self::PILE_FSTYPE)
+                    .unwrap_or(false)
+        })
     }
 
-    /// Single-file-nullfs-mount `host_file` read-write onto `<root><guest_file>`,
-    /// first ensuring the guest target file exists. Mounting the FILE (not its
-    /// parent directory) is the symlink-confused-deputy fix: the jail's `/pile`
-    /// and `/shared` are the jail's OWN clone dirs, never writable host dirs.
+    /// Read the current `mount(8)` listing, failing CLOSED if the command itself
+    /// failed (we must never proceed on an unreadable mount table — a silently
+    /// empty listing would let a missing mount pass as "already correct").
+    fn mount_listing(&self) -> Result<String> {
+        let out = self.run(&["sudo", "-n", "mount"], None, ADMIN_TIMEOUT)?;
+        if !out.success() {
+            bail!("`mount` failed: {}", out.stderr_lossy());
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    /// THE ONE shared, FAIL-CLOSED single-file pile mount primitive, used by BOTH
+    /// fresh provision AND reattach (so reattach is no longer the weak path).
     ///
-    /// The mount's own status is deliberately IGNORED — this is the REATTACH
-    /// path. A re-mount of the same source file at the same live target FAILS
-    /// (FreeBSD 15.1: EBUSY, "Device busy") but crucially does NOT stack: exactly
-    /// one mount remains and a single `umount` clears it (verified 2026-07-24).
-    /// So a re-mount over a mount that never went away is a safe no-op. The
-    /// fresh-provision path uses [`JailBackend::nullfs_mount_verified`], which
-    /// does NOT ignore the status (a first-mount failure there is fatal).
-    fn nullfs_mount(&self, host_file: &str, root: &str, guest_file: &str) {
+    /// Single-file-nullfs-mounts `host_file` rw onto `<root><guest_file>` and
+    /// GUARANTEES, on success, that the exact intended mount
+    /// `(source=host_file, target, fstype=nullfs)` is live. It handles the two
+    /// legitimate entry states uniformly and refuses every dangerous one:
+    ///
+    ///   1. **Already correctly mounted** (the reattach EBUSY no-op case): a
+    ///      re-mount of the same source at the same live target FAILS with EBUSY
+    ///      on FreeBSD 15.1 and does NOT stack. Rather than ignore the mount
+    ///      status (the old weak reattach path), we VALIDATE the pre-existing
+    ///      mount is EXACTLY ours first; if so, this is a verified no-op.
+    ///   2. **Not yet mounted** (fresh provision, or the mount went away across a
+    ///      restart): ensure the target file exists, mount, then re-read the
+    ///      table and CONFIRM the exact `(source, target, nullfs)` tuple is now
+    ///      present.
+    ///
+    /// Fail closed on: an unreadable mount table; a target already occupied by a
+    /// DIFFERENT source or a non-nullfs filesystem (a tenant-controlled
+    /// mountpoint redirection — do NOT start/keep a jail whose pile target is
+    /// something we did not put there); a mount that reports success but does not
+    /// appear in the table; a failed mkdir/touch of the target. In every failure
+    /// the caller `bail!`s rather than booting a jail with a missing or
+    /// redirected `PILE`. `mkdir`/`touch` of the guest target traverse the jail's
+    /// OWN clone dir (never a host dir); the exact-tuple check is what makes the
+    /// mount itself trustworthy.
+    fn ensure_pile_mount(&self, host_file: &str, root: &str, guest_file: &str) -> Result<()> {
         let target = format!("{root}{guest_file}");
-        // Ensure the target file exists on EVERY attach — reattach doesn't run
-        // the fresh-provision arm that first made it.
-        self.ensure_mount_target(&target);
-        let _ = self.run(
-            &["sudo", "-n", "mount", "-t", "nullfs", host_file, &target],
-            None,
-            ADMIN_TIMEOUT,
-        );
-    }
 
-    /// Single-file-nullfs-mount `host_file` rw onto `<root><guest_file>` and
-    /// VERIFY the mount actually took, `bail!`-ing on a real failure. Used ONLY
-    /// on the fresh-provision path, where ignoring the status is dangerous: a
-    /// silently failed mount leaves guest `/pile/self.pile` on the EMPTY file
-    /// baked into the ZFS clone, so a faculty writes into the clone — which
-    /// `destroy_session` then `zfs destroy`s (silent data loss). We confirm the
-    /// mountpoint appears in `mount` output before trusting it. (On reattach the
-    /// EBUSY no-op from [`JailBackend::nullfs_mount`] applies instead, so
-    /// verification there would false-positive on the harmless duplicate.)
-    fn nullfs_mount_verified(&self, host_file: &str, root: &str, guest_file: &str) -> Result<()> {
-        let target = format!("{root}{guest_file}");
+        // If the target is ALREADY mounted, it must be EXACTLY our mount — same
+        // source, same target, nullfs. A different source or fstype at this path
+        // is a redirection we refuse to trust (blocker #3: a tenant-controlled
+        // underlying mountpoint must never become a silently-accepted PILE).
+        let listing = self.mount_listing()?;
+        if listing
+            .lines()
+            .any(|line| Self::line_target_is(line, &target))
+        {
+            if Self::mount_listing_has_exact(&listing, host_file, &target) {
+                // Reattach no-op: the pre-existing mount is precisely ours.
+                return Ok(());
+            }
+            bail!(
+                "refusing to reuse jail: pile target {target} is already mounted by \
+                 something other than {host_file} (nullfs) — possible mount redirection"
+            );
+        }
+
+        // Not mounted yet: ensure the guest target FILE exists (inside the jail's
+        // own clone), then mount.
         let parent = match target.rfind('/') {
             Some(i) => &target[..i],
             None => target.as_str(),
@@ -642,45 +726,37 @@ impl JailBackend {
         if !mount.success() {
             bail!("nullfs mount {host_file} -> {target} failed: {}", mount.stderr_lossy());
         }
-        // Post-condition: the target must actually be a mountpoint now. A
-        // silently-failed mount (exit 0 but nothing mounted) would leave
-        // /pile/self.pile on the empty clone file; catch it here, before
-        // /etc/profile points PILE at it.
-        let check = self.run(&["sudo", "-n", "mount"], None, ADMIN_TIMEOUT)?;
-        if !check.success() {
-            bail!("verify mount {target}: `mount` failed: {}", check.stderr_lossy());
-        }
-        let listing = String::from_utf8_lossy(&check.stdout);
-        // `mount` prints one line per filesystem as "src on TARGET (type, …)";
-        // require the exact target as a whitespace-delimited token so
-        // /pile/self.pile does not match a substring.
-        let mounted = listing
-            .lines()
-            .any(|line| line.split_whitespace().any(|tok| tok == target));
-        if !mounted {
-            bail!("nullfs mount {host_file} -> {target} did not take (not in `mount` output)");
+        // Post-condition: re-read the table and confirm the EXACT tuple is live.
+        // A silently-failed mount (exit 0, nothing mounted) would leave the guest
+        // pile on the EMPTY clone file, silently redirecting PILE to throwaway
+        // scratch that `destroy_session` later `zfs destroy`s (data loss).
+        let after = self.mount_listing()?;
+        if !Self::mount_listing_has_exact(&after, host_file, &target) {
+            bail!(
+                "nullfs mount {host_file} -> {target} did not take exactly \
+                 (not present as ({host_file}, {target}, nullfs) in `mount` output)"
+            );
         }
         Ok(())
     }
 
-    /// Re-establish BOTH single-file pile mounts (self + shared) over a jail root
-    /// on the REATTACH path — the mounts do NOT survive a jail restart, exactly
-    /// like the devfs mount. Status is ignored: a re-mount over a still-live
-    /// mount is a safe no-op (see `nullfs_mount`). Each mount first ensures its
-    /// guest target file exists, so reattach works even though it never ran the
-    /// fresh-provision arm that originally made them.
-    fn mount_piles(&self, jail: &str, root: &str) {
-        self.nullfs_mount(&self.self_pile_file(jail), root, Self::GUEST_SELF_PILE);
-        self.nullfs_mount(&self.shared_pile_file(), root, Self::GUEST_SHARED_PILE);
+    /// Whether a `mount` line's TARGET token equals `target` (whole-token, so
+    /// `/pile/self.pile` never matches a longer path). Shared by the
+    /// already-mounted probe and the exact-tuple check.
+    fn line_target_is(line: &str, target: &str) -> bool {
+        line.split_once(" on ")
+            .and_then(|(_, rest)| rest.split_once(" ("))
+            .map(|(tgt, _)| tgt.trim() == target)
+            .unwrap_or(false)
     }
 
-    /// Fresh-provision variant of [`JailBackend::mount_piles`]: mount BOTH piles
-    /// and VERIFY each took (see `nullfs_mount_verified`). A failure `bail!`s,
-    /// which on the provision path cleanly triggers `cleanup_leftovers` —
-    /// preferable to a silently-empty /pile that later gets `zfs destroy`ed.
-    fn mount_piles_verified(&self, jail: &str, root: &str) -> Result<()> {
-        self.nullfs_mount_verified(&self.self_pile_file(jail), root, Self::GUEST_SELF_PILE)?;
-        self.nullfs_mount_verified(&self.shared_pile_file(), root, Self::GUEST_SHARED_PILE)?;
+    /// Re-establish BOTH single-file pile mounts (self + shared) over a jail
+    /// root, FAIL-CLOSED, via the one shared [`JailBackend::ensure_pile_mount`]
+    /// primitive. Used by BOTH fresh provision and reattach: a failure `bail!`s
+    /// so no jail is ever started or kept with a missing/redirected pile mount.
+    fn mount_piles(&self, jail: &str, root: &str) -> Result<()> {
+        self.ensure_pile_mount(&self.self_pile_file(jail), root, Self::GUEST_SELF_PILE)?;
+        self.ensure_pile_mount(&self.shared_pile_file(), root, Self::GUEST_SHARED_PILE)?;
         Ok(())
     }
 
@@ -791,47 +867,101 @@ impl JailBackend {
             .unwrap_or(false)
     }
 
-    /// True iff the ZFS dataset exists. `zfs list <dataset>` exits 0 when the
-    /// dataset is present, non-zero otherwise.
-    fn dataset_exists(&self, dataset: &str) -> bool {
-        self.run(&["sudo", "-n", "zfs", "list", dataset], None, ADMIN_TIMEOUT)
-            .map(|o| o.success())
-            .unwrap_or(false)
+    /// TRI-STATE, error-preserving probe for a ZFS dataset (see
+    /// [`DatasetState`]). `zfs list <dataset>` exits 0 when the dataset is
+    /// present; on absence it exits non-zero with a stderr that includes the
+    /// canonical `dataset does not exist` phrase. We classify:
+    ///
+    ///   - runner `Err`, a local timeout, or the runner's transport-error exit
+    ///     (ssh 255) -> [`DatasetState::Unknown`] (we never reached / trusted
+    ///     the answer);
+    ///   - exit 0 -> [`DatasetState::Exists`];
+    ///   - a non-zero exit whose stderr contains the not-found phrase ->
+    ///     [`DatasetState::Absent`];
+    ///   - ANY OTHER non-zero exit (permission denied, faulted pool, an
+    ///     unexpected message) -> [`DatasetState::Unknown`].
+    ///
+    /// Callers must NEVER run destructive cleanup on `Unknown`: on doubt, fail
+    /// closed and destroy nothing. This is the primary fix for the blocker-#3
+    /// data-loss class where a transient SSH failure looked identical to a real
+    /// absence and triggered a `zfs destroy` of a valid workspace.
+    fn dataset_state(&self, dataset: &str) -> DatasetState {
+        let out = match self.run(&["sudo", "-n", "zfs", "list", dataset], None, ADMIN_TIMEOUT) {
+            Ok(out) => out,
+            // The command never produced a trustworthy status (spawn failed,
+            // pipe error, ...). We do not know — fail closed.
+            Err(_) => return DatasetState::Unknown,
+        };
+        if out.success() {
+            return DatasetState::Exists;
+        }
+        // A local wall-clock kill or the transport's own error exit (ssh 255)
+        // means we never got ZFS's real answer — Unknown, not Absent.
+        if out.timed_out || (out.exit_code.is_some() && out.exit_code == self.runner.transport_error_exit())
+        {
+            return DatasetState::Unknown;
+        }
+        // Non-zero from ZFS itself: only the canonical not-found stderr proves a
+        // genuine absence. Anything else (permission, faulted pool, an
+        // unexpected error) is Unknown — we refuse to treat it as "free to
+        // clone into / safe to destroy".
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if stderr.contains("does not exist") {
+            DatasetState::Absent
+        } else {
+            DatasetState::Unknown
+        }
     }
 
     /// Re-establish a jail context over an EXISTING persistent dataset: the
-    /// ephemeral devfs mount (does not survive a reboot) plus `jail -c`. The
-    /// dataset and its `/etc/profile` are left exactly as they are — this
-    /// clones nothing and re-seeds nothing. Shared by `open_session`'s reattach
-    /// arm, `provision_sandbox`'s already-provisioned arm, and `reattach_all`.
+    /// ephemeral devfs mount (does not survive a reboot) plus the two pile mounts
+    /// plus `jail -c`. The dataset and its `/etc/profile` are left exactly as
+    /// they are — this clones nothing and re-seeds nothing. Shared by
+    /// `open_session`'s reattach arm, `provision_sandbox`'s already-provisioned
+    /// arm, and `reattach_all`.
     ///
-    /// The devfs re-mount's own status is deliberately ignored: if /dev is
-    /// already mounted from a still-live mount, the mount fails with "already
-    /// mounted" and that is fine; any other failure leaves /dev broken, which
-    /// the first `jexec` surfaces loudly (a broken /dev shows up at exec time,
-    /// not attach time — cleaner than brittle stderr matching here).
-    ///
-    /// The two single-file pile mounts (self + shared) are re-established the
-    /// same ignore-status way, but for a DIFFERENT mechanism than devfs's
-    /// "already mounted": a duplicate single-file nullfs mount of the same source
-    /// at the same live target FAILS with EBUSY ("Device busy") and does NOT
-    /// stack (verified on FreeBSD 15.1, 2026-07-24 — exactly one mount survives a
-    /// re-mount over a live one, and a single umount clears it). So a re-mount
-    /// over a still-live pile mount is a safe no-op here. Note this is the
-    /// reattach path; the first-ever provision uses the VERIFIED mount
-    /// (`mount_piles_verified`), where a silent mount failure is fatal.
+    /// FAIL-CLOSED (blocker #3): reattach used to ignore devfs / nullfs mount
+    /// failures and start the jail anyway, silently redirecting `PILE` to
+    /// clone-local scratch and, worse, letting a tenant-controlled underlying
+    /// mountpoint become a later host-root mount redirection. Now BOTH pile
+    /// mounts go through the one shared [`JailBackend::ensure_pile_mount`]
+    /// primitive (exact `(source, target, nullfs)` validation, so a redirected
+    /// or missing pile target aborts the reattach) AND we VERIFY devfs took —
+    /// establishing every mount BEFORE `jail -c`, so a jail is never started with
+    /// a missing or redirected mount. Fresh provision and reattach share this one
+    /// primitive; reattach is no longer the weak path.
     fn reattach(&self, jail: &str, dataset: &str) -> Result<()> {
         let root = self.mountpoint(dataset)?;
+        // devfs: re-mount and VERIFY it is live. A re-mount over a still-live
+        // devfs fails "already mounted", so we do not gate on the mount's own
+        // exit; instead we confirm `{root}/dev` is a devfs mount in the table
+        // afterward (covers both the fresh mount and the already-mounted no-op),
+        // and fail closed if it is absent — a jail with a broken /dev must not
+        // start.
+        let dev_target = format!("{root}/dev");
         let _ = self.run(
             &[
                 "sudo", "-n", "mount", "-t", "devfs", "-o", "ruleset=4", "devfs",
-                &format!("{root}/dev"),
+                &dev_target,
             ],
             None,
             ADMIN_TIMEOUT,
         );
-        // Pile mounts do not survive a jail restart either — re-establish both.
-        self.mount_piles(jail, &root);
+        let listing = self.mount_listing()?;
+        let devfs_live = listing.lines().any(|line| {
+            Self::line_target_is(line, &dev_target)
+                && line
+                    .split_once(" (")
+                    .and_then(|(_, tail)| tail.split([',', ')']).next())
+                    .map(|fs| fs.trim() == "devfs")
+                    .unwrap_or(false)
+        });
+        if !devfs_live {
+            bail!("reattach {jail}: devfs not mounted at {dev_target} (refusing to start jail)");
+        }
+        // Pile mounts do not survive a jail restart either — re-establish both,
+        // FAIL-CLOSED (exact-tuple validated). A failure aborts before `jail -c`.
+        self.mount_piles(jail, &root)?;
         let created = self.run(
             &[
                 "sudo",
@@ -860,6 +990,13 @@ impl SandboxBackend for JailBackend {
         "jail"
     }
 
+    /// The canonical key IS the injective jail name (repair #1): the provider's
+    /// per-tenant lock and this backend's own lifecycle lock therefore agree on
+    /// one key per physical box, including for two labels that alias to one jail.
+    fn canonical_key(&self, tenant: &crate::sandbox::Tenant) -> String {
+        self.jail_name(&tenant.label)
+    }
+
     fn open_session(&self, spec: &SessionSpec) -> Result<SessionId> {
         Self::validate_label(&spec.tenant.label)?;
         let jail = self.jail_name(&spec.tenant.label);
@@ -881,42 +1018,64 @@ impl SandboxBackend for JailBackend {
             spec.tenant.pile.host_path.display()
         );
 
-        // Pure reuse-or-reattach: the box must already be provisioned (via
-        // `provision_sandbox` / `playground user create`). open NEVER clones.
+        // Serialize the whole reuse/reattach decision under the per-canonical-
+        // tenant lifecycle lock (blocker #3): a concurrent provision/destroy of
+        // the SAME box cannot interleave with this open.
+        self.lifecycle.with_lock(&jail, || {
+            // Pure reuse-or-reattach: the box must already be provisioned (via
+            // `provision_sandbox` / `playground user create`). open NEVER clones.
 
-        // 1. Already up? The tenant's jail context is running over its dataset;
-        //    just hand back the same id — no `jail -c`, no re-seed. First VERIFY
-        //    the dataset's recorded tenant matches the requester (authoritative
-        //    injectivity check): a mismatch means a digest collision or
-        //    tampering, and we refuse rather than hand over another tenant's box.
-        if self.jail_running(&jail) {
-            self.verify_tenant_property(&dataset, &spec.tenant.label)
-                .with_context(|| format!("verify tenant provenance for jail '{jail}'"))?;
-            eprintln!("[{}] reusing persistent sandbox '{}'", self.name(), jail);
-            return Ok(SessionId::new(jail));
-        }
+            // 1. Already up? The tenant's jail context is running over its
+            //    dataset; just hand back the same id — no `jail -c`, no re-seed.
+            //    First VERIFY the dataset's recorded tenant matches the requester
+            //    (authoritative injectivity check): a mismatch means a digest
+            //    collision or tampering, and we refuse rather than hand over
+            //    another tenant's box.
+            if self.jail_running(&jail) {
+                self.verify_tenant_property(&dataset, &spec.tenant.label)
+                    .with_context(|| format!("verify tenant provenance for jail '{jail}'"))?;
+                eprintln!("[{}] reusing persistent sandbox '{}'", self.name(), jail);
+                return Ok(SessionId::new(jail.clone()));
+            }
 
-        // 2. Not running, but the persistent dataset exists (host reboot /
-        //    playground restart wiped the jail context). Re-attach it: devfs
-        //    re-mount + `jail -c`, keeping the dataset and its /etc/profile as
-        //    they are. Never destroy the dataset on a transient failure — it is
-        //    the tenant's PERSISTENT storage. VERIFY the recorded tenant first,
-        //    same as the reuse arm.
-        if self.dataset_exists(&dataset) {
-            self.verify_tenant_property(&dataset, &spec.tenant.label)
-                .with_context(|| format!("verify tenant provenance for jail '{jail}'"))?;
-            eprintln!("[{}] reattaching persistent sandbox '{}'", self.name(), jail);
-            self.reattach(&jail, &dataset)
-                .with_context(|| format!("reattach jail '{jail}'"))?;
-            return Ok(SessionId::new(jail));
-        }
-
-        // 3. No dataset at all: the tenant was never provisioned.
-        bail!(
-            "sandbox for tenant '{}' is not provisioned — run `playground user create {}`",
-            spec.tenant.label,
-            spec.tenant.label
-        )
+            // 2. Not running: probe the persistent dataset with a TRI-STATE,
+            //    error-preserving check so a transient failure never masquerades
+            //    as absence. `open_session` never destroys anything, but it must
+            //    still distinguish a genuine "not provisioned" (Absent) from "the
+            //    probe could not tell" (Unknown) so it fails CLOSED on doubt
+            //    rather than emitting a misleading "run `playground user create`".
+            match self.dataset_state(&dataset) {
+                // The persistent dataset exists (host reboot / playground restart
+                // wiped the jail context). Re-attach it: devfs + pile re-mount +
+                // `jail -c`, keeping the dataset and its /etc/profile as they are.
+                // Never destroy the dataset — it is the tenant's PERSISTENT
+                // storage. VERIFY the recorded tenant first, same as the reuse arm.
+                DatasetState::Exists => {
+                    self.verify_tenant_property(&dataset, &spec.tenant.label)
+                        .with_context(|| format!("verify tenant provenance for jail '{jail}'"))?;
+                    eprintln!("[{}] reattaching persistent sandbox '{}'", self.name(), jail);
+                    self.reattach(&jail, &dataset)
+                        .with_context(|| format!("reattach jail '{jail}'"))?;
+                    Ok(SessionId::new(jail.clone()))
+                }
+                // 3. No dataset at all: the tenant was never provisioned.
+                DatasetState::Absent => bail!(
+                    "sandbox for tenant '{}' is not provisioned — run `playground user create {}`",
+                    spec.tenant.label,
+                    spec.tenant.label
+                ),
+                // The probe failed for a reason that is NOT a clean absence
+                // (transport error, timeout, permission, faulted pool). Fail
+                // closed: do not reattach a box we cannot confirm and do not claim
+                // it is unprovisioned.
+                DatasetState::Unknown => bail!(
+                    "cannot determine sandbox state for tenant '{}' (dataset {} probe was \
+                     inconclusive — transport/permission/timeout); refusing to act",
+                    spec.tenant.label,
+                    dataset
+                ),
+            }
+        })
     }
 
     fn provision_sandbox(&self, spec: &SessionSpec) -> Result<()> {
@@ -924,24 +1083,47 @@ impl SandboxBackend for JailBackend {
         let jail = self.jail_name(&spec.tenant.label);
         let dataset = self.dataset(&jail);
 
+        // Serialize the entire create/converge under the per-canonical-tenant
+        // lifecycle lock (blocker #3): a concurrent provision/open/destroy of the
+        // SAME box cannot interleave with this one. Combined with the tri-state
+        // probe + operation-owned cleanup below, a concurrent create can neither
+        // clone-over nor destroy a valid dataset.
+        self.lifecycle.with_lock(&jail, || {
         // Idempotent: a tenant whose dataset already exists is already
         // provisioned. Don't clone or re-seed; just ensure the jail is up so
         // `provision` doubles as "converge to running" (reattach if the jail
         // context is gone). VERIFY the recorded tenant first (authoritative
         // injectivity check), same as `open_session`'s reuse arms.
-        if self.dataset_exists(&dataset) {
-            self.verify_tenant_property(&dataset, &spec.tenant.label)
-                .with_context(|| format!("verify tenant provenance for jail '{jail}'"))?;
-            eprintln!(
-                "[{}] sandbox '{}' already provisioned; ensuring it is up",
-                self.name(),
-                jail
-            );
-            if !self.jail_running(&jail) {
-                self.reattach(&jail, &dataset)
-                    .with_context(|| format!("reattach existing jail '{jail}'"))?;
+        //
+        // TRI-STATE probe: we only proceed to CLONE on a definite `Absent`. An
+        // `Unknown` (transport/permission/timeout) must NOT fall through to the
+        // clone path — a clone into a name whose real state is unknown, followed
+        // by a failure, is exactly the situation that used to `zfs destroy` a
+        // valid dataset. Fail closed instead.
+        match self.dataset_state(&dataset) {
+            DatasetState::Exists => {
+                self.verify_tenant_property(&dataset, &spec.tenant.label)
+                    .with_context(|| format!("verify tenant provenance for jail '{jail}'"))?;
+                eprintln!(
+                    "[{}] sandbox '{}' already provisioned; ensuring it is up",
+                    self.name(),
+                    jail
+                );
+                if !self.jail_running(&jail) {
+                    self.reattach(&jail, &dataset)
+                        .with_context(|| format!("reattach existing jail '{jail}'"))?;
+                }
+                return Ok(());
             }
-            return Ok(());
+            DatasetState::Unknown => bail!(
+                "cannot determine sandbox state for tenant '{}' (dataset {} probe was \
+                 inconclusive — transport/permission/timeout); refusing to provision \
+                 (would risk cloning over or destroying an existing workspace)",
+                spec.tenant.label,
+                dataset
+            ),
+            // Definitely absent: safe to clone a fresh box below.
+            DatasetState::Absent => {}
         }
 
         eprintln!(
@@ -951,9 +1133,20 @@ impl SandboxBackend for JailBackend {
             dataset
         );
 
+        // OPERATION-OWNED CLEANUP: a failed provision may only tear down what
+        // THIS operation created. `created_clone` flips true the instant our own
+        // `zfs clone` succeeds; on failure we only `zfs destroy` when it is set,
+        // so a provision that fails BEFORE (or AT) the clone never destroys a
+        // dataset it did not make. This closes the concurrent-create data-loss
+        // race: even if two provisions somehow both proceed past the tri-state
+        // probe, the loser's `zfs clone` fails EEXIST (it did not create the
+        // dataset), `created_clone` stays false, and the winner's valid dataset
+        // is left untouched.
+        let mut created_clone = false;
+
         // Brand-new tenant: clone the template, then set up /dev, cwd, and
         // /etc/profile from scratch, then `jail -c`.
-        let provision = (|| -> Result<()> {
+        let provision = (|created_clone: &mut bool| -> Result<()> {
             let clone = self.run(
                 &["sudo", "-n", "zfs", "clone", &self.template_snapshot, &dataset],
                 None,
@@ -966,6 +1159,9 @@ impl SandboxBackend for JailBackend {
                     clone.stderr_lossy()
                 );
             }
+            // Our clone succeeded: from here on, teardown of THIS dataset is
+            // ours to do on failure (and only ours).
+            *created_clone = true;
 
             // Record the ORIGINAL tenant label on the dataset immediately after
             // the clone: this is the authoritative provenance the reuse/reattach
@@ -1095,15 +1291,16 @@ impl SandboxBackend for JailBackend {
                 bail!("chflags sappnd shared.pile failed: {}", protect_shared.stderr_lossy());
             }
 
-            // single-file-nullfs-mount BOTH pile files rw (each touches its own
-            // guest target file first). The mounts themselves do not survive a jail
-            // restart (re-established by `reattach`), but they must be live for
-            // this first `jail -c`. On the fresh-provision path we VERIFY each
-            // mount took: a silently-failed mount would leave guest /pile on the
-            // EMPTY dir baked into the clone, so PILE=/pile/self.pile writes into
-            // the clone, which destroy_session then `zfs destroy`s — silent data
-            // loss. A bail! here cleanly triggers cleanup_leftovers.
-            self.mount_piles_verified(&jail, &root)?;
+            // single-file-nullfs-mount BOTH pile files rw via the one shared
+            // FAIL-CLOSED primitive (same one reattach uses). The mounts do not
+            // survive a jail restart (re-established by `reattach`), but they must
+            // be live and EXACTLY correct for this first `jail -c`: a silently-
+            // failed mount would leave guest /pile on the EMPTY file baked into
+            // the clone, so PILE=/pile/self.pile writes into the clone, which
+            // destroy_session then `zfs destroy`s — silent data loss. A bail! here
+            // triggers the operation-owned cleanup (we created the clone, so it is
+            // ours to tear down).
+            self.mount_piles(&jail, &root)?;
 
             // Seed session env + default cwd via /etc/profile, which `sh -l`
             // sources on every exec (same mechanism as the Lima template's
@@ -1153,15 +1350,34 @@ impl SandboxBackend for JailBackend {
                 bail!("jail -c {jail} failed: {}", created.stderr_lossy());
             }
             Ok(())
-        })();
+        })(&mut created_clone);
 
         if let Err(e) = provision {
-            // A brand-new box that failed to provision must not leak a
-            // half-made dataset.
-            self.cleanup_leftovers(&jail);
+            if created_clone {
+                // THIS operation created the clone and then failed part-way: it
+                // is ours to tear down, and only this dataset. `cleanup_leftovers`
+                // stops the jail, unmounts, and `zfs destroy`s the dataset we
+                // just made — never a pre-existing one, because we only reach
+                // here with `created_clone == true`.
+                self.cleanup_leftovers(&jail);
+            } else {
+                // We failed AT or BEFORE the clone (e.g. the clone lost an
+                // EEXIST race to a concurrent provision, or the tri-state probe
+                // path let us in but the clone still refused). We did NOT create
+                // this dataset, so we destroy NOTHING — the existing/winning
+                // dataset stays intact. This is the operation-owned-cleanup
+                // invariant that makes concurrent creates non-destructive.
+                eprintln!(
+                    "[{}] provision '{}' failed before creating the dataset; \
+                     destroying nothing (operation-owned cleanup)",
+                    self.name(),
+                    jail
+                );
+            }
             return Err(e.context(format!("provision jail '{jail}'")));
         }
         Ok(())
+        })
     }
 
     fn reattach_all(&self) -> Result<usize> {
@@ -1290,43 +1506,51 @@ impl SandboxBackend for JailBackend {
         }
         let dataset = self.dataset(jail);
 
-        // Remove the jail (kills its processes). Failure is tolerated — the
-        // jail may already be gone — but is surfaced on stderr.
-        let removed = self.run(&["sudo", "-n", "jail", "-r", jail], None, ADMIN_TIMEOUT)?;
-        if !removed.success() {
-            eprintln!(
-                "[{}] jail -r {jail}: {} (continuing to dataset teardown)",
-                self.name(),
-                removed.stderr_lossy()
-            );
-        }
-
-        // Unmount devfs AND the two single-file pile mounts (must precede zfs
-        // destroy: a dataset with mounts anywhere under its tree cannot be
-        // destroyed — enforce_statfs). Model B: we unmount the piles but NEVER
-        // delete the host self.pile or shared.pile — they are host-owned and
-        // outlive the jail (a re-provision reattaches the same self.pile).
-        if let Ok(root) = self.mountpoint(&dataset) {
-            for guest in [Self::GUEST_SELF_PILE, Self::GUEST_SHARED_PILE, "/dev"] {
-                let _ = self.run(
-                    &["sudo", "-n", "umount", "-f", &format!("{root}{guest}")],
-                    None,
-                    ADMIN_TIMEOUT,
+        // Serialize teardown under the per-canonical-tenant lifecycle lock
+        // (blocker #3): a concurrent provision/open of the SAME box cannot
+        // interleave with this destroy.
+        self.lifecycle.with_lock(jail, || {
+            // Remove the jail (kills its processes). Failure is tolerated — the
+            // jail may already be gone — but is surfaced on stderr.
+            let removed = self.run(&["sudo", "-n", "jail", "-r", jail], None, ADMIN_TIMEOUT)?;
+            if !removed.success() {
+                eprintln!(
+                    "[{}] jail -r {jail}: {} (continuing to dataset teardown)",
+                    self.name(),
+                    removed.stderr_lossy()
                 );
             }
-        }
 
-        // Destroy the dataset. This MUST succeed or we leak the session dataset;
-        // one retry covers transient "dataset is busy" races after jail -r.
-        let mut destroy = self.run(&["sudo", "-n", "zfs", "destroy", &dataset], None, ADMIN_TIMEOUT)?;
-        if !destroy.success() {
-            std::thread::sleep(Duration::from_secs(2));
-            destroy = self.run(&["sudo", "-n", "zfs", "destroy", &dataset], None, ADMIN_TIMEOUT)?;
-        }
-        if !destroy.success() {
-            bail!("zfs destroy {dataset} failed: {}", destroy.stderr_lossy());
-        }
-        Ok(())
+            // Unmount devfs AND the two single-file pile mounts (must precede zfs
+            // destroy: a dataset with mounts anywhere under its tree cannot be
+            // destroyed — enforce_statfs). Model B: we unmount the piles but NEVER
+            // delete the host self.pile or shared.pile — they are host-owned and
+            // outlive the jail (a re-provision reattaches the same self.pile).
+            if let Ok(root) = self.mountpoint(&dataset) {
+                for guest in [Self::GUEST_SELF_PILE, Self::GUEST_SHARED_PILE, "/dev"] {
+                    let _ = self.run(
+                        &["sudo", "-n", "umount", "-f", &format!("{root}{guest}")],
+                        None,
+                        ADMIN_TIMEOUT,
+                    );
+                }
+            }
+
+            // Destroy the dataset. This MUST succeed or we leak the session
+            // dataset; one retry covers transient "dataset is busy" races after
+            // jail -r.
+            let mut destroy =
+                self.run(&["sudo", "-n", "zfs", "destroy", &dataset], None, ADMIN_TIMEOUT)?;
+            if !destroy.success() {
+                std::thread::sleep(Duration::from_secs(2));
+                destroy =
+                    self.run(&["sudo", "-n", "zfs", "destroy", &dataset], None, ADMIN_TIMEOUT)?;
+            }
+            if !destroy.success() {
+                bail!("zfs destroy {dataset} failed: {}", destroy.stderr_lossy());
+            }
+            Ok(())
+        })
     }
 }
 
@@ -1341,11 +1565,26 @@ mod tests {
     /// prefix, defaulting to success with empty output. Tests hold an `Arc`
     /// to it and hand a clone to the backend (mirrors the mock-backend
     /// pattern in `crate::mcp` tests).
+    ///
+    /// The `mount(8)` family is modelled STATEFULLY (`mounts` below): a
+    /// `mount -t <fstype> <src> <target>` records a mount, `umount -f <target>`
+    /// removes it, and bare `mount` renders the live table in FreeBSD's
+    /// `"<src> on <TARGET> (<fstype>, local)"` shape. This makes the mock behave
+    /// like a real host for the fail-closed mount primitive: the pre-mount check
+    /// sees an empty target, the post-mount verify sees the exact tuple, a
+    /// re-mount over a live mount is the EBUSY no-op (recorded once, so the
+    /// exact-tuple check still passes), and a redirection (a different source at
+    /// a target) is faithfully refused. Tests that need the mount table itself to
+    /// fail script it explicitly (a scripted `mount`/`umount` prefix wins over the
+    /// stateful model).
     #[derive(Default)]
     struct MockRunner {
         calls: Mutex<Vec<(Vec<String>, Option<Vec<u8>>)>>,
-        /// (argv-prefix-to-match, canned output)
+        /// (argv-prefix-to-match, canned output). Checked FIRST, so a test can
+        /// force any command (including a `mount`/`umount`) to a canned result.
         script: Vec<(Vec<&'static str>, HostOutput)>,
+        /// Stateful mount table: `(source, target, fstype)`, newest last.
+        mounts: Mutex<Vec<(String, String, String)>>,
     }
 
     impl MockRunner {
@@ -1355,6 +1594,28 @@ mod tests {
         }
         fn calls(&self) -> Vec<Vec<String>> {
             self.calls.lock().unwrap().iter().map(|(a, _)| a.clone()).collect()
+        }
+        /// Seed a mount into the stateful table (e.g. to model a jail whose pile
+        /// mounts are already live for a reattach test).
+        fn with_mount(self, source: &str, target: &str, fstype: &str) -> Self {
+            self.mounts.lock().unwrap().push((
+                source.to_string(),
+                target.to_string(),
+                fstype.to_string(),
+            ));
+            self
+        }
+        /// Render the stateful mount table in FreeBSD `mount(8)` output shape.
+        fn render_mounts(&self) -> HostOutput {
+            let listing = self
+                .mounts
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(src, tgt, fs)| format!("{src} on {tgt} ({fs}, local)"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            ok_with_stdout(&format!("{listing}\n"))
         }
         /// Backend + handle pair: the backend owns one Arc clone, the test the other.
         fn into_backend(self) -> (JailBackend, Arc<MockRunner>) {
@@ -1369,12 +1630,42 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((argv.to_vec(), stdin.map(|b| b.to_vec())));
+            // Explicit scripts win, so a test can force any command to fail.
             for (prefix, out) in &self.script {
                 if argv.len() >= prefix.len()
                     && argv.iter().zip(prefix.iter()).all(|(a, p)| a == p)
                 {
                     return Ok(out.clone());
                 }
+            }
+            // Stateful mount table for the unscripted mount family.
+            let a: Vec<&str> = argv.iter().map(String::as_str).collect();
+            match a.as_slice() {
+                // bare `mount` (possibly with sudo -n): render the live table.
+                ["sudo", "-n", "mount"] | ["mount"] => return Ok(self.render_mounts()),
+                // `mount -t <fstype> <src> <target>`: record it (once per exact
+                // (src,target) — a duplicate re-mount is the EBUSY no-op and must
+                // not stack).
+                ["sudo", "-n", "mount", "-t", fstype, .., src, target] => {
+                    let mut mounts = self.mounts.lock().unwrap();
+                    let already = mounts.iter().any(|(s, t, _)| s == src && t == target);
+                    if already {
+                        // EBUSY no-op: exactly one mount survives (already there).
+                        return Ok(fail());
+                    }
+                    // A DIFFERENT source already at this target is a redirection —
+                    // model it as still-present (the real kernel would stack /
+                    // shadow; either way our validator must catch the mismatch),
+                    // so record the new one and let the exact-tuple check decide.
+                    mounts.push((src.to_string(), target.to_string(), fstype.to_string()));
+                    return Ok(HostOutput { exit_code: Some(0), ..Default::default() });
+                }
+                // `umount -f <target>`: drop every mount at that target.
+                ["sudo", "-n", "umount", "-f", target] | ["umount", "-f", target] => {
+                    self.mounts.lock().unwrap().retain(|(_, t, _)| t != target);
+                    return Ok(HostOutput { exit_code: Some(0), ..Default::default() });
+                }
+                _ => {}
             }
             Ok(HostOutput {
                 exit_code: Some(0),
@@ -1391,10 +1682,37 @@ mod tests {
         }
     }
 
-    /// A non-zero exit: used to script "jail not running" / "dataset absent".
+    /// A non-zero exit with no stderr: used to script "jail not running".
     fn fail() -> HostOutput {
         HostOutput {
             exit_code: Some(1),
+            ..Default::default()
+        }
+    }
+
+    /// A `zfs list` reply that means "dataset genuinely does NOT exist": the
+    /// tri-state probe ([`JailBackend::dataset_state`]) classifies this as
+    /// [`DatasetState::Absent`] only because the stderr carries ZFS's canonical
+    /// not-found phrase. A bare non-zero `fail()` is instead classified as
+    /// [`DatasetState::Unknown`] (an error we cannot interpret as clean
+    /// absence), which is the whole point — a transient failure must NOT look
+    /// like an absence and trigger a clone/cleanup.
+    fn dataset_absent() -> HostOutput {
+        HostOutput {
+            exit_code: Some(1),
+            stderr: b"cannot open 'aitemp/playground/x': dataset does not exist\n".to_vec(),
+            ..Default::default()
+        }
+    }
+
+    /// A `zfs list` reply that means "the probe FAILED for a reason that is NOT
+    /// clean absence" (permission denied here; a transport 255 or timeout would
+    /// be equivalent). Classified [`DatasetState::Unknown`], so a lifecycle op
+    /// must fail closed and destroy nothing.
+    fn dataset_probe_error() -> HostOutput {
+        HostOutput {
+            exit_code: Some(1),
+            stderr: b"cannot open 'aitemp/playground/x': permission denied\n".to_vec(),
             ..Default::default()
         }
     }
@@ -1448,29 +1766,33 @@ mod tests {
             )
     }
 
-    /// A `mount` listing that shows BOTH single-file pile mounts live under
-    /// alice's jail root, in the `src on TARGET (type, …)` shape FreeBSD `mount`
-    /// prints. The fresh-provision path calls bare `mount` to VERIFY each nullfs
-    /// mount took (matching the exact guest FILE target token); scripting this
-    /// satisfies that post-condition. Keyed on the bare `["sudo","-n","mount"]`
-    /// prefix, which also matches the `mount -t nullfs` / `mount -t devfs` calls
-    /// — harmless, they only need exit 0.
-    fn mount_listing_for_alice() -> HostOutput {
-        let jail = alice_jail();
-        let root = alice_root();
-        ok_with_stdout(&format!(
-            "{}/{jail} on {root} (zfs, local, nfsv4acls)\n\
-             /aitemp/playground/piles/{jail}/self.pile on {root}/pile/self.pile (nullfs, local)\n\
-             /aitemp/playground/piles/shared/shared.pile on {root}/shared/shared.pile (nullfs, local)\n\
-             devfs on {root}/dev (devfs)\n",
-            "aitemp/playground"
-        ))
+    /// Mock ready for the fresh-provision path. The mount table is now STATEFUL
+    /// (the mock records `mount -t …` and renders bare `mount`), so no static
+    /// `mount` listing is scripted: the fail-closed mount primitive sees an empty
+    /// target on the pre-check, issues the real `mount`, and the post-verify sees
+    /// the exact tuple the mock just recorded — a faithful fresh provision.
+    fn mock_provision_ready() -> MockRunner {
+        mock_with_mountpoint()
     }
 
-    /// Mock ready for the fresh-provision path: mountpoint query + the `mount`
-    /// verify listing showing both pile mounts live.
-    fn mock_provision_ready() -> MockRunner {
-        mock_with_mountpoint().reply(&["sudo", "-n", "mount"], mount_listing_for_alice())
+    /// A mock modelling an ALREADY-attached jail whose devfs + both pile mounts
+    /// are live at alice's root (the reattach entry state): re-mounts over these
+    /// are the EBUSY no-op, and the exact-tuple validation must accept them.
+    fn mock_reattached_alice() -> MockRunner {
+        let jail = alice_jail();
+        let root = alice_root();
+        mock_with_mountpoint()
+            .with_mount("devfs", &format!("{root}/dev"), "devfs")
+            .with_mount(
+                &format!("/aitemp/playground/piles/{jail}/self.pile"),
+                &format!("{root}/pile/self.pile"),
+                "nullfs",
+            )
+            .with_mount(
+                "/aitemp/playground/piles/shared/shared.pile",
+                &format!("{root}/shared/shared.pile"),
+                "nullfs",
+            )
     }
 
     #[test]
@@ -1542,7 +1864,7 @@ mod tests {
         // provision keys off dataset existence, not the jail.)
         let (backend, mock) = mock_provision_ready()
             .reply(&["sudo", "-n", "jls", "-j"], fail())
-            .reply(&["sudo", "-n", "zfs", "list"], fail())
+            .reply(&["sudo", "-n", "zfs", "list"], dataset_absent())
             .into_backend();
         backend.provision_sandbox(&spec("alice")).expect("provision");
 
@@ -1578,6 +1900,328 @@ mod tests {
         assert!(jail_call.contains(&"persist".to_string()));
     }
 
+    // ---- blocker #3: lifecycle uncertainty must never destroy valid data ----
+
+    /// The tri-state probe classifies each `zfs list` outcome correctly: exit 0
+    /// is `Exists`, the canonical not-found stderr is `Absent`, and EVERYTHING
+    /// else (a bare non-zero, a permission error, a transport 255, a local
+    /// timeout) is `Unknown` — never mistaken for a clean absence.
+    #[test]
+    fn dataset_state_distinguishes_absent_from_error() {
+        let cases: &[(HostOutput, DatasetState)] = &[
+            (ok_with_stdout("aitemp/playground/x\n"), DatasetState::Exists),
+            (dataset_absent(), DatasetState::Absent),
+            (dataset_probe_error(), DatasetState::Unknown),
+            (fail(), DatasetState::Unknown), // bare non-zero, no stderr
+            (
+                HostOutput { exit_code: Some(255), ..Default::default() },
+                DatasetState::Unknown,
+            ),
+            (
+                HostOutput { timed_out: true, exit_code: None, ..Default::default() },
+                DatasetState::Unknown,
+            ),
+        ];
+        for (out, want) in cases {
+            let (backend, _mock) = MockRunner::default()
+                .reply(&["sudo", "-n", "zfs", "list"], out.clone())
+                .into_backend();
+            // The mock runner's transport-error-exit is None, so a bare exit 255
+            // is not treated as a transport error here — but it still classifies
+            // as Unknown because its stderr lacks the canonical not-found phrase.
+            // (The dedicated ssh-transport path is covered by
+            // `exec_maps_exit_255_per_runner_transport`.) A local timeout
+            // (`timed_out`) is Unknown unconditionally.
+            assert_eq!(
+                backend.dataset_state("aitemp/playground/x"),
+                *want,
+                "probe {out:?} should classify as {want:?}"
+            );
+        }
+    }
+
+    /// (a) A provision whose dataset probe is INCONCLUSIVE (`Unknown` — here a
+    /// permission error, equivalent to a transport failure or timeout) must fail
+    /// closed: NO `zfs clone`, and above all NO `zfs destroy`. The old bool probe
+    /// collapsed this into "absent", cloned, then on the inevitable failure ran
+    /// destructive cleanup — the data-loss class this repair closes.
+    #[test]
+    fn provision_bails_on_unknown_probe_without_destroying_anything() {
+        let (backend, mock) = MockRunner::default()
+            .reply(&["sudo", "-n", "zfs", "list"], dataset_probe_error())
+            .into_backend();
+        let err = backend
+            .provision_sandbox(&spec("alice"))
+            .expect_err("must refuse on an inconclusive probe");
+        assert!(
+            format!("{err:#}").contains("inconclusive"),
+            "should explain the fail-closed reason: {err:#}"
+        );
+        let calls = mock.calls();
+        assert!(
+            !calls.iter().any(|c| c.get(2).map(String::as_str) == Some("zfs")
+                && c.get(3).map(String::as_str) == Some("clone")),
+            "an Unknown probe must NOT clone: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.get(2).map(String::as_str) == Some("zfs")
+                && c.get(3).map(String::as_str) == Some("destroy")),
+            "an Unknown probe must NEVER destroy: {calls:?}"
+        );
+    }
+
+    /// (a') `open_session` likewise fails closed on an `Unknown` probe: it does
+    /// not reattach an unconfirmable box and does not misreport it as
+    /// "unprovisioned".
+    #[test]
+    fn open_session_bails_on_unknown_probe() {
+        let (backend, mock) = mock_with_mountpoint()
+            .reply(&["sudo", "-n", "jls", "-j"], fail()) // not running
+            .reply(&["sudo", "-n", "zfs", "list"], dataset_probe_error())
+            .into_backend();
+        let err = backend
+            .open_session(&spec("alice"))
+            .expect_err("must refuse on an inconclusive probe");
+        assert!(format!("{err:#}").contains("inconclusive"), "{err:#}");
+        let calls = mock.calls();
+        assert!(
+            !calls.iter().any(|c| {
+                c.get(2).map(String::as_str) == Some("jail")
+                    && c.get(3).map(String::as_str) == Some("-c")
+            }),
+            "must NOT reattach (jail -c) on an Unknown probe: {calls:?}"
+        );
+    }
+
+    /// (b) OPERATION-OWNED CLEANUP: a provision that fails AT the `zfs clone`
+    /// (modelling the loser of a concurrent create — its clone loses the EEXIST
+    /// race) must NOT run `zfs destroy`. It never created the dataset, so the
+    /// winner's valid dataset stays intact. This is the invariant that makes
+    /// concurrent creates non-destructive even without a lock.
+    #[test]
+    fn failed_clone_destroys_nothing_operation_owned_cleanup() {
+        let (backend, mock) = MockRunner::default()
+            .reply(&["sudo", "-n", "zfs", "list"], dataset_absent()) // looked absent
+            .reply(&["sudo", "-n", "zfs", "clone"], fail()) // but the clone loses the race
+            .into_backend();
+        let err = backend
+            .provision_sandbox(&spec("alice"))
+            .expect_err("clone failure must surface");
+        assert!(format!("{err:#}").contains("zfs clone"), "{err:#}");
+        let calls = mock.calls();
+        assert!(
+            !calls.iter().any(|c| c.get(2).map(String::as_str) == Some("zfs")
+                && c.get(3).map(String::as_str) == Some("destroy")),
+            "a provision that did not create the dataset must destroy NOTHING: {calls:?}"
+        );
+    }
+
+    /// (b') Conversely, when the clone SUCCEEDS and a later step fails, the op
+    /// DID create the dataset, so operation-owned cleanup DOES tear down that
+    /// one dataset (and only it). Here the post-clone `jail -c` fails.
+    #[test]
+    fn failed_provision_after_clone_destroys_only_its_own_dataset() {
+        let (backend, mock) = mock_provision_ready()
+            .reply(&["sudo", "-n", "zfs", "list"], dataset_absent())
+            .reply(&["sudo", "-n", "jail", "-c"], fail()) // fail AFTER the clone
+            .into_backend();
+        backend
+            .provision_sandbox(&spec("alice"))
+            .expect_err("jail -c failure must surface");
+        let calls = mock.calls();
+        let destroys: Vec<_> = calls
+            .iter()
+            .filter(|c| {
+                c.get(2).map(String::as_str) == Some("zfs")
+                    && c.get(3).map(String::as_str) == Some("destroy")
+            })
+            .collect();
+        assert!(
+            !destroys.is_empty(),
+            "a provision that created the clone must clean it up on failure: {calls:?}"
+        );
+        assert!(
+            destroys
+                .iter()
+                .all(|c| c.last().map(String::as_str) == Some(alice_dataset().as_str())),
+            "cleanup must destroy ONLY the dataset this op created: {destroys:?}"
+        );
+    }
+
+    /// (d) FAIL-CLOSED MOUNT: a pile mount that reports success but does not
+    /// actually appear in the mount table (a silently-failed mount) must abort
+    /// the provision — never boot a jail whose PILE points at empty clone-local
+    /// scratch. We model this by scripting the nullfs `mount` to succeed while
+    /// the stateful table is bypassed (an explicit `mount -t nullfs` script
+    /// returns success but records nothing), so the post-mount exact-tuple verify
+    /// finds the target absent.
+    #[test]
+    fn silently_failed_pile_mount_fails_closed() {
+        let (backend, mock) = mock_provision_ready()
+            .reply(&["sudo", "-n", "zfs", "list"], dataset_absent())
+            // nullfs mount "succeeds" but is scripted, so the stateful table
+            // never records it -> the exact-tuple post-verify must catch it.
+            .reply(
+                &["sudo", "-n", "mount", "-t", "nullfs"],
+                HostOutput { exit_code: Some(0), ..Default::default() },
+            )
+            .into_backend();
+        let err = backend
+            .provision_sandbox(&spec("alice"))
+            .expect_err("a mount that did not take must fail the provision");
+        assert!(
+            format!("{err:#}").contains("did not take exactly"),
+            "should fail closed on the missing mount: {err:#}"
+        );
+        // And because the clone WAS created, operation-owned cleanup destroys it.
+        let calls = mock.calls();
+        assert!(
+            calls.iter().any(|c| c.get(2).map(String::as_str) == Some("zfs")
+                && c.get(3).map(String::as_str) == Some("destroy")),
+            "the created-but-unusable clone must be torn down: {calls:?}"
+        );
+    }
+
+    /// (d') MOUNT REDIRECTION REFUSED: reattaching a jail whose pile target is
+    /// already mounted by a DIFFERENT source (a tenant-controlled mountpoint
+    /// redirection) must refuse rather than trust the reused mount and start the
+    /// jail. We seed the mount table with a rogue source at alice's self.pile
+    /// target.
+    #[test]
+    fn reattach_refuses_redirected_pile_mount() {
+        let root = alice_root();
+        let (backend, mock) = mock_with_mountpoint()
+            .reply(&["sudo", "-n", "jls", "-j"], fail()) // not running -> reattach
+            // devfs is fine; the SELF pile target is hijacked by a rogue source.
+            .with_mount("devfs", &format!("{root}/dev"), "devfs")
+            .with_mount(
+                "/evil/rogue.pile",
+                &format!("{root}/pile/self.pile"),
+                "nullfs",
+            )
+            .into_backend();
+        let err = backend
+            .open_session(&spec("alice"))
+            .expect_err("a redirected pile mount must abort the reattach");
+        assert!(
+            format!("{err:#}").contains("mount redirection")
+                || format!("{err:#}").contains("already mounted by something other"),
+            "should refuse the redirection: {err:#}"
+        );
+        // The jail must NOT have been started with the redirected pile.
+        let calls = mock.calls();
+        assert!(
+            !calls.iter().any(|c| {
+                c.get(2).map(String::as_str) == Some("jail")
+                    && c.get(3).map(String::as_str) == Some("-c")
+            }),
+            "must not `jail -c` with a redirected pile mount: {calls:?}"
+        );
+    }
+
+    /// (c) PER-TENANT LIFECYCLE LOCK serializes two concurrent same-tenant
+    /// backend ops: while one provision holds the lock, a second same-tenant
+    /// provision cannot begin its work until the first releases. We prove
+    /// mutual exclusion by having the first op block inside the lock (on a
+    /// barrier) and asserting the second has made NO host calls until the first
+    /// finishes.
+    #[test]
+    fn lifecycle_lock_serializes_same_tenant_ops() {
+        use std::sync::mpsc;
+        use std::sync::Arc;
+
+        // A runner whose FIRST `zfs list` (dataset probe) blocks on a channel, so
+        // the op that grabs the tenant lock first stalls inside the critical
+        // section; a same-tenant op must then wait for the lock.
+        struct GateRunner {
+            calls: Mutex<Vec<Vec<String>>>,
+            gate_rx: Mutex<Option<mpsc::Receiver<()>>>,
+            entered: mpsc::Sender<()>,
+        }
+        impl HostRunner for Arc<GateRunner> {
+            fn run(
+                &self,
+                argv: &[String],
+                _stdin: Option<&[u8]>,
+                _t: Duration,
+            ) -> Result<HostOutput> {
+                self.calls.lock().unwrap().push(argv.to_vec());
+                if argv.get(2).map(String::as_str) == Some("zfs")
+                    && argv.get(3).map(String::as_str) == Some("list")
+                {
+                    // Only the first caller finds a receiver; it blocks until the
+                    // test releases the gate. The second caller (which only
+                    // reaches here AFTER acquiring the lock) sees None.
+                    if let Some(rx) = self.gate_rx.lock().unwrap().take() {
+                        let _ = self.entered.send(());
+                        let _ = rx.recv(); // block inside the lock
+                    }
+                    return Ok(dataset_absent());
+                }
+                if argv.get(2).map(String::as_str) == Some("zfs")
+                    && argv.get(3).map(String::as_str) == Some("clone")
+                {
+                    // Fail the clone so neither op does real work past the probe.
+                    return Ok(fail());
+                }
+                Ok(HostOutput { exit_code: Some(0), ..Default::default() })
+            }
+        }
+
+        let (gate_tx, gate_rx) = mpsc::channel::<()>();
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let runner = Arc::new(GateRunner {
+            calls: Mutex::new(Vec::new()),
+            gate_rx: Mutex::new(Some(gate_rx)),
+            entered: entered_tx,
+        });
+        let backend = Arc::new(JailBackend::with_runner(Box::new(runner.clone())));
+
+        // Op 1: grabs the lock, blocks inside the probe.
+        let b1 = backend.clone();
+        let t1 = std::thread::spawn(move || {
+            let _ = b1.provision_sandbox(&spec("alice"));
+        });
+        // Wait until op 1 is confirmed inside the critical section.
+        entered_rx.recv().expect("op1 entered the probe");
+
+        // Op 2: same tenant. It should BLOCK on the lifecycle lock and make no
+        // host calls yet. Give it a moment to try.
+        let b2 = backend.clone();
+        let t2 = std::thread::spawn(move || {
+            let _ = b2.provision_sandbox(&spec("alice"));
+        });
+        std::thread::sleep(Duration::from_millis(200));
+
+        // Op 1 is still inside the lock; op 2 must not have issued its own probe.
+        let probes_before = runner
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c.get(2).map(String::as_str) == Some("zfs")
+                && c.get(3).map(String::as_str) == Some("list"))
+            .count();
+        assert_eq!(
+            probes_before, 1,
+            "only op1's probe may have run while it holds the tenant lock"
+        );
+
+        // Release op 1; op 2 may now proceed and run its own probe.
+        gate_tx.send(()).expect("release gate");
+        t1.join().unwrap();
+        t2.join().unwrap();
+        let probes_after = runner
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c.get(2).map(String::as_str) == Some("zfs")
+                && c.get(3).map(String::as_str) == Some("list"))
+            .count();
+        assert_eq!(probes_after, 2, "op2 runs its probe only after op1 releases");
+    }
+
     /// Model-B pile provisioning: a brand-new tenant gets BOTH host-owned pile
     /// FILES single-file-nullfs-mounted rw (self at guest /pile/self.pile, shared
     /// at guest /shared/shared.pile), each seeded from bootstrap.pile via a
@@ -1588,7 +2232,7 @@ mod tests {
     #[test]
     fn provision_mounts_both_piles_seeds_path_and_pile() {
         let (backend, mock) = mock_provision_ready()
-            .reply(&["sudo", "-n", "zfs", "list"], fail())
+            .reply(&["sudo", "-n", "zfs", "list"], dataset_absent())
             .into_backend();
         backend.provision_sandbox(&spec("alice")).expect("provision");
         let calls = mock.calls();
@@ -1742,7 +2386,7 @@ mod tests {
     fn open_session_errors_when_unprovisioned() {
         let (backend, mock) = mock_with_mountpoint()
             .reply(&["sudo", "-n", "jls", "-j"], fail())
-            .reply(&["sudo", "-n", "zfs", "list"], fail())
+            .reply(&["sudo", "-n", "zfs", "list"], dataset_absent())
             .into_backend();
         let err = backend.open_session(&spec("alice")).expect_err("must bail");
         assert!(
@@ -1829,6 +2473,30 @@ mod tests {
         assert!(
             !calls.iter().any(|c| c.get(2).map(String::as_str) == Some("cp")),
             "reattach must not re-seed a pile: {calls:?}"
+        );
+    }
+
+    /// Reattach over a jail whose devfs + both pile mounts are ALREADY live and
+    /// EXACTLY correct (the FreeBSD EBUSY-no-op entry state) succeeds as a
+    /// verified no-op: the shared fail-closed primitive accepts a pre-existing
+    /// mount that matches the intended `(source, target, nullfs)` tuple, and the
+    /// jail is (re)started. This is the reattach happy path the primitive must
+    /// NOT break while it fails closed on redirections/missing mounts.
+    #[test]
+    fn reattach_accepts_exact_existing_mounts_as_noop() {
+        let (backend, mock) = mock_reattached_alice()
+            .reply(&["sudo", "-n", "jls", "-j"], fail()) // not running -> reattach
+            .into_backend();
+        let id = backend.open_session(&spec("alice")).expect("reattach no-op");
+        assert_eq!(id.as_str(), alice_jail());
+        // The jail is (re)started even though the mounts were already live.
+        let calls = mock.calls();
+        assert!(
+            calls.iter().any(|c| {
+                c.get(2).map(String::as_str) == Some("jail")
+                    && c.get(3).map(String::as_str) == Some("-c")
+            }),
+            "reattach must still jail -c over already-live exact mounts: {calls:?}"
         );
     }
 
@@ -1922,7 +2590,7 @@ mod tests {
         for label in ["alice", "bob"] {
             let jail = JailBackend::local().jail_name(label);
             let (backend, mock) = mock_provision_ready()
-                .reply(&["sudo", "-n", "zfs", "list"], fail())
+                .reply(&["sudo", "-n", "zfs", "list"], dataset_absent())
                 .into_backend();
             backend.provision_sandbox(&spec(label)).expect("provision");
             let calls = mock.calls();
@@ -1989,7 +2657,7 @@ mod tests {
     #[test]
     fn bootstrap_cp_only_targets_host_private_staging() {
         let (backend, mock) = mock_provision_ready()
-            .reply(&["sudo", "-n", "zfs", "list"], fail())
+            .reply(&["sudo", "-n", "zfs", "list"], dataset_absent())
             .into_backend();
         backend.provision_sandbox(&spec("alice")).expect("provision");
         let calls = mock.calls();
@@ -2040,7 +2708,7 @@ mod tests {
         // (`sh -c "test -f && test ! -L"`) SUCCEEDS -> destination is a genuine
         // regular file, so the seed is a create-if-absent no-op, not an error.
         let (backend, _mock) = mock_provision_ready()
-            .reply(&["sudo", "-n", "zfs", "list"], fail())
+            .reply(&["sudo", "-n", "zfs", "list"], dataset_absent())
             .reply(&["sudo", "-n", "ln"], fail())
             // default success for the `sh -c "test ..."` validator (regular file)
             .into_backend();
@@ -2061,7 +2729,7 @@ mod tests {
         // (destination is a symlink / special file) -> provision must bail, not
         // silently proceed to mount a tenant-planted target.
         let (backend, mock) = mock_provision_ready()
-            .reply(&["sudo", "-n", "zfs", "list"], fail())
+            .reply(&["sudo", "-n", "zfs", "list"], dataset_absent())
             .reply(&["sudo", "-n", "ln"], fail())
             .reply(&["sudo", "-n", "sh", "-c"], fail())
             .into_backend();
@@ -2099,7 +2767,7 @@ mod tests {
     #[test]
     fn no_host_directory_is_mounted_into_a_jail() {
         let (backend, mock) = mock_provision_ready()
-            .reply(&["sudo", "-n", "zfs", "list"], fail())
+            .reply(&["sudo", "-n", "zfs", "list"], dataset_absent())
             .into_backend();
         backend.provision_sandbox(&spec("alice")).expect("provision");
         let calls = mock.calls();
@@ -2251,13 +2919,111 @@ echo "PASS: single-file nullfs concurrent append kept all 100 lines"
         );
     }
 
+    /// Security repair #3 — LIVE on the real FreeBSD host. Pins the two
+    /// FreeBSD/ZFS SEMANTICS the fail-closed lifecycle depends on (the unit tests
+    /// above pin the argv + classification against a mock; this pins the actual
+    /// kernel/zfs behaviour):
+    ///
+    ///   1. Tri-state probe grounding: `zfs list` of a NONEXISTENT dataset exits
+    ///      non-zero AND its stderr contains the canonical `dataset does not
+    ///      exist` phrase — the exact signal [`JailBackend::dataset_state`] keys
+    ///      `Absent` on. (An error we can't interpret would be `Unknown`.)
+    ///   2. Exact-mount no-op grounding: a nullfs re-mount of the SAME source at
+    ///      the SAME live target fails (EBUSY) and does NOT stack — exactly one
+    ///      mount survives and a single umount clears it. This is the property the
+    ///      shared mount primitive relies on to treat an already-correct reattach
+    ///      mount as a verified no-op.
+    ///
+    /// Gated + fully torn down (mutates a scratch ZFS dataset under the deploy
+    /// pool): `SANDBOX_JAIL_LIVE_TESTS=1 cargo test --bins jail_live_probe_and_mount_semantics`.
+    /// `SANDBOX_JAIL_LIVE_POOL` overrides the scratch parent (default `aitemp`).
+    #[test]
+    fn jail_live_probe_and_mount_semantics() {
+        if std::env::var("SANDBOX_JAIL_LIVE_TESTS").as_deref() != Ok("1") {
+            eprintln!(
+                "skipping: set SANDBOX_JAIL_LIVE_TESTS=1 to run (mutates a scratch \
+                 ZFS dataset on the FreeBSD deploy host)"
+            );
+            return;
+        }
+        let host = std::env::var("SANDBOX_JAIL_LIVE_HOST")
+            .unwrap_or_else(|_| "ai.bultmann.eu".to_string());
+        let pool = std::env::var("SANDBOX_JAIL_LIVE_POOL").unwrap_or_else(|_| "aitemp".to_string());
+
+        // Self-contained: prove the not-found stderr, then prove the EBUSY
+        // no-op on a real nullfs single-file mount, then tear everything down.
+        let script = format!(
+            r#"
+set -eu
+POOL="{pool}"
+SCRATCH="$POOL/pg-live-repair3-$$"
+WORK=$(mktemp -d /tmp/jail-live-repair3.XXXXXX)
+cleanup() {{
+  sudo -n umount "$WORK/target" 2>/dev/null || true
+  sudo -n zfs destroy -r "$SCRATCH" 2>/dev/null || true
+  sudo -n rm -rf "$WORK" 2>/dev/null || true
+}}
+trap cleanup EXIT
+
+# ---- Proof 1: `zfs list` of a nonexistent dataset -> canonical not-found ----
+ERR=$(sudo -n zfs list "$SCRATCH" 2>&1 >/dev/null || true)
+case "$ERR" in
+  *"does not exist"*) echo "PASS: zfs list of an absent dataset says 'does not exist'";;
+  *) echo "FAIL: absent-dataset stderr was '$ERR' (no 'does not exist' phrase)"; exit 1;;
+esac
+
+# ---- Proof 2: nullfs re-mount over a live mount is EBUSY + does not stack ----
+echo "SRC" | sudo -n tee "$WORK/source" >/dev/null
+sudo -n touch "$WORK/target"
+sudo -n mount -t nullfs "$WORK/source" "$WORK/target"
+BEFORE=$(mount | grep -c " on $WORK/target " || true)
+# Re-mount the SAME source at the SAME target: must FAIL (EBUSY).
+if sudo -n mount -t nullfs "$WORK/source" "$WORK/target" 2>/dev/null; then
+  echo "FAIL: duplicate nullfs re-mount SUCCEEDED (should be EBUSY)"; exit 1
+fi
+AFTER=$(mount | grep -c " on $WORK/target " || true)
+if [ "$BEFORE" != "1" ] || [ "$AFTER" != "1" ]; then
+  echo "FAIL: mount stacked (before=$BEFORE after=$AFTER, want 1/1)"; exit 1
+fi
+sudo -n umount "$WORK/target"
+STILL=$(mount | grep -c " on $WORK/target " || true)
+if [ "$STILL" != "0" ]; then
+  echo "FAIL: a single umount did not clear the mount (still=$STILL)"; exit 1
+fi
+echo "PASS: nullfs re-mount is EBUSY no-op, one umount clears it"
+"#,
+        );
+
+        let out = Command::new("ssh")
+            .arg("-o")
+            .arg("BatchMode=yes")
+            .arg("-o")
+            .arg("ConnectTimeout=10")
+            .arg(&host)
+            .arg(&script)
+            .output()
+            .expect("spawn ssh to the live host");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        eprintln!("live-host stdout:\n{stdout}\nlive-host stderr:\n{stderr}");
+        assert!(out.status.success(), "live host script failed: {stderr}");
+        assert!(
+            stdout.contains("PASS: zfs list of an absent dataset says 'does not exist'"),
+            "missing tri-state not-found grounding: {stdout}"
+        );
+        assert!(
+            stdout.contains("PASS: nullfs re-mount is EBUSY no-op, one umount clears it"),
+            "missing exact-mount no-op grounding: {stdout}"
+        );
+    }
+
     #[test]
     fn provision_sandbox_sanitises_label() {
         // No dataset yet: provision the fresh box; its id is the injective name
         // `<prefix>-<safe>-<digest>` — `<safe>` is the human-readable
         // sanitisation (`li ora/x` -> `li-ora-x`), and the digest disambiguates.
         let (backend, mock) = mock_provision_ready()
-            .reply(&["sudo", "-n", "zfs", "list"], fail())
+            .reply(&["sudo", "-n", "zfs", "list"], dataset_absent())
             .into_backend();
         backend.provision_sandbox(&spec("li ora/x")).expect("provision");
         let calls = mock.calls();

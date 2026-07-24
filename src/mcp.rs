@@ -41,7 +41,8 @@ use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
 
 use crate::sandbox::{
-    ExecRequest, ExecResult, PileMount, SandboxBackend, SessionId, SessionSpec, Tenant,
+    ExecRequest, ExecResult, LifecycleLocks, PileMount, SandboxBackend, SessionId, SessionSpec,
+    Tenant,
 };
 
 /// Parameters for the `open_session` MCP method.
@@ -90,6 +91,15 @@ struct SessionEntry {
 pub struct SandboxProvider {
     backend: Box<dyn SandboxBackend>,
     sessions: Mutex<HashMap<SessionId, SessionEntry>>,
+    /// Per-canonical-tenant lifecycle lock. Serializes `open_session` /
+    /// `close_session` / `destroy_session` for one tenant so the refcount
+    /// close/open race (repair #1 follow-up) cannot orphan a concurrently-opened
+    /// session: `close_session` holds this lock across the whole
+    /// decrement + backend-close + registry-remove, so a same-tenant
+    /// `open_session` either runs entirely before (and is not evicted) or
+    /// entirely after (and re-opens cleanly). Keyed by
+    /// [`SandboxBackend::canonical_key`], the same key the jail backend locks on.
+    lifecycle: LifecycleLocks,
 }
 
 impl SandboxProvider {
@@ -97,6 +107,7 @@ impl SandboxProvider {
         SandboxProvider {
             backend,
             sessions: Mutex::new(HashMap::new()),
+            lifecycle: LifecycleLocks::new(),
         }
     }
 
@@ -109,27 +120,34 @@ impl SandboxProvider {
     /// rejected here (provider-layer defence complementing the jail backend's
     /// ZFS-property provenance check).
     pub fn open_session(&self, params: OpenSessionParams) -> Result<SessionId> {
-        let spec = SessionSpec {
-            tenant: params.tenant.clone(),
-            cwd: params.cwd,
-            env: params.env,
-        };
-        let id = self.backend.open_session(&spec)?;
-        let mut guard = self.sessions.lock().expect("sessions poisoned");
-        let entry = guard.entry(id.clone()).or_insert(SessionEntry {
-            tenant: params.tenant.clone(),
-            refs: 0,
-        });
-        if entry.tenant.label != params.tenant.label {
-            return Err(anyhow!(
-                "session id {} already bound to tenant '{}', refusing to attach tenant '{}'",
-                id.as_str(),
-                entry.tenant.label,
-                params.tenant.label
-            ));
-        }
-        entry.refs += 1;
-        Ok(id)
+        // Serialize against a concurrent same-tenant close: hold the per-tenant
+        // lifecycle lock across the backend open AND the refcount bump, so this
+        // open cannot land in the window where close has decremented to 0 but not
+        // yet removed the entry (which would orphan us).
+        let key = self.backend.canonical_key(&params.tenant);
+        self.lifecycle.with_lock(&key, || {
+            let spec = SessionSpec {
+                tenant: params.tenant.clone(),
+                cwd: params.cwd.clone(),
+                env: params.env.clone(),
+            };
+            let id = self.backend.open_session(&spec)?;
+            let mut guard = self.sessions.lock().expect("sessions poisoned");
+            let entry = guard.entry(id.clone()).or_insert(SessionEntry {
+                tenant: params.tenant.clone(),
+                refs: 0,
+            });
+            if entry.tenant.label != params.tenant.label {
+                return Err(anyhow!(
+                    "session id {} already bound to tenant '{}', refusing to attach tenant '{}'",
+                    id.as_str(),
+                    entry.tenant.label,
+                    params.tenant.label
+                ));
+            }
+            entry.refs += 1;
+            Ok(id)
+        })
     }
 
     /// MCP `exec`: run a command in an open session.
@@ -158,44 +176,78 @@ impl SandboxProvider {
     /// box lives on and the same tenant can reconnect. Use `destroy_session` to
     /// remove it for good.
     pub fn close_session(&self, session: &SessionId) -> Result<()> {
-        {
-            let mut guard = self.sessions.lock().expect("sessions poisoned");
-            let entry = guard
-                .get_mut(session)
-                .ok_or_else(|| anyhow!("unknown session {}", session.as_str()))?;
-            entry.refs = entry.refs.saturating_sub(1);
-            if entry.refs > 0 {
-                // Other endpoints still hold this box — do NOT touch the backend.
-                return Ok(());
+        // Resolve the tenant so we can lock on the SAME per-tenant key
+        // `open_session` uses. If the session is unknown, there is nothing to
+        // close (and nothing to serialize).
+        let tenant = {
+            let guard = self.sessions.lock().expect("sessions poisoned");
+            match guard.get(session) {
+                Some(entry) => entry.tenant.clone(),
+                None => return Err(anyhow!("unknown session {}", session.as_str())),
             }
-        }
-        // Last handle: detach the backend, then drop the entry. Backend close
-        // runs without the lock (it can block on ssh/limactl); we remove the
-        // entry only after it succeeds so a failed close leaves the session
-        // known (and retryable) rather than silently orphaned.
-        self.backend.close_session(session)?;
-        self.sessions
-            .lock()
-            .expect("sessions poisoned")
-            .remove(session);
-        Ok(())
+        };
+        let key = self.backend.canonical_key(&tenant);
+        // Hold the per-tenant lifecycle lock across the ENTIRE close: the
+        // decrement, the last-handle backend detach, AND the registry removal.
+        // A concurrent same-tenant `open_session` blocks on this lock, so it
+        // cannot slip into the old window (refs decremented to 0, lock released,
+        // then we remove the entry it just bumped) and be orphaned. It runs
+        // wholly before or wholly after this close.
+        self.lifecycle.with_lock(&key, || {
+            {
+                let mut guard = self.sessions.lock().expect("sessions poisoned");
+                let entry = guard
+                    .get_mut(session)
+                    .ok_or_else(|| anyhow!("unknown session {}", session.as_str()))?;
+                entry.refs = entry.refs.saturating_sub(1);
+                if entry.refs > 0 {
+                    // Other endpoints still hold this box — do NOT touch the backend.
+                    return Ok(());
+                }
+            }
+            // Last handle: detach the backend, then drop the entry. The
+            // per-tenant lifecycle lock (held for this whole closure) serializes
+            // this against a concurrent open; the short sessions-map lock is
+            // still released around the backend call (it can block on
+            // ssh/limactl). We remove the entry only after the close succeeds so
+            // a failed close leaves the session known (and retryable).
+            self.backend.close_session(session)?;
+            self.sessions
+                .lock()
+                .expect("sessions poisoned")
+                .remove(session);
+            Ok(())
+        })
     }
 
     /// MCP `destroy_session`: permanently tear a sandbox down and deregister it,
     /// REGARDLESS of refcount — this is the explicit hard teardown (jail:
     /// `jail -r` + `zfs destroy`; lima: `limactl stop` + `limactl delete`), as
-    /// opposed to `close_session`'s last-handle detach. Any other endpoints
-    /// still holding the box are cut off; making concurrent-exec safe DURING a
-    /// destroy (draining in-flight execs, a transactional lifecycle) is repair
-    /// #3's job and out of scope here.
+    /// opposed to `close_session`'s last-handle detach. Any other endpoints still
+    /// holding the box are cut off. Destroy now takes the per-tenant lifecycle
+    /// lock, so it serializes against concurrent open/close of the same box
+    /// (repair #3); draining in-flight EXECs during a destroy (a fully
+    /// transactional exec lifecycle) is still future work.
     pub fn destroy_session(&self, session: &SessionId) -> Result<()> {
-        self.ensure_known(session)?;
-        self.backend.destroy_session(session)?;
-        self.sessions
-            .lock()
-            .expect("sessions poisoned")
-            .remove(session);
-        Ok(())
+        // Resolve the tenant to lock on the same per-tenant key as open/close, so
+        // a hard teardown serializes against concurrent lifecycle ops on this
+        // box rather than racing them.
+        let tenant = {
+            let guard = self.sessions.lock().expect("sessions poisoned");
+            match guard.get(session) {
+                Some(entry) => entry.tenant.clone(),
+                None => return Err(anyhow!("unknown session {}", session.as_str())),
+            }
+        };
+        let key = self.backend.canonical_key(&tenant);
+        self.lifecycle.with_lock(&key, || {
+            self.backend.destroy_session(session)?;
+            self.sessions
+                .lock()
+                .expect("sessions poisoned")
+                .remove(session);
+            Ok(())
+        })
     }
 
     /// Tear down every session this provider still has open, best-effort.
@@ -1074,5 +1126,90 @@ mod tests {
             provider.exec(exec_params(&id)).is_err(),
             "destroyed session is gone regardless of prior refcount"
         );
+    }
+
+    /// (c) The per-tenant lifecycle lock closes the close/open refcount race
+    /// (repair #1 review follow-up): a single handle's `close_session`
+    /// decrements refs to 0 and detaches the backend, but a CONCURRENT
+    /// same-tenant `open_session` that lands in that window must NOT be orphaned
+    /// — the box must stay registered and execable for it.
+    ///
+    /// We force the race by making the backend's `close_session` block on a
+    /// barrier: the closing thread is parked mid-teardown (after the decrement,
+    /// before the registry remove) while the opening thread runs. Without the
+    /// lock, the opener would bump the entry and the parked closer would then
+    /// `remove` it, orphaning the box (a later `exec` would fail "unknown
+    /// session"). With the lock, the open blocks until the close fully finishes,
+    /// then re-opens cleanly — so the final session is always known and execable.
+    #[test]
+    fn lifecycle_lock_prevents_close_open_orphan() {
+        use std::sync::mpsc;
+        use std::sync::Arc;
+
+        /// Backend whose `close_session` blocks on a channel so the test can hold
+        /// a close mid-flight and drive a concurrent open into the race window.
+        struct BlockingCloseBackend {
+            in_close: mpsc::Sender<()>,
+            release: Mutex<Option<mpsc::Receiver<()>>>,
+        }
+        impl SandboxBackend for BlockingCloseBackend {
+            fn name(&self) -> &'static str {
+                "blocking-close"
+            }
+            fn open_session(&self, spec: &SessionSpec) -> Result<SessionId> {
+                Ok(SessionId::new(format!("box-{}", spec.tenant.label)))
+            }
+            fn exec(&self, _s: &SessionId, _r: &ExecRequest) -> Result<ExecResult> {
+                Ok(ExecResult { exit_code: Some(0), ..Default::default() })
+            }
+            fn close_session(&self, _s: &SessionId) -> Result<()> {
+                // Signal we are mid-close, then block until released — this is the
+                // window where the old code had dropped the lock.
+                let _ = self.in_close.send(());
+                if let Some(rx) = self.release.lock().unwrap().take() {
+                    let _ = rx.recv();
+                }
+                Ok(())
+            }
+            fn destroy_session(&self, _s: &SessionId) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let (in_close_tx, in_close_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let provider = Arc::new(SandboxProvider::new(Box::new(BlockingCloseBackend {
+            in_close: in_close_tx,
+            release: Mutex::new(Some(release_rx)),
+        })));
+
+        // One handle open (refs = 1).
+        let id = provider.open_session(params("alice")).expect("open 1");
+
+        // Thread A closes: it decrements to 0 and blocks inside backend close,
+        // holding the per-tenant lifecycle lock the whole time.
+        let pa = provider.clone();
+        let close_thread = std::thread::spawn(move || {
+            pa.close_session(&id).expect("close");
+        });
+        in_close_rx.recv().expect("close reached the backend");
+
+        // Thread B opens the SAME tenant while the close is parked. With the
+        // lock, it BLOCKS until the close finishes; give it time to try, then
+        // release the close.
+        let pb = provider.clone();
+        let open_thread = std::thread::spawn(move || pb.open_session(params("alice")).expect("open 2"));
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        release_tx.send(()).expect("release close");
+
+        close_thread.join().unwrap();
+        let id2 = open_thread.join().unwrap();
+
+        // The concurrently-opened session is NOT orphaned: it is registered and
+        // execable. (Without the lock, thread A's post-window `remove` would have
+        // evicted thread B's freshly-bumped entry.)
+        provider
+            .exec(exec_params(&id2))
+            .expect("concurrently-opened session must remain known and execable");
     }
 }
