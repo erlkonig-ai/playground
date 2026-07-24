@@ -104,6 +104,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use sha2::{Digest, Sha256};
 
 use super::proc::drive_child;
 use super::{ExecRequest, ExecResult, SandboxBackend, SessionId, SessionSpec};
@@ -285,19 +286,91 @@ impl JailBackend {
         }
     }
 
-    /// Deterministic jail name for a tenant label. Jail names and ZFS dataset
-    /// components share the safe alphabet `[A-Za-z0-9-]` here; anything else
-    /// in the label is mapped to `-` (mirrors Lima's instance sanitisation).
+    /// Deterministic, INJECTIVE jail name for a tenant label:
+    /// `<prefix>-<safe>-<digest>`.
     ///
-    /// Public so the `user` CLI derives the same `<prefix>-<sanitised>` name the
-    /// backend uses — the two must agree on session ids (destroy, reattach).
+    /// The `<safe>` part is the human-readable sanitisation (label mapped onto
+    /// `[A-Za-z0-9-]`, `-` for anything else) TRUNCATED to
+    /// [`Self::SAFE_NAME_LEN`] bytes for operator legibility only — it is NOT
+    /// what distinguishes tenants. The `<digest>` part is the first
+    /// [`Self::DIGEST_HEX_LEN`] hex chars of SHA-256 over the ORIGINAL full
+    /// label, and THAT is what guarantees injectivity: two labels that collapse
+    /// to the same `<safe>` (e.g. `a/b`, `a?b`, `a-b`) still differ in the
+    /// digest, so they get distinct jail names / ZFS datasets / private piles —
+    /// no cross-tenant hijack. Same label → same name (deterministic, so
+    /// reattach/destroy find the exact box).
+    ///
+    /// Public so the `user` CLI derives the same name the backend uses via this
+    /// one function — the two must never drift on session ids (destroy,
+    /// reattach). Callers that accept a raw principal label must
+    /// [`validate_label`](Self::validate_label) it first; `jail_name` itself is
+    /// total (it maps any string), but the lifecycle entry points reject
+    /// pathological labels before they reach here.
     pub fn jail_name(&self, label: &str) -> String {
-        let safe: String = label
+        let mut safe: String = label
             .chars()
             .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
             .collect();
-        format!("{}-{}", self.jail_prefix, safe)
+        safe.truncate(Self::SAFE_NAME_LEN);
+        let mut hasher = Sha256::new();
+        hasher.update(label.as_bytes());
+        let digest = hasher.finalize();
+        let hex: String = digest
+            .iter()
+            .take(Self::DIGEST_HEX_LEN / 2)
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        format!("{}-{}-{}", self.jail_prefix, safe, hex)
     }
+
+    /// Truncation bound for the human-readable `<safe>` part of a jail name
+    /// (operator legibility only; injectivity comes from the digest).
+    const SAFE_NAME_LEN: usize = 32;
+    /// Number of hex chars of the SHA-256 label digest carried in a jail name.
+    /// 20 hex chars = 80 bits: collision-resistant well past any realistic
+    /// tenant count, and the ZFS `playground:tenant` property is the
+    /// authoritative backstop even if it ever collided.
+    const DIGEST_HEX_LEN: usize = 20;
+
+    /// ZFS user property that records the ORIGINAL tenant label on a session's
+    /// dataset. Set right after `zfs clone` and verified on every reuse /
+    /// reattach: a stored-vs-requested mismatch means a digest collision or
+    /// tampering, and the backend refuses rather than hand one tenant another's
+    /// box. This is the authoritative injectivity check (the jail-name digest is
+    /// the first line of defence; this is defence-in-depth).
+    const TENANT_PROPERTY: &'static str = "playground:tenant";
+
+    /// Reject pathological tenant labels before they are used to derive a jail
+    /// name / dataset. A well-behaved principal (email, uuid, OAuth subject)
+    /// always passes; this only stops empties, overlong strings, and labels
+    /// carrying control characters (newline / NUL / other C0), which have no
+    /// business in an identity and would be hazardous in property values,
+    /// argv, or operator output. Called at the entry of `open_session`,
+    /// `provision_sandbox`, and `destroy_session`.
+    pub fn validate_label(label: &str) -> Result<()> {
+        if label.is_empty() {
+            bail!("invalid tenant label: empty");
+        }
+        if label.len() > Self::MAX_LABEL_LEN {
+            bail!(
+                "invalid tenant label: {} bytes exceeds the {}-byte limit",
+                label.len(),
+                Self::MAX_LABEL_LEN
+            );
+        }
+        if let Some(c) = label.chars().find(|c| c.is_control()) {
+            bail!(
+                "invalid tenant label: contains control character U+{:04X}",
+                c as u32
+            );
+        }
+        Ok(())
+    }
+
+    /// Upper bound on a tenant label's length (bytes). A real principal is well
+    /// under this; the cap stops a pathological label from ballooning argv /
+    /// property values.
+    const MAX_LABEL_LEN: usize = 200;
 
     fn dataset(&self, jail: &str) -> String {
         format!("{}/{}", self.dataset_parent, jail)
@@ -432,6 +505,53 @@ impl JailBackend {
         self.runner.run(&argv, stdin, timeout)
     }
 
+    /// Record the ORIGINAL tenant label on a freshly-cloned dataset as a ZFS
+    /// user property (`zfs set playground:tenant=<label> <dataset>`, argv form —
+    /// no shell). This is the provenance the reuse/reattach arms verify against.
+    fn set_tenant_property(&self, dataset: &str, label: &str) -> Result<()> {
+        let assignment = format!("{}={}", Self::TENANT_PROPERTY, label);
+        let out = self.run(
+            &["sudo", "-n", "zfs", "set", &assignment, dataset],
+            None,
+            ADMIN_TIMEOUT,
+        )?;
+        if !out.success() {
+            bail!(
+                "zfs set {} on {dataset} failed: {}",
+                Self::TENANT_PROPERTY,
+                out.stderr_lossy()
+            );
+        }
+        Ok(())
+    }
+
+    /// Read back the recorded tenant label and VERIFY it equals `expected`. A
+    /// mismatch means a digest collision or tampering — the caller must refuse
+    /// to hand this box to the requester. This makes tenant identity
+    /// authoritative even if the jail-name digest ever collided.
+    fn verify_tenant_property(&self, dataset: &str, expected: &str) -> Result<()> {
+        let out = self.run(
+            &["sudo", "-n", "zfs", "get", "-H", "-o", "value", Self::TENANT_PROPERTY, dataset],
+            None,
+            ADMIN_TIMEOUT,
+        )?;
+        if !out.success() {
+            bail!(
+                "zfs get {} on {dataset} failed: {}",
+                Self::TENANT_PROPERTY,
+                out.stderr_lossy()
+            );
+        }
+        let stored = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if stored != expected {
+            bail!(
+                "tenant mismatch on {dataset}: stored '{stored}' != requested '{expected}' \
+                 (hash collision or tampering — refusing)"
+            );
+        }
+        Ok(())
+    }
+
     /// `zfs get -H -o value mountpoint <dataset>` — the jail root path.
     fn mountpoint(&self, dataset: &str) -> Result<String> {
         let out = self.run(
@@ -550,6 +670,7 @@ impl SandboxBackend for JailBackend {
     }
 
     fn open_session(&self, spec: &SessionSpec) -> Result<SessionId> {
+        Self::validate_label(&spec.tenant.label)?;
         let jail = self.jail_name(&spec.tenant.label);
         let dataset = self.dataset(&jail);
         eprintln!(
@@ -573,8 +694,13 @@ impl SandboxBackend for JailBackend {
         // `provision_sandbox` / `playground user create`). open NEVER clones.
 
         // 1. Already up? The tenant's jail context is running over its dataset;
-        //    just hand back the same id — no `jail -c`, no re-seed.
+        //    just hand back the same id — no `jail -c`, no re-seed. First VERIFY
+        //    the dataset's recorded tenant matches the requester (authoritative
+        //    injectivity check): a mismatch means a digest collision or
+        //    tampering, and we refuse rather than hand over another tenant's box.
         if self.jail_running(&jail) {
+            self.verify_tenant_property(&dataset, &spec.tenant.label)
+                .with_context(|| format!("verify tenant provenance for jail '{jail}'"))?;
             eprintln!("[{}] reusing persistent sandbox '{}'", self.name(), jail);
             return Ok(SessionId::new(jail));
         }
@@ -583,8 +709,11 @@ impl SandboxBackend for JailBackend {
         //    playground restart wiped the jail context). Re-attach it: devfs
         //    re-mount + `jail -c`, keeping the dataset and its /etc/profile as
         //    they are. Never destroy the dataset on a transient failure — it is
-        //    the tenant's PERSISTENT storage.
+        //    the tenant's PERSISTENT storage. VERIFY the recorded tenant first,
+        //    same as the reuse arm.
         if self.dataset_exists(&dataset) {
+            self.verify_tenant_property(&dataset, &spec.tenant.label)
+                .with_context(|| format!("verify tenant provenance for jail '{jail}'"))?;
             eprintln!("[{}] reattaching persistent sandbox '{}'", self.name(), jail);
             self.reattach(&jail, &dataset)
                 .with_context(|| format!("reattach jail '{jail}'"))?;
@@ -600,14 +729,18 @@ impl SandboxBackend for JailBackend {
     }
 
     fn provision_sandbox(&self, spec: &SessionSpec) -> Result<()> {
+        Self::validate_label(&spec.tenant.label)?;
         let jail = self.jail_name(&spec.tenant.label);
         let dataset = self.dataset(&jail);
 
         // Idempotent: a tenant whose dataset already exists is already
         // provisioned. Don't clone or re-seed; just ensure the jail is up so
         // `provision` doubles as "converge to running" (reattach if the jail
-        // context is gone).
+        // context is gone). VERIFY the recorded tenant first (authoritative
+        // injectivity check), same as `open_session`'s reuse arms.
         if self.dataset_exists(&dataset) {
+            self.verify_tenant_property(&dataset, &spec.tenant.label)
+                .with_context(|| format!("verify tenant provenance for jail '{jail}'"))?;
             eprintln!(
                 "[{}] sandbox '{}' already provisioned; ensuring it is up",
                 self.name(),
@@ -642,6 +775,11 @@ impl SandboxBackend for JailBackend {
                     clone.stderr_lossy()
                 );
             }
+
+            // Record the ORIGINAL tenant label on the dataset immediately after
+            // the clone: this is the authoritative provenance the reuse/reattach
+            // arms verify against (defence-in-depth over the jail-name digest).
+            self.set_tenant_property(&dataset, &spec.tenant.label)?;
 
             let root = self.mountpoint(&dataset)?;
 
@@ -969,6 +1107,13 @@ impl SandboxBackend for JailBackend {
     }
 
     fn destroy_session(&self, session: &SessionId) -> Result<()> {
+        // `destroy_session` receives an already-derived jail-name session id (not
+        // a raw label), so the pathological-label gate is the caller's job at
+        // open/provision time; here we validate the session-id string itself is
+        // non-empty / control-char-free before it reaches argv, and enforce the
+        // namespace guard below.
+        Self::validate_label(session.as_str())
+            .context("invalid destroy_session session id")?;
         let jail = session.as_str();
         if !jail.starts_with(&format!("{}-", self.jail_prefix)) {
             bail!(
@@ -1102,12 +1247,38 @@ mod tests {
         }
     }
 
-    /// The mountpoint query needs a scripted reply everywhere.
+    /// The canonical jail name for a label under the default prefix, computed
+    /// via the SAME `jail_name` the backend uses so tests never hardcode the
+    /// injective `<prefix>-<safe>-<digest>` string (which would drift if the
+    /// scheme changed). Alice's name is e.g. `playground-alice-<20 hex>`.
+    fn alice_jail() -> String {
+        JailBackend::local().jail_name("alice")
+    }
+
+    /// Alice's dataset + jail root under the default namespace, both derived
+    /// from her injective jail name.
+    fn alice_dataset() -> String {
+        format!("aitemp/playground/{}", alice_jail())
+    }
+    fn alice_root() -> String {
+        format!("/aitemp/playground/{}", alice_jail())
+    }
+
+    /// The mountpoint query needs a scripted reply everywhere. Keyed on the
+    /// `zfs get … mountpoint` prefix (dataset name excluded), so it matches
+    /// whatever injective dataset name alice resolves to and returns her root.
+    /// Also scripts the `playground:tenant` provenance read-back so the
+    /// reuse/reattach arms (which now VERIFY it) see alice's recorded label.
     fn mock_with_mountpoint() -> MockRunner {
-        MockRunner::default().reply(
-            &["zfs", "get", "-H", "-o", "value", "mountpoint"],
-            ok_with_stdout("/aitemp/playground/playground-alice\n"),
-        )
+        MockRunner::default()
+            .reply(
+                &["zfs", "get", "-H", "-o", "value", "mountpoint"],
+                ok_with_stdout(&format!("{}\n", alice_root())),
+            )
+            .reply(
+                &["sudo", "-n", "zfs", "get", "-H", "-o", "value", "playground:tenant"],
+                ok_with_stdout("alice\n"),
+            )
     }
 
     /// A `mount` listing that shows BOTH pile mounts live under alice's jail
@@ -1117,12 +1288,14 @@ mod tests {
     /// `["sudo","-n","mount"]` prefix, which also matches the `mount -t nullfs`
     /// / `mount -t devfs` calls — harmless, they only need exit 0.
     fn mount_listing_for_alice() -> HostOutput {
-        let root = "/aitemp/playground/playground-alice";
+        let jail = alice_jail();
+        let root = alice_root();
         ok_with_stdout(&format!(
-            "aitemp/playground/playground-alice on {root} (zfs, local, nfsv4acls)\n\
-             /aitemp/playground/piles/playground-alice on {root}/pile (nullfs, local)\n\
+            "{}/{jail} on {root} (zfs, local, nfsv4acls)\n\
+             /aitemp/playground/piles/{jail} on {root}/pile (nullfs, local)\n\
              /aitemp/playground/piles/shared on {root}/shared (nullfs, local)\n\
-             devfs on {root}/dev (devfs)\n"
+             devfs on {root}/dev (devfs)\n",
+            "aitemp/playground"
         ))
     }
 
@@ -1206,13 +1379,22 @@ mod tests {
         backend.provision_sandbox(&spec("alice")).expect("provision");
 
         let calls = mock.calls();
+        let jail = alice_jail();
 
-        // Must clone the template into the namespaced dataset...
+        // Must clone the template into the namespaced (injective) dataset...
         assert!(calls.iter().any(|c| c.starts_with(&[
             "sudo".into(), "-n".into(), "zfs".into(), "clone".into(),
             "aitemp/playground/template@base".into(),
-            "aitemp/playground/playground-alice".into(),
+            alice_dataset(),
         ] as &[String])));
+        // ...record the tenant provenance right after the clone...
+        assert!(
+            calls.iter().any(|c| c == &[
+                "sudo".to_string(), "-n".into(), "zfs".into(), "set".into(),
+                "playground:tenant=alice".into(), alice_dataset(),
+            ]),
+            "must `zfs set playground:tenant=alice` on the fresh dataset: {calls:?}"
+        );
         // ...and create a jail with no network, correct name/path.
         let jail_call = calls
             .iter()
@@ -1221,8 +1403,8 @@ mod tests {
                     && c.get(3).map(String::as_str) == Some("-c")
             })
             .expect("jail -c issued");
-        assert!(jail_call.contains(&"name=playground-alice".to_string()));
-        assert!(jail_call.contains(&"path=/aitemp/playground/playground-alice".to_string()));
+        assert!(jail_call.contains(&format!("name={jail}")));
+        assert!(jail_call.contains(&format!("path={}", alice_root())));
         assert!(jail_call.contains(&"ip4=disable".to_string()));
         assert!(jail_call.contains(&"ip6=disable".to_string()));
         assert!(jail_call.contains(&"persist".to_string()));
@@ -1241,10 +1423,13 @@ mod tests {
             .into_backend();
         backend.provision_sandbox(&spec("alice")).expect("provision");
         let calls = mock.calls();
-        let root = "/aitemp/playground/playground-alice";
+        let jail = alice_jail();
+        let root = alice_root();
+        let root = root.as_str();
 
-        // Default pile-root derived paths.
-        let self_dir = "/aitemp/playground/piles/playground-alice";
+        // Default pile-root derived paths (keyed on the injective jail name).
+        let self_dir = format!("/aitemp/playground/piles/{jail}");
+        let self_dir = self_dir.as_str();
         let self_pile = format!("{self_dir}/self.pile");
         let shared_dir = "/aitemp/playground/piles/shared";
         let shared_pile = format!("{shared_dir}/shared.pile");
@@ -1288,7 +1473,7 @@ mod tests {
             ] as &[String])),
             "must mkdir the shared pile dir: {calls:?}"
         );
-        let shared_tmp = format!("{shared_dir}/shared.pile.playground-alice.tmp");
+        let shared_tmp = format!("{shared_dir}/shared.pile.{jail}.tmp");
         // Stage: cp bootstrap -> per-provision temp (NOT directly to shared.pile).
         assert!(
             calls.iter().any(|c| c.ends_with(&[
@@ -1390,7 +1575,7 @@ mod tests {
             // dataset present: zfs list succeeds (default success from the mock).
             .into_backend();
         let id = backend.open_session(&spec("alice")).expect("open");
-        assert_eq!(id.as_str(), "playground-alice");
+        assert_eq!(id.as_str(), alice_jail());
 
         let calls = mock.calls();
         // jail -c must be issued (reattach)...
@@ -1426,13 +1611,15 @@ mod tests {
             .into_backend();
         backend.open_session(&spec("alice")).expect("open");
         let calls = mock.calls();
-        let root = "/aitemp/playground/playground-alice";
+        let jail = alice_jail();
+        let root = alice_root();
+        let root = root.as_str();
 
         assert!(
             calls.iter().any(|c| c == &[
                 "sudo".to_string(), "-n".into(), "mount".into(), "-t".into(),
                 "nullfs".into(),
-                "/aitemp/playground/piles/playground-alice".into(),
+                format!("/aitemp/playground/piles/{jail}"),
                 format!("{root}/pile"),
             ]),
             "reattach must re-mount the self pile at /pile: {calls:?}"
@@ -1461,10 +1648,11 @@ mod tests {
     fn destroy_unmounts_both_piles_and_never_deletes_host_piles() {
         let (backend, mock) = mock_with_mountpoint().into_backend();
         backend
-            .destroy_session(&SessionId::new("playground-alice"))
+            .destroy_session(&SessionId::new(alice_jail()))
             .expect("destroy");
         let calls = mock.calls();
-        let root = "/aitemp/playground/playground-alice";
+        let root = alice_root();
+        let root = root.as_str();
 
         let idx_of = |suffix: &str| -> usize {
             calls
@@ -1522,7 +1710,7 @@ mod tests {
             .collect();
         assert!(
             destroys.iter().all(|c| c.last().map(String::as_str)
-                == Some("aitemp/playground/playground-alice")),
+                == Some(alice_dataset().as_str())),
             "only the session dataset may be destroyed: {destroys:?}"
         );
     }
@@ -1540,7 +1728,7 @@ mod tests {
     #[test]
     fn shared_pile_seed_is_atomic_and_create_if_absent() {
         for label in ["alice", "bob"] {
-            let jail = format!("playground-{label}");
+            let jail = JailBackend::local().jail_name(label);
             let (backend, mock) = mock_provision_ready()
                 .reply(&["sudo", "-n", "zfs", "list"], fail())
                 .into_backend();
@@ -1599,15 +1787,112 @@ mod tests {
 
     #[test]
     fn provision_sandbox_sanitises_label() {
-        // No dataset yet: provision the fresh box; its id is the sanitised name.
+        // No dataset yet: provision the fresh box; its id is the injective name
+        // `<prefix>-<safe>-<digest>` — `<safe>` is the human-readable
+        // sanitisation (`li ora/x` -> `li-ora-x`), and the digest disambiguates.
         let (backend, mock) = mock_provision_ready()
             .reply(&["sudo", "-n", "zfs", "list"], fail())
             .into_backend();
         backend.provision_sandbox(&spec("li ora/x")).expect("provision");
         let calls = mock.calls();
-        // The jail -c call carries the sanitised name.
-        assert!(calls.iter().any(|c| c.contains(&"name=playground-li-ora-x".to_string())));
-        assert_eq!(backend.jail_name("li ora/x"), "playground-li-ora-x");
+        let jail = backend.jail_name("li ora/x");
+        // The jail -c call carries the injective name...
+        assert!(calls.iter().any(|c| c.contains(&format!("name={jail}"))));
+        // ...whose human-readable prefix is the sanitisation, followed by a
+        // 20-hex-char digest.
+        assert!(
+            jail.starts_with("playground-li-ora-x-"),
+            "name must keep the readable sanitisation: {jail}"
+        );
+        let digest = jail.strip_prefix("playground-li-ora-x-").unwrap();
+        assert_eq!(digest.len(), 20, "digest is 20 hex chars: {jail}");
+        assert!(digest.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    /// Security repair #1(a): `jail_name` is INJECTIVE. The three labels
+    /// `a/b`, `a?b`, `a-b` all collapse to the same human-readable `<safe>`
+    /// part (`a-b`) — the pre-repair bug mapped them to ONE jail name / dataset
+    /// / private pile (cross-tenant hijack). The digest over the ORIGINAL label
+    /// now makes all three DISTINCT, while the same label stays DETERMINISTIC
+    /// (so reattach/destroy still find the exact box).
+    #[test]
+    fn jail_name_is_injective_across_colliding_labels() {
+        let b = JailBackend::local();
+        let ab_slash = b.jail_name("a/b");
+        let ab_question = b.jail_name("a?b");
+        let ab_dash = b.jail_name("a-b");
+
+        // All three share the readable prefix but differ overall.
+        for n in [&ab_slash, &ab_question, &ab_dash] {
+            assert!(n.starts_with("playground-a-b-"), "shared readable part: {n}");
+        }
+        assert_ne!(ab_slash, ab_question, "a/b and a?b must differ");
+        assert_ne!(ab_slash, ab_dash, "a/b and a-b must differ");
+        assert_ne!(ab_question, ab_dash, "a?b and a-b must differ");
+
+        // THREE distinct names from three distinct labels.
+        let distinct: std::collections::HashSet<_> =
+            [&ab_slash, &ab_question, &ab_dash].into_iter().collect();
+        assert_eq!(distinct.len(), 3, "three labels -> three jail names");
+
+        // Determinism: the same label always yields the same name (reattach).
+        assert_eq!(b.jail_name("a/b"), ab_slash);
+        assert_eq!(b.jail_name("alice"), b.jail_name("alice"));
+    }
+
+    /// Security repair #1(a): pathological tenant labels are rejected up front
+    /// (a well-behaved principal — email / uuid / OAuth subject — always
+    /// passes). Empty, control-char-bearing, and overlong labels bail; the
+    /// error is clear.
+    #[test]
+    fn validate_label_rejects_pathological_labels() {
+        // Empty.
+        assert!(JailBackend::validate_label("").is_err());
+        // Control chars: newline, NUL, and a C0 control.
+        assert!(JailBackend::validate_label("a\nb").is_err());
+        assert!(JailBackend::validate_label("a\0b").is_err());
+        assert!(JailBackend::validate_label("a\x07b").is_err());
+        // Overlong (past the 200-byte cap).
+        assert!(JailBackend::validate_label(&"x".repeat(201)).is_err());
+
+        // Well-behaved principals pass.
+        for good in [
+            "alice",
+            "jp@bultmann.eu",
+            "8e09ce34824a51534bee9f635cb6a81d",
+            "auth0|abc123",
+            &"x".repeat(200),
+        ] {
+            assert!(
+                JailBackend::validate_label(good).is_ok(),
+                "well-behaved label rejected: {good:?}"
+            );
+        }
+    }
+
+    /// Security repair #1(2): the reuse arm REFUSES a box whose recorded
+    /// `playground:tenant` provenance does not match the requester — a digest
+    /// collision or tampering must never hand one tenant another's sandbox.
+    #[test]
+    fn open_session_refuses_on_tenant_property_mismatch() {
+        // jail is up (default success) but the dataset's recorded tenant is
+        // someone else — the reuse arm must bail rather than reattach.
+        let (backend, _mock) = MockRunner::default()
+            .reply(
+                &["zfs", "get", "-H", "-o", "value", "mountpoint"],
+                ok_with_stdout(&format!("{}\n", alice_root())),
+            )
+            .reply(
+                &["sudo", "-n", "zfs", "get", "-H", "-o", "value", "playground:tenant"],
+                ok_with_stdout("someone-else\n"),
+            )
+            .into_backend();
+        let err = backend.open_session(&spec("alice")).expect_err("must refuse");
+        assert!(
+            err.to_string().contains("tenant mismatch")
+                || format!("{err:#}").contains("tenant mismatch"),
+            "err: {err:#}"
+        );
     }
 
     #[test]
@@ -1679,13 +1964,22 @@ mod tests {
     /// id WITHOUT re-cloning or re-creating the jail (persistent reuse).
     #[test]
     fn open_session_reuses_running_jail() {
-        let (backend, mock) = MockRunner::default()
-            .reply(&["sudo", "-n", "jls", "-j", "playground-alice"], ok_with_stdout("1\n"))
-            .into_backend();
+        // jail is up (jls succeeds by default) and the recorded tenant matches;
+        // mock_with_mountpoint scripts the `playground:tenant` read-back.
+        let (backend, mock) = mock_with_mountpoint().into_backend();
         let id = backend.open_session(&spec("alice")).expect("open");
-        assert_eq!(id.as_str(), "playground-alice");
+        assert_eq!(id.as_str(), alice_jail());
 
         let calls = mock.calls();
+        // The reuse arm VERIFIES the recorded tenant provenance before handing
+        // back the box.
+        assert!(
+            calls.iter().any(|c| c.starts_with(&[
+                "sudo".to_string(), "-n".into(), "zfs".into(), "get".into(),
+                "-H".into(), "-o".into(), "value".into(), "playground:tenant".into(),
+            ] as &[String])),
+            "reuse must verify playground:tenant provenance: {calls:?}"
+        );
         // Reuse must not provision anything: no clone, no jail -c.
         assert!(
             !calls.iter().any(|c| c.get(2).map(String::as_str) == Some("zfs")
