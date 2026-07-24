@@ -62,14 +62,34 @@ pub struct ExecParams {
     pub timeout: Option<Duration>,
 }
 
+/// One registry entry: which tenant a session belongs to, plus a reference
+/// count of how many live MCP endpoints/connections currently hold it open.
+///
+/// The refcount is the multi-endpoint sharing invariant: two honest
+/// connections from the SAME tenant map to the SAME backend session id (the
+/// jail is per-tenant, not per-connection), so they must SHARE one jail
+/// concurrently and teardown must happen only when the LAST handle detaches —
+/// otherwise the first connection's `close_session` would evict the second's
+/// still-live box.
+struct SessionEntry {
+    tenant: Tenant,
+    refs: usize,
+}
+
 /// The sandbox MCP provider: owns a backend and the set of live sessions.
 ///
 /// Multi-tenancy: each session records its [`Tenant`] so a single provider can
 /// host several piles/drivers at once. The provider enforces that `exec` and
 /// `close_session` only touch sessions it opened.
+///
+/// Reference counting: multiple endpoints from one tenant share a single
+/// backend session (see [`SessionEntry`]). `open_session` bumps the count and
+/// `close_session` decrements it, only DETACHING the backend at the last
+/// handle; `destroy_session` is the explicit hard teardown that ignores the
+/// count.
 pub struct SandboxProvider {
     backend: Box<dyn SandboxBackend>,
-    sessions: Mutex<HashMap<SessionId, Tenant>>,
+    sessions: Mutex<HashMap<SessionId, SessionEntry>>,
 }
 
 impl SandboxProvider {
@@ -80,7 +100,14 @@ impl SandboxProvider {
         }
     }
 
-    /// MCP `open_session`: provision a sandbox and register it.
+    /// MCP `open_session`: provision a sandbox and register it (or attach to an
+    /// already-open one from the same tenant, sharing the backend session).
+    ///
+    /// The backend maps a tenant to a stable session id, so a second endpoint
+    /// from the same tenant lands on the same id: we bump that entry's refcount
+    /// instead of re-opening. A different tenant resolving to the same id is
+    /// rejected here (provider-layer defence complementing the jail backend's
+    /// ZFS-property provenance check).
     pub fn open_session(&self, params: OpenSessionParams) -> Result<SessionId> {
         let spec = SessionSpec {
             tenant: params.tenant.clone(),
@@ -88,10 +115,20 @@ impl SandboxProvider {
             env: params.env,
         };
         let id = self.backend.open_session(&spec)?;
-        self.sessions
-            .lock()
-            .expect("sessions poisoned")
-            .insert(id.clone(), params.tenant);
+        let mut guard = self.sessions.lock().expect("sessions poisoned");
+        let entry = guard.entry(id.clone()).or_insert(SessionEntry {
+            tenant: params.tenant.clone(),
+            refs: 0,
+        });
+        if entry.tenant.label != params.tenant.label {
+            return Err(anyhow!(
+                "session id {} already bound to tenant '{}', refusing to attach tenant '{}'",
+                id.as_str(),
+                entry.tenant.label,
+                params.tenant.label
+            ));
+        }
+        entry.refs += 1;
         Ok(id)
     }
 
@@ -113,12 +150,29 @@ impl SandboxProvider {
         self.backend.exec(&params.session, &request)
     }
 
-    /// MCP `close_session`: release a sandbox and deregister it. Both shipped
-    /// backends (jail, lima) are persistent, so this only DETACHES — the box
-    /// lives on and the same tenant can reconnect; use `destroy_session` to
+    /// MCP `close_session`: drop one endpoint's handle on a sandbox. Both
+    /// shipped backends (jail, lima) are persistent, so this only DETACHES — and
+    /// with refcounting it detaches only when the LAST endpoint sharing the box
+    /// leaves. A `close_session` from one of several handles just decrements the
+    /// count and leaves the box (and every other handle's `exec`) untouched; the
+    /// box lives on and the same tenant can reconnect. Use `destroy_session` to
     /// remove it for good.
     pub fn close_session(&self, session: &SessionId) -> Result<()> {
-        self.ensure_known(session)?;
+        {
+            let mut guard = self.sessions.lock().expect("sessions poisoned");
+            let entry = guard
+                .get_mut(session)
+                .ok_or_else(|| anyhow!("unknown session {}", session.as_str()))?;
+            entry.refs = entry.refs.saturating_sub(1);
+            if entry.refs > 0 {
+                // Other endpoints still hold this box — do NOT touch the backend.
+                return Ok(());
+            }
+        }
+        // Last handle: detach the backend, then drop the entry. Backend close
+        // runs without the lock (it can block on ssh/limactl); we remove the
+        // entry only after it succeeds so a failed close leaves the session
+        // known (and retryable) rather than silently orphaned.
         self.backend.close_session(session)?;
         self.sessions
             .lock()
@@ -127,11 +181,13 @@ impl SandboxProvider {
         Ok(())
     }
 
-    /// MCP `destroy_session`: permanently tear a sandbox down and deregister it.
-    /// Both shipped backends (jail, lima) are persistent, so this is the real
-    /// teardown that removes the box for good (jail: `jail -r` + `zfs destroy`;
-    /// lima: `limactl stop` + `limactl delete`), as opposed to `close_session`'s
-    /// detach.
+    /// MCP `destroy_session`: permanently tear a sandbox down and deregister it,
+    /// REGARDLESS of refcount — this is the explicit hard teardown (jail:
+    /// `jail -r` + `zfs destroy`; lima: `limactl stop` + `limactl delete`), as
+    /// opposed to `close_session`'s last-handle detach. Any other endpoints
+    /// still holding the box are cut off; making concurrent-exec safe DURING a
+    /// destroy (draining in-flight execs, a transactional lifecycle) is repair
+    /// #3's job and out of scope here.
     pub fn destroy_session(&self, session: &SessionId) -> Result<()> {
         self.ensure_known(session)?;
         self.backend.destroy_session(session)?;
@@ -149,7 +205,10 @@ impl SandboxProvider {
     /// be released so a crashed or disconnected client can never orphan a VM or
     /// jail. Failures to close an individual session are logged to stderr and do
     /// not abort the sweep — a backend hiccup on one session must not strand the
-    /// rest. The session registry is left empty regardless.
+    /// rest. The session registry is left empty regardless. This is independent
+    /// of refcounts: each unique backend session is closed exactly ONCE (the map
+    /// keys on session id, so N endpoints sharing one box already collapse to one
+    /// entry), so process teardown never double-closes a shared box.
     ///
     /// Returns the number of sessions that failed to close cleanly (0 on a full
     /// teardown).
@@ -203,7 +262,7 @@ impl SandboxProvider {
             .lock()
             .expect("sessions poisoned")
             .get(session)
-            .map(|tenant| tenant.label.clone())
+            .map(|entry| entry.tenant.label.clone())
     }
 
     fn ensure_known(&self, session: &SessionId) -> Result<()> {
@@ -871,5 +930,149 @@ mod tests {
         // (a second sweep closes nothing).
         assert_eq!(closes.load(std::sync::atomic::Ordering::SeqCst), 2);
         assert_eq!(server.provider.close_all_sessions(), 0);
+    }
+
+    // -- Security repair #1(3): reference-counted sessions --------------------
+
+    use crate::sandbox::{PileMount, Tenant};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Build `OpenSessionParams` for a tenant label (the pile fields are inert
+    /// for the mock backend, which keys the session id on the label only).
+    fn params(label: &str) -> OpenSessionParams {
+        OpenSessionParams {
+            tenant: Tenant {
+                label: label.to_string(),
+                pile: PileMount {
+                    host_path: std::path::PathBuf::from(format!("/tmp/{label}/self.pile")),
+                    guest_path: std::path::PathBuf::from("/pile/self.pile"),
+                    append_only: true,
+                },
+            },
+            cwd: None,
+            env: Vec::new(),
+        }
+    }
+
+    fn exec_params(session: &SessionId) -> ExecParams {
+        ExecParams {
+            session: session.clone(),
+            command: "true".to_string(),
+            cwd: None,
+            stdin: None,
+            timeout: None,
+        }
+    }
+
+    /// Two `open_session`s from the SAME tenant map to ONE backend sandbox
+    /// (shared jail): the second open bumps a refcount rather than re-opening,
+    /// the first `close_session` only decrements (box still known + execable),
+    /// and the SECOND `close_session` triggers exactly ONE backend close (the
+    /// last handle detaches). This is the explicit multi-endpoint sharing
+    /// requirement — one honest connection closing must not evict another.
+    #[test]
+    fn provider_refcounts_shared_tenant_sessions() {
+        let closes = Arc::new(AtomicUsize::new(0));
+        let backend = MockBackend {
+            closes: closes.clone(),
+            ..Default::default()
+        };
+        let provider = SandboxProvider::new(Box::new(backend));
+
+        // Two endpoints from the same tenant -> the same backend session id.
+        let id1 = provider.open_session(params("alice")).expect("open 1");
+        let id2 = provider.open_session(params("alice")).expect("open 2");
+        assert_eq!(id1, id2, "same tenant shares one backend sandbox");
+
+        // First close: refcount 2 -> 1. No backend close yet; still execable.
+        provider.close_session(&id1).expect("close 1");
+        assert_eq!(closes.load(Ordering::SeqCst), 0, "first close must not detach");
+        provider.exec(exec_params(&id1)).expect("still execable after first close");
+
+        // Second close: refcount 1 -> 0. Exactly one backend close, now unknown.
+        provider.close_session(&id1).expect("close 2");
+        assert_eq!(closes.load(Ordering::SeqCst), 1, "last close detaches exactly once");
+        assert!(
+            provider.exec(exec_params(&id1)).is_err(),
+            "session must be unknown after the last handle leaves"
+        );
+    }
+
+    /// A second, DIFFERENT tenant whose principal would resolve to the same
+    /// backend session id is REFUSED at the provider (tenant mismatch) — the
+    /// provider-layer defence complementing the jail backend's ZFS-property
+    /// provenance check. Modelled with a backend that pins every session to a
+    /// fixed id regardless of tenant, so two tenants collide.
+    #[test]
+    fn provider_refuses_colliding_second_tenant() {
+        /// Every `open_session` returns the SAME id, forcing a collision between
+        /// distinct tenants.
+        #[derive(Default)]
+        struct CollidingBackend {
+            closes: Arc<AtomicUsize>,
+        }
+        impl SandboxBackend for CollidingBackend {
+            fn name(&self) -> &'static str {
+                "colliding"
+            }
+            fn open_session(&self, _spec: &SessionSpec) -> Result<SessionId> {
+                Ok(SessionId::new("shared-id"))
+            }
+            fn exec(&self, _s: &SessionId, _r: &ExecRequest) -> Result<ExecResult> {
+                Ok(ExecResult::default())
+            }
+            fn close_session(&self, _s: &SessionId) -> Result<()> {
+                self.closes.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            fn destroy_session(&self, _s: &SessionId) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let provider = SandboxProvider::new(Box::new(CollidingBackend::default()));
+        let id = provider.open_session(params("alice")).expect("open alice");
+
+        // Bob resolves to the same backend id: the provider must refuse to
+        // attach him to alice's entry.
+        let err = provider
+            .open_session(params("bob"))
+            .expect_err("colliding second tenant must be refused");
+        assert!(
+            err.to_string().contains("already bound to tenant"),
+            "err: {err}"
+        );
+
+        // Alice's session is intact and still owned by her.
+        provider.exec(exec_params(&id)).expect("alice still execable");
+    }
+
+    /// `destroy_session` is the hard teardown: it tears the box down and
+    /// deregisters it REGARDLESS of a nonzero refcount (a second endpoint still
+    /// held it). Concurrent-exec safety during destroy is repair #3's job.
+    #[test]
+    fn provider_destroy_ignores_refcount() {
+        let destroys = Arc::new(AtomicUsize::new(0));
+        let closes = Arc::new(AtomicUsize::new(0));
+        let backend = MockBackend {
+            destroys: destroys.clone(),
+            closes: closes.clone(),
+            ..Default::default()
+        };
+        let provider = SandboxProvider::new(Box::new(backend));
+
+        // Two handles on one shared box (refcount 2).
+        let id = provider.open_session(params("alice")).expect("open 1");
+        provider.open_session(params("alice")).expect("open 2");
+
+        // Hard teardown removes the entry despite refs == 2, backend destroy once.
+        provider.destroy_session(&id).expect("destroy");
+        assert_eq!(destroys.load(Ordering::SeqCst), 1);
+        assert_eq!(closes.load(Ordering::SeqCst), 0, "destroy is not a close");
+        assert!(
+            provider.exec(exec_params(&id)).is_err(),
+            "destroyed session is gone regardless of prior refcount"
+        );
     }
 }
