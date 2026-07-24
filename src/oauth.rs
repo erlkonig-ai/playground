@@ -115,6 +115,14 @@ pub struct ClientEntry {
 /// An invite code: the operator-minted, human-carried credential that maps a
 /// browser-based login onto a tenant. Single-use by default; a used
 /// single-use invite is deleted.
+///
+/// An invite may optionally be **bound** to an expected `client_id` and/or
+/// `redirect_uri` (repair #5 HIGH: an open-registration attacker must not be
+/// able to have a victim's invite authorize a client the attacker controls). A
+/// bound invite is only redeemable by an authorize request whose client/redirect
+/// exact-match the binding; an unbound invite keeps the prior behaviour (any
+/// registered client). The operator mints a bound invite when they already know
+/// which connector the human will use.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InviteEntry {
     /// Tenant the resulting tokens act as.
@@ -124,6 +132,23 @@ pub struct InviteEntry {
     pub reusable: bool,
     /// Unix seconds at mint.
     pub created_at: u64,
+    /// If set, the invite is only redeemable by this exact `client_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+    /// If set, the invite is only redeemable with this exact `redirect_uri`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redirect_uri: Option<String>,
+}
+
+/// Why an invite redemption was refused at the authorize step — each a
+/// no-write, pre-redirect failure (repair #5 HIGH).
+enum InviteRejection {
+    /// No such invite (or already spent).
+    Unknown,
+    /// Invite is bound to a different `client_id`.
+    ClientMismatch,
+    /// Invite is bound to a different `redirect_uri`.
+    RedirectMismatch,
 }
 
 /// One live OAuth access token. Resolves to the same shape as a static
@@ -196,18 +221,14 @@ impl OauthStore {
         }
     }
 
-    /// Persist the store to `path` (pretty JSON, mode 0600).
+    /// Persist the store to `path` (pretty JSON, mode 0600) crash-atomically —
+    /// a `0600` temp sibling written + fsync'd, then `rename`d into place, so a
+    /// crash never leaves the auth state torn or briefly world-readable. Shares
+    /// [`crate::mcp_http::atomic_write_0600`] with the static token store.
     pub fn save(&self, path: &Path) -> Result<()> {
         let json = serde_json::to_string_pretty(self)?;
-        std::fs::write(path, json)
-            .with_context(|| format!("write oauth state {}", path.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-                .with_context(|| format!("chmod 600 oauth state {}", path.display()))?;
-        }
-        Ok(())
+        crate::mcp_http::atomic_write_0600(path, json.as_bytes())
+            .with_context(|| format!("write oauth state {}", path.display()))
     }
 
     /// Register a public client; returns the minted `client_id`.
@@ -244,7 +265,16 @@ impl OauthStore {
     }
 
     /// Mint an invite code bound to `tenant`. Single-use unless `reusable`.
-    pub fn mint_invite(&mut self, tenant: &str, reusable: bool, now: u64) -> String {
+    /// Optionally bound to an expected `client_id` / `redirect_uri` (repair #5
+    /// HIGH: invite→attacker-client), which the authorize step exact-matches.
+    pub fn mint_invite(
+        &mut self,
+        tenant: &str,
+        reusable: bool,
+        client_id: Option<String>,
+        redirect_uri: Option<String>,
+        now: u64,
+    ) -> String {
         let code = random_urlsafe(32);
         self.invites.insert(
             code.clone(),
@@ -252,6 +282,8 @@ impl OauthStore {
                 tenant: tenant.to_string(),
                 reusable,
                 created_at: now,
+                client_id,
+                redirect_uri,
             },
         );
         code
@@ -459,6 +491,23 @@ impl TokenBucket {
     }
 }
 
+/// Take one token from `source`'s bucket in `buckets`, creating it (full) on
+/// first sight, then sweep buckets that have refilled to capacity (no memory
+/// worth keeping) so the map stays bounded without a reaper. `true` = allowed.
+/// Shared by the registration and write-edge limiters.
+fn bucket_allowed(buckets: &Mutex<HashMap<IpAddr, TokenBucket>>, source: IpAddr, now: u64) -> bool {
+    let mut buckets = buckets.lock().expect("buckets poisoned");
+    let allowed = buckets
+        .entry(source)
+        .or_insert_with(|| TokenBucket::new(now))
+        .try_take(now);
+    buckets.retain(|_, b| {
+        let elapsed = now.saturating_sub(b.last_refill) as f64;
+        (b.tokens + elapsed * REGISTER_REFILL_PER_SEC) < REGISTER_BUCKET_CAPACITY
+    });
+    allowed
+}
+
 /// Live OAuth state hung off `HttpState` when the feature is configured.
 pub struct OauthRuntime {
     /// `OauthConfig::public_url`, normalized (no trailing slash).
@@ -470,6 +519,11 @@ pub struct OauthRuntime {
     /// Registration rate-limiter, keyed by remote IP (or a single shared bucket
     /// under the unspecified `0.0.0.0` key when `ConnectInfo` is unavailable).
     register_buckets: Mutex<HashMap<IpAddr, TokenBucket>>,
+    /// Rate-limiter for the other unauthenticated write-ish edges — the
+    /// `/oauth/token` (refresh/code) and `POST /oauth/authorize` handlers
+    /// (repair #5 HIGH: rate-limit at the trusted edge). Separate bucket map so
+    /// legitimate token traffic and registration bursts don't share a budget.
+    edge_buckets: Mutex<HashMap<IpAddr, TokenBucket>>,
 }
 
 impl OauthRuntime {
@@ -495,23 +549,20 @@ impl OauthRuntime {
             store: Mutex::new(store),
             codes: Mutex::new(HashMap::new()),
             register_buckets: Mutex::new(HashMap::new()),
+            edge_buckets: Mutex::new(HashMap::new()),
         })
     }
 
     /// Consult the registration rate-limiter for `source`. `true` = allowed.
-    /// A stale-bucket sweep keeps the map bounded (a bucket at full capacity
-    /// has no memory worth keeping).
     fn register_allowed(&self, source: IpAddr, now: u64) -> bool {
-        let mut buckets = self.register_buckets.lock().expect("buckets poisoned");
-        let allowed = buckets
-            .entry(source)
-            .or_insert_with(|| TokenBucket::new(now))
-            .try_take(now);
-        buckets.retain(|_, b| {
-            let elapsed = now.saturating_sub(b.last_refill) as f64;
-            (b.tokens + elapsed * REGISTER_REFILL_PER_SEC) < REGISTER_BUCKET_CAPACITY
-        });
-        allowed
+        bucket_allowed(&self.register_buckets, source, now)
+    }
+
+    /// Consult the shared write-edge rate-limiter for `source` (`/oauth/token`,
+    /// `POST /oauth/authorize`). `true` = allowed. Same token-bucket shape as
+    /// registration; a separate map so the budgets don't interfere.
+    fn edge_allowed(&self, source: IpAddr, now: u64) -> bool {
+        bucket_allowed(&self.edge_buckets, source, now)
     }
 
     /// Apply a mutation to the persistent store under the cross-process file
@@ -524,6 +575,23 @@ impl OauthRuntime {
     fn with_locked_store<R>(
         &self,
         mutate: impl FnOnce(&mut OauthStore) -> R,
+    ) -> Result<R> {
+        // Callers of this method always mutate (mint/rotate-success), so the
+        // write is unconditional here. No-op/error paths use
+        // [`with_locked_store_if`] instead so they never write.
+        self.with_locked_store_if(|store| (true, mutate(store)))
+    }
+
+    /// Like [`with_locked_store`], but the closure returns `(dirty, R)`: the
+    /// store is `save()`d only when `dirty` is true. This is the write-avoidance
+    /// primitive for no-op/error paths (repair #5 HIGH: unauthenticated OAuth
+    /// write amplification) — an invalid unauthenticated request that reaches
+    /// the lock still re-reads the latest disk state (so a real concurrent write
+    /// is never lost), but performs no write of its own, so it cannot be used to
+    /// force an unbounded stream of full-file rewrites.
+    fn with_locked_store_if<R>(
+        &self,
+        mutate: impl FnOnce(&mut OauthStore) -> (bool, R),
     ) -> Result<R> {
         let mut mirror = self.store.lock().expect("oauth store poisoned");
         let (fresh, result) = mutate_state_locked(&self.state_path, mutate)?;
@@ -593,11 +661,18 @@ impl OauthRuntime {
                 return Err("unknown token");
             }
         }
-        // Fell through: the token is present but expired. Reap it under the lock.
-        let outcome = self.with_locked_store(|store| store.lookup_access(token, now));
+        // Fell through: the token is present but expired. Reap it under the
+        // lock — but only *write* when the reap actually removed something
+        // (`OauthStore::lookup_access` reports that via the `mutated` bool), so
+        // a token another writer already cleaned up doesn't trigger a redundant
+        // full-file rewrite.
+        let outcome = self.with_locked_store_if(|store| match store.lookup_access(token, now) {
+            Ok(entry) => (false, Ok(entry)),
+            Err((message, mutated)) => (mutated, Err(message)),
+        });
         match outcome {
             Ok(Ok(entry)) => Ok(entry), // Refreshed on another writer; still valid.
-            Ok(Err((message, _))) => Err(message),
+            Ok(Err(message)) => Err(message),
             Err(e) => {
                 eprintln!("warning: failed to reap expired oauth token: {e:#}");
                 Err("access token expired")
@@ -693,19 +768,24 @@ fn lock_path_for(state_path: &Path) -> PathBuf {
 }
 
 /// Run `mutate` against the *current on-disk* store under the exclusive file
-/// lock, then persist the result: lock → re-read disk → mutate → write →
-/// unlock. This is the one safe read-modify-write primitive; the server and the
-/// CLI both funnel through it so a stale snapshot can never clobber a newer one.
-/// Returns the mutated store (so callers can refresh their in-memory cache) and
-/// the closure's own return value.
+/// lock, then persist the result iff the closure reports a change: lock →
+/// re-read disk → mutate → (write only if dirty) → unlock. This is the one safe
+/// read-modify-write primitive; the server and the CLI both funnel through it so
+/// a stale snapshot can never clobber a newer one. The `dirty` half of the
+/// closure's return lets no-op/error paths skip the (O(N), fsyncing) write
+/// entirely so they cannot be turned into a write-amplification lever. Returns
+/// the freshly-read store (so callers can refresh their in-memory cache) and the
+/// closure's own return value.
 fn mutate_state_locked<R>(
     state_path: &Path,
-    mutate: impl FnOnce(&mut OauthStore) -> R,
+    mutate: impl FnOnce(&mut OauthStore) -> (bool, R),
 ) -> Result<(OauthStore, R)> {
     let _lock = FileLock::acquire(state_path)?;
     let mut store = OauthStore::load(state_path)?;
-    let result = mutate(&mut store);
-    store.save(state_path)?;
+    let (dirty, result) = mutate(&mut store);
+    if dirty {
+        store.save(state_path)?;
+    }
     Ok((store, result))
 }
 
@@ -718,10 +798,16 @@ pub fn mint_invite_locked(
     state_path: &Path,
     tenant: &str,
     reusable: bool,
+    client_id: Option<String>,
+    redirect_uri: Option<String>,
     now: u64,
 ) -> Result<String> {
-    let (_store, code) =
-        mutate_state_locked(state_path, |store| store.mint_invite(tenant, reusable, now))?;
+    let (_store, code) = mutate_state_locked(state_path, |store| {
+        (
+            true,
+            store.mint_invite(tenant, reusable, client_id.clone(), redirect_uri.clone(), now),
+        )
+    })?;
     Ok(code)
 }
 
@@ -762,6 +848,27 @@ fn oauth(state: &HttpState) -> &OauthRuntime {
         .oauth
         .as_ref()
         .expect("oauth routes are mounted only when oauth is configured")
+}
+
+/// Run a store-mutating closure on the blocking pool (repair #5 HIGH: move
+/// blocking persistence off the async runtime workers). The OAuth store writes
+/// take a cross-process `flock`, re-read the file, and `fsync` — all blocking
+/// syscalls that must not sit on a tokio worker. `write` gets `&OauthRuntime`
+/// (via the moved `Arc<HttpState>`) and returns the same `Result<R>` the
+/// `with_locked_store*` methods do; a `spawn_blocking` join failure is folded
+/// into that `Result` so callers see one error channel.
+async fn run_store_write<R>(
+    state: &Arc<HttpState>,
+    write: impl FnOnce(&OauthRuntime) -> Result<R> + Send + 'static,
+) -> Result<R>
+where
+    R: Send + 'static,
+{
+    let state = state.clone();
+    match tokio::task::spawn_blocking(move || write(oauth(&state))).await {
+        Ok(result) => result,
+        Err(join) => Err(anyhow::anyhow!("oauth store write task panicked: {join}")),
+    }
 }
 
 /// `GET /.well-known/oauth-protected-resource` (RFC 9728): tells a connector
@@ -869,14 +976,31 @@ async fn register(
 
     // GC self-drains abandoned registrations, then the hard cap bounds N (which
     // also bounds the O(N) full-file rewrite this save does). Both run inside
-    // the file lock so the count we check is the count we write.
-    let outcome = oauth.with_locked_store(|store| {
-        store.gc_stale_clients(now);
-        if store.clients.len() >= MAX_CLIENTS {
-            return Err(());
-        }
-        Ok(store.register_client(redirect_uris.clone(), client_name.clone(), now))
-    });
+    // the file lock so the count we check is the count we write. The store is
+    // written only when something actually changed — a rejected (store-full)
+    // registration that also GC'd nothing performs no write, so a burst of
+    // registrations against a full store cannot amplify into a write storm.
+    //
+    // The whole flock + re-read + fsync critical section is blocking IO, so it
+    // runs on the blocking pool (repair #5 HIGH: move blocking persistence off
+    // the async runtime workers) rather than stalling a tokio worker.
+    // Clone what the blocking closure consumes; `redirect_uris`/`client_name`
+    // are reused in the success response body below, so they must not be moved
+    // into the closure.
+    let uris_for_store = redirect_uris.clone();
+    let name_for_store = client_name.clone();
+    let outcome = run_store_write(&state, move |oauth| {
+        oauth.with_locked_store_if(|store| {
+            let reclaimed = store.gc_stale_clients(now);
+            if store.clients.len() >= MAX_CLIENTS {
+                // Persist only if GC actually freed clients; otherwise no-op.
+                return (reclaimed > 0, Err(()));
+            }
+            let client_id = store.register_client(uris_for_store.clone(), name_for_store.clone(), now);
+            (true, Ok(client_id))
+        })
+    })
+    .await;
     let client_id = match outcome {
         Ok(Ok(client_id)) => client_id,
         Ok(Err(())) => return registration_store_full(),
@@ -930,6 +1054,41 @@ fn registration_rate_limited() -> Response {
             "error_description": "registration rate limit exceeded; retry later",
         })
         .to_string(),
+    )
+        .into_response()
+}
+
+/// 429 for the `/oauth/token` edge (repair #5 HIGH: rate-limit at the trusted
+/// edge). RFC 6749 §5.2 `slow_down`, with `Cache-Control: no-store` like every
+/// other token-endpoint response.
+fn token_rate_limited() -> Response {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [
+            (header::CONTENT_TYPE, "application/json"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        json!({
+            "error": "slow_down",
+            "error_description": "token endpoint rate limit exceeded; retry later",
+        })
+        .to_string(),
+    )
+        .into_response()
+}
+
+/// 429 page for the `POST /oauth/authorize` edge (repair #5 HIGH). A human-facing
+/// HTML page (unlike the JSON token edge), since this endpoint serves the
+/// consent form.
+fn authorize_rate_limited() -> Response {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">\
+         <title>playground &mdash; slow down</title></head>\n\
+         <body style=\"font: 16px/1.5 system-ui, sans-serif; max-width: 26rem; margin: 4rem auto;\">\n\
+         <h1>Too many attempts</h1>\n<p>Please wait a moment and try again.</p>\n</body></html>\n"
+            .to_string(),
     )
         .into_response()
 }
@@ -993,10 +1152,13 @@ impl AuthorizeParams {
 /// Validate the identity half of an authorize request: known client, exactly
 /// registered redirect URI. Failures here get a 400 page, never a redirect —
 /// redirecting to an unvalidated URI is an open redirect (RFC 6749 §4.1.2.1).
+/// Returns the client's registered display name (if any) so the consent page
+/// can show *who* is asking (repair #5 HIGH: the consent page must show the
+/// client identity + redirect host).
 fn validate_client_and_redirect(
     state: &HttpState,
     params: &AuthorizeParams,
-) -> std::result::Result<(), Response> {
+) -> std::result::Result<Option<String>, Response> {
     let store = oauth(state).store.lock().expect("oauth store poisoned");
     let Some(client) = store.clients.get(&params.client_id) else {
         return Err(authorize_error_page("unknown client_id"));
@@ -1006,7 +1168,7 @@ fn validate_client_and_redirect(
             "redirect_uri is not registered for this client",
         ));
     }
-    Ok(())
+    Ok(client.client_name.clone())
 }
 
 /// Validate the protocol half: `response_type=code`, PKCE challenge present,
@@ -1037,16 +1199,23 @@ fn validate_grant_shape(params: &AuthorizeParams) -> std::result::Result<(), Res
 /// because hidden form fields are attacker-editable.
 async fn authorize_form(State(state): State<Arc<HttpState>>, uri: Uri) -> Response {
     let params = AuthorizeParams::from_map(&parse_form(uri.query().unwrap_or("")));
-    if let Err(response) = validate_client_and_redirect(&state, &params) {
-        return response;
-    }
+    let client_name = match validate_client_and_redirect(&state, &params) {
+        Ok(name) => name,
+        Err(response) => return response,
+    };
     if let Err(response) = validate_grant_shape(&params) {
         return response;
     }
+    // Anti-framing (repair #5 HIGH): the consent page must not be embeddable, so
+    // a clickjacking overlay can't trick the human into submitting the invite.
     (
         StatusCode::OK,
-        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-        authorize_page(&params),
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::X_FRAME_OPTIONS, "DENY"),
+            (header::CONTENT_SECURITY_POLICY, "frame-ancestors 'none'"),
+        ],
+        authorize_page(&params, client_name.as_deref()),
     )
         .into_response()
 }
@@ -1054,8 +1223,18 @@ async fn authorize_form(State(state): State<Arc<HttpState>>, uri: Uri) -> Respon
 /// `POST /oauth/authorize`: redeem the invite code, mint an authorization
 /// code bound to {client, redirect URI, PKCE challenge, tenant}, and bounce
 /// the browser back to the client with `code` (+ `state` passthrough).
-async fn authorize_submit(State(state): State<Arc<HttpState>>, body: Bytes) -> Response {
+async fn authorize_submit(
+    State(state): State<Arc<HttpState>>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    body: Bytes,
+) -> Response {
     let oauth = oauth(&state);
+    // Rate-limit the submit edge (repair #5 HIGH: rate-limit at the trusted
+    // edge) before touching the store — a burst of invite guesses from one
+    // source is throttled here, ahead of the (now no-write) invalid-invite path.
+    if !oauth.edge_allowed(peer.ip(), unix_now()) {
+        return authorize_rate_limited();
+    }
     let Ok(body) = std::str::from_utf8(&body) else {
         return authorize_error_page("form body is not UTF-8");
     };
@@ -1075,18 +1254,60 @@ async fn authorize_submit(State(state): State<Arc<HttpState>>, body: Bytes) -> R
     // An invalid invite is a *pre-redirect* failure → 400 page, never a bounce
     // off this origin (the open-redirect defence: the redirect_uri is only
     // trusted as a redirect target once a real invite has been presented).
-    let invite_code = form.get("invite_code").map(String::as_str).unwrap_or("");
+    let invite_code = form.get("invite_code").cloned().unwrap_or_default();
     let now = unix_now();
-    let consumed = oauth.with_locked_store(|store| {
-        let tenant = store.consume_invite(invite_code)?;
-        if let Some(client) = store.clients.get_mut(&params.client_id) {
-            client.authorized_at = Some(now);
-        }
-        Some(tenant)
-    });
+    let expected_client = params.client_id.clone();
+    let expected_redirect = params.redirect_uri.clone();
+    // The flock + fsync runs on the blocking pool (repair #5 HIGH: off the
+    // runtime workers), and only writes when the invite is actually consumed
+    // (repair #5 HIGH: no write on a rejected binding / invalid invite).
+    let consumed = run_store_write(&state, move |oauth| {
+        oauth.with_locked_store_if(|store| {
+            // Peek the invite WITHOUT consuming, so we can enforce the client /
+            // redirect binding (repair #5 HIGH: invite→attacker-client) and
+            // reject a mismatch with NO write (repair #5 HIGH: write
+            // amplification). The invite is only spent once it passes the binding.
+            let Some(invite) = store.invites.get(&invite_code).cloned() else {
+                return (false, Err(InviteRejection::Unknown));
+            };
+            if invite
+                .client_id
+                .as_deref()
+                .is_some_and(|want| want != expected_client)
+            {
+                return (false, Err(InviteRejection::ClientMismatch));
+            }
+            if invite
+                .redirect_uri
+                .as_deref()
+                .is_some_and(|want| want != expected_redirect)
+            {
+                return (false, Err(InviteRejection::RedirectMismatch));
+            }
+            // Binding cleared: now actually consume (mutation) + stamp the client.
+            let tenant = store
+                .consume_invite(&invite_code)
+                .expect("invite present, just peeked");
+            if let Some(client) = store.clients.get_mut(&expected_client) {
+                client.authorized_at = Some(now);
+            }
+            (true, Ok(tenant))
+        })
+    })
+    .await;
     let tenant = match consumed {
-        Ok(Some(tenant)) => tenant,
-        Ok(None) => return authorize_error_page("invalid invite code"),
+        Ok(Ok(tenant)) => tenant,
+        Ok(Err(InviteRejection::Unknown)) => return authorize_error_page("invalid invite code"),
+        Ok(Err(InviteRejection::ClientMismatch)) => {
+            return authorize_error_page(
+                "this invite is bound to a different client_id",
+            );
+        }
+        Ok(Err(InviteRejection::RedirectMismatch)) => {
+            return authorize_error_page(
+                "this invite is bound to a different redirect_uri",
+            );
+        }
         Err(e) => {
             return http_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1113,14 +1334,24 @@ async fn authorize_submit(State(state): State<Arc<HttpState>>, body: Bytes) -> R
 /// `POST /oauth/token`: the code-for-tokens (and refresh-rotation) exchange.
 /// Form-encoded per RFC 6749; errors use the §5.2 JSON shape. Every response
 /// carries `Cache-Control: no-store` (§5.1).
-async fn token(State(state): State<Arc<HttpState>>, body: Bytes) -> Response {
+async fn token(
+    State(state): State<Arc<HttpState>>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    body: Bytes,
+) -> Response {
     let oauth = oauth(&state);
+    let now = unix_now();
+    // Rate-limit the token edge (repair #5 HIGH: rate-limit at the trusted
+    // edge) — an unauthenticated caller replaying garbage codes/refresh tokens
+    // is throttled here, ahead of the (now no-write) invalid paths.
+    if !oauth.edge_allowed(peer.ip(), now) {
+        return token_rate_limited();
+    }
     let Ok(body) = std::str::from_utf8(&body) else {
         return token_error("invalid_request", "form body is not UTF-8");
     };
     let form = parse_form(body);
     let get = |key: &str| form.get(key).map(String::as_str).unwrap_or("");
-    let now = unix_now();
 
     let (access, refresh, scope) = match get("grant_type") {
         // --- authorization_code + PKCE --------------------------------
@@ -1154,16 +1385,23 @@ async fn token(State(state): State<Arc<HttpState>>, body: Bytes) -> Response {
             }
 
             // Mint under the file lock (re-read → mint → write) so a concurrent
-            // `token invite` write can't roll this token pair back.
-            let minted = oauth.with_locked_store(|store| {
-                store.mint_token_pair(
-                    &code.tenant,
-                    &state.config.backend_name,
-                    &code.client_id,
-                    oauth.access_ttl,
-                    now,
-                )
-            });
+            // `token invite` write can't roll this token pair back — on the
+            // blocking pool (repair #5 HIGH: off the runtime workers).
+            let backend_name = state.config.backend_name.clone();
+            let code_tenant = code.tenant.clone();
+            let code_client = code.client_id.clone();
+            let minted = run_store_write(&state, move |oauth| {
+                oauth.with_locked_store(|store| {
+                    store.mint_token_pair(
+                        &code_tenant,
+                        &backend_name,
+                        &code_client,
+                        oauth.access_ttl,
+                        now,
+                    )
+                })
+            })
+            .await;
             let (access, refresh) = match minted {
                 Ok(pair) => pair,
                 Err(e) => {
@@ -1177,15 +1415,36 @@ async fn token(State(state): State<Arc<HttpState>>, body: Bytes) -> Response {
         }
         // --- refresh_token rotation -----------------------------------
         "refresh_token" => {
-            let client_id = form.get("client_id").map(String::as_str);
+            let client_id = form.get("client_id").cloned();
+            let refresh_token = get("refresh_token").to_string();
             // The rotation itself (including the family-revoke on reuse) is a
             // store mutation, so it runs inside the file lock: re-read the
             // latest on-disk state, rotate, write. This is exactly the path M2
             // guards — a stale CLI write must never resurrect a family revoked
-            // here.
-            let rotated = oauth.with_locked_store(|store| {
-                store.rotate_refresh(get("refresh_token"), client_id, oauth.access_ttl, now)
-            });
+            // here. It runs on the blocking pool (repair #5 HIGH: off the
+            // runtime workers). The write is CONDITIONAL on an actual mutation
+            // (repair #5 HIGH: OAuth write amplification): an unknown refresh
+            // token or a client mismatch changes nothing, so it performs no
+            // write — an unauthenticated caller replaying garbage refresh tokens
+            // can no longer force a full-file rewrite per request. A successful
+            // rotation and a reuse-triggered family-revoke both DO write.
+            let rotated = run_store_write(&state, move |oauth| {
+                oauth.with_locked_store_if(|store| {
+                    match store.rotate_refresh(
+                        &refresh_token,
+                        client_id.as_deref(),
+                        oauth.access_ttl,
+                        now,
+                    ) {
+                        Ok(rotation) => (true, Ok(rotation)),
+                        // ReuseRevoked mutated (burned the family); Unknown /
+                        // ClientMismatch did not.
+                        Err(RotateError::ReuseRevoked) => (true, Err(RotateError::ReuseRevoked)),
+                        Err(other) => (false, Err(other)),
+                    }
+                })
+            })
+            .await;
             let rotation = match rotated {
                 Ok(rotation) => rotation,
                 Err(e) => {
@@ -1261,7 +1520,14 @@ fn token_error(error: &str, description: &str) -> Response {
 /// The invite-code form: fully self-contained (inline CSS, no external
 /// assets), request parameters round-tripped as hidden fields. Everything
 /// interpolated is HTML-escaped — `state` in particular is attacker-chosen.
-fn authorize_page(params: &AuthorizeParams) -> String {
+///
+/// The consent copy names the requesting **client** (registered `client_name`
+/// if any, else its `client_id`) and the **redirect host** (repair #5 HIGH: the
+/// human must be able to see *who* is asking and *where* the code will be sent —
+/// this is what lets them refuse an attacker-chosen client/callback before
+/// pasting a valid invite). The redirect host is derived independently from the
+/// registered `redirect_uri`, not from anything the client can restyle.
+fn authorize_page(params: &AuthorizeParams, client_name: Option<&str>) -> String {
     let hidden = [
         ("response_type", &params.response_type),
         ("client_id", &params.client_id),
@@ -1279,6 +1545,17 @@ fn authorize_page(params: &AuthorizeParams) -> String {
         )
     })
     .collect::<String>();
+
+    // The client label the human sees: the registered name if present, else the
+    // raw client_id (always shown so a nameless client isn't invisible).
+    let client_label = match client_name {
+        Some(name) if !name.is_empty() => {
+            format!("{} (<code>{}</code>)", html_escape(name), html_escape(&params.client_id))
+        }
+        _ => format!("<code>{}</code>", html_escape(&params.client_id)),
+    };
+    let redirect_host = redirect_host(&params.redirect_uri);
+
     format!(
         "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n\
@@ -1289,17 +1566,44 @@ fn authorize_page(params: &AuthorizeParams) -> String {
          input[type=text] {{ width: 100%; padding: .5rem; font: inherit; box-sizing: border-box; }}\n\
          button {{ margin-top: 1rem; padding: .5rem 1.5rem; font: inherit; }}\n\
          p.hint {{ color: #555; font-size: .875rem; }}\n\
+         dl.details {{ background: #f4f4f4; padding: .75rem 1rem; border-radius: .375rem; }}\n\
+         dl.details dt {{ font-weight: 600; }}\n\
+         dl.details dd {{ margin: 0 0 .5rem; word-break: break-all; }}\n\
+         dl.details dd:last-child {{ margin-bottom: 0; }}\n\
          </style>\n</head>\n<body>\n\
          <h1>Authorize access</h1>\n\
-         <p>A client wants to connect to this playground server.</p>\n\
+         <p>A client is asking to connect to this playground server. Check who it \
+         is and where it will send your authorization before continuing.</p>\n\
+         <dl class=\"details\">\n\
+         <dt>Client</dt><dd>{client_label}</dd>\n\
+         <dt>Will send the code to</dt><dd><code>{redirect_host}</code></dd>\n\
+         </dl>\n\
          <form method=\"post\" action=\"/oauth/authorize\">\n{hidden}\n\
          <label for=\"invite_code\">Invite code</label>\n\
          <input type=\"text\" id=\"invite_code\" name=\"invite_code\" autofocus \
          autocomplete=\"off\" spellcheck=\"false\">\n\
-         <p class=\"hint\">Ask the operator for an invite code (<code>playground invite</code>).</p>\n\
+         <p class=\"hint\">Ask the operator for an invite code (<code>playground invite</code>). \
+         Only paste it if the client and destination above are the ones you expect.</p>\n\
          <button type=\"submit\">Authorize</button>\n\
          </form>\n</body>\n</html>\n",
     )
+}
+
+/// The host (`scheme://host[:port]`) of a redirect URI, for the consent page —
+/// derived from the registered URI independently of anything else the client
+/// controls. Falls back to the (escaped) whole URI if it won't parse as one
+/// with an authority (registration already rejects those, so this is just
+/// defensive).
+fn redirect_host(redirect_uri: &str) -> String {
+    match redirect_uri.parse::<Uri>() {
+        Ok(uri) => match (uri.scheme_str(), uri.authority()) {
+            (Some(scheme), Some(authority)) => {
+                html_escape(&format!("{scheme}://{authority}"))
+            }
+            _ => html_escape(redirect_uri),
+        },
+        Err(_) => html_escape(redirect_uri),
+    }
 }
 
 /// 400 error page for failures where redirecting would be unsafe (unknown
@@ -1550,8 +1854,8 @@ mod tests {
     #[test]
     fn invite_consumption_semantics() {
         let mut store = OauthStore::default();
-        let single = store.mint_invite("alice", false, 1_000);
-        let multi = store.mint_invite("team", true, 1_000);
+        let single = store.mint_invite("alice", false, None, None, 1_000);
+        let multi = store.mint_invite("team", true, None, None, 1_000);
 
         assert_eq!(store.consume_invite(&single).as_deref(), Some("alice"));
         assert_eq!(store.consume_invite(&single), None, "single-use is gone");
@@ -1580,7 +1884,7 @@ mod tests {
             Some("Claude".to_string()),
             1_000,
         );
-        let invite = store.mint_invite("alice", false, 1_001);
+        let invite = store.mint_invite("alice", false, None, None, 1_001);
         let (access, refresh) =
             store.mint_token_pair("alice", "mock", &client_id, Duration::from_secs(60), 1_002);
         store.save(&path).expect("save");
@@ -1789,7 +2093,7 @@ mod tests {
         // the CLI does — the server reads the on-disk store when consuming.
         let oauth = state.oauth.as_ref().expect("oauth configured");
         let invite = oauth
-            .with_locked_store(|store| store.mint_invite("alice", false, unix_now()))
+            .with_locked_store(|store| store.mint_invite("alice", false, None, None, unix_now()))
             .expect("mint invite");
         let submit = |invite: &str, challenge: &str| {
             agent
@@ -1875,7 +2179,7 @@ mod tests {
 
         // --- Wrong verifier burns its (fresh) code and yields invalid_grant.
         let invite2 = oauth
-            .with_locked_store(|store| store.mint_invite("bob", false, unix_now()))
+            .with_locked_store(|store| store.mint_invite("bob", false, None, None, unix_now()))
             .expect("mint invite2");
         let mut granted2 = submit(&invite2, &challenge);
         let (_, query) = location_query(&granted2);
@@ -2202,6 +2506,7 @@ mod tests {
                 .rotate_refresh(&refresh, Some("client-1"), Duration::from_secs(3600), 2_100)
                 .err();
             assert_eq!(err, Some(RotateError::ReuseRevoked));
+            (true, ())
         })
         .unwrap();
 
@@ -2213,7 +2518,7 @@ mod tests {
         // SAME locked re-read primitive (not a blind write of `stale_snapshot`),
         // it starts from the server's revoked state and only ADDS an invite —
         // the revoked family is NOT resurrected.
-        let _invite = mint_invite_locked(&path, "bob", false, 3_000).unwrap();
+        let _invite = mint_invite_locked(&path, "bob", false, None, None, 3_000).unwrap();
 
         let final_state = OauthStore::load(&path).unwrap();
         assert!(
@@ -2315,5 +2620,239 @@ mod tests {
         // A day is allowed; a day-and-a-second is over the ceiling.
         assert!(Duration::from_secs(24 * 3600) <= MAX_ACCESS_TTL);
         assert!(Duration::from_secs(24 * 3600 + 1) > MAX_ACCESS_TTL);
+    }
+
+    // -- repair #5 HIGH: no write on no-op/error OAuth paths -----------------
+
+    /// An unauthenticated garbage `refresh_token` and an invalid `invite_code`
+    /// perform NO write to the state file — the byte content and mtime are
+    /// unchanged — so an attacker cannot use them to force full-file rewrites
+    /// (write amplification). A genuine mutation still writes (control).
+    #[test]
+    fn no_op_oauth_paths_perform_no_write() {
+        let dir = scratch_dir("nowrite");
+        let path = dir.join("oauth.json");
+
+        // Seed a real family so the file exists with content.
+        {
+            let mut store = OauthStore::default();
+            store.mint_token_pair("alice", "mock", "client-1", Duration::from_secs(3600), 1_000);
+            store.save(&path).unwrap();
+        }
+        let read_all = || std::fs::read(&path).unwrap();
+        let mtime = || std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        let before_bytes = read_all();
+        let before_mtime = mtime();
+        // Sleep so a real write would move the (coarse-resolution) mtime.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+
+        // Unknown refresh token: rotate_refresh returns Unknown, no mutation.
+        {
+            let (_store, result) = mutate_state_locked(&path, |store| {
+                match store.rotate_refresh("never-issued", None, Duration::from_secs(3600), 2_000) {
+                    Ok(r) => (true, Ok(r)),
+                    Err(RotateError::ReuseRevoked) => (true, Err(RotateError::ReuseRevoked)),
+                    Err(other) => (false, Err(other)),
+                }
+            })
+            .unwrap();
+            assert_eq!(result.err(), Some(RotateError::Unknown));
+        }
+        assert_eq!(read_all(), before_bytes, "unknown refresh wrote nothing");
+        assert_eq!(mtime(), before_mtime, "unknown refresh left mtime untouched");
+
+        // Invalid invite consume: consume_invite returns None, no mutation.
+        {
+            let (_store, wrote) = mutate_state_locked(&path, |store| {
+                let consumed = store.consume_invite("never-minted");
+                (consumed.is_some(), consumed)
+            })
+            .unwrap();
+            assert!(wrote.is_none(), "invalid invite consumed nothing");
+        }
+        assert_eq!(read_all(), before_bytes, "invalid invite wrote nothing");
+        assert_eq!(mtime(), before_mtime, "invalid invite left mtime untouched");
+
+        // Control: a real invite mint DOES write (mtime advances, bytes change).
+        mint_invite_locked(&path, "bob", false, None, None, 3_000).unwrap();
+        assert_ne!(read_all(), before_bytes, "a real mint does write");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The `/oauth/token` edge is rate-limited: a burst of garbage refresh
+    /// exchanges past the bucket capacity gets 429s from one source.
+    #[test]
+    fn token_edge_is_rate_limited() {
+        let dir = scratch_dir("tokenrate");
+        let state = test_state_with_oauth(
+            "https://mcp.example.test",
+            &dir.join("oauth.json"),
+            Duration::from_secs(3600),
+        );
+        let addr = spawn_server(state);
+        let agent = no_redirect_agent();
+
+        let mut saw_429 = false;
+        for _ in 0..(REGISTER_BUCKET_CAPACITY as usize + 5) {
+            let status = agent
+                .post(format!("http://{addr}/oauth/token"))
+                .send_form([("grant_type", "refresh_token"), ("refresh_token", "garbage")])
+                .expect("token")
+                .status()
+                .as_u16();
+            if status == 429 {
+                saw_429 = true;
+                break;
+            }
+            assert_eq!(status, 400, "pre-throttle a bad refresh is a 400 (no write, no 500)");
+        }
+        assert!(saw_429, "a burst of token exchanges is rate-limited at the edge");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- repair #5 HIGH: invite bound to expected client / redirect ----------
+
+    /// A client/redirect-bound invite is only redeemable by the matching
+    /// authorize request: a mismatched redirect (or client) is refused with a
+    /// 400 page and the invite is NOT consumed; the matching request redeems it.
+    #[test]
+    fn invite_binding_enforced_and_no_consume_on_mismatch() {
+        let dir = scratch_dir("invitebind");
+        let state_path = dir.join("oauth.json");
+        let issuer = "https://mcp.example.test";
+        let state = test_state_with_oauth(issuer, &state_path, Duration::from_secs(3600));
+        let addr = spawn_server(state.clone());
+        let agent = no_redirect_agent();
+        let good_redirect = "https://client.example.test/callback";
+
+        // Register a client with TWO registered redirect URIs — both pass the
+        // client-redirect check, so the invite BINDING is what distinguishes them.
+        let other_redirect = "https://client.example.test/other";
+        let mut registered = agent
+            .post(format!("http://{addr}/oauth/register"))
+            .send_json(json!({ "redirect_uris": [good_redirect, other_redirect] }))
+            .expect("register");
+        let client_id = read_json(&mut registered)["client_id"].as_str().unwrap().to_string();
+
+        // Mint an invite BOUND to this client + the good redirect.
+        let oauth = state.oauth.as_ref().unwrap();
+        let invite = oauth
+            .with_locked_store(|store| {
+                store.mint_invite(
+                    "alice",
+                    false,
+                    Some(client_id.clone()),
+                    Some(good_redirect.to_string()),
+                    unix_now(),
+                )
+            })
+            .expect("mint bound invite");
+
+        let challenge = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"; // valid S256 shape
+        let submit = |redirect: &str| {
+            agent
+                .post(format!("http://{addr}/oauth/authorize"))
+                .send_form([
+                    ("response_type", "code"),
+                    ("client_id", client_id.as_str()),
+                    ("redirect_uri", redirect),
+                    ("code_challenge", challenge),
+                    ("code_challenge_method", "S256"),
+                    ("state", "s"),
+                    ("scope", "mcp"),
+                    ("invite_code", invite.as_str()),
+                ])
+                .expect("authorize submit")
+        };
+
+        // Mismatched (but registered) redirect: refused with a 400 page, no
+        // redirect off-origin, and the invite is NOT consumed.
+        let mut wrong = submit(other_redirect);
+        assert_eq!(wrong.status().as_u16(), 400, "invite bound to a different redirect is refused");
+        assert!(wrong.headers().get("location").is_none(), "no redirect on a binding mismatch");
+        let _ = wrong.body_mut().read_to_string();
+        assert!(
+            OauthStore::load(&state_path).unwrap().invites.values().any(|i| i.tenant == "alice"),
+            "the invite survives a mismatched attempt (not consumed)"
+        );
+
+        // Matching redirect: redeems, 302 with a code, and the invite is spent.
+        let mut ok = submit(good_redirect);
+        assert_eq!(ok.status().as_u16(), 302, "matching client+redirect redeems the bound invite");
+        let (base, query) = location_query(&ok);
+        assert_eq!(base, good_redirect);
+        assert!(query.contains_key("code"), "an auth code was issued");
+        let _ = ok.body_mut().read_to_string();
+        assert!(
+            OauthStore::load(&state_path).unwrap().invites.is_empty(),
+            "the single-use bound invite is consumed on success"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- repair #5 HIGH: consent page shows client + redirect + anti-framing --
+
+    /// The consent page names the requesting client (registered name) and the
+    /// redirect host, and carries anti-framing headers so it cannot be
+    /// clickjacked.
+    #[test]
+    fn consent_page_shows_client_and_redirect_and_anti_framing() {
+        let dir = scratch_dir("consent");
+        let issuer = "https://mcp.example.test";
+        let state = test_state_with_oauth(issuer, &dir.join("oauth.json"), Duration::from_secs(3600));
+        let addr = spawn_server(state);
+        let agent = no_redirect_agent();
+        let redirect_uri = "https://connector.example.org/mcp/callback";
+
+        let mut registered = agent
+            .post(format!("http://{addr}/oauth/register"))
+            .send_json(json!({
+                "redirect_uris": [redirect_uri],
+                "client_name": "Acme Connector",
+            }))
+            .expect("register");
+        let client_id = read_json(&mut registered)["client_id"].as_str().unwrap().to_string();
+
+        let challenge = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+        let mut form_page = agent
+            .get(format!(
+                "http://{addr}/oauth/authorize?response_type=code&client_id={}&redirect_uri={}&code_challenge={}&code_challenge_method=S256",
+                url_encode(&client_id),
+                url_encode(redirect_uri),
+                url_encode(challenge),
+            ))
+            .call()
+            .expect("authorize form");
+        assert_eq!(form_page.status().as_u16(), 200);
+
+        // Anti-framing headers present.
+        assert_eq!(
+            form_page.headers().get("x-frame-options").unwrap().to_str().unwrap(),
+            "DENY"
+        );
+        assert!(
+            form_page
+                .headers()
+                .get("content-security-policy")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("frame-ancestors 'none'"),
+            "CSP forbids framing"
+        );
+
+        let html = form_page.body_mut().read_to_string().unwrap();
+        assert!(html.contains("Acme Connector"), "consent page names the client");
+        assert!(html.contains(&client_id), "consent page shows the client_id");
+        assert!(
+            html.contains("https://connector.example.org"),
+            "consent page shows the redirect host"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

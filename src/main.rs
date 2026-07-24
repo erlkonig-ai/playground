@@ -286,6 +286,15 @@ struct McpHttpArgs {
     /// inheriting axum's 2 MiB default). (repair #4 HIGH follow-up)
     #[arg(long, default_value_t = mcp_http::DEFAULT_MAX_BODY_BYTES)]
     max_body_bytes: usize,
+    /// Max live transport (MCP) sessions across ALL tenants — the table bound.
+    /// At the cap (after an idle sweep) `initialize` is refused with 503.
+    /// (repair #5 HIGH: unbounded transport-session retention)
+    #[arg(long, default_value_t = mcp_http::DEFAULT_MAX_SESSIONS_GLOBAL)]
+    max_sessions: usize,
+    /// Max live transport (MCP) sessions for ONE tenant; at the cap the
+    /// tenant's own idlest session is evicted to make room. (repair #5 HIGH)
+    #[arg(long, default_value_t = mcp_http::DEFAULT_MAX_SESSIONS_PER_TENANT)]
+    max_sessions_per_tenant: usize,
 }
 
 /// Backend/token configuration shared by every `user` verb: which sandbox
@@ -520,6 +529,16 @@ struct TokenInviteArgs {
     /// first successful authorization).
     #[arg(long, default_value_t = false)]
     reusable: bool,
+    /// Bind the invite to an exact `client_id`: only that client may redeem it
+    /// (repair #5 HIGH — stops open registration authorizing an attacker's
+    /// client). Omit to leave the invite usable by any registered client.
+    #[arg(long)]
+    client_id: Option<String>,
+    /// Bind the invite to an exact `redirect_uri`: the authorize request must
+    /// present this redirect for the invite to redeem (repair #5 HIGH). Omit to
+    /// leave the redirect unconstrained (still must be a registered URI).
+    #[arg(long)]
+    redirect_uri: Option<String>,
 }
 
 #[derive(Parser, Debug)]
@@ -682,6 +701,7 @@ fn run_mcp_http(args: McpHttpArgs) -> Result<()> {
     mcp_http::serve(
         server,
         tokens,
+        args.tokens,
         mcp_http::HttpServerConfig {
             bind: args.bind,
             backend_name: args.backend.name().to_string(),
@@ -689,6 +709,8 @@ fn run_mcp_http(args: McpHttpArgs) -> Result<()> {
             idle_timeout: std::time::Duration::from_secs(args.idle_timeout_secs),
             max_body_bytes: args.max_body_bytes,
             oauth,
+            max_sessions_global: args.max_sessions,
+            max_sessions_per_tenant: args.max_sessions_per_tenant,
         },
     )
 }
@@ -871,9 +893,22 @@ fn run_token_invite(args: TokenInviteArgs) -> Result<()> {
     // races the running server's read-modify-write and could roll back a
     // server mutation (worst case resurrecting a revoked token family). The
     // locked path re-reads the server's latest state before writing.
-    let invite = oauth::mint_invite_locked(&args.oauth_state, &args.tenant, args.reusable, now)?;
+    let invite = oauth::mint_invite_locked(
+        &args.oauth_state,
+        &args.tenant,
+        args.reusable,
+        args.client_id.clone(),
+        args.redirect_uri.clone(),
+        now,
+    )?;
+    let binding = match (&args.client_id, &args.redirect_uri) {
+        (Some(c), Some(r)) => format!(" (bound to client {c} + redirect {r})"),
+        (Some(c), None) => format!(" (bound to client {c})"),
+        (None, Some(r)) => format!(" (bound to redirect {r})"),
+        (None, None) => String::new(),
+    };
     eprintln!(
-        "minted {} invite for tenant '{}' into {} — hand it to the human authorizing a connector:",
+        "minted {} invite for tenant '{}'{binding} into {} — hand it to the human authorizing a connector:",
         if args.reusable { "reusable" } else { "single-use" },
         args.tenant,
         args.oauth_state.display(),

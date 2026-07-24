@@ -127,18 +127,14 @@ impl TokenStore {
         }
     }
 
-    /// Persist the store to `path` (pretty JSON, mode 0600).
+    /// Persist the store to `path` (pretty JSON, mode 0600) crash-atomically:
+    /// a `0600` temp sibling is written, fsync'd, then `rename`d into place, so
+    /// there is never a truncate-in-place window an interrupted write could
+    /// leave torn or world-readable. See [`atomic_write_0600`].
     pub fn save(&self, path: &Path) -> Result<()> {
         let json = serde_json::to_string_pretty(self)?;
-        std::fs::write(path, json)
-            .with_context(|| format!("write token store {}", path.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-                .with_context(|| format!("chmod 600 token store {}", path.display()))?;
-        }
-        Ok(())
+        atomic_write_0600(path, json.as_bytes())
+            .with_context(|| format!("write token store {}", path.display()))
     }
 
     /// Mint a fresh random token bound to `tenant` on `backend` and add it to
@@ -156,11 +152,215 @@ impl TokenStore {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Live token authority (repair #5 HIGH: reset must be live revocation)
+// ---------------------------------------------------------------------------
+
+/// The one live, in-memory authority the request path consults for static
+/// bearer tokens — the fix for "reset is not live revocation".
+///
+/// Before this, the daemon snapshotted the token map at startup into a plain
+/// `HashMap` and never looked at disk again, so `playground user token reset`
+/// (a *separate* process that rewrites the JSON) took effect only after a full
+/// server restart: the revoked token stayed valid and the fresh one was
+/// rejected until then.
+///
+/// The daemon and the `user` CLI are distinct processes, so their shared
+/// channel is the on-disk store — exactly as the OAuth layer already treats its
+/// state file as the source of truth. This makes that explicit: the live
+/// authority is an `RwLock<HashMap>` that the auth path reads, and it
+/// **reloads from disk the moment the file's mtime changes** (a cheap `stat` on
+/// each auth, a full re-read only when it actually moved). A CLI
+/// `create`/`reset`/`destroy` writes the store atomically (see
+/// [`atomic_write_0600`]); the daemon picks the change up on the very next
+/// request — no restart. The on-disk store is the durable copy; this live set
+/// is the source of truth for every auth decision.
+///
+/// Admin ops running *inside* the daemon (were any added) would mutate the
+/// `RwLock` directly and be instantly live too; the disk-reload path is what
+/// bridges the current out-of-process CLI. Tokens minted for other backends are
+/// kept here as-is — the backend check downstream in [`authenticate`] 403s
+/// them, unchanged.
+pub(crate) struct TokenAuthority {
+    /// The live token map. `RwLock` because auth is read-mostly (every request
+    /// takes a read guard; a reload — rare — takes the write guard briefly).
+    tokens: std::sync::RwLock<HashMap<String, TokenEntry>>,
+    /// The on-disk store this authority tracks, and the last mtime we loaded.
+    /// `None` = a purely in-memory authority (tests, or a future all-in-process
+    /// deployment) with no disk to reload from.
+    disk: Option<Mutex<DiskTracking>>,
+}
+
+/// The path + last-seen modification time of the backing store file, so a
+/// reload happens exactly when the file actually changed.
+struct DiskTracking {
+    path: std::path::PathBuf,
+    /// Last modification time we loaded, if the file existed then. `None` means
+    /// "not yet loaded / file was absent", which always triggers a reload
+    /// attempt so a store that appears after startup is still picked up.
+    loaded_mtime: Option<std::time::SystemTime>,
+}
+
+impl TokenAuthority {
+    /// Build a live authority from a store loaded off `path`, tracking that
+    /// file for out-of-process mutations (the CLI's `create`/`reset`/`destroy`).
+    pub(crate) fn from_disk(store: TokenStore, path: std::path::PathBuf) -> Self {
+        let loaded_mtime = file_mtime(&path);
+        TokenAuthority {
+            tokens: std::sync::RwLock::new(store.tokens),
+            disk: Some(Mutex::new(DiskTracking { path, loaded_mtime })),
+        }
+    }
+
+    /// Build a purely in-memory authority (no disk tracking) — for tests and
+    /// any deployment that mutates the live set directly rather than via a file.
+    #[cfg(test)]
+    pub(crate) fn in_memory(tokens: HashMap<String, TokenEntry>) -> Self {
+        TokenAuthority {
+            tokens: std::sync::RwLock::new(tokens),
+            disk: None,
+        }
+    }
+
+    /// Number of tokens currently live (for the startup banner only).
+    pub(crate) fn len(&self) -> usize {
+        self.tokens.read().expect("token authority poisoned").len()
+    }
+
+    /// Resolve `token` to its entry against the *current* live set, reloading
+    /// from disk first if the backing file changed since the last load. This is
+    /// the request-path hook: a revoked token is rejected and a freshly-minted
+    /// one accepted immediately, with no restart.
+    pub(crate) fn resolve(&self, token: &str) -> Option<TokenEntry> {
+        self.refresh_if_changed();
+        self.tokens
+            .read()
+            .expect("token authority poisoned")
+            .get(token)
+            .cloned()
+    }
+
+    /// If the backing file's mtime moved since our last load, re-read it and
+    /// swap the live map. Cheap in the steady state (one `stat`, no lock
+    /// upgrade); the full re-read + write-lock happens only when the file
+    /// actually changed. A read error is logged and the current in-memory set
+    /// is kept — a transient disk hiccup must not blank out every token.
+    fn refresh_if_changed(&self) {
+        let Some(disk) = &self.disk else {
+            return; // in-memory authority: nothing to track.
+        };
+        let mut tracking = disk.lock().expect("token authority disk poisoned");
+        let current = file_mtime(&tracking.path);
+        // Reload when the mtime changed (including appearing/disappearing).
+        // `None`/`None` (file still absent) is a no-op after the first check.
+        if current == tracking.loaded_mtime && current.is_some() {
+            return;
+        }
+        if current.is_none() && tracking.loaded_mtime.is_none() {
+            return;
+        }
+        match TokenStore::load(&tracking.path) {
+            Ok(fresh) => {
+                *self.tokens.write().expect("token authority poisoned") = fresh.tokens;
+                tracking.loaded_mtime = current;
+            }
+            Err(e) => {
+                eprintln!(
+                    "warning: failed to reload token store {} (keeping the current live set): {e:#}",
+                    tracking.path.display(),
+                );
+            }
+        }
+    }
+}
+
+/// The modification time of `path`, or `None` if it is absent or unstattable.
+fn file_mtime(path: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
 /// `n` bytes of OS randomness as URL-safe base64 (no padding).
 pub(crate) fn random_urlsafe(n: usize) -> String {
     let mut bytes = vec![0u8; n];
     rand::rngs::OsRng.fill_bytes(&mut bytes);
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&bytes)
+}
+
+/// Write `bytes` to `path` crash-atomically with mode `0600` from the first
+/// byte — the auth-store persistence primitive (both [`TokenStore::save`] and
+/// [`crate::oauth::OauthStore::save`] funnel through it).
+///
+/// The old path (`std::fs::write` then `set_permissions`) had two windows a
+/// crash could tear open: (1) `write` truncates the destination in place, so an
+/// interrupted write leaves a half-written store on disk; (2) the file is
+/// briefly world-default-perms before the `chmod`, so a secret store is
+/// readable in that gap. This instead:
+///
+/// 1. creates a temp sibling in the *same directory* (so the final `rename` is
+///    a same-filesystem atomic swap) with `O_CREAT|O_EXCL|O_WRONLY` and mode
+///    `0600` up front — the secret is never world-readable, not even for an
+///    instant;
+/// 2. writes the full contents and `fsync`s the temp file (durability);
+/// 3. `rename`s the temp over `path` — atomic, so a reader sees either the old
+///    complete file or the new complete file, never a torn one;
+/// 4. best-effort `fsync`s the parent directory so the rename itself survives a
+///    crash.
+///
+/// On any failure before the rename the temp file is removed, so a crashed
+/// write leaves no `.tmp` litter and never touches the live store.
+pub(crate) fn atomic_write_0600(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write as _;
+
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    // Unpredictable temp name in the same dir: same-filesystem rename + no
+    // collision with a concurrent writer's temp, and O_EXCL below refuses to
+    // follow a pre-planted symlink at this name (confused-deputy defence).
+    let tmp = {
+        let mut name = path.file_name().unwrap_or_default().to_os_string();
+        name.push(format!(".tmp.{}.{}", std::process::id(), random_urlsafe(8)));
+        dir.join(name)
+    };
+
+    // Create O_EXCL with mode 0600 from the start. `.mode()` is unix-only; on
+    // other targets the file is created with default perms (this crate's
+    // deployment target is unix, where the auth stores live).
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let write_result = (|| -> Result<()> {
+        let mut file = opts
+            .open(&tmp)
+            .with_context(|| format!("create temp file {}", tmp.display()))?;
+        file.write_all(bytes)
+            .with_context(|| format!("write temp file {}", tmp.display()))?;
+        file.sync_all()
+            .with_context(|| format!("fsync temp file {}", tmp.display()))?;
+        Ok(())
+    })();
+    if let Err(e) = write_result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+
+    if let Err(e) = std::fs::rename(&tmp, path)
+        .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))
+    {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+
+    // Best-effort directory fsync so the rename is durable across a crash. A
+    // failure here doesn't invalidate the (already atomic) swap, so it's not
+    // fatal — the data is safe, only the rename's crash-durability is at stake.
+    #[cfg(unix)]
+    if let Ok(dir_file) = std::fs::File::open(dir) {
+        let _ = dir_file.sync_all();
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -188,11 +388,31 @@ pub struct HttpServerConfig {
     /// OAuth 2.1 for browser-based connectors ([`crate::oauth`]); `None` (the
     /// default posture) leaves this file's static-token behavior untouched.
     pub oauth: Option<crate::oauth::OauthConfig>,
+    /// Ceiling on live transport sessions across all tenants (repair #5 HIGH:
+    /// unbounded transport-session retention). Once the table is full — after
+    /// an idle sweep — `initialize` is refused with 503 rather than growing
+    /// memory without bound.
+    pub max_sessions_global: usize,
+    /// Ceiling on live transport sessions per tenant. A tenant at its cap has
+    /// its own idlest session evicted to make room, so a single token can never
+    /// hold more than this many `Mcp-Session-Id`s (and so can't crowd the
+    /// global table on its own).
+    pub max_sessions_per_tenant: usize,
 }
 
 /// Default explicit request-body ceiling (1 MiB). Comfortably fits any JSON-RPC
 /// MCP message while bounding what one request can make the server buffer.
 pub const DEFAULT_MAX_BODY_BYTES: usize = 1024 * 1024;
+
+/// Default global transport-session ceiling. Each entry is tiny (a tenant label
+/// plus an `Instant`), so this bounds the table's memory at a few tens of KiB
+/// while comfortably fitting real fan-out.
+pub const DEFAULT_MAX_SESSIONS_GLOBAL: usize = 10_000;
+
+/// Default per-tenant transport-session ceiling. A well-behaved client holds
+/// one or a few sessions; this leaves generous headroom for reconnect churn
+/// while stopping one token from minting sessions without limit.
+pub const DEFAULT_MAX_SESSIONS_PER_TENANT: usize = 64;
 
 /// One live MCP session (Streamable-HTTP `Mcp-Session-Id`).
 ///
@@ -206,7 +426,9 @@ pub(crate) struct HttpSession {
 
 pub(crate) struct HttpState {
     pub(crate) server: McpServer,
-    pub(crate) tokens: HashMap<String, TokenEntry>,
+    /// The live static-token authority (disk-tracking; picks up CLI
+    /// create/reset/destroy without a restart). See [`TokenAuthority`].
+    pub(crate) tokens: TokenAuthority,
     pub(crate) sessions: Mutex<HashMap<String, HttpSession>>,
     /// Present iff OAuth was configured; the oauth routes are mounted exactly
     /// then, so their handlers may unwrap it.
@@ -216,9 +438,19 @@ pub(crate) struct HttpState {
 
 /// Serve `server` over Streamable HTTP until the process is killed.
 ///
+/// `tokens` is the startup snapshot of the static token store and `tokens_path`
+/// the file it came from — the live [`TokenAuthority`] tracks that file so a CLI
+/// `user create`/`token reset`/`destroy` (a separate process) takes effect
+/// without a restart.
+///
 /// Owns the tokio runtime, so callers (the sync `main`) need no async of
 /// their own.
-pub fn serve(server: McpServer, tokens: TokenStore, config: HttpServerConfig) -> Result<()> {
+pub fn serve(
+    server: McpServer,
+    tokens: TokenStore,
+    tokens_path: std::path::PathBuf,
+    config: HttpServerConfig,
+) -> Result<()> {
     let bind = config.bind;
     // OAuth is opt-in: a runtime (persistent state + in-memory auth codes)
     // exists exactly when it was configured, and its routes mount exactly then.
@@ -229,7 +461,7 @@ pub fn serve(server: McpServer, tokens: TokenStore, config: HttpServerConfig) ->
         .transpose()?;
     let state = Arc::new(HttpState {
         server,
-        tokens: tokens.tokens,
+        tokens: TokenAuthority::from_disk(tokens, tokens_path),
         sessions: Mutex::new(HashMap::new()),
         oauth,
         config,
@@ -350,15 +582,10 @@ async fn post_mcp(
     // Session handling: `initialize` mints an Mcp-Session-Id; everything else
     // must present one that belongs to this token's tenant and isn't idle-out.
     let issued_session = if method == "initialize" {
-        let session_id = random_urlsafe(16);
-        state.sessions.lock().expect("sessions poisoned").insert(
-            session_id.clone(),
-            HttpSession {
-                tenant: token.tenant.clone(),
-                last_seen: Instant::now(),
-            },
-        );
-        Some(session_id)
+        match open_session(&state, &token.tenant) {
+            Ok(session_id) => Some(session_id),
+            Err(response) => return response,
+        }
     } else {
         if let Err(response) = validate_session(&state, &headers, &token) {
             return response;
@@ -453,6 +680,71 @@ async fn delete_mcp(State(state): State<Arc<HttpState>>, headers: HeaderMap) -> 
 }
 
 // ---------------------------------------------------------------------------
+// Transport-session table (bounded — repair #5 HIGH)
+// ---------------------------------------------------------------------------
+
+/// Mint a transport session for `tenant`, sweeping idle ones and enforcing the
+/// per-tenant and global ceilings first (repair #5 HIGH: unbounded
+/// transport-session retention).
+///
+/// Order, all under one lock so the counts checked are the counts written:
+/// 1. **Idle sweep** — drop every session idle longer than `idle_timeout`. This
+///    is the "periodic expiry" the review asked for, folded onto the mint path
+///    (the busy path) rather than a reaper thread, matching this file's
+///    lazy-reaping style. Abandoned ids therefore self-drain as new ones arrive.
+/// 2. **Per-tenant cap** — if this tenant is already at `max_sessions_per_tenant`,
+///    evict *its own* idlest session (LRU). A single token thus never holds more
+///    than the cap, and only ever displaces itself.
+/// 3. **Global cap** — if the whole table is still at `max_sessions_global`,
+///    refuse with 503 rather than grow memory unbounded. (The per-tenant cap
+///    already stops one tenant filling it, so this is the multi-tenant backstop.)
+// `Response` is the module-wide error type for the pre-dispatch checks (as on
+// `authenticate`/`validate_session`/…); the `result_large_err` lint is an
+// accepted trade there, so keep the same idiom here rather than boxing one fn.
+#[allow(clippy::result_large_err)]
+fn open_session(state: &HttpState, tenant: &str) -> Result<String, Response> {
+    let now = Instant::now();
+    let idle_timeout = state.config.idle_timeout;
+    let mut sessions = state.sessions.lock().expect("sessions poisoned");
+
+    // 1. Idle sweep.
+    sessions.retain(|_, s| now.duration_since(s.last_seen) <= idle_timeout);
+
+    // 2. Per-tenant cap: evict this tenant's idlest until it has room for one more.
+    let mut mine: Vec<(String, Instant)> = sessions
+        .iter()
+        .filter(|(_, s)| s.tenant == tenant)
+        .map(|(id, s)| (id.clone(), s.last_seen))
+        .collect();
+    if mine.len() >= state.config.max_sessions_per_tenant {
+        // Oldest first, evict down to (cap - 1) so the new one fits at the cap.
+        mine.sort_by_key(|(_, last_seen)| *last_seen);
+        let evict = mine.len() + 1 - state.config.max_sessions_per_tenant;
+        for (id, _) in mine.into_iter().take(evict) {
+            sessions.remove(&id);
+        }
+    }
+
+    // 3. Global cap: after the sweep + per-tenant trim, refuse if still full.
+    if sessions.len() >= state.config.max_sessions_global {
+        return Err(http_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "transport-session table is full; retry later",
+        ));
+    }
+
+    let session_id = random_urlsafe(16);
+    sessions.insert(
+        session_id.clone(),
+        HttpSession {
+            tenant: tenant.to_string(),
+            last_seen: now,
+        },
+    );
+    Ok(session_id)
+}
+
+// ---------------------------------------------------------------------------
 // Checks (origin, token, session, tenant scope)
 // ---------------------------------------------------------------------------
 
@@ -479,8 +771,12 @@ fn authenticate(state: &HttpState, headers: &HeaderMap) -> Result<TokenEntry, Re
     let Some(token) = bearer else {
         return Err(unauthorized(state, "missing Authorization: Bearer <token>"));
     };
-    let entry = if let Some(entry) = state.tokens.get(token) {
-        entry.clone()
+    // Static-token resolution goes through the live authority, which reloads
+    // the on-disk store if it changed since the last request — so a CLI
+    // `token reset`/`destroy` revokes immediately and a freshly-minted token is
+    // accepted immediately, no restart (repair #5 HIGH: live revocation).
+    let entry = if let Some(entry) = state.tokens.resolve(token) {
+        entry
     } else if let Some(oauth) = &state.oauth {
         match oauth.lookup_access(token) {
             Ok(entry) => entry,
@@ -680,7 +976,7 @@ pub(crate) mod tests {
         }
         Arc::new(HttpState {
             server,
-            tokens,
+            tokens: TokenAuthority::in_memory(tokens),
             sessions: Mutex::new(HashMap::new()),
             oauth: None,
             config: HttpServerConfig {
@@ -690,6 +986,8 @@ pub(crate) mod tests {
                 idle_timeout,
                 max_body_bytes: DEFAULT_MAX_BODY_BYTES,
                 oauth: None,
+                max_sessions_global: DEFAULT_MAX_SESSIONS_GLOBAL,
+                max_sessions_per_tenant: DEFAULT_MAX_SESSIONS_PER_TENANT,
             },
         })
     }
@@ -1097,7 +1395,7 @@ pub(crate) mod tests {
         );
         let state = Arc::new(HttpState {
             server,
-            tokens,
+            tokens: TokenAuthority::in_memory(tokens),
             sessions: Mutex::new(HashMap::new()),
             oauth: None,
             config: HttpServerConfig {
@@ -1107,6 +1405,8 @@ pub(crate) mod tests {
                 idle_timeout: Duration::from_secs(3600),
                 max_body_bytes: 1024, // 1 KiB
                 oauth: None,
+                max_sessions_global: DEFAULT_MAX_SESSIONS_GLOBAL,
+                max_sessions_per_tenant: DEFAULT_MAX_SESSIONS_PER_TENANT,
             },
         });
         let addr = spawn_server(state);
@@ -1207,5 +1507,219 @@ pub(crate) mod tests {
 
         // `user token show alice` now finds nothing.
         assert!(!store.tokens.values().any(|e| e.tenant == "alice"));
+    }
+
+    // -- repair #5 HIGH: atomic auth-store persistence ----------------------
+
+    /// [`atomic_write_0600`] never leaves a truncate-in-place window and writes
+    /// mode 0600 from the first byte: the destination is created 0600 (never a
+    /// world-perms gap), an overwrite is a rename (either the whole old or whole
+    /// new content is visible, never a torn prefix), and no `.tmp` litter is
+    /// left behind on success.
+    #[test]
+    #[cfg(unix)]
+    fn atomic_write_is_0600_and_leaves_no_tmp() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "playground_atomic_{}_{:x}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("store.json");
+
+        // First write creates the file 0600.
+        atomic_write_0600(&path, b"first").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"first");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "created file must be 0600 from the first byte");
+
+        // Overwriting a file whose mode was tampered to 0644 still yields 0600
+        // (the write goes through a fresh 0600 temp + rename, not an in-place
+        // truncate that would keep the loose mode).
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        atomic_write_0600(&path, b"second-and-longer").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"second-and-longer");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "overwrite restores 0600 (no truncate-in-place)");
+
+        // No `.tmp` sibling survives a successful write.
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(leftovers.is_empty(), "no temp files left after a clean write");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- repair #5 HIGH: live token revocation (no restart) -----------------
+
+    /// A disk-backed [`TokenAuthority`] picks up a store rewritten out of band
+    /// (the CLI's `token reset`/`destroy`, a separate process) on the very next
+    /// request: a revoked token is rejected immediately and a freshly-minted one
+    /// accepted immediately, with no server restart.
+    #[test]
+    fn live_token_authority_tracks_disk_reset() {
+        let dir = std::env::temp_dir().join(format!(
+            "playground_live_tokens_{}_{:x}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tokens.json");
+
+        // Seed a store on disk with alice's original token, then boot a server
+        // whose authority tracks that file.
+        let mut store = TokenStore::default();
+        store.tokens.insert(
+            "tok-old".to_string(),
+            TokenEntry { tenant: "alice".to_string(), backend: "mock".to_string() },
+        );
+        store.save(&path).unwrap();
+
+        let provider = SandboxProvider::new(Box::new(MockBackend::default()));
+        let server = McpServer::new(provider);
+        let loaded = TokenStore::load(&path).unwrap();
+        let state = Arc::new(HttpState {
+            server,
+            tokens: TokenAuthority::from_disk(loaded, path.clone()),
+            sessions: Mutex::new(HashMap::new()),
+            oauth: None,
+            config: HttpServerConfig {
+                bind: "127.0.0.1:0".parse().unwrap(),
+                backend_name: "mock".to_string(),
+                allowed_origins: vec![],
+                idle_timeout: Duration::from_secs(3600),
+                max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+                oauth: None,
+                max_sessions_global: DEFAULT_MAX_SESSIONS_GLOBAL,
+                max_sessions_per_tenant: DEFAULT_MAX_SESSIONS_PER_TENANT,
+            },
+        });
+        let addr = spawn_server(state);
+        let agent = agent();
+
+        // The original token works.
+        let ok = post(&agent, addr, Some("tok-old"), None, None, &rpc(1, "initialize", json!({})));
+        assert_eq!(ok.status, 200, "original token accepted before reset");
+
+        // Out-of-band `token reset`: rewrite the store atomically with a fresh
+        // token for alice, dropping the old one — exactly what the CLI does in a
+        // separate process. Ensure the mtime advances so the tracker notices
+        // even on a coarse-resolution clock.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let mut reset = TokenStore::default();
+        reset.tokens.insert(
+            "tok-new".to_string(),
+            TokenEntry { tenant: "alice".to_string(), backend: "mock".to_string() },
+        );
+        reset.save(&path).unwrap();
+
+        // WITHOUT a restart: the old token is now rejected...
+        let revoked = post(&agent, addr, Some("tok-old"), None, None, &rpc(2, "initialize", json!({})));
+        assert_eq!(revoked.status, 401, "revoked token rejected immediately, no restart");
+
+        // ...and the freshly-minted one is accepted immediately.
+        let fresh = post(&agent, addr, Some("tok-new"), None, None, &rpc(3, "initialize", json!({})));
+        assert_eq!(fresh.status, 200, "freshly-issued token accepted immediately, no restart");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- repair #5 HIGH: transport-session sweep + caps ---------------------
+
+    /// Idle transport sessions are swept on the next `initialize` and never
+    /// accrete: with a zero idle timeout each new session sweeps the previous
+    /// one, so the table never grows past one entry no matter how many
+    /// `initialize`s arrive.
+    #[test]
+    fn transport_sessions_sweep_on_idle() {
+        let state = test_state(vec![], Duration::ZERO);
+        let addr = spawn_server(state.clone());
+        let agent = agent();
+        for i in 0..5 {
+            let init = post(&agent, addr, Some("tok-alice"), None, None, &rpc(i, "initialize", json!({})));
+            assert_eq!(init.status, 200);
+        }
+        let live = state.sessions.lock().unwrap().len();
+        assert_eq!(live, 1, "zero-idle sweep keeps the table at a single fresh entry");
+    }
+
+    /// The per-tenant cap evicts a tenant's own idlest session (never another
+    /// tenant's) and the global cap refuses `initialize` with 503 when the whole
+    /// table is full.
+    #[test]
+    fn transport_sessions_respect_caps() {
+        // Build a state with a long idle timeout (so nothing is swept for age)
+        // and tiny caps: per-tenant 2, global 3.
+        let provider = SandboxProvider::new(Box::new(MockBackend::default()));
+        let server = McpServer::new(provider);
+        let mut tokens = HashMap::new();
+        for (t, tenant) in [("tok-alice", "alice"), ("tok-bob", "bob")] {
+            tokens.insert(
+                t.to_string(),
+                TokenEntry { tenant: tenant.to_string(), backend: "mock".to_string() },
+            );
+        }
+        let state = Arc::new(HttpState {
+            server,
+            tokens: TokenAuthority::in_memory(tokens),
+            sessions: Mutex::new(HashMap::new()),
+            oauth: None,
+            config: HttpServerConfig {
+                bind: "127.0.0.1:0".parse().unwrap(),
+                backend_name: "mock".to_string(),
+                allowed_origins: vec![],
+                idle_timeout: Duration::from_secs(3600),
+                max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+                oauth: None,
+                max_sessions_global: 3,
+                max_sessions_per_tenant: 2,
+            },
+        });
+        let addr = spawn_server(state.clone());
+        let agent = agent();
+
+        // alice mints 4 sessions; the per-tenant cap of 2 keeps only her 2 newest.
+        let mut alice_sessions = Vec::new();
+        for i in 0..4 {
+            let init = post(&agent, addr, Some("tok-alice"), None, None, &rpc(i, "initialize", json!({})));
+            assert_eq!(init.status, 200);
+            alice_sessions.push(init.session.unwrap());
+        }
+        {
+            let sessions = state.sessions.lock().unwrap();
+            let alice_live = sessions.values().filter(|s| s.tenant == "alice").count();
+            assert_eq!(alice_live, 2, "per-tenant cap holds alice to 2 sessions");
+            // Her two oldest were evicted; the two newest survive.
+            assert!(!sessions.contains_key(&alice_sessions[0]));
+            assert!(!sessions.contains_key(&alice_sessions[1]));
+            assert!(sessions.contains_key(&alice_sessions[2]));
+            assert!(sessions.contains_key(&alice_sessions[3]));
+        }
+
+        // bob mints one (table now: alice 2 + bob 1 = 3 = global cap).
+        let bob1 = post(&agent, addr, Some("tok-bob"), None, None, &rpc(10, "initialize", json!({})));
+        assert_eq!(bob1.status, 200);
+        assert_eq!(state.sessions.lock().unwrap().len(), 3, "table at the global cap");
+
+        // bob's second initialize: bob is under his per-tenant cap (1 < 2), so no
+        // self-eviction happens, and the global table is full → 503. alice's
+        // sessions are untouched (a tenant can't crowd others out).
+        let bob2 = post(&agent, addr, Some("tok-bob"), None, None, &rpc(11, "initialize", json!({})));
+        assert_eq!(bob2.status, 503, "global cap refuses a new session when full");
+        let sessions = state.sessions.lock().unwrap();
+        assert_eq!(sessions.values().filter(|s| s.tenant == "alice").count(), 2, "alice untouched");
+
+        let _ = std::fs::remove_dir_all(std::env::temp_dir().join("nonexistent-cleanup"));
     }
 }
