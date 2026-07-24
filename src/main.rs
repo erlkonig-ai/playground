@@ -135,6 +135,8 @@ impl McpBackendKind {
         jail_dataset_parent: String,
         jail_pile_root: String,
         jail_bootstrap_pile: String,
+        jail_clone_refquota: String,
+        jail_pile_quota: String,
     ) -> Result<Box<dyn sandbox::SandboxBackend>> {
         match self {
             McpBackendKind::Lima => {
@@ -166,9 +168,22 @@ impl McpBackendKind {
                 backend.dataset_parent = jail_dataset_parent;
                 backend.pile_root = jail_pile_root;
                 backend.bootstrap_pile = jail_bootstrap_pile;
+                backend.clone_refquota = quota_opt(jail_clone_refquota);
+                backend.pile_root_quota = quota_opt(jail_pile_quota);
                 Ok(Box::new(backend))
             }
         }
+    }
+}
+
+/// Normalise a quota CLI value: an empty / `0` / `none` string disables the
+/// quota (`None`), any other value is passed through as a ZFS size string.
+fn quota_opt(value: String) -> Option<String> {
+    let v = value.trim();
+    if v.is_empty() || v == "0" || v == "none" {
+        None
+    } else {
+        Some(v.to_string())
     }
 }
 
@@ -247,6 +262,30 @@ struct McpHttpArgs {
     /// `--jail-host` is ignored).
     #[arg(long, default_value_t = false)]
     jail_local: bool,
+    /// Jail backend: ZFS `refquota` (size string, e.g. `10G`) set on each
+    /// per-tenant clone so a tenant cannot fill the host pool. `0`/empty
+    /// disables. (repair #4 storage bound)
+    #[arg(long, default_value = "10G")]
+    jail_clone_refquota: String,
+    /// Jail backend: ZFS `quota` (size string, e.g. `50G`) set on the pile-root
+    /// dataset — a GLOBAL cap across all tenants' piles. `0`/empty disables; a
+    /// non-dataset pile root is skipped with a note. (repair #4 storage bound)
+    #[arg(long, default_value = "50G")]
+    jail_pile_quota: String,
+    /// Max `exec`s in flight across ALL tenants (the daemon bound). (repair #4)
+    #[arg(long, default_value_t = mcp::DEFAULT_GLOBAL_EXEC_LIMIT)]
+    max_concurrent_execs: usize,
+    /// Max `exec`s in flight for ONE tenant (fairness). (repair #4)
+    #[arg(long, default_value_t = mcp::DEFAULT_PER_TENANT_EXEC_LIMIT)]
+    max_concurrent_execs_per_tenant: usize,
+    /// Max `exec`s that may WAIT for a slot before admission is rejected outright
+    /// (bounded queue). (repair #4)
+    #[arg(long, default_value_t = mcp::DEFAULT_MAX_WAITERS)]
+    max_queued_execs: usize,
+    /// Explicit maximum request body in bytes (states the policy rather than
+    /// inheriting axum's 2 MiB default). (repair #4 HIGH follow-up)
+    #[arg(long, default_value_t = mcp_http::DEFAULT_MAX_BODY_BYTES)]
+    max_body_bytes: usize,
 }
 
 /// Backend/token configuration shared by every `user` verb: which sandbox
@@ -304,6 +343,15 @@ struct UserBackendArgs {
     /// over SSH (server-side hosting on the FreeBSD jail host itself).
     #[arg(long, default_value_t = false)]
     jail_local: bool,
+    /// Jail backend: ZFS `refquota` set on each per-tenant clone at provision
+    /// (size string, e.g. `10G`; `0`/empty disables). (repair #4 storage bound)
+    #[arg(long, default_value = "10G")]
+    jail_clone_refquota: String,
+    /// Jail backend: ZFS `quota` set on the pile-root dataset — a global cap
+    /// across all tenants' piles (size string, e.g. `50G`; `0`/empty disables).
+    /// (repair #4 storage bound)
+    #[arg(long, default_value = "50G")]
+    jail_pile_quota: String,
 }
 
 #[cfg(feature = "mcp-http")]
@@ -325,6 +373,8 @@ impl UserBackendArgs {
                 backend.dataset_parent = self.jail_dataset_parent.clone();
                 backend.pile_root = self.jail_pile_root.clone();
                 backend.bootstrap_pile = self.jail_bootstrap_pile.clone();
+                backend.clone_refquota = quota_opt(self.jail_clone_refquota.clone());
+                backend.pile_root_quota = quota_opt(self.jail_pile_quota.clone());
                 Ok(Box::new(backend))
             }
             McpBackendKind::Lima => {
@@ -535,6 +585,10 @@ fn run_mcp(args: McpArgs) -> Result<()> {
         args.jail_dataset_parent,
         args.jail_pile_root,
         args.jail_bootstrap_pile,
+        // Stdio is the operator-local transport; keep the backend's default
+        // storage quotas (these strings match `JailBackend`'s defaults).
+        "10G".to_string(),
+        "50G".to_string(),
     )?;
 
     let provider = mcp::SandboxProvider::new(backend);
@@ -561,6 +615,8 @@ fn run_mcp_http(args: McpHttpArgs) -> Result<()> {
         args.jail_dataset_parent,
         args.jail_pile_root,
         args.jail_bootstrap_pile,
+        args.jail_clone_refquota,
+        args.jail_pile_quota,
     )?;
 
     let tokens = mcp_http::TokenStore::load(&args.tokens)?;
@@ -614,7 +670,14 @@ fn run_mcp_http(args: McpHttpArgs) -> Result<()> {
         Err(e) => eprintln!("playground mcp-http: reattach sweep failed: {e:#}"),
     }
 
-    let provider = mcp::SandboxProvider::new(backend);
+    let provider = mcp::SandboxProvider::with_admission(
+        backend,
+        mcp::AdmissionConfig {
+            global_limit: args.max_concurrent_execs,
+            per_tenant_limit: args.max_concurrent_execs_per_tenant,
+            max_waiters: args.max_queued_execs,
+        },
+    );
     let server = mcp::McpServer::new(provider);
     mcp_http::serve(
         server,
@@ -624,6 +687,7 @@ fn run_mcp_http(args: McpHttpArgs) -> Result<()> {
             backend_name: args.backend.name().to_string(),
             allowed_origins: args.allow_origin,
             idle_timeout: std::time::Duration::from_secs(args.idle_timeout_secs),
+            max_body_bytes: args.max_body_bytes,
             oauth,
         },
     )

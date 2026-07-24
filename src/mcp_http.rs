@@ -179,10 +179,20 @@ pub struct HttpServerConfig {
     pub allowed_origins: Vec<String>,
     /// MCP sessions idle longer than this expire (lazily, on next access).
     pub idle_timeout: Duration,
+    /// Maximum accepted request body, in bytes. Made EXPLICIT (rather than
+    /// inheriting axum's 2 MiB `DefaultBodyLimit`) so the policy is a stated
+    /// bound, not a dependency default a future axum bump could silently move.
+    /// A JSON-RPC MCP message (even one carrying `stdin`) is tiny, so this is a
+    /// low ceiling that rejects an oversized body before it is buffered.
+    pub max_body_bytes: usize,
     /// OAuth 2.1 for browser-based connectors ([`crate::oauth`]); `None` (the
     /// default posture) leaves this file's static-token behavior untouched.
     pub oauth: Option<crate::oauth::OauthConfig>,
 }
+
+/// Default explicit request-body ceiling (1 MiB). Comfortably fits any JSON-RPC
+/// MCP message while bounding what one request can make the server buffer.
+pub const DEFAULT_MAX_BODY_BYTES: usize = 1024 * 1024;
 
 /// One live MCP session (Streamable-HTTP `Mcp-Session-Id`).
 ///
@@ -302,7 +312,12 @@ fn router(state: Arc<HttpState>) -> Router {
     if state.oauth.is_some() {
         router = router.merge(crate::oauth::routes());
     }
-    router.with_state(state)
+    // EXPLICIT request-body ceiling (repair #4 HIGH follow-up): state the bound
+    // rather than inheriting axum's 2 MiB `DefaultBodyLimit`. An oversized body
+    // is rejected with 413 before it is buffered.
+    router
+        .layer(axum::extract::DefaultBodyLimit::max(state.config.max_body_bytes))
+        .with_state(state)
 }
 
 /// `POST /mcp`: one JSON-RPC message in, one JSON-RPC response (or 202) out.
@@ -673,6 +688,7 @@ pub(crate) mod tests {
                 backend_name: "mock".to_string(),
                 allowed_origins,
                 idle_timeout,
+                max_body_bytes: DEFAULT_MAX_BODY_BYTES,
                 oauth: None,
             },
         })
@@ -1063,6 +1079,54 @@ pub(crate) mod tests {
             &json!([rpc(1, "initialize", json!({}))]),
         );
         assert_eq!(batch.status, 400);
+    }
+
+    /// The explicit request-body ceiling rejects an oversized body (repair #4
+    /// HIGH follow-up): a body past `max_body_bytes` is refused with 413 rather
+    /// than being buffered. We build a state with a tiny 1 KiB limit and POST a
+    /// larger body.
+    #[test]
+    fn oversized_body_is_413() {
+        // A dedicated state with a small explicit body cap.
+        let provider = SandboxProvider::new(Box::new(MockBackend::default()));
+        let server = McpServer::new(provider);
+        let mut tokens = HashMap::new();
+        tokens.insert(
+            "tok-alice".to_string(),
+            TokenEntry { tenant: "alice".to_string(), backend: "mock".to_string() },
+        );
+        let state = Arc::new(HttpState {
+            server,
+            tokens,
+            sessions: Mutex::new(HashMap::new()),
+            oauth: None,
+            config: HttpServerConfig {
+                bind: "127.0.0.1:0".parse().unwrap(),
+                backend_name: "mock".to_string(),
+                allowed_origins: vec![],
+                idle_timeout: Duration::from_secs(3600),
+                max_body_bytes: 1024, // 1 KiB
+                oauth: None,
+            },
+        });
+        let addr = spawn_server(state);
+        let agent = agent();
+
+        // A body well over 1 KiB: a command string padded past the cap.
+        let big = "x".repeat(4096);
+        let reply = post(
+            &agent,
+            addr,
+            Some("tok-alice"),
+            None,
+            None,
+            &rpc(1, "initialize", json!({ "pad": big })),
+        );
+        assert_eq!(reply.status, 413, "oversized body must be 413: {}", reply.body);
+
+        // A small body still works (sanity: the limit is not rejecting everything).
+        let ok = post(&agent, addr, Some("tok-alice"), None, None, &rpc(2, "initialize", json!({})));
+        assert_eq!(ok.status, 200);
     }
 
     #[test]

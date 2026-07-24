@@ -34,7 +34,7 @@
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
@@ -44,6 +44,178 @@ use crate::sandbox::{
     ExecRequest, ExecResult, LifecycleLocks, PileMount, SandboxBackend, SessionId, SessionSpec,
     Tenant,
 };
+
+// ---------------------------------------------------------------------------
+// Admission control
+// ---------------------------------------------------------------------------
+
+/// Default cap on `exec`s in flight ACROSS ALL tenants. This is the daemon
+/// bound: a tenant `exec` pins one tokio blocking-pool worker (the provider is
+/// blocking; the HTTP transport bridges via `spawn_blocking`) plus one jail
+/// process for up to the timeout ceiling, so the global cap keeps a flood from
+/// occupying every blocking thread and wedging the whole service.
+pub const DEFAULT_GLOBAL_EXEC_LIMIT: usize = 32;
+
+/// Default cap on `exec`s in flight FOR ONE tenant. The per-tenant bound is the
+/// fairness guarantee: no single authenticated tenant can consume all the
+/// global slots and starve everyone else.
+pub const DEFAULT_PER_TENANT_EXEC_LIMIT: usize = 4;
+
+/// Default bound on how many `exec`s may WAIT for a slot (globally). Past this,
+/// admission is rejected immediately rather than queued — a bounded queue, so a
+/// burst cannot pile up unbounded waiters (each holding a blocking-pool thread).
+pub const DEFAULT_MAX_WAITERS: usize = 64;
+
+/// How long a waiting `exec` blocks for a slot before giving up. Bounds the time
+/// a queued request pins its blocking-pool thread.
+const ADMISSION_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Per-tenant + global concurrency limiter for `exec`. Holds a permit for the
+/// life of one `exec` and releases it (even on panic) via [`AdmissionGuard`].
+///
+/// Enforcement is a single mutex-guarded state + a condvar: an admitted `exec`
+/// increments the global and per-tenant counters; a blocked one waits on the
+/// condvar (bounded by [`AdmissionConfig::max_waiters`] and a wall-clock
+/// timeout) until a permit frees or it is rejected. This is deliberately
+/// std-only (no tokio): the provider is synchronous and this guards the blocking
+/// side, which is exactly the scarce resource.
+pub struct AdmissionControl {
+    config: AdmissionConfig,
+    state: Mutex<AdmissionState>,
+    freed: Condvar,
+}
+
+/// Tunables for [`AdmissionControl`].
+#[derive(Debug, Clone, Copy)]
+pub struct AdmissionConfig {
+    pub global_limit: usize,
+    pub per_tenant_limit: usize,
+    pub max_waiters: usize,
+}
+
+impl Default for AdmissionConfig {
+    fn default() -> Self {
+        AdmissionConfig {
+            global_limit: DEFAULT_GLOBAL_EXEC_LIMIT,
+            per_tenant_limit: DEFAULT_PER_TENANT_EXEC_LIMIT,
+            max_waiters: DEFAULT_MAX_WAITERS,
+        }
+    }
+}
+
+#[derive(Default)]
+struct AdmissionState {
+    /// Total `exec`s currently holding a permit.
+    global_in_flight: usize,
+    /// Per-tenant in-flight counts (entries drop to 0 stay until swept lazily;
+    /// a handful of tenants, so unbounded growth is not a concern).
+    per_tenant: HashMap<String, usize>,
+    /// Number of `exec`s currently blocked waiting for a permit.
+    waiters: usize,
+}
+
+impl AdmissionControl {
+    pub fn new(config: AdmissionConfig) -> Self {
+        AdmissionControl {
+            config,
+            state: Mutex::new(AdmissionState::default()),
+            freed: Condvar::new(),
+        }
+    }
+
+    /// Acquire a permit for one `exec` by `tenant`, or return an error if the
+    /// caps are full and either the wait queue is full or the wait times out.
+    /// The returned guard releases the permit (and wakes a waiter) on drop.
+    fn acquire(&self, tenant: &str) -> Result<AdmissionGuard<'_>> {
+        let mut state = self.state.lock().expect("admission poisoned");
+        loop {
+            let tenant_in_flight = state.per_tenant.get(tenant).copied().unwrap_or(0);
+            let has_slot = state.global_in_flight < self.config.global_limit
+                && tenant_in_flight < self.config.per_tenant_limit;
+            if has_slot {
+                state.global_in_flight += 1;
+                *state.per_tenant.entry(tenant.to_string()).or_insert(0) += 1;
+                return Ok(AdmissionGuard {
+                    control: self,
+                    tenant: tenant.to_string(),
+                });
+            }
+            // No slot. Refuse to queue past the waiter bound (a bounded queue).
+            if state.waiters >= self.config.max_waiters {
+                return Err(anyhow!(
+                    "sandbox busy: {} exec(s) already queued (global {}/{}, tenant '{}' {}/{}); \
+                     retry shortly",
+                    state.waiters,
+                    state.global_in_flight,
+                    self.config.global_limit,
+                    tenant,
+                    tenant_in_flight,
+                    self.config.per_tenant_limit
+                ));
+            }
+            state.waiters += 1;
+            let (next, wait) = self
+                .freed
+                .wait_timeout(state, ADMISSION_WAIT_TIMEOUT)
+                .expect("admission poisoned");
+            state = next;
+            state.waiters -= 1;
+            if wait.timed_out() {
+                // Retry once more (a permit may have freed as we timed out); if
+                // still full, give up so the caller's blocking-pool thread is not
+                // pinned indefinitely.
+                let tenant_in_flight = state.per_tenant.get(tenant).copied().unwrap_or(0);
+                if state.global_in_flight >= self.config.global_limit
+                    || tenant_in_flight >= self.config.per_tenant_limit
+                {
+                    return Err(anyhow!(
+                        "sandbox busy: timed out after {:?} waiting for an exec slot \
+                         (global {}/{}, tenant '{}' {}/{})",
+                        ADMISSION_WAIT_TIMEOUT,
+                        state.global_in_flight,
+                        self.config.global_limit,
+                        tenant,
+                        tenant_in_flight,
+                        self.config.per_tenant_limit
+                    ));
+                }
+            }
+            // Woken (or a slot may exist): loop and re-check.
+        }
+    }
+
+    fn release(&self, tenant: &str) {
+        let mut state = self.state.lock().expect("admission poisoned");
+        state.global_in_flight = state.global_in_flight.saturating_sub(1);
+        if let Some(n) = state.per_tenant.get_mut(tenant) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                state.per_tenant.remove(tenant);
+            }
+        }
+        drop(state);
+        // Wake ALL waiters, not one: a freed slot might be unusable to the first
+        // waiter it wakes (that waiter's tenant could still be at its per-tenant
+        // cap) while a DIFFERENT tenant's waiter could take it. `notify_all` lets
+        // every waiter re-check `has_slot` so the freed permit is never stranded
+        // behind a capped-tenant waiter. Waiter counts are small (bounded by
+        // `max_waiters`), so the re-check herd is cheap.
+        self.freed.notify_all();
+    }
+}
+
+/// RAII permit: releases its admission slot (and wakes waiters) on drop, so a
+/// permit is freed even if the guarded `exec` panics.
+struct AdmissionGuard<'a> {
+    control: &'a AdmissionControl,
+    tenant: String,
+}
+
+impl Drop for AdmissionGuard<'_> {
+    fn drop(&mut self) {
+        self.control.release(&self.tenant);
+    }
+}
 
 /// Parameters for the `open_session` MCP method.
 #[derive(Debug, Clone)]
@@ -100,14 +272,28 @@ pub struct SandboxProvider {
     /// entirely after (and re-opens cleanly). Keyed by
     /// [`SandboxBackend::canonical_key`], the same key the jail backend locks on.
     lifecycle: LifecycleLocks,
+    /// Per-tenant + global admission gate for `exec` (repair #4). A tenant
+    /// command pins one blocking-pool worker + one jail process for up to the
+    /// timeout ceiling; this caps how many run at once so no single tenant can
+    /// occupy every worker (per-tenant limit) and no flood can wedge the daemon
+    /// (global limit), with a bounded wait queue in between.
+    admission: AdmissionControl,
 }
 
 impl SandboxProvider {
     pub fn new(backend: Box<dyn SandboxBackend>) -> Self {
+        Self::with_admission(backend, AdmissionConfig::default())
+    }
+
+    /// [`SandboxProvider::new`] with an explicit admission-control config (the
+    /// server passes operator-tuned limits; tests pass tight ones to exercise
+    /// the caps).
+    pub fn with_admission(backend: Box<dyn SandboxBackend>, admission: AdmissionConfig) -> Self {
         SandboxProvider {
             backend,
             sessions: Mutex::new(HashMap::new()),
             lifecycle: LifecycleLocks::new(),
+            admission: AdmissionControl::new(admission),
         }
     }
 
@@ -158,7 +344,19 @@ impl SandboxProvider {
     /// is chosen — the backend trait will grow an `exec_streaming` variant then,
     /// not before.
     pub fn exec(&self, params: ExecParams) -> Result<ExecResult> {
-        self.ensure_known(&params.session)?;
+        // Resolve the owning tenant (also enforces that this provider knows the
+        // session) so admission can key the per-tenant limit on it.
+        let tenant = {
+            let guard = self.sessions.lock().expect("sessions poisoned");
+            match guard.get(&params.session) {
+                Some(entry) => entry.tenant.label.clone(),
+                None => return Err(anyhow!("unknown session {}", params.session.as_str())),
+            }
+        };
+        // ADMISSION: hold a per-tenant + global permit for the whole exec. When
+        // the caps are full this blocks (bounded) or is rejected; the guard
+        // releases the permit on drop, including if the backend exec panics.
+        let _permit = self.admission.acquire(&tenant)?;
         let request = ExecRequest {
             command: params.command,
             cwd: params.cwd,
@@ -315,19 +513,6 @@ impl SandboxProvider {
             .expect("sessions poisoned")
             .get(session)
             .map(|entry| entry.tenant.label.clone())
-    }
-
-    fn ensure_known(&self, session: &SessionId) -> Result<()> {
-        if self
-            .sessions
-            .lock()
-            .expect("sessions poisoned")
-            .contains_key(session)
-        {
-            Ok(())
-        } else {
-            Err(anyhow!("unknown session {}", session.as_str()))
-        }
     }
 }
 
@@ -1211,5 +1396,157 @@ mod tests {
         provider
             .exec(exec_params(&id2))
             .expect("concurrently-opened session must remain known and execable");
+    }
+
+    // -- Security repair #4: admission control (per-tenant + global caps) ------
+
+    /// The [`AdmissionControl`] unit: the per-tenant cap, the global cap, and
+    /// the bounded wait queue, exercised directly (fast, no backend).
+    #[test]
+    fn admission_caps_are_enforced() {
+        // Global 3, per-tenant 2, no waiters allowed (reject immediately on full).
+        let ctl = AdmissionControl::new(AdmissionConfig {
+            global_limit: 3,
+            per_tenant_limit: 2,
+            max_waiters: 0,
+        });
+
+        // alice takes her 2 (the per-tenant limit)...
+        let a1 = ctl.acquire("alice").expect("a1");
+        let a2 = ctl.acquire("alice").expect("a2");
+        // ...a 3rd for alice is refused (per-tenant cap), even though a GLOBAL
+        // slot is still free — the per-tenant limit is the fairness guarantee.
+        assert!(
+            ctl.acquire("alice").is_err(),
+            "a tenant must not exceed its per-tenant cap"
+        );
+
+        // bob can still take a slot (his own per-tenant budget), filling global.
+        let b1 = ctl.acquire("bob").expect("b1");
+        // Now global is full (3/3): even a fresh tenant is refused.
+        assert!(
+            ctl.acquire("carol").is_err(),
+            "the global cap must hold across tenants"
+        );
+
+        // Releasing one frees exactly one slot.
+        drop(a1);
+        let c1 = ctl.acquire("carol").expect("a freed global slot admits carol");
+
+        drop(a2);
+        drop(b1);
+        drop(c1);
+    }
+
+    /// A blocked acquire WAITS (up to the queue bound) and is then admitted when
+    /// a permit frees — proving the queue is a bounded wait, not just a reject.
+    #[test]
+    fn admission_waits_then_admits_on_release() {
+        use std::sync::Arc;
+        let ctl = Arc::new(AdmissionControl::new(AdmissionConfig {
+            global_limit: 1,
+            per_tenant_limit: 1,
+            max_waiters: 4,
+        }));
+
+        // Hold the only slot.
+        let held = ctl.acquire("alice").expect("first");
+
+        // A second acquire on a DIFFERENT tenant must block (global is full),
+        // then succeed once we release.
+        let ctl2 = ctl.clone();
+        let waiter = std::thread::spawn(move || {
+            // This blocks until the held permit is dropped.
+            let _g = ctl2.acquire("bob").expect("admitted after release");
+        });
+        // Give the waiter time to park on the condvar, then release.
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        drop(held);
+        waiter.join().expect("waiter admitted");
+    }
+
+    /// Provider-level: a single tenant cannot run more than its per-tenant exec
+    /// limit concurrently. We hold execs open with a blocking backend and prove
+    /// the (limit+1)-th same-tenant exec is refused with `max_waiters = 0`.
+    #[test]
+    fn provider_admission_bounds_one_tenant() {
+        use std::sync::Arc;
+        use std::sync::mpsc;
+
+        /// Backend whose `exec` blocks until released, so a test can hold N execs
+        /// in flight and probe the admission cap.
+        struct BlockingExecBackend {
+            entered: mpsc::Sender<()>,
+            release: Mutex<mpsc::Receiver<()>>,
+        }
+        impl SandboxBackend for BlockingExecBackend {
+            fn name(&self) -> &'static str {
+                "blocking-exec"
+            }
+            fn open_session(&self, spec: &SessionSpec) -> Result<SessionId> {
+                Ok(SessionId::new(format!("box-{}", spec.tenant.label)))
+            }
+            fn exec(&self, _s: &SessionId, _r: &ExecRequest) -> Result<ExecResult> {
+                let _ = self.entered.send(());
+                // Block until the test releases one unit.
+                let _ = self.release.lock().expect("poisoned").recv();
+                Ok(ExecResult { exit_code: Some(0), ..Default::default() })
+            }
+            fn close_session(&self, _s: &SessionId) -> Result<()> {
+                Ok(())
+            }
+            fn destroy_session(&self, _s: &SessionId) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let provider = Arc::new(SandboxProvider::with_admission(
+            Box::new(BlockingExecBackend {
+                entered: entered_tx,
+                release: Mutex::new(release_rx),
+            }),
+            AdmissionConfig {
+                global_limit: 10,   // plenty of global room...
+                per_tenant_limit: 2, // ...but only 2 per tenant.
+                max_waiters: 0,      // full => reject immediately (no queue).
+            },
+        ));
+
+        let id = provider.open_session(params("alice")).expect("open");
+
+        // Launch 2 execs that will block inside the backend, holding both of
+        // alice's per-tenant permits.
+        let mut runners = Vec::new();
+        for _ in 0..2 {
+            let p = provider.clone();
+            let id = id.clone();
+            runners.push(std::thread::spawn(move || {
+                let _ = p.exec(exec_params(&id));
+            }));
+        }
+        // Wait until BOTH are actually inside the backend (permits held).
+        entered_rx.recv().expect("exec 1 entered");
+        entered_rx.recv().expect("exec 2 entered");
+
+        // A 3rd concurrent exec for alice must be refused: per-tenant cap is full
+        // and no waiter slot exists. (Global still has 8 free — this proves the
+        // per-tenant bound, not the global one.)
+        let err = provider
+            .exec(exec_params(&id))
+            .expect_err("3rd same-tenant exec must be refused");
+        assert!(err.to_string().contains("sandbox busy"), "err: {err}");
+
+        // Release both in-flight execs and join.
+        release_tx.send(()).unwrap();
+        release_tx.send(()).unwrap();
+        for r in runners {
+            r.join().unwrap();
+        }
+
+        // With the permits freed, a fresh exec is admitted again.
+        release_tx.send(()).unwrap(); // pre-load one release for the final exec
+        provider.exec(exec_params(&id)).expect("exec admitted after release");
     }
 }
