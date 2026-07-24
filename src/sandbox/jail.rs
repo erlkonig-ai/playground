@@ -126,7 +126,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 
-use super::proc::drive_child;
+use super::proc::{DEFAULT_MAX_OUTPUT_BYTES, drive_child, drive_child_capped};
 use super::{ExecRequest, ExecResult, LifecycleLocks, SandboxBackend, SessionId, SessionSpec};
 
 /// Output of one host command, however it was transported. Local-backstop
@@ -137,12 +137,45 @@ pub use super::proc::ChildOutput as HostOutput;
 /// Default per-command timeout when an [`ExecRequest`] does not specify one.
 /// Matches `super::lima::DEFAULT_EXEC_TIMEOUT`.
 const DEFAULT_EXEC_TIMEOUT: Duration = Duration::from_secs(300);
+/// Server-side CEILING on a per-command timeout. A caller may request LESS via
+/// `ExecRequest::timeout`, never MORE: the effective timeout is
+/// `min(requested, MAX_EXEC_TIMEOUT)`. This bounds how long one tenant can pin a
+/// blocking worker + a jail process regardless of what `timeout_ms` it sends
+/// (the review's caller-selected-`u64`-timeout class). 30 minutes is generous
+/// for an honest long build while still finite.
+const MAX_EXEC_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// Timeout for administrative host commands (zfs/jail/mount lifecycle).
 const ADMIN_TIMEOUT: Duration = Duration::from_secs(120);
 /// Extra local wall-clock grace on top of the server-side `timeout(1)`: the
 /// server kill is authoritative; the local kill only fires if SSH itself
 /// wedges.
 const LOCAL_TIMEOUT_GRACE: Duration = Duration::from_secs(20);
+/// Per-stream output ceiling for a tenant `exec` (see
+/// [`super::proc::DEFAULT_MAX_OUTPUT_BYTES`]). Each of stdout/stderr is capped
+/// independently and the jail process is killed the instant either exceeds it,
+/// so a runaway producer cannot make the daemon accumulate unbounded memory.
+const MAX_EXEC_OUTPUT_BYTES: usize = DEFAULT_MAX_OUTPUT_BYTES;
+/// Default ZFS `refquota` for a per-tenant clone (a ZFS size string). Bounds how
+/// much a tenant can write into its own dataset so it cannot fill the host pool.
+const DEFAULT_CLONE_REFQUOTA: &str = "10G";
+/// Default ZFS `quota` for the pile-root dataset (a ZFS size string). Global cap
+/// across all tenants' piles (self + shared) so pile writes cannot fill the pool.
+const DEFAULT_PILE_ROOT_QUOTA: &str = "50G";
+/// Default per-jail `rctl(8)` rules (the `<resource>:<action>=<amount>` tails).
+/// Applied ONLY when host RACCT is enabled (probed at runtime); a no-op on the
+/// current RACCT-off deploy box. These clamp the fork/thread/FD/RAM/CPU pressure
+/// the review flagged as reaching host-global resources: cap processes and
+/// threads (fork-bomb), resident + swap memory (RAM exhaustion), open files (FD
+/// exhaustion), and CPU-seconds (runaway spin). Deny actions fail the offending
+/// syscall; the CPU rule signals the process.
+const DEFAULT_RCTL_RULES: &[&str] = &[
+    "maxproc:deny=512",
+    "openfiles:deny=8192",
+    "memoryuse:deny=2G",
+    "swapuse:deny=1G",
+    "pcpu:deny=90",
+    "nthr:deny=2048",
+];
 
 /// Tri-state, ERROR-PRESERVING result of a "does this ZFS dataset exist?" probe.
 ///
@@ -176,8 +209,26 @@ pub trait HostRunner: Send + Sync {
     /// Run `argv` on the host, optionally feeding `stdin`, killing after
     /// `timeout` wall-clock. Implementations must capture stdout/stderr
     /// completely (drain concurrently — a full pipe must not deadlock the
-    /// child).
+    /// child). Used for administrative host commands whose output is bounded by
+    /// construction (zfs/jail/mount).
     fn run(&self, argv: &[String], stdin: Option<&[u8]>, timeout: Duration) -> Result<HostOutput>;
+
+    /// Like [`run`](Self::run) but caps each of stdout/stderr at
+    /// `max_output_bytes` and KILLS the transported child the instant either
+    /// exceeds it (`ChildOutput::output_truncated` is then set). This is the
+    /// path for a TENANT `exec`, whose output is attacker-controlled: it must
+    /// not accumulate unbounded memory in the daemon. The default is unbounded
+    /// (delegates to `run`), correct only for a runner that never carries a
+    /// tenant command; the production runners override it.
+    fn run_capped(
+        &self,
+        argv: &[String],
+        stdin: Option<&[u8]>,
+        timeout: Duration,
+        _max_output_bytes: usize,
+    ) -> Result<HostOutput> {
+        self.run(argv, stdin, timeout)
+    }
 
     /// Exit code that means "the transport itself failed", as opposed to the
     /// host command's own status. `ssh` reserves 255 for this; a local spawn
@@ -232,6 +283,32 @@ impl HostRunner for SshRunner {
         drive_child(child, stdin.map(|b| b.to_vec()), timeout)
     }
 
+    fn run_capped(
+        &self,
+        argv: &[String],
+        stdin: Option<&[u8]>,
+        timeout: Duration,
+        max_output_bytes: usize,
+    ) -> Result<HostOutput> {
+        let remote = argv.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" ");
+        let mut cmd = Command::new("ssh");
+        cmd.arg("-o")
+            .arg("BatchMode=yes")
+            .arg("-o")
+            .arg(format!("ConnectTimeout={}", self.connect_timeout.as_secs()))
+            .arg(&self.host)
+            .arg(remote);
+        cmd.stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() });
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+        let child = cmd.spawn().context("spawn ssh")?;
+        // Killing the LOCAL ssh on a cap breach also tears down the pipe to the
+        // remote; the authoritative remote-side kill of the jail process tree is
+        // the backend's `timeout(1)` wrapper (server-side, exit 124). The cap is
+        // the daemon-memory bound; the timeout is the process-tree bound.
+        drive_child_capped(child, stdin.map(|b| b.to_vec()), timeout, max_output_bytes)
+    }
+
     fn transport_error_exit(&self) -> Option<i32> {
         Some(255) // ssh reserves 255 for its own failures
     }
@@ -258,6 +335,25 @@ impl HostRunner for LocalRunner {
 
         let child = cmd.spawn().with_context(|| format!("spawn {program}"))?;
         drive_child(child, stdin.map(|b| b.to_vec()), timeout)
+    }
+
+    fn run_capped(
+        &self,
+        argv: &[String],
+        stdin: Option<&[u8]>,
+        timeout: Duration,
+        max_output_bytes: usize,
+    ) -> Result<HostOutput> {
+        let Some((program, args)) = argv.split_first() else {
+            bail!("empty argv");
+        };
+        let mut cmd = Command::new(program);
+        cmd.args(args);
+        cmd.stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() });
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+        let child = cmd.spawn().with_context(|| format!("spawn {program}"))?;
+        drive_child_capped(child, stdin.map(|b| b.to_vec()), timeout, max_output_bytes)
     }
 }
 
@@ -303,6 +399,33 @@ pub struct JailBackend {
     /// coworker's `self.pile` (and used to seed the shared pile the first time).
     /// This is the server-side bootstrap seed, not any caller-supplied pile.
     pub bootstrap_pile: String,
+    /// ZFS `refquota` (bytes) set on each per-tenant clone at provision so a
+    /// tenant cannot fill the host pool via its own dataset's writes (repair #4
+    /// storage bound). `refquota` (vs `quota`) bounds the dataset's OWN data
+    /// only, not descendants/snapshots — exactly the tenant-controlled surface.
+    /// `None` disables it (e.g. a pool with its own delegated quota). A ZFS-value
+    /// string like "10G" is accepted via the CLI; stored as the raw bytes here.
+    pub clone_refquota: Option<String>,
+    /// ZFS `quota` (a size string) set on the pile-root DATASET at provision so
+    /// tenants cannot fill the host pool through pile writes (the host-owned
+    /// `self.pile`s + the shared `shared.pile` all live under `pile_root`).
+    /// `quota` (vs `refquota`) here bounds the dataset AND all its descendants,
+    /// i.e. every per-tenant pile dir at once — a single global pile-storage cap.
+    /// Best-effort + idempotent: applied only when `pile_root` resolves to a real
+    /// ZFS dataset (a plain-directory `pile_root` is skipped with a note).
+    /// Per-tenant pile isolation would need per-tenant pile datasets — a noted
+    /// follow-up; this global cap already stops the fill-the-pool attack. `None`
+    /// disables it.
+    pub pile_root_quota: Option<String>,
+    /// Per-jail `rctl(8)` resource rules applied at provision, but ONLY when the
+    /// host has RACCT enabled (`kern.racct.enable=1`, probed at runtime). Each
+    /// entry is the `<resource>:<action>=<amount>` tail of a
+    /// `jail:<name>:<resource>:<action>=<amount>` rule (e.g. `maxproc:deny=512`).
+    /// Host RACCT is currently OFF on the deploy box, so these are a NO-OP there
+    /// with a clear operator note (deploy/freebsd/README.md) on enabling it;
+    /// once enabled they clamp per-jail process/RAM/CPU/FD pressure without any
+    /// code change. Empty disables the programmatic path.
+    pub rctl_rules: Vec<String>,
     /// Per-canonical-tenant (jail-name-keyed) lifecycle lock. Serializes
     /// provision / open / destroy for one tenant WITHIN this process, so two
     /// concurrent lifecycle ops on the same box cannot race (blocker #3). The
@@ -335,6 +458,17 @@ impl JailBackend {
             dataset_parent: "aitemp/playground".to_string(),
             pile_root: "/aitemp/playground/piles".to_string(),
             bootstrap_pile: "/aitemp/playground/bootstrap.pile".to_string(),
+            // Sane default: 10 GiB per tenant clone. Generous for a working
+            // sandbox, finite enough that no tenant can fill the pool. Operators
+            // tune it with `--jail-clone-refquota` (`0`/empty disables).
+            clone_refquota: Some(DEFAULT_CLONE_REFQUOTA.to_string()),
+            // Sane default: 50 GiB across ALL tenants' piles (self + shared).
+            // Tune with `--jail-pile-quota` (`0`/empty disables).
+            pile_root_quota: Some(DEFAULT_PILE_ROOT_QUOTA.to_string()),
+            // Default per-jail rctl rules — applied ONLY when host RACCT is on
+            // (probed at runtime; a no-op on the current RACCT-off deploy box).
+            // Bounds process count, RAM, swap, open files, and CPU per jail.
+            rctl_rules: DEFAULT_RCTL_RULES.iter().map(|s| s.to_string()).collect(),
             lifecycle: LifecycleLocks::new(),
         }
     }
@@ -772,6 +906,21 @@ impl JailBackend {
         self.runner.run(&argv, stdin, timeout)
     }
 
+    /// `run` for a TENANT command: caps each output stream at `max_output_bytes`
+    /// and kills the transported child on breach (see
+    /// [`HostRunner::run_capped`]). Used only by `exec`, never by the admin
+    /// commands (whose output is bounded by construction).
+    fn run_capped(
+        &self,
+        argv: &[&str],
+        stdin: Option<&[u8]>,
+        timeout: Duration,
+        max_output_bytes: usize,
+    ) -> Result<HostOutput> {
+        let argv: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+        self.runner.run_capped(&argv, stdin, timeout, max_output_bytes)
+    }
+
     /// Record the ORIGINAL tenant label on a freshly-cloned dataset as a ZFS
     /// user property (`zfs set playground:tenant=<label> <dataset>`, argv form —
     /// no shell). This is the provenance the reuse/reattach arms verify against.
@@ -790,6 +939,143 @@ impl JailBackend {
             );
         }
         Ok(())
+    }
+
+    /// Set the ZFS `refquota` on a freshly-cloned per-tenant dataset (repair #4
+    /// storage bound), if one is configured. `refquota` bounds the dataset's OWN
+    /// referenced data (not snapshots/descendants), so a tenant cannot fill the
+    /// host pool through its clone's writes — the empty pile target files, any
+    /// scratch under `/workspace`, /tmp, logs, etc. A `None` or empty/`"0"`
+    /// setting disables it (leaving pool-level quota to the operator). Idempotent
+    /// (re-setting the same value is a no-op), so it is safe on a converge path.
+    fn set_clone_refquota(&self, dataset: &str) -> Result<()> {
+        let Some(refquota) = self.clone_refquota.as_deref() else {
+            return Ok(());
+        };
+        if refquota.is_empty() || refquota == "0" || refquota == "none" {
+            return Ok(());
+        }
+        let assignment = format!("refquota={refquota}");
+        let out = self.run(
+            &["sudo", "-n", "zfs", "set", &assignment, dataset],
+            None,
+            ADMIN_TIMEOUT,
+        )?;
+        if !out.success() {
+            bail!(
+                "zfs set refquota={refquota} on {dataset} failed: {}",
+                out.stderr_lossy()
+            );
+        }
+        Ok(())
+    }
+
+    /// Ensure a global ZFS `quota` is set on the pile-root DATASET so all
+    /// tenants' pile writes together cannot fill the host pool (repair #4). The
+    /// pile files live under `pile_root` (a host path); we resolve which ZFS
+    /// dataset that path belongs to and, if it IS a dataset mountpoint, set the
+    /// quota. Best-effort + idempotent (safe to run on every provision): if
+    /// `pile_root` is a plain directory inside some larger dataset we do NOT
+    /// touch that dataset (setting a quota on an unrelated shared dataset would
+    /// be wrong), we just log — the operator sets a pile-root dataset up for the
+    /// bound to bite. A `None`/empty/`"0"` config disables it entirely.
+    fn ensure_pile_root_quota(&self) {
+        let Some(quota) = self.pile_root_quota.as_deref() else {
+            return;
+        };
+        if quota.is_empty() || quota == "0" || quota == "none" {
+            return;
+        }
+        // `zfs list -H -o name <path>` prints the dataset a path lives in; if the
+        // path is exactly a dataset mountpoint we get that dataset. We only set
+        // the quota when the path's dataset mountpoint IS the pile root, so we
+        // never clamp an unrelated ancestor dataset.
+        let name = self.run(
+            &["sudo", "-n", "zfs", "list", "-H", "-o", "name", &self.pile_root],
+            None,
+            ADMIN_TIMEOUT,
+        );
+        let dataset = match name {
+            Ok(out) if out.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
+            _ => {
+                eprintln!(
+                    "[{}] pile-root '{}' is not a ZFS dataset mountpoint; skipping the global \
+                     pile quota (set up a dataset at the pile root to enforce it)",
+                    self.name(),
+                    self.pile_root
+                );
+                return;
+            }
+        };
+        let assignment = format!("quota={quota}");
+        match self.run(
+            &["sudo", "-n", "zfs", "set", &assignment, &dataset],
+            None,
+            ADMIN_TIMEOUT,
+        ) {
+            Ok(out) if out.success() => {}
+            Ok(out) => eprintln!(
+                "[{}] zfs set quota={quota} on pile-root dataset {dataset} failed: {} \
+                 (continuing; the per-clone refquota still bounds each tenant)",
+                self.name(),
+                out.stderr_lossy()
+            ),
+            Err(e) => eprintln!(
+                "[{}] zfs set quota on pile-root dataset {dataset} errored: {e:#} (continuing)",
+                self.name()
+            ),
+        }
+    }
+
+    /// Is host RACCT/RCTL enabled? Probes `sysctl -n kern.racct.enable`; a value
+    /// of `1` means `rctl(8)` rules can be set. Any failure (sysctl missing,
+    /// transport error) is read conservatively as DISABLED, so we never try to
+    /// set a rule that would error. Cheap and side-effect-free.
+    fn racct_enabled(&self) -> bool {
+        match self.run(&["sysctl", "-n", "kern.racct.enable"], None, ADMIN_TIMEOUT) {
+            Ok(out) if out.success() => {
+                String::from_utf8_lossy(&out.stdout).trim() == "1"
+            }
+            _ => false,
+        }
+    }
+
+    /// Apply the configured per-jail `rctl(8)` rules IF host RACCT is enabled.
+    /// This is the guarded programmatic path the review asks for: on the current
+    /// RACCT-off deploy box `racct_enabled()` returns false and this is a no-op
+    /// (with a one-line operator hint); once the operator sets
+    /// `kern.racct.enable=1` the same rules clamp per-jail resource pressure with
+    /// no code change. Best-effort per rule: a rule that fails to apply is logged
+    /// and the rest proceed (partial limits beat none). Called AFTER `jail -c`,
+    /// since a `jail:<name>:...` rule needs the jail to exist.
+    fn apply_rctl_rules(&self, jail: &str) {
+        if self.rctl_rules.is_empty() {
+            return;
+        }
+        if !self.racct_enabled() {
+            eprintln!(
+                "[{}] host RACCT is disabled (kern.racct.enable=0); skipping per-jail rctl \
+                 limits for '{jail}'. Enable RACCT + reprovision to clamp CPU/RAM/maxproc/FDs \
+                 (see deploy/freebsd/README.md).",
+                self.name()
+            );
+            return;
+        }
+        for tail in &self.rctl_rules {
+            let rule = format!("jail:{jail}:{tail}");
+            match self.run(&["sudo", "-n", "rctl", "-a", &rule], None, ADMIN_TIMEOUT) {
+                Ok(out) if out.success() => {}
+                Ok(out) => eprintln!(
+                    "[{}] rctl -a {rule} failed: {} (continuing with remaining rules)",
+                    self.name(),
+                    out.stderr_lossy()
+                ),
+                Err(e) => eprintln!(
+                    "[{}] rctl -a {rule} errored: {e:#} (continuing)",
+                    self.name()
+                ),
+            }
+        }
     }
 
     /// Read back the recorded tenant label and VERIFY it equals `expected`. A
@@ -1168,6 +1454,13 @@ impl SandboxBackend for JailBackend {
             // arms verify against (defence-in-depth over the jail-name digest).
             self.set_tenant_property(&dataset, &spec.tenant.label)?;
 
+            // STORAGE BOUND (repair #4): cap the tenant clone's referenced data
+            // with a ZFS refquota so it cannot fill the host pool. Set right
+            // after the clone, before the jail is even started, so the bound is
+            // live for every byte the tenant ever writes into its dataset.
+            self.set_clone_refquota(&dataset)
+                .with_context(|| format!("set refquota on clone {dataset}"))?;
+
             let root = self.mountpoint(&dataset)?;
 
             // devfs, mounted manually (not via jail(8) params) so lifecycle
@@ -1277,6 +1570,10 @@ impl SandboxBackend for JailBackend {
             if !mkdir_shared.success() {
                 bail!("mkdir shared pile dir failed: {}", mkdir_shared.stderr_lossy());
             }
+            // STORAGE BOUND (repair #4): ensure the global pile-storage quota is
+            // set on the pile-root dataset so no tenant can fill the pool via
+            // pile appends. Best-effort + idempotent (see the helper).
+            self.ensure_pile_root_quota();
             self.stage_and_publish_pile(&jail, &shared_pile)
                 .context("seed shared.pile from bootstrap")?;
             // Same append-only protection on the SHARED pile — the higher-stakes
@@ -1349,6 +1646,12 @@ impl SandboxBackend for JailBackend {
             if !created.success() {
                 bail!("jail -c {jail} failed: {}", created.stderr_lossy());
             }
+
+            // RESOURCE BOUND (repair #4): apply per-jail rctl rules now that the
+            // jail exists — but only if host RACCT is enabled (a no-op otherwise,
+            // with an operator hint). This clamps fork/thread/FD/RAM/CPU pressure
+            // per jail once the operator turns RACCT on; see deploy README.
+            self.apply_rctl_rules(&jail);
             Ok(())
         })(&mut created_clone);
 
@@ -1447,7 +1750,12 @@ impl SandboxBackend for JailBackend {
             None => request.command.clone(),
         };
 
-        let timeout = request.timeout.unwrap_or(DEFAULT_EXEC_TIMEOUT);
+        // TIMEOUT CEILING: a caller may request LESS than the default, never
+        // MORE than the server-side maximum. `min(requested, MAX)` bounds how
+        // long one tenant pins a blocking worker + a jail process regardless of
+        // the `timeout_ms` it sends (the caller-selected-`u64` class).
+        let requested = request.timeout.unwrap_or(DEFAULT_EXEC_TIMEOUT);
+        let timeout = requested.min(MAX_EXEC_TIMEOUT);
         // Server-side kill is authoritative: FreeBSD timeout(1) exits 124 and
         // actually terminates the process tree on the server (a local ssh kill
         // alone would leave the remote command running).
@@ -1456,7 +1764,39 @@ impl SandboxBackend for JailBackend {
             "sudo", "-n", "timeout", "-k", "5", &secs, "jexec", jail, "/bin/sh", "-lc", &script,
         ];
 
-        let out = self.run(&argv, request.stdin.as_deref(), timeout + LOCAL_TIMEOUT_GRACE)?;
+        // Tenant output is attacker-controlled: cap each stream and kill the
+        // transported child on breach (bounds daemon memory; see MAX_EXEC_OUTPUT_BYTES).
+        let out = self.run_capped(
+            &argv,
+            request.stdin.as_deref(),
+            timeout + LOCAL_TIMEOUT_GRACE,
+            MAX_EXEC_OUTPUT_BYTES,
+        )?;
+
+        // REAP the jail's process tree on ANY early kill (local timeout backstop
+        // or output-cap breach). The server-side `timeout(1)` reaps the tree it
+        // launched on a clean server-side expiry (exit 124), but if the LOCAL
+        // side gave up first — an ssh/transport wedge, or a cap kill that tore
+        // down only the local ssh — the `jexec`'d command (and any background
+        // processes it spawned inside the jail) can still be alive on the host.
+        // A jailed process can only be signalled from OUTSIDE the jail, so we
+        // ask the host to kill every process in this jail. Best-effort: on a
+        // clean exit there is nothing to kill and this is skipped.
+        if out.timed_out || out.output_truncated {
+            // `jexec <jail> kill -TERM -1` signals every process inside the jail
+            // (PID -1 = all processes the caller may signal; as jail-root that is
+            // the whole jail), then a short grace and SIGKILL for stragglers.
+            let _ = self.run(
+                &["sudo", "-n", "jexec", jail, "/bin/kill", "-TERM", "-1"],
+                None,
+                ADMIN_TIMEOUT,
+            );
+            let _ = self.run(
+                &["sudo", "-n", "jexec", jail, "/bin/kill", "-KILL", "-1"],
+                None,
+                ADMIN_TIMEOUT,
+            );
+        }
 
         let mut result = ExecResult {
             stdout: out.stdout,
@@ -1467,7 +1807,23 @@ impl SandboxBackend for JailBackend {
         if out.timed_out || out.exit_code == Some(124) {
             // Mirror LimaBackend: timeouts surface as exit 124 + error text.
             result.exit_code = Some(124);
-            result.error = Some(format!("command timed out after {timeout:?}"));
+            let ceiling = if requested > MAX_EXEC_TIMEOUT {
+                format!(
+                    " (requested {requested:?} was clamped to the {MAX_EXEC_TIMEOUT:?} server maximum)"
+                )
+            } else {
+                String::new()
+            };
+            result.error = Some(format!(
+                "command timed out after {timeout:?}{ceiling}; jail process tree killed"
+            ));
+        } else if out.output_truncated {
+            // Output ceiling breached: the process was KILLED at the cap, its
+            // tree reaped, and the captured bytes stop at the ceiling.
+            result.error = Some(format!(
+                "output truncated at {MAX_EXEC_OUTPUT_BYTES} bytes per stream; \
+                 process killed and jail tree reaped"
+            ));
         } else if out.exit_code.is_some() && out.exit_code == self.runner.transport_error_exit() {
             // Transport failure (e.g. ssh's reserved exit 255), not the host
             // command's own exit code. Never fires for LocalRunner.
@@ -1518,6 +1874,17 @@ impl SandboxBackend for JailBackend {
                     "[{}] jail -r {jail}: {} (continuing to dataset teardown)",
                     self.name(),
                     removed.stderr_lossy()
+                );
+            }
+
+            // Remove any per-jail rctl rules (keyed by jail NAME, so they would
+            // otherwise linger and re-bind if the name were ever reused). Only
+            // meaningful when RACCT is on; a no-op / tolerated failure otherwise.
+            if !self.rctl_rules.is_empty() && self.racct_enabled() {
+                let _ = self.run(
+                    &["sudo", "-n", "rctl", "-r", &format!("jail:{jail}")],
+                    None,
+                    ADMIN_TIMEOUT,
                 );
             }
 
@@ -1898,6 +2265,185 @@ mod tests {
         assert!(jail_call.contains(&"ip4=disable".to_string()));
         assert!(jail_call.contains(&"ip6=disable".to_string()));
         assert!(jail_call.contains(&"persist".to_string()));
+    }
+
+    // ---- repair #4: resource bounds ----------------------------------------
+
+    /// Provision sets the ZFS `refquota` on the fresh per-tenant clone (storage
+    /// bound) — a tenant cannot fill the host pool via its own dataset. The
+    /// default backend carries `clone_refquota = Some("10G")`.
+    #[test]
+    fn provision_sets_clone_refquota() {
+        let (backend, mock) = mock_provision_ready()
+            .reply(&["sudo", "-n", "jls", "-j"], fail())
+            .reply(&["sudo", "-n", "zfs", "list"], dataset_absent())
+            .into_backend();
+        backend.provision_sandbox(&spec("alice")).expect("provision");
+
+        let calls = mock.calls();
+        assert!(
+            calls.iter().any(|c| c == &[
+                "sudo".to_string(), "-n".into(), "zfs".into(), "set".into(),
+                "refquota=10G".into(), alice_dataset(),
+            ]),
+            "must `zfs set refquota=10G` on the fresh clone: {calls:?}"
+        );
+    }
+
+    /// A `None`/disabled `clone_refquota` skips the refquota set entirely (so an
+    /// operator whose pool has its own delegated quota is not forced into ours).
+    #[test]
+    fn provision_skips_refquota_when_disabled() {
+        let (mut backend, mock) = mock_provision_ready()
+            .reply(&["sudo", "-n", "jls", "-j"], fail())
+            .reply(&["sudo", "-n", "zfs", "list"], dataset_absent())
+            .into_backend();
+        backend.clone_refquota = None;
+        backend.provision_sandbox(&spec("alice")).expect("provision");
+        let calls = mock.calls();
+        assert!(
+            !calls.iter().any(|c| c.iter().any(|a| a.starts_with("refquota="))),
+            "no refquota set must be issued when disabled: {calls:?}"
+        );
+    }
+
+    /// With host RACCT OFF (the mock's `sysctl kern.racct.enable` yields empty →
+    /// not "1"), provision must NOT attempt any `rctl -a` rule — it fails closed
+    /// on the probe and only emits the operator hint.
+    #[test]
+    fn provision_skips_rctl_when_racct_off() {
+        let (backend, mock) = mock_provision_ready()
+            .reply(&["sudo", "-n", "jls", "-j"], fail())
+            .reply(&["sudo", "-n", "zfs", "list"], dataset_absent())
+            // sysctl returns empty stdout by the mock default → racct_enabled() == false.
+            .into_backend();
+        backend.provision_sandbox(&spec("alice")).expect("provision");
+        let calls = mock.calls();
+        assert!(
+            !calls.iter().any(|c| c.get(2).map(String::as_str) == Some("rctl")),
+            "no rctl rule may be applied while RACCT is off: {calls:?}"
+        );
+    }
+
+    /// With host RACCT ON (sysctl → "1"), provision applies the configured
+    /// per-jail `rctl -a jail:<name>:<rule>` rules.
+    #[test]
+    fn provision_applies_rctl_when_racct_on() {
+        let (backend, mock) = mock_provision_ready()
+            .reply(&["sudo", "-n", "jls", "-j"], fail())
+            .reply(&["sudo", "-n", "zfs", "list"], dataset_absent())
+            .reply(&["sysctl", "-n", "kern.racct.enable"], ok_with_stdout("1\n"))
+            .into_backend();
+        backend.provision_sandbox(&spec("alice")).expect("provision");
+
+        let calls = mock.calls();
+        let jail = alice_jail();
+        // At least the maxproc rule must be applied, keyed on alice's jail name.
+        assert!(
+            calls.iter().any(|c| c == &[
+                "sudo".to_string(), "-n".into(), "rctl".into(), "-a".into(),
+                format!("jail:{jail}:maxproc:deny=512"),
+            ]),
+            "must apply the maxproc rctl rule when RACCT is on: {calls:?}"
+        );
+    }
+
+    /// The caller-supplied exec timeout is CLAMPED to the server maximum: a huge
+    /// `timeout_ms` becomes `timeout(1) <MAX>`, never larger. (A caller may still
+    /// ask for LESS.)
+    #[test]
+    fn exec_clamps_timeout_to_the_ceiling() {
+        let (backend, mock) = MockRunner::default().into_backend();
+        // Ask for 10 hours — far past the 30-minute ceiling.
+        let req = ExecRequest {
+            command: "true".to_string(),
+            cwd: None,
+            stdin: None,
+            timeout: Some(Duration::from_secs(10 * 3600)),
+        };
+        backend
+            .exec(&SessionId::new("playground-alice"), &req)
+            .expect("exec");
+        let calls = mock.calls();
+        // Find the `timeout(1)` argv and read the seconds arg (index after -k 5).
+        let tcall = calls
+            .iter()
+            .find(|c| c.get(2).map(String::as_str) == Some("timeout"))
+            .expect("timeout(1) issued");
+        // argv: sudo -n timeout -k 5 <secs> jexec ...
+        let secs: u64 = tcall[5].parse().expect("secs is numeric");
+        assert_eq!(
+            secs,
+            MAX_EXEC_TIMEOUT.as_secs(),
+            "a huge requested timeout must be clamped to the ceiling: {calls:?}"
+        );
+    }
+
+    /// A caller requesting LESS than the ceiling gets exactly what it asked for.
+    #[test]
+    fn exec_honours_a_smaller_requested_timeout() {
+        let (backend, mock) = MockRunner::default().into_backend();
+        let req = ExecRequest {
+            command: "true".to_string(),
+            cwd: None,
+            stdin: None,
+            timeout: Some(Duration::from_secs(5)),
+        };
+        backend
+            .exec(&SessionId::new("playground-alice"), &req)
+            .expect("exec");
+        let calls = mock.calls();
+        let tcall = calls
+            .iter()
+            .find(|c| c.get(2).map(String::as_str) == Some("timeout"))
+            .expect("timeout(1) issued");
+        assert_eq!(tcall[5], "5", "a sub-ceiling timeout passes through: {calls:?}");
+    }
+
+    /// On an output-cap breach the jail process tree is reaped (best-effort
+    /// `jexec <jail> kill -TERM/-KILL -1`) and the result carries the truncation
+    /// error, so a runaway producer's background procs cannot outlive the exec.
+    #[test]
+    fn exec_reaps_tree_on_output_truncation() {
+        let (backend, mock) = MockRunner::default()
+            .reply(
+                &["sudo", "-n", "timeout"],
+                HostOutput {
+                    stdout: vec![b'x'; 4096],
+                    output_truncated: true,
+                    exit_code: Some(0),
+                    ..Default::default()
+                },
+            )
+            .into_backend();
+        let req = ExecRequest {
+            command: "yes".to_string(),
+            cwd: None,
+            stdin: None,
+            timeout: None,
+        };
+        let result = backend
+            .exec(&SessionId::new("playground-alice"), &req)
+            .expect("exec");
+        assert!(
+            result.error.as_deref().unwrap_or("").contains("output truncated"),
+            "truncation must be signalled: {:?}",
+            result.error
+        );
+        let calls = mock.calls();
+        // The kill -TERM -1 and kill -KILL -1 reap calls were issued.
+        assert!(
+            calls.iter().any(|c| c
+                == &["sudo".to_string(), "-n".into(), "jexec".into(),
+                     "playground-alice".into(), "/bin/kill".into(), "-TERM".into(), "-1".into()]),
+            "must SIGTERM the jail tree on truncation: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c
+                == &["sudo".to_string(), "-n".into(), "jexec".into(),
+                     "playground-alice".into(), "/bin/kill".into(), "-KILL".into(), "-1".into()]),
+            "must SIGKILL stragglers on truncation: {calls:?}"
+        );
     }
 
     // ---- blocker #3: lifecycle uncertainty must never destroy valid data ----
@@ -3014,6 +3560,76 @@ echo "PASS: nullfs re-mount is EBUSY no-op, one umount clears it"
         assert!(
             stdout.contains("PASS: nullfs re-mount is EBUSY no-op, one umount clears it"),
             "missing exact-mount no-op grounding: {stdout}"
+        );
+    }
+
+    /// LIVE, env-gated (repair #4 storage bound + RACCT probe). On a scratch
+    /// dataset: prove a ZFS `refquota` actually STOPS a write past the cap
+    /// (`ENOSPC`), and report the host's `kern.racct.enable` so the operator
+    /// knows whether the programmatic rctl path is live. Requires sudo on the
+    /// FreeBSD deploy host (JP grant, scratch datasets only, torn down):
+    /// `SANDBOX_JAIL_LIVE_TESTS=1 cargo test --bins jail_live_refquota_enforced`.
+    /// `SANDBOX_JAIL_LIVE_POOL` overrides the scratch parent (default `aitemp`).
+    #[test]
+    fn jail_live_refquota_enforced() {
+        if std::env::var("SANDBOX_JAIL_LIVE_TESTS").as_deref() != Ok("1") {
+            eprintln!(
+                "skipping: set SANDBOX_JAIL_LIVE_TESTS=1 to run (mutates a scratch \
+                 ZFS dataset on the FreeBSD deploy host)"
+            );
+            return;
+        }
+        let host = std::env::var("SANDBOX_JAIL_LIVE_HOST")
+            .unwrap_or_else(|_| "ai.bultmann.eu".to_string());
+        let pool = std::env::var("SANDBOX_JAIL_LIVE_POOL").unwrap_or_else(|_| "aitemp".to_string());
+
+        // Create a scratch dataset, set a tiny refquota, then prove a write that
+        // exceeds it fails with ENOSPC (the pool is NOT filled — refquota bounds
+        // the dataset's own referenced data). Also surface kern.racct.enable so
+        // the operator note in deploy/freebsd/README.md is grounded in fact.
+        let script = format!(
+            r#"
+set -eu
+POOL="{pool}"
+SCRATCH="$POOL/pg-live-repair4-$$"
+cleanup() {{
+  sudo -n zfs destroy -r "$SCRATCH" 2>/dev/null || true
+}}
+trap cleanup EXIT
+
+# ---- Proof: refquota bounds the dataset's own writes (ENOSPC past the cap) ----
+sudo -n zfs create "$SCRATCH"
+sudo -n zfs set refquota=16M "$SCRATCH"
+MP=$(sudo -n zfs get -H -o value mountpoint "$SCRATCH")
+# Write past the 16M refquota; it MUST fail (ENOSPC) rather than fill the pool.
+if sudo -n dd if=/dev/zero of="$MP/fill" bs=1M count=64 2>/dev/null; then
+  echo "FAIL: a 64M write past a 16M refquota SUCCEEDED (quota not enforced)"; exit 1
+fi
+USED=$(sudo -n zfs get -H -o value used "$SCRATCH")
+echo "PASS: refquota enforced — 64M write refused, used capped at $USED"
+
+# ---- Report: is host RACCT enabled? (the guarded rctl path only runs if so) --
+RACCT=$(sysctl -n kern.racct.enable 2>/dev/null || echo "?")
+echo "INFO: kern.racct.enable=$RACCT"
+"#,
+        );
+
+        let out = Command::new("ssh")
+            .arg("-o")
+            .arg("BatchMode=yes")
+            .arg("-o")
+            .arg("ConnectTimeout=10")
+            .arg(&host)
+            .arg(&script)
+            .output()
+            .expect("spawn ssh to the live host");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        eprintln!("live-host stdout:\n{stdout}\nlive-host stderr:\n{stderr}");
+        assert!(out.status.success(), "live host script failed: {stderr}");
+        assert!(
+            stdout.contains("PASS: refquota enforced"),
+            "refquota did not bound the write: {stdout}"
         );
     }
 

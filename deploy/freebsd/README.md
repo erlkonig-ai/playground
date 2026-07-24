@@ -150,6 +150,79 @@ Interim remote use without any exposure decision: an SSH port-forward
 (`ssh -L 8377:127.0.0.1:8377 ai.bultmann.eu`) gives an operator with an
 ssh account the full service on their own loopback.
 
+## Resource limits (repair #4 — bound every tenant-controllable resource)
+
+The server enforces these bounds itself (no host reconfig needed). Tunable via
+`mcp-http`/`user create` flags; sane defaults shown.
+
+- **Output cap.** Each `exec`'s stdout and stderr are capped at **16 MiB** per
+  stream and the jail process (and its tree) is **killed** the instant either
+  crosses it — the tenant sees `output truncated at N bytes … process killed`.
+  A runaway producer (`cat /dev/zero`) cannot make the daemon accumulate
+  unbounded memory upstream of any proxy response cap.
+- **Timeout ceiling.** A caller may request a smaller `timeout_ms`, never a
+  larger one: the effective timeout is `min(requested, 30 min)`. On expiry the
+  server-side `timeout(1)` reaps the jail process tree (exit 124); on a
+  local-side kill or an output-cap kill the backend additionally
+  `jexec <jail> kill -TERM/-KILL -1` to reap any background/orphan processes
+  inside the jail.
+- **Admission control.** Per-tenant (`--max-concurrent-execs-per-tenant`,
+  default **4**) and global (`--max-concurrent-execs`, default **32**)
+  concurrency caps around `exec`, with a bounded wait queue
+  (`--max-queued-execs`, default **64**) — past the queue, admission is refused
+  with `sandbox busy`. No single tenant can occupy every blocking worker; the
+  global cap protects the daemon.
+- **Storage quotas (ZFS).** Each per-tenant clone gets a
+  `refquota` (`--jail-clone-refquota`, default **10G**) so a tenant cannot fill
+  the host pool via its own dataset; the pile-root dataset gets a global `quota`
+  (`--jail-pile-quota`, default **50G**) so pile writes cannot fill the pool
+  either. `0`/empty disables. Set at provision, before the jail starts. NOTE:
+  the pile-root quota is applied only when `--jail-pile-root` is an actual ZFS
+  dataset mountpoint (a plain directory is skipped with a log line — create a
+  dataset at the pile root for the bound to bite). Per-tenant pile isolation
+  (a dataset per tenant pile dir) is a noted follow-up; the global pile quota
+  already stops the fill-the-pool attack.
+- **Request body limit.** The HTTP body is explicitly capped
+  (`--max-body-bytes`, default **1 MiB**) — a stated policy, not axum's silent
+  2 MiB default. Oversized bodies get `413` before buffering.
+
+### RACCT/RCTL — MUST be enabled before public exposure
+
+RACCT/RCTL is OFF unless a host explicitly enables it (FreeBSD's default), so
+verify it per host before exposure — kernel per-jail resource accounting is not
+something to assume. The server does **not** assume it: the ZFS quotas, output
+cap, timeout ceiling, and admission caps above hold regardless. But CPU, RAM,
+process-count, and FD pressure *inside* a jail reach host-global resources until
+RACCT is on. Before any public / mutually-untrusted exposure, enable it and the
+per-jail rules:
+
+```sh
+# 1. Turn on kernel resource accounting (needs a reboot to take effect).
+sudo sysrc -f /boot/loader.conf kern.racct.enable=1
+sudo shutdown -r now   # RACCT is a loader tunable; a live sysctl set is not enough
+
+# 2. After reboot, confirm it is on:
+sysctl kern.racct.enable    # must print: kern.racct.enable: 1
+```
+
+Once RACCT is on, the server applies these per-jail `rctl(8)` rules at each
+provision automatically (guarded behind the runtime `kern.racct.enable` probe —
+a no-op while it is off, live with no code change once on):
+
+```
+jail:<name>:maxproc:deny=512      # fork-bomb bound
+jail:<name>:nthr:deny=2048        # thread bound
+jail:<name>:openfiles:deny=8192   # FD-exhaustion bound
+jail:<name>:memoryuse:deny=2G     # resident RAM bound
+jail:<name>:swapuse:deny=1G       # swap bound
+jail:<name>:pcpu:deny=90          # CPU-percent bound (signals the process)
+```
+
+To verify after a provision (RACCT on): `sudo rctl -h jail:<name>` lists the
+live rules. `destroy_session` removes them (`rctl -r jail:<name>`). To apply
+rules to already-running jails without reprovisioning, add them by hand with the
+lines above.
+
 ## DEFERRED — decisions that need JP (do not improvise these)
 
 1. **Internet exposure.** Today: loopback only, nothing else installed.
@@ -170,8 +243,12 @@ ssh account the full service on their own loopback.
    (empty /usr/local). What colleagues' jails should ship (git,
    compilers, python?) is a product decision; rebuild additively (new
    snapshot), never destroy `@base` while clones may exist.
-4. **Jail resource limits.** Sessions currently have no rctl/zfs-quota
-   caps.
+4. **Jail resource limits.** The server now enforces output/timeout/
+   admission/ZFS-quota bounds itself (see "Resource limits" above). The
+   remaining operator action is enabling **RACCT/RCTL** on the host
+   (`kern.racct.enable=1` + reboot) so the per-jail CPU/RAM/maxproc/FD
+   `rctl` rules bite — required before any public exposure. Exact steps and
+   rules are in the "RACCT/RCTL" subsection above.
 5. **Bootstrap seed contents.** Model B seeds each tenant `self.pile` and
    the `shared.pile` from `--jail-bootstrap-pile`. That seed MUST be a
    generic bootstrap with no operator memory — the shipped

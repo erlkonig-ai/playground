@@ -62,11 +62,14 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 
-use super::proc::drive_child;
+use super::proc::{DEFAULT_MAX_OUTPUT_BYTES, drive_child, drive_child_capped};
 use super::{ExecRequest, ExecResult, SandboxBackend, SessionId, SessionSpec};
 
 /// Default per-command timeout when an [`ExecRequest`] does not specify one.
 const DEFAULT_EXEC_TIMEOUT: Duration = Duration::from_secs(300);
+/// Server-side CEILING on a per-command timeout (mirrors the jail backend): a
+/// caller may request less, never more.
+const MAX_EXEC_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// Timeout for administrative `limactl` commands (start/stop/delete/list).
 /// Generous because a cold `limactl start` boots a VM.
 const ADMIN_TIMEOUT: Duration = Duration::from_secs(600);
@@ -523,8 +526,19 @@ impl SandboxBackend for LimaBackend {
         // Concurrent stdin-feed + stdout/stderr drain (super::proc): a command
         // pushing more than a pipe buffer of output — or consuming more than a
         // pipe buffer of stdin — must not deadlock against the timeout loop.
-        let timeout = request.timeout.unwrap_or(DEFAULT_EXEC_TIMEOUT);
-        let out = drive_child(child, request.stdin.clone(), timeout)?;
+        // TIMEOUT CEILING + OUTPUT CAP mirror the jail backend: clamp the
+        // caller-supplied timeout to the server maximum, and kill the child if
+        // either output stream exceeds the per-stream ceiling.
+        let timeout = request
+            .timeout
+            .unwrap_or(DEFAULT_EXEC_TIMEOUT)
+            .min(MAX_EXEC_TIMEOUT);
+        let out = drive_child_capped(
+            child,
+            request.stdin.clone(),
+            timeout,
+            DEFAULT_MAX_OUTPUT_BYTES,
+        )?;
 
         let mut result = ExecResult {
             stdout: out.stdout,
@@ -535,6 +549,10 @@ impl SandboxBackend for LimaBackend {
         if out.timed_out {
             result.exit_code = Some(124);
             result.error = Some(format!("command timed out after {timeout:?}"));
+        } else if out.output_truncated {
+            result.error = Some(format!(
+                "output truncated at {DEFAULT_MAX_OUTPUT_BYTES} bytes per stream; process killed"
+            ));
         }
         Ok(result)
     }
