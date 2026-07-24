@@ -21,11 +21,25 @@ Two hosting modes exist and stay interchangeable:
   jail gets its OWN host-owned, server-born piles, provisioned on this box
   under `--jail-pile-root` (default `/aitemp/playground/piles`): a per-tenant
   `self.pile` (seeded from a generic `bootstrap.pile` — no operator memory)
-  mounted at guest `/pile`, plus one org-wide `shared.pile` mounted at guest
-  `/shared`. Both are `chflags sappnd` append-only and decoupled from the jail
-  lifecycle (`destroy_session` never deletes them). A stolen tenant token thus
-  reaches only that tenant's own seeded pile and the shared org pile — never the
+  single-file-mounted at guest `/pile/self.pile`, plus one org-wide
+  `shared.pile` single-file-mounted at guest `/shared/shared.pile`. Both are
+  `chflags sappnd` append-only and decoupled from the jail lifecycle
+  (`destroy_session` never deletes them). A stolen tenant token thus reaches
+  only that tenant's own seeded pile and the shared org pile — never the
   caller-supplied pile, and never any other pile on the host.
+- **Only the pile FILES are mounted — never a host directory (2026-07-24).**
+  Each pile is a single-FILE nullfs mount (the host pile file onto a pre-created
+  empty target file inside the jail's own ZFS clone), so the jail's `/pile` and
+  `/shared` are the jail's OWN clone dirs, not writable host directories. A
+  tenant (root in its jail) therefore cannot create sibling entries in a host
+  dir — closing the symlink confused-deputy class where a pre-placed
+  `shared.pile.<jail>.tmp` symlink tricked the privileged provision `cp` into
+  overwriting a chosen host file. The bootstrap `cp` also stages only into a
+  host-PRIVATE `0700` dir (`--jail-pile-root`'s sibling `…/staging`, never
+  mounted into a jail) and publishes with a no-follow / create-only hardlink,
+  so the privileged copy can never follow a tenant-planted symlink. FreeBSD
+  nullfs single-file mounts and concurrent multi-writer append were verified on
+  the deploy host's 15.1 kernel.
 - **Append-only is enforced by the host, not trusted to the guest.** `chflags
   sappnd` lets a jailed process `O_APPEND` but not `O_TRUNC`/unlink/rename, so a
   buggy or stale tool cannot truncate a pile (the 2026-07-03 truncation class).
