@@ -648,18 +648,29 @@ impl JailBackend {
     ///   1. `cp bootstrap` -> `<staging_root>/<jail>.pile.tmp` (a host-PRIVATE
     ///      0700 dir that is never mounted into any jail, so no tenant can
     ///      pre-place a symlink there and redirect the privileged copy).
-    ///   2. Publish with `ln <staging_tmp> <dest>` — a hardlink, which is ATOMIC,
-    ///      CREATE-ONLY (fails `EEXIST` if `<dest>` already exists), and NEVER
-    ///      follows a symlink at `<dest>` (verified on FreeBSD 15.1: `ln` onto a
-    ///      symlink pointing at a victim file fails EEXIST and leaves the victim
-    ///      untouched). So the privileged copy can never be tricked into
-    ///      overwriting a chosen host file. `staging_root` and the pile dirs share
-    ///      one ZFS filesystem, so the hardlink is valid.
-    ///   3. `rm -f` the staging temp (on success it is just the second name of
+    ///   2. Publish with `ln -h <staging_tmp> <dest>` — a hardlink, which is
+    ///      ATOMIC, CREATE-ONLY (fails `EEXIST` if `<dest>` already exists), and
+    ///      NEVER follows a symlink at `<dest>`. The `-h` is the load-bearing
+    ///      no-follow flag on FreeBSD: plain `ln` FOLLOWS a `<dest>` that is a
+    ///      symlink-to-a-DIRECTORY and SUCCEEDS by creating
+    ///      `<real-target-dir>/<basename(staging_tmp)>` INSIDE the attacker-
+    ///      pointed directory (sol's independent review of repair #2, 2026-07-24);
+    ///      `ln -h` operates on the link itself, so a symlink `<dest>` — to a file
+    ///      OR a directory — fails EEXIST instead of being followed. (Verified on
+    ///      FreeBSD 15.1: `ln -h` onto a symlink pointing at a victim file OR
+    ///      directory fails and creates nothing in the target.) `staging_root` and
+    ///      the pile dirs share one ZFS filesystem, so the hardlink is valid.
+    ///   3. Post-link verification on the SUCCESS path too (not only on failure):
+    ///      lstat/no-follow the dest and confirm it is a regular, non-symlink file
+    ///      at the exact expected path. This catches any residual follow /
+    ///      misplacement even if a future `ln` flag ever regressed the no-follow
+    ///      guarantee. A failed post-link check is a publish failure (bail; the
+    ///      caller never proceeds to mount).
+    ///   4. `rm -f` the staging temp (on success it is just the second name of
     ///      the now-published inode; on the create-if-absent no-op it is our
     ///      leftover copy).
     ///
-    /// On an `ln` failure we distinguish "destination already a regular file"
+    /// On an `ln -h` failure we distinguish "destination already a regular file"
     /// (the benign create-if-absent no-op: a reprovision kept the accumulated
     /// pile, or a concurrent provision won the publish) from a genuine error
     /// (e.g. destination is a symlink or special file — refuse loudly rather than
@@ -680,17 +691,31 @@ impl JailBackend {
                 cp.stderr_lossy()
             );
         }
-        // Atomic create-only, no-follow publish via hardlink.
+        // Atomic create-only, no-follow publish via hardlink. `-h` is REQUIRED:
+        // plain `ln` follows a symlink-to-a-DIRECTORY at `<dest>` and silently
+        // succeeds by writing INSIDE the attacker-pointed dir; `ln -h` operates
+        // on the link itself, so any symlink `<dest>` fails EEXIST.
         let link = self.run(
-            &["sudo", "-n", "ln", &staging_tmp, dest],
+            &["sudo", "-n", "ln", "-h", &staging_tmp, dest],
             None,
             ADMIN_TIMEOUT,
         )?;
         // Clean up the staging temp regardless: on success it is a redundant
         // second name for the published inode; on a no-op it is our leftover.
         let _ = self.run(&["sudo", "-n", "rm", "-f", &staging_tmp], None, ADMIN_TIMEOUT);
-        if !link.success() {
-            // `ln` failed. The ONLY acceptable reason is "destination already
+        if link.success() {
+            // Post-link verification on the SUCCESS path too. Even a successful
+            // `ln -h` must land the dest as a REGULAR, NON-SYMLINK file at the
+            // EXACT expected path — no follow, no misplacement. Defence in depth:
+            // if a future `ln` flag ever regressed the no-follow guarantee, this
+            // lstat/no-follow check turns a silent follow into a loud publish
+            // failure, so the caller never mounts something a tenant redirected.
+            self.assert_regular_nonsymlink(dest).with_context(|| {
+                format!("publish pile -> {dest} succeeded but the destination is not a \
+                     regular non-symlink file at the expected path (refusing)")
+            })?;
+        } else {
+            // `ln -h` failed. The ONLY acceptable reason is "destination already
             // exists as a regular, non-symlink file" — the create-if-absent
             // no-op. Verify that with a no-follow test; anything else (symlink,
             // special file, or a real link error) is refused loudly.
@@ -2847,13 +2872,15 @@ mod tests {
                 ] as &[String])),
                 "must cp bootstrap.pile into the host-private staging temp: {calls:?}"
             );
-            // Publish: ln staging_tmp -> dest (atomic, create-only, no-follow).
+            // Publish: `ln -h staging_tmp -> dest` (atomic, create-only,
+            // no-follow). `-h` is required so a symlink-to-a-DIRECTORY dest is
+            // NOT followed (sol's review of repair #2).
             assert!(
                 calls.iter().any(|c| c == &[
-                    "sudo".to_string(), "-n".into(), "ln".into(),
+                    "sudo".to_string(), "-n".into(), "ln".into(), "-h".into(),
                     staging_tmp.clone(), dest.clone(),
                 ]),
-                "must publish {dest} via no-follow/create-only `ln` from staging: {calls:?}"
+                "must publish {dest} via no-follow/create-only `ln -h` from staging: {calls:?}"
             );
         }
         // The bootstrap `cp` must NEVER write to a tenant-reachable pile path
@@ -3182,6 +3209,14 @@ mod tests {
                 "publish must be a HARDLINK (no -s), for create-only no-follow: {:?}",
                 shared_lns[0]
             );
+            // The `ln` must carry `-h` (no-follow): plain `ln` follows a
+            // symlink-to-a-DIRECTORY dest and succeeds inside it (sol's review).
+            assert!(
+                shared_lns[0].iter().any(|a| a == "-h"),
+                "publish must be no-follow (`ln -h`), so a symlink-to-dir dest is \
+                 refused not followed: {:?}",
+                shared_lns[0]
+            );
             // NEVER a `cp` straight into shared.pile — non-atomic AND the
             // historical symlink confused-deputy sink this fix removes.
             assert!(
@@ -3304,6 +3339,56 @@ mod tests {
         );
     }
 
+    /// Security repair #2 (sol's independent review, 2026-07-24): the publish
+    /// REFUSES a destination that is a symlink-to-a-DIRECTORY, creating NO file
+    /// through the link. This is the hole the review found: plain `ln` FOLLOWS a
+    /// symlink-to-dir dest and SUCCEEDS by writing `<real-dir>/<basename(tmp)>`
+    /// inside the attacker-pointed directory. The fix is `ln -h` (no-follow), so
+    /// the publish fails EEXIST just like the symlink-to-file case; the mock
+    /// models that (`ln` fails, the no-follow validator finds no safe regular
+    /// file) and provisioning must BAIL, never proceed to mount. We also pin that
+    /// the publish carried `-h` — the flag that makes the symlink-to-dir dest fail
+    /// at all rather than be followed.
+    #[test]
+    fn publish_refuses_symlink_to_directory_destination() {
+        // `ln -h` fails (EEXIST: the dest already exists as a symlink) AND the
+        // no-follow validator FAILS (a symlink is not a regular non-symlink file)
+        // -> provision must bail. Under plain `ln` the link would instead SUCCEED
+        // by following into the pointed directory; `-h` is what turns that into a
+        // clean EEXIST refusal, so no file is ever created through the link.
+        let (backend, mock) = mock_provision_ready()
+            .reply(&["sudo", "-n", "zfs", "list"], dataset_absent())
+            .reply(&["sudo", "-n", "ln", "-h"], fail())
+            .reply(&["sudo", "-n", "sh", "-c"], fail())
+            .into_backend();
+        let err = backend
+            .provision_sandbox(&spec("alice"))
+            .expect_err("provision must refuse a symlink-to-directory destination");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("not a regular non-symlink file")
+                || msg.contains("not a safe regular file"),
+            "error must name the no-follow refusal: {msg}"
+        );
+        // The publish MUST have used `ln -h` (no-follow): that is the only thing
+        // that makes a symlink-to-DIRECTORY dest fail EEXIST instead of being
+        // followed into. A plain `ln` would have followed and created a file.
+        let calls = mock.calls();
+        assert!(
+            calls.iter().any(|c| c.get(2).map(String::as_str) == Some("ln")
+                && c.get(3).map(String::as_str) == Some("-h")),
+            "publish must use `ln -h` (no-follow) so a symlink-to-dir dest is \
+             refused not followed: {calls:?}"
+        );
+        // And no file was published: the mount step is never reached because the
+        // publish bailed. (No nullfs mount of self.pile appears once the publish
+        // refuses; the bail short-circuits provision before any pile mount.)
+        assert!(
+            !calls.iter().any(|c| c.iter().any(|a| a == "nullfs")),
+            "a refused publish must short-circuit BEFORE any nullfs mount: {calls:?}"
+        );
+    }
+
     /// Security repair #2: no HOST DIRECTORY is ever nullfs-mounted into a jail —
     /// only the individual pile FILES. This is the structural half of the fix:
     /// with only file mounts, the jail's `/pile` and `/shared` are the jail's OWN
@@ -3370,9 +3455,14 @@ mod tests {
     /// FreeBSD-specific properties this repair depends on, against the actual
     /// kernel (unit tests above pin the argv shape; this pins the SEMANTICS):
     ///
-    ///   1. No-follow / create-only publish: a `ln` onto a pre-placed absolute
+    ///   1. No-follow / create-only publish: a `ln -h` onto a pre-placed absolute
     ///      symlink at the destination FAILS and leaves the symlink's victim
-    ///      target byte-for-byte untouched (the confused-deputy exploit is dead).
+    ///      target untouched — for a symlink pointing at a FILE (byte-for-byte
+    ///      untouched) AND for a symlink pointing at a DIRECTORY (no file is
+    ///      created inside the pointed dir). The symlink-to-DIRECTORY case is the
+    ///      hole sol's review found: plain `ln` FOLLOWS it and SUCCEEDS, writing
+    ///      inside the attacker-pointed dir; `ln -h` refuses both. (The
+    ///      confused-deputy exploit is dead on the real kernel.)
     ///   2. Single-file nullfs concurrent append: mounting ONE host `shared.pile`
     ///      file onto target files in two separate "jail" dirs, then appending
     ///      from both views, lands every line in the one source with no loss —
@@ -3408,19 +3498,46 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# ---- Proof 1: no-follow / create-only publish (ln onto a symlink) ----
+# ---- Proof 1a: no-follow / create-only publish, dest = symlink-to-FILE ----
 echo "SECRET-VICTIM" | sudo -n tee "$WORK/victim" >/dev/null
 echo "BOOTSTRAP-BYTES" | sudo -n tee "$WORK/staging.tmp" >/dev/null
-# A tenant-planted absolute symlink at the publish destination.
+# A tenant-planted absolute symlink pointing at a victim FILE.
 sudo -n ln -s "$WORK/victim" "$WORK/dest"
-# The publish primitive: a plain hardlink. Must FAIL (EEXIST), no follow.
-if sudo -n ln "$WORK/staging.tmp" "$WORK/dest" 2>/dev/null; then
-  echo "FAIL: ln onto a symlink destination SUCCEEDED (followed through)"; exit 1
+# The publish primitive: `ln -h` (no-follow hardlink). Must FAIL (EEXIST).
+if sudo -n ln -h "$WORK/staging.tmp" "$WORK/dest" 2>/dev/null; then
+  echo "FAIL: ln -h onto a symlink-to-FILE destination SUCCEEDED (followed)"; exit 1
 fi
 if [ "$(cat "$WORK/victim")" != "SECRET-VICTIM" ]; then
   echo "FAIL: victim file was overwritten through the symlink"; exit 1
 fi
-echo "PASS: ln refused symlink destination, victim untouched"
+echo "PASS: ln -h refused symlink-to-FILE destination, victim untouched"
+
+# ---- Proof 1b: no-follow / create-only publish, dest = symlink-to-DIRECTORY --
+# This is the hole sol's review found: plain `ln` FOLLOWS a symlink-to-a-DIR
+# dest and SUCCEEDS, creating <real-dir>/<basename(staging.tmp)> INSIDE the
+# attacker-pointed directory. `ln -h` must instead FAIL (EEXIST) and create
+# NOTHING inside the pointed dir.
+sudo -n mkdir -p "$WORK/attacker-dir"
+sudo -n ln -s "$WORK/attacker-dir" "$WORK/destdir"
+if sudo -n ln -h "$WORK/staging.tmp" "$WORK/destdir" 2>/dev/null; then
+  echo "FAIL: ln -h onto a symlink-to-DIRECTORY dest SUCCEEDED (followed in)"; exit 1
+fi
+# Nothing may have been created inside the pointed-at directory.
+PLANTED=$(sudo -n find "$WORK/attacker-dir" -mindepth 1 | wc -l | tr -d ' ')
+if [ "$PLANTED" != "0" ]; then
+  echo "FAIL: a file was created inside the symlinked target directory ($PLANTED)"; exit 1
+fi
+# For contrast, prove plain `ln` (no -h) WOULD have followed into the dir — the
+# exact bug — so this test would catch a regression to plain `ln`. Cleaned up.
+if sudo -n ln "$WORK/staging.tmp" "$WORK/destdir" 2>/dev/null; then
+  FOLLOWED=$(sudo -n find "$WORK/attacker-dir" -mindepth 1 | wc -l | tr -d ' ')
+  sudo -n find "$WORK/attacker-dir" -mindepth 1 -exec rm -f {} + 2>/dev/null || true
+  if [ "$FOLLOWED" = "0" ]; then
+    echo "FAIL: plain ln did not follow the symlink-to-dir (unexpected kernel)"; exit 1
+  fi
+  echo "NOTE: confirmed plain ln FOLLOWS symlink-to-dir (the bug -h fixes)"
+fi
+echo "PASS: ln -h refused symlink-to-DIRECTORY destination, nothing planted"
 
 # ---- Proof 2: single-file nullfs concurrent shared-append ----
 echo "SEED" | sudo -n tee "$WORK/shared.pile" >/dev/null
@@ -3456,8 +3573,12 @@ echo "PASS: single-file nullfs concurrent append kept all 100 lines"
         eprintln!("live-host stdout:\n{stdout}\nlive-host stderr:\n{stderr}");
         assert!(out.status.success(), "live host script failed: {stderr}");
         assert!(
-            stdout.contains("PASS: ln refused symlink destination, victim untouched"),
-            "missing no-follow/create-only proof: {stdout}"
+            stdout.contains("PASS: ln -h refused symlink-to-FILE destination, victim untouched"),
+            "missing no-follow/create-only symlink-to-FILE proof: {stdout}"
+        );
+        assert!(
+            stdout.contains("PASS: ln -h refused symlink-to-DIRECTORY destination, nothing planted"),
+            "missing no-follow/create-only symlink-to-DIRECTORY proof (sol's review): {stdout}"
         );
         assert!(
             stdout.contains("PASS: single-file nullfs concurrent append kept all 100 lines"),
