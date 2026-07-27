@@ -1,6 +1,6 @@
 //! FreeBSD jail backend for the sandbox provider.
 //!
-//! Drives a remote FreeBSD host (default `ai.bultmann.eu`) over SSH and maps
+//! Drives a remote FreeBSD host (`--jail-host` / `PLAYGROUND_JAIL_HOST`) over SSH and maps
 //! the [`SandboxBackend`] verbs onto base `jail(8)` + ZFS:
 //!
 //!   - `provision_sandbox` = explicit CREATE of a PERSISTENT per-tenant box: a
@@ -4158,8 +4158,10 @@ mod tests {
             );
             return;
         }
-        let host = std::env::var("SANDBOX_JAIL_LIVE_HOST")
-            .unwrap_or_else(|_| "ai.bultmann.eu".to_string());
+        let Ok(host) = std::env::var("SANDBOX_JAIL_LIVE_HOST") else {
+            eprintln!("skipping: set SANDBOX_JAIL_LIVE_HOST to run this live-host test");
+            return;
+        };
 
         // One self-contained shell script: create a scratch dir, run BOTH proofs,
         // print PASS/FAIL markers, tear down. Any non-zero `set -e` step or a
@@ -4291,8 +4293,10 @@ echo "PASS: single-file nullfs concurrent append kept all 100 lines"
             );
             return;
         }
-        let host = std::env::var("SANDBOX_JAIL_LIVE_HOST")
-            .unwrap_or_else(|_| "ai.bultmann.eu".to_string());
+        let Ok(host) = std::env::var("SANDBOX_JAIL_LIVE_HOST") else {
+            eprintln!("skipping: set SANDBOX_JAIL_LIVE_HOST to run this live-host test");
+            return;
+        };
         let pool = std::env::var("SANDBOX_JAIL_LIVE_POOL").unwrap_or_else(|_| "aitemp".to_string());
 
         // Self-contained: prove the not-found stderr, then prove the EBUSY
@@ -4378,8 +4382,10 @@ echo "PASS: nullfs re-mount is EBUSY no-op, one umount clears it"
             );
             return;
         }
-        let host = std::env::var("SANDBOX_JAIL_LIVE_HOST")
-            .unwrap_or_else(|_| "ai.bultmann.eu".to_string());
+        let Ok(host) = std::env::var("SANDBOX_JAIL_LIVE_HOST") else {
+            eprintln!("skipping: set SANDBOX_JAIL_LIVE_HOST to run this live-host test");
+            return;
+        };
         let pool = std::env::var("SANDBOX_JAIL_LIVE_POOL").unwrap_or_else(|_| "aitemp".to_string());
 
         // Create a scratch dataset, set a tiny refquota, then prove a write that
@@ -4462,8 +4468,10 @@ echo "INFO: kern.racct.enable=$RACCT"
             );
             return;
         }
-        let host = std::env::var("SANDBOX_JAIL_LIVE_HOST")
-            .unwrap_or_else(|_| "ai.bultmann.eu".to_string());
+        let Ok(host) = std::env::var("SANDBOX_JAIL_LIVE_HOST") else {
+            eprintln!("skipping: set SANDBOX_JAIL_LIVE_HOST to run this live-host test");
+            return;
+        };
         let pool = std::env::var("SANDBOX_JAIL_LIVE_POOL").unwrap_or_else(|_| "aitemp".to_string());
 
         let script = format!(

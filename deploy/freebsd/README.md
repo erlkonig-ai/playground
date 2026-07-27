@@ -1,7 +1,9 @@
 # playground sandbox-MCP on FreeBSD (server-side hosting)
 
-Runs the sandbox provider *on* the jail host (`ai.bultmann.eu`, FreeBSD
-15.1): `playground mcp-http --backend jail --jail-local` bound to
+Runs the sandbox provider *on* the jail host (FreeBSD 15.1). The host is
+deployment configuration, not repository content: set `PLAYGROUND_JAIL_HOST`
+(or pass `--jail-host`); the examples below use `$JAIL_HOST` for it.
+`playground mcp-http --backend jail --jail-local` bound to
 loopback, with per-tenant bearer tokens. The jail backend executes
 `sudo -n zfs/jail/jexec ...` directly ([`LocalRunner`], no ssh hop);
 sessions are ZFS clones of `aitemp/playground/template@base`, jails are
@@ -71,10 +73,10 @@ rsync -a --delete \
   --exclude '*.pile' --exclude 'models/' --exclude 'weights/' \
   --exclude '__pycache__/' \
   playground faculties triblespace-rs GORBIE mary cubecl-fork gorbie_commonmark \
-  ai.bultmann.eu:playground-build/
+  $JAIL_HOST:playground-build/
 
 # verify the pile rail held before anything else:
-ssh ai.bultmann.eu "find playground-build -name '*.pile'"   # must print nothing
+ssh $JAIL_HOST "find playground-build -name '*.pile'"   # must print nothing
 
 cd ~/playground-build/playground
 cargo build --release --locked --no-default-features --features mcp-http
@@ -147,7 +149,7 @@ ls /aitemp/playground/piles     # per-tenant self.pile dirs + shared/ persist
 ```
 
 Interim remote use without any exposure decision: an SSH port-forward
-(`ssh -L 8377:127.0.0.1:8377 ai.bultmann.eu`) gives an operator with an
+(`ssh -L 8377:127.0.0.1:8377 $JAIL_HOST`) gives an operator with an
 ssh account the full service on their own loopback.
 
 ## Resource limits (repair #4 — bound every tenant-controllable resource)

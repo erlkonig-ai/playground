@@ -73,7 +73,7 @@ struct McpArgs {
     faculties_src: Option<PathBuf>,
     /// Jail backend: SSH host that runs the jails (needs BatchMode keys +
     /// non-interactive root via `sudo -n`).
-    #[arg(long, default_value = "ai.bultmann.eu")]
+    #[arg(long, env = "PLAYGROUND_JAIL_HOST")]
     jail_host: String,
     /// Jail backend: ZFS template snapshot cloned per session.
     #[arg(long, default_value = "aitemp/playground/template@base")]
@@ -238,7 +238,7 @@ struct McpHttpArgs {
     faculties_src: Option<PathBuf>,
     /// Jail backend: SSH host that runs the jails (needs BatchMode keys +
     /// non-interactive root via `sudo -n`).
-    #[arg(long, default_value = "ai.bultmann.eu")]
+    #[arg(long, env = "PLAYGROUND_JAIL_HOST")]
     jail_host: String,
     /// Jail backend: ZFS template snapshot cloned per session.
     #[arg(long, default_value = "aitemp/playground/template@base")]
@@ -329,7 +329,7 @@ struct UserBackendArgs {
     faculties_src: Option<PathBuf>,
     /// Jail backend: SSH host that runs the jails (needs BatchMode keys +
     /// non-interactive root via `sudo -n`).
-    #[arg(long, default_value = "ai.bultmann.eu")]
+    #[arg(long, env = "PLAYGROUND_JAIL_HOST")]
     jail_host: String,
     /// Jail backend: ZFS template snapshot cloned per session.
     #[arg(long, default_value = "aitemp/playground/template@base")]
