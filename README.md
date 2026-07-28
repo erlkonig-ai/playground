@@ -82,8 +82,13 @@ cargo run --manifest-path playground/Cargo.toml -- \
 
 Other `user` verbs: `user list` (tenants in the store, annotated live/down),
 `user destroy <name>` (tear the sandbox down + drop its tokens), `user token
-show <name>`, `user token reset <name>` (revoke + re-mint). `PLAYGROUND_MCP_TOKENS`
-sets the default store path for the `user` verbs and `mcp-http`.
+show <name>`, `user token reset <name>` (revoke + re-mint). Pass
+`--oauth-state <path>` to `destroy` or `token reset` to revoke that tenant's
+OAuth invites, pending authorization codes, access tokens, and refresh tokens
+at the same time; the running daemon observes the change without a restart.
+`PLAYGROUND_MCP_OAUTH_STATE` supplies the same path by environment.
+`PLAYGROUND_MCP_TOKENS` sets the default static-token store path for the `user`
+verbs and `mcp-http`.
 
 ## Deployment
 
