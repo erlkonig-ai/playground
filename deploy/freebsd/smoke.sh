@@ -14,7 +14,8 @@
 #
 # Optional FreeBSD cancellation proof (run as root in the dedicated parent
 # jail, after the normal pass is known-good):
-#   PLAYGROUND_TOKEN=... PLAYGROUND_FREEBSD_JOB_SMOKE=YES ./smoke.sh
+#   PLAYGROUND_TOKEN=... PLAYGROUND_BASE_URL=http://127.0.0.1:8377 \
+#     PLAYGROUND_PRIVATE_HTTP=YES PLAYGROUND_FREEBSD_JOB_SMOKE=YES ./smoke.sh
 #
 # That opt-in test creates an unrelated sentinel in the tenant jail, starts a
 # job containing a daemonized TERM-ignoring descendant, cancels the job, and
@@ -110,7 +111,7 @@ UNAUTH_STATUS=$(curl --silent --show-error \
 	--proto "$CURL_PROTO" --connect-timeout 10 --max-time 30 \
 	-D "$TMP_ROOT/unauth.headers" -o "$TMP_ROOT/unauth.body" \
 	-w '%{http_code}' -H 'Content-Type: application/json' \
-	--data-binary "$INITIALIZE" "$MCP_URL") || die "TLS/public endpoint request failed"
+	--data-binary "$INITIALIZE" "$MCP_URL") || die "endpoint request failed"
 [ "$UNAUTH_STATUS" = 401 ] || die "unauthenticated initialize returned HTTP $UNAUTH_STATUS, expected 401"
 grep -Eiq '^www-authenticate:[[:space:]]*Bearer' "$TMP_ROOT/unauth.headers" || \
 	die "401 response did not carry a Bearer challenge"
