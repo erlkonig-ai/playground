@@ -10,6 +10,12 @@ sessions are ZFS clones of
 `airoot/jails/playground/jails/template@base`, jails are `playground-*`, and
 the parent jail is delegated only that ZFS subtree.
 
+The trusted parent must set `enforce_statfs = 0`. FreeBSD otherwise allows it
+to create the nested single-file nullfs mounts but redacts those mounts (and
+their FSIDs) from the parent afterward, which prevents exact verification and
+safe unmount. This setting applies only to the operator-controlled parent;
+tenant child jails retain their restricted/default view.
+
 **Deployment status (2026-07-28): not live.** This directory now contains the
 minimal candidate service, Caddy, rotation, configuration, and smoke-test
 artifacts. They have not been applied to a host. The public
@@ -131,6 +137,7 @@ sudo install -o root -g wheel -m 0444 <generic-bootstrap.pile> \
 # from the PHYSICAL host and prove all six name-keyed rules are loaded. Jailed
 # root cannot add them after the child exists. `user create` then provisions
 # the persistent jail and mints its token; --jail-local uses no ssh hop.
+test "$(sysctl -n security.jail.enforce_statfs)" = 0
 sudo playground user create <label> --backend jail --jail-local \
   --jail-external-rctl \
   --jail-template-snapshot airoot/jails/playground/jails/template@base \
