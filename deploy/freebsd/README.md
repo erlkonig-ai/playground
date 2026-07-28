@@ -16,14 +16,14 @@ their FSIDs) from the parent afterward, which prevents exact verification and
 safe unmount. This setting applies only to the operator-controlled parent;
 tenant child jails retain their restricted/default view.
 
-**Deployment status (2026-07-28): private staging.** The exact provider,
-useful child template, generic bootstrap, pilot tenant, and loopback service are
-installed on the intended host. The private smoke, public Caddy/TLS edge,
-end-to-end OAuth flow, and real-client flows are not yet proven, so this profile
-does not claim public go-live. The `mcp.bultmann.eu` AAAA record already points
-at the sandbox host; there is no public A record. The current administration
-path is `ssh -6 jp@ai.bultmann.eu`: that hostname's IPv4 address is a different
-SSH host, so do not allow SSH or rsync to fall back to IPv4.
+**Deployment status (2026-07-28): live at `https://mcp.bultmann.eu/mcp`.**
+The IPv6-only public edge, trusted TLS, loopback provider, persistent pilot,
+cold-boot reattach, synchronous and asynchronous execution, exact cancellation,
+and invite-gated OAuth 2.1 flow are proven on the real host; see the deployment
+receipt below. Real Claude/ChatGPT connector UI flows remain a client-integration
+check, not an unproven server path. The administration path is
+`ssh -6 jp@ai.bultmann.eu`: that hostname's IPv4 address is a different SSH
+host, so do not allow SSH or rsync to fall back to IPv4.
 
 Two hosting modes exist and stay interchangeable:
 
@@ -71,32 +71,37 @@ Two hosting modes exist and stay interchangeable:
 - The provider binds `127.0.0.1` and speaks plain HTTP. Caddy is the sole public
   listener and sole TLS terminator; the provider port is never exposed.
 
-## Build (on the server)
+## Build on the parent jail
 
 The provider crate has no sibling-repository path dependencies. Build and
 install it on its own; faculties belong in the child-jail template and are a
 separate artifact.
 
 ```sh
-# one-time toolchain: rust 1.96 as of 2026-07; rsync for the source sync
-sudo pkg install -y rust rsync
+# Run from the local playground checkout. IPv4 is a different host.
+PHYSICAL_HOST='jp@ai.bultmann.eu'
+REV=$(git rev-parse --short=12 HEAD)
+REMOTE_SOURCE="/jails/playground/root/build/playground-$REV"
 
-# The current administration path is IPv6-only. IPv4 is a different host.
-JAIL_HOST='jp@ai.bultmann.eu'
+# One-time toolchain inside the trusted parent jail.
+ssh -6 "$PHYSICAL_HOST" \
+  'sudo jexec playground pkg install -y rust rsync'
 
-# From the local playground checkout, sync only this repository. NOTE the
-# --exclude='*.pile': no operator pile may land on this server, ever.
-rsync -a -e 'ssh -6' --delete \
+# Refuse to merge with a stale tree, then sync only this repository directly
+# into the parent jail. No operator pile may land on this server, ever.
+ssh -6 "$PHYSICAL_HOST" "sudo test ! -e '$REMOTE_SOURCE'"
+rsync -a -e 'ssh -6' --rsync-path='sudo rsync' \
   --exclude 'target/' --exclude '.git/' --exclude '.claude/' \
   --exclude '*.pile' --exclude 'models/' --exclude 'weights/' \
   --exclude '__pycache__/' \
-  ./ $JAIL_HOST:playground-build/playground/
+  ./ "$PHYSICAL_HOST:$REMOTE_SOURCE/"
 
-# verify the pile rail held before anything else:
-ssh -6 "$JAIL_HOST" "find playground-build -name '*.pile'"   # must print nothing
-
-cd ~/playground-build/playground
-cargo build --release --locked --no-default-features --features mcp-http
+# Verify the pile rail before executing anything, then build inside the parent.
+ssh -6 "$PHYSICAL_HOST" \
+  "if sudo find '$REMOTE_SOURCE' -name '*.pile' -print | grep .; then exit 70; fi"
+ssh -6 "$PHYSICAL_HOST" \
+  "sudo jexec playground sh -c 'cd /root/build/playground-$REV && \
+    cargo build --release --locked --no-default-features --features mcp-http'"
 ```
 
 `--no-default-features --features mcp-http` builds the MCP provider + HTTP
@@ -370,50 +375,42 @@ The provider's rc prestart independently refuses to run unless
 its jail. The physical-host `rctl "jail:${GLOBAL_CHILD}"` check is a real
 provisioning gate, not optional paperwork.
 
-## Go-live checklist
+## Live deployment receipt (2026-07-28)
 
-The code path is now small: one Caddy site, one loopback provider, one local
-jail backend, and one bounded execution state machine. Public deployment still
-waits on evidence from the actual host; documentation is not that evidence.
+The deployed provider binary was built from commit `646ea65`. The following was
+measured on the real FreeBSD 15.1 host rather than inferred from configuration:
 
-Required before opening ports 80/443:
+- Public DNS is intentionally IPv6-only: independent resolvers return
+  `mcp.bultmann.eu AAAA 2a00:c380:c0d5:1::17` and no A record. Caddy owns public
+  TCP 80/443 and UDP 443; the provider owns only `127.0.0.1:8377`, which is
+  unreachable at the public address. HTTP redirects to HTTPS and the trusted
+  certificate names `mcp.bultmann.eu`.
+- The useful immutable template is
+  `template-faculties-df087a2@base`, with 27 faculty executables and a generic
+  bootstrap pile containing no operator memory. The pilot child has networking
+  disabled, `securelevel=1`, a 10 GiB ZFS refquota, six host-owned RCTL rules,
+  and exact single-file append-only self/shared pile mounts. The pile dataset has
+  a 50 GiB quota.
+- A physical reboot proved RACCT, the parent's `enforce_statfs=0`, provider rc
+  startup, persistent tenant discovery, exactly one reconstructed devfs, both
+  exact pile mounts, and child reattachment without manual intervention. The
+  static tenant token and filesystem state survived. Private smoke then proved
+  all seven MCP tools, close/reopen persistence, and exact cancellation of a
+  daemonized TERM-ignoring descendant while an unrelated process survived.
+- Through the public hostname, the static-bearer smoke proved TLS, MCP
+  initialization, the seven-tool surface, synchronous execution, and persistent
+  reconnect. A real asynchronous job was started, incrementally polled through
+  `state == terminal && has_more == false`, checked for exit 0, and detached.
+- The invite-gated OAuth flow proved RFC 9728/8414 discovery, dynamic public
+  client registration, S256 PKCE consent, exact redirect/state handling, code
+  exchange, `mcp offline_access`, wrong-resource rejection, refresh rotation,
+  and MCP initialization with the rotated access token. Secret values stayed in
+  mode-0700 temporary storage and were not logged.
 
-1. **Use and re-audit the real administration path.** Force
-   `ssh -6 jp@ai.bultmann.eu`; its IPv4 address is a different SSH host. Confirm
-   the intended physical host and `playground` parent jail before copying
-   anything, and never accept an IPv4 host-key change as part of this deploy.
-2. **Prove the parent boundary.** Version or inspect the real parent-jail and
-   physical-host PF configuration: the service must be root only inside that
-   parent, delegated only `airoot/jails/playground/jails`, with child networking
-   denied unless deliberately enabled. The rc script refuses host-root,
-   `securelevel < 1`, and RACCT-off starts.
-3. **Turn on and prove RACCT/RCTL.** Reboot after enabling it, predeclare the
-   exact global child name before each tenant creation, and inspect all six
-   host-owned rules from the physical host. Also prove the 10G clone
-   `refquota` and the 50G pile-dataset `quota`; a plain pile directory is not a
-   substitute.
-4. **Build the useful child image.** The observed template was stock FreeBSD.
-   Install the intended faculties/tools, freeze a new immutable snapshot, and
-   install a reviewed generic bootstrap pile containing no operator memory.
-   Decide explicitly whether tenants need outbound networking; the current
-   child topology has none.
-5. **Bring up the private service first.** Install the binary and rc profile,
-   provision one pilot token, run the loopback MCP round-trip, then run the
-   opt-in FreeBSD job cancellation smoke. It must kill the escaped job
-   descendant while preserving the unrelated process in the same jail.
-6. **Bring up Caddy and resolve DNS deliberately.** Validate the Caddy config,
-   obtain the real certificate, and verify the physical firewall exposes only
-   80/443. Decide whether the public service may remain IPv6-only or needs an A
-   record/proxy, and repair local split-horizon resolution before relying on
-   local browser tests.
-7. **Exercise real clients.** Complete authorization-code + PKCE flows from both
-   Claude and ChatGPT, then use `open_session`, synchronous `exec`, and the
-   `job_exec` / `job_poll` / `job_cancel` path through the public hostname.
-   Poll a job until `state == terminal && has_more == false`.
-
-`ai.bultmann.eu` is intentionally absent from this list: there is currently no
-UI or other product to serve there. Adding a second OAuth/CORS origin before a
-real consumer exists would add authority and ambiguity, not capability.
+The remaining check is product integration through the actual Claude and
+ChatGPT connector UIs. It requires their browser callbacks and is deliberately
+not simulated as a server deployment gate. `ai.bultmann.eu` still has no UI or
+other product to serve, so no second OAuth/CORS origin is exposed there.
 
 The first pilot does not need VNET, a second privileged helper, a pile-backed
 job ledger, or multiple execution strategies. Those are later responses to
