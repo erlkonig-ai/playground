@@ -54,9 +54,10 @@ pub struct ChildOutput {
     /// kills (e.g. FreeBSD `timeout(1)` on a jail host) surface as
     /// `exit_code == Some(124)` instead.
     pub timed_out: bool,
-    /// True iff a captured (non-streamed) child was KILLED because it exceeded
-    /// the per-stream output ceiling. Streamed jobs use bounded sink retention
-    /// instead and do not trip this flag merely because old output was evicted.
+    /// True iff a captured (non-streamed) child exceeded the per-stream output
+    /// ceiling. Child-only transports are killed; a local descendant-reaper
+    /// transport keeps draining while retaining only the bounded prefix, so it
+    /// never sacrifices cleanup proof merely to enforce the memory bound.
     pub output_truncated: bool,
     /// True iff an [`ExecControl`] cancellation request killed this child.
     pub cancelled: bool,
@@ -86,6 +87,7 @@ fn read_capped(
     tripped: &AtomicBool,
     control: &ExecControl,
     stream: ExecStream,
+    stop_on_cap: bool,
 ) -> Vec<u8> {
     let mut buf = Vec::new();
     let capture_output = control.captures_output();
@@ -95,19 +97,28 @@ fn read_capped(
             Ok(0) => break, // EOF
             Ok(n) => {
                 control.emit(stream, &chunk[..n]);
+                let exceeded_cap = capture_output && cap != 0 && n > cap.saturating_sub(buf.len());
                 if capture_output {
-                    buf.extend_from_slice(&chunk[..n]);
+                    let remaining = cap.saturating_sub(buf.len());
+                    let retained = if cap == 0 { n } else { n.min(remaining) };
+                    buf.extend_from_slice(&chunk[..retained]);
                 }
                 // Cap of 0 means "unbounded". Streamed executions retain their
                 // own bounded ring and deliberately keep draining after
                 // eviction instead of turning model polling speed into command
                 // semantics.
-                if capture_output && cap != 0 && buf.len() >= cap {
-                    // Trip the kill switch and stop draining. The poll loop sees
-                    // `tripped` and kills the child; the closed write end then
-                    // lets the (now-unread) pipe EOF so the caller's join returns.
+                if exceeded_cap {
                     tripped.store(true, Ordering::SeqCst);
-                    break;
+                    if stop_on_cap {
+                        // Child-only transports must stop the producer. The
+                        // poll loop kills it and the closed write end lets this
+                        // deliberately abandoned pipe reach EOF.
+                        break;
+                    }
+                    // A local descendant reaper is the stronger cleanup
+                    // boundary. Keep draining, but retain no more bytes: the
+                    // server-side timeout remains authoritative and the daemon
+                    // never kills its own proof witness just to bound memory.
                 }
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -252,8 +263,11 @@ fn drive_child_capped_inner(
     };
 
     // Shared trip flag: either drain thread sets it when its stream exceeds the
-    // cap, and the poll loop reacts by killing the child (see below).
+    // cap. Child-only transports stop the producer; a process-group transport
+    // keeps draining past the retained prefix so its descendant reaper remains
+    // the authoritative cleanup boundary.
     let tripped = Arc::new(AtomicBool::new(false));
+    let stop_on_cap = matches!(cancel_target, CancelTarget::Child);
 
     let out_thread = child.stdout.take().map(|pipe| {
         let tripped = tripped.clone();
@@ -265,6 +279,7 @@ fn drive_child_capped_inner(
                 &tripped,
                 &control,
                 ExecStream::Stdout,
+                stop_on_cap,
             )
         })
     });
@@ -278,6 +293,7 @@ fn drive_child_capped_inner(
                 &tripped,
                 &control,
                 ExecStream::Stderr,
+                stop_on_cap,
             )
         })
     });
@@ -352,20 +368,13 @@ fn drive_child_capped_inner(
                     cancelled = true;
                     break child.wait().context("reap cancelled sandbox child")?;
                 }
-                // Output ceiling breached: kill the child NOW so it stops
-                // producing (rather than truncating the buffer while it runs on).
-                if tripped.load(Ordering::SeqCst) {
+                // A child-only transport is killed on the first cap breach. A
+                // local process-group transport keeps draining but retaining no
+                // more bytes; its server-side reaper remains alive and bounded.
+                if tripped.load(Ordering::SeqCst) && !output_truncated {
                     output_truncated = true;
                     if matches!(cancel_target, CancelTarget::ProcessGroup) {
-                        // This is the LocalRunner/reaper path. A descendant may
-                        // have escaped the wrapper's process group while retaining
-                        // one of its pipes. Kill best-effort and fail immediately;
-                        // joining either the leader or drains could hang forever.
-                        let _ = signal_process_group(child.id(), 9);
-                        let _ = child.kill();
-                        return Err(anyhow!(
-                            "process-group output ceiling required killing the descendant reaper"
-                        ));
+                        continue;
                     }
                     let _ = child.kill();
                     break child.wait().context("reap output-capped sandbox child")?;
@@ -681,11 +690,10 @@ mod tests {
         assert!(out.output_truncated, "cap breach must be signalled");
         assert!(!out.success(), "an output-capped run is not a success");
         assert!(!out.timed_out, "the cap kill, not the timeout, fired");
-        // Captured up to the cap plus at most one 64 KiB chunk of slack.
-        assert!(out.stdout.len() >= cap, "captured at least the cap");
-        assert!(
-            out.stdout.len() < cap + 128 * 1024,
-            "did not run far past the cap"
+        assert_eq!(
+            out.stdout.len(),
+            cap,
+            "capture itself stays strictly bounded"
         );
         assert!(
             start.elapsed() < Duration::from_secs(10),
@@ -711,6 +719,18 @@ mod tests {
         assert!(!out.output_truncated);
         assert!(out.success());
         assert_eq!(out.stdout, b"small output\n");
+    }
+
+    #[test]
+    fn output_exactly_at_the_cap_is_not_truncated() {
+        let cap = 32 * 1024;
+        let child = sh("dd if=/dev/zero bs=32768 count=1 2>/dev/null")
+            .spawn()
+            .expect("spawn");
+        let out = drive_capped(child, None, Duration::from_secs(10), cap).expect("drive");
+        assert!(!out.output_truncated);
+        assert!(out.success());
+        assert_eq!(out.stdout.len(), cap);
     }
 
     #[derive(Default)]
@@ -817,6 +837,29 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn process_group_output_cap_keeps_the_cleanup_boundary_alive() {
+        use std::os::unix::process::CommandExt;
+
+        let cap = 32 * 1024;
+        let mut command = sh("dd if=/dev/zero bs=1024 count=512 2>/dev/null");
+        command.process_group(0);
+        let child = command.spawn().expect("spawn");
+        let out = drive_child_capped_controlled_process_group(
+            child,
+            None,
+            Duration::from_secs(10),
+            cap,
+            &ExecControl::default(),
+        )
+        .expect("an ordinary output cap must not revoke execution authority");
+        assert!(out.output_truncated);
+        assert_eq!(out.stdout.len(), cap);
+        assert_eq!(out.exit_code, Some(0));
+        assert!(!out.timed_out);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn forced_group_kill_fails_without_waiting_on_the_reaper() {
         use std::os::unix::process::CommandExt;
 
@@ -866,27 +909,6 @@ mod tests {
         assert!(
             start.elapsed() < Duration::from_secs(2),
             "timeout path joined a pipe held by an escaped descendant"
-        );
-        holder.terminate_and_wait_for_reap();
-
-        // Captured-output cap path: after filling stdout, the escaped helper
-        // keeps both descriptors open for five seconds. This must use the same
-        // fail-without-joining behavior as the timeout hard kill.
-        let (child, mut holder) = spawn_escaped_pipe_holder("spam");
-        let start = Instant::now();
-        let error = drive_child_capped_controlled_process_group(
-            child,
-            None,
-            Duration::from_secs(30),
-            32 * 1024,
-            &ExecControl::default(),
-        )
-        .expect_err("output-capped process group must lose execution authority");
-        assert!(crate::sandbox::is_sandbox_control_lost(&error));
-        assert!(error.to_string().contains("output ceiling"), "{error:#}");
-        assert!(
-            start.elapsed() < Duration::from_secs(2),
-            "output-cap path joined a pipe held by an escaped descendant"
         );
         holder.terminate_and_wait_for_reap();
     }

@@ -156,12 +156,11 @@ const ADMIN_TIMEOUT: Duration = Duration::from_secs(120);
 /// server kill is authoritative; the local kill only fires if SSH itself
 /// wedges.
 const LOCAL_TIMEOUT_GRACE: Duration = Duration::from_secs(20);
-/// Per-stream output ceiling for a directly captured tenant `exec` (see
-/// [`super::proc::DEFAULT_MAX_OUTPUT_BYTES`]). Each of stdout/stderr is capped
-/// independently and the jail process is killed the instant either exceeds it.
-/// Streamed jobs instead drain continuously into the bounded job output ring,
-/// so they do not need to kill a healthy command merely because old output was
-/// evicted.
+/// Per-stream retention ceiling for a directly captured tenant `exec` (see
+/// [`super::proc::DEFAULT_MAX_OUTPUT_BYTES`]). Each of stdout/stderr is bounded
+/// independently while the local runner continues draining; the descendant
+/// reaper remains the process-tree lifetime bound. Streamed jobs instead drain
+/// into their own bounded output ring.
 const MAX_EXEC_OUTPUT_BYTES: usize = DEFAULT_MAX_OUTPUT_BYTES;
 /// Default ZFS `refquota` for a per-tenant clone (a ZFS size string). Bounds how
 /// much a tenant can write into its own dataset so it cannot fill the host pool.
@@ -229,13 +228,15 @@ pub trait HostRunner: Send + Sync {
     }
 
     /// Like [`run`](Self::run), but with an output policy suitable for a tenant
-    /// command. When `control` has no streaming sink, implementations cap each
-    /// captured stream at `max_output_bytes` and kill the transported child on
-    /// breach (`ChildOutput::output_truncated` is then set). With a sink, they
-    /// continuously drain output into the separately bounded job ring and do
-    /// not duplicate it in these returned buffers. The default is unbounded
-    /// (delegates to `run`), correct only for a runner that never carries a
-    /// tenant command; the production runners override it.
+    /// command. When `control` has no streaming sink, implementations retain at
+    /// most `max_output_bytes` from each captured stream
+    /// (`ChildOutput::output_truncated` records a breach). Child-only transports
+    /// stop on breach; the local descendant-reaper transport keeps draining so
+    /// memory stays bounded without losing cleanup proof. With a sink, output
+    /// drains into the separately bounded job ring and is not duplicated in the
+    /// returned buffers. The default is unbounded (delegates to `run`), correct
+    /// only for a runner that never carries a tenant command; production runners
+    /// override it.
     fn run_capped(
         &self,
         argv: &[String],
@@ -2488,9 +2489,10 @@ impl SandboxBackend for JailBackend {
             "sudo", "-n", "timeout", "-k", "5", &secs, "jexec", jail, "/bin/sh", "-lc", &script,
         ];
 
-        // Tenant output is attacker-controlled. Direct capture caps each stream
-        // and kills on breach; job execution continuously drains into its
-        // bounded ring (see MAX_EXEC_OUTPUT_BYTES and HostRunner::run_capped).
+        // Tenant output is attacker-controlled. Direct capture retains a
+        // bounded prefix of each stream; the local reaper path keeps draining,
+        // while child-only transports stop on breach. Job execution continuously
+        // drains into its bounded ring (see HostRunner::run_capped).
         let out = self.run_capped(
             &argv,
             request.stdin.as_deref(),
@@ -2507,9 +2509,7 @@ impl SandboxBackend for JailBackend {
         // Unsupported/remote runners do not expose `job_cancel`; their ordinary
         // transport failures remain retryable and the server-side timeout still
         // bounds remote work.
-        let cleanup_unproven = out.timed_out
-            || out.output_truncated
-            || (out.cancelled && !out.cancelled_process_group);
+        let cleanup_unproven = out.timed_out || (out.cancelled && !out.cancelled_process_group);
         if cleanup_unproven && self.runner.supports_background_jobs() {
             return Err(sandbox_control_lost(format!(
                 "FreeBSD command reaper returned without descendant-cleanup proof for jail '{jail}'"
@@ -2550,12 +2550,13 @@ impl SandboxBackend for JailBackend {
                 "command timed out after {timeout:?}{ceiling}; {cleanup}"
             ));
         } else if out.output_truncated {
-            // This arm is reachable only on a runner that does not advertise
-            // proven background-job cleanup. Its remote timeout remains the
-            // process bound after the local transport is killed at the cap.
+            let cleanup = if self.runner.supports_background_jobs() {
+                "command completed under the local descendant reaper"
+            } else {
+                "transport capture stopped at the bound; the server timeout remains the remote cleanup ceiling"
+            };
             result.error = Some(format!(
-                "output truncated at {MAX_EXEC_OUTPUT_BYTES} bytes per stream; \
-                 local transport killed and remote work remains bounded by the server timeout"
+                "output truncated at {MAX_EXEC_OUTPUT_BYTES} bytes per stream; {cleanup}"
             ));
         } else if out.exit_code.is_some() && out.exit_code == self.runner.transport_error_exit() {
             // Transport failure (e.g. ssh's reserved exit 255), not the host
@@ -3664,11 +3665,11 @@ mod tests {
         );
     }
 
-    /// A capable local runner must never hide loss of its descendant reaper
-    /// behind an automatic whole-jail reset. It reports the typed fatal marker;
-    /// the serving boundary exits and leaves the jail for operator inspection.
+    /// Reaching the synchronous capture bound is an ordinary result, not loss
+    /// of sandbox authority. The capable local runner kept its descendant
+    /// reaper alive while discarding bytes beyond the retained prefix.
     #[test]
-    fn capable_exec_control_loss_is_fatal_without_jail_reset() {
+    fn capable_output_limit_preserves_cleanup_authority() {
         let jail = alice_jail();
         let (backend, mock) = MockRunner::default()
             .with_background_jobs()
@@ -3688,12 +3689,16 @@ mod tests {
             stdin: None,
             timeout: None,
         };
-        let error = backend
+        let result = backend
             .exec(&SessionId::new(jail.clone()), &req, &ExecControl::default())
-            .expect_err("lost descendant cleanup must be process-fatal");
+            .expect("bounded output is an ordinary execution result");
         assert!(
-            crate::sandbox::is_sandbox_control_lost(&error),
-            "typed fatal marker was lost: {error:#}"
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("completed under the local descendant reaper"),
+            "unexpected output-limit result: {result:?}"
         );
         let calls = mock.calls();
         assert!(
@@ -3701,7 +3706,7 @@ mod tests {
                 call.get(2).map(String::as_str) == Some("jail")
                     && matches!(call.get(3).map(String::as_str), Some("-r" | "-c"))
             }),
-            "fatal execution loss must not mutate the jail lifecycle: {calls:?}"
+            "ordinary output limiting must not mutate the jail lifecycle: {calls:?}"
         );
     }
 

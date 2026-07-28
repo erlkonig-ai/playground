@@ -99,6 +99,10 @@ struct McpArgs {
     /// `--jail-host` is ignored).
     #[arg(long, default_value_t = false)]
     jail_local: bool,
+    /// Jail backend: per-child RCTL rules are predeclared by the physical host
+    /// because this process runs inside a parent jail without PRIV_RCTL_*.
+    #[arg(long, default_value_t = false)]
+    jail_external_rctl: bool,
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
@@ -132,6 +136,7 @@ impl McpBackendKind {
         faculties_src: Option<PathBuf>,
         jail_host: Option<String>,
         jail_local: bool,
+        jail_external_rctl: bool,
         jail_prefix: String,
         jail_template_snapshot: String,
         jail_dataset_parent: String,
@@ -172,6 +177,9 @@ impl McpBackendKind {
                 backend.bootstrap_pile = jail_bootstrap_pile;
                 backend.clone_refquota = quota_opt(jail_clone_refquota);
                 backend.pile_root_quota = quota_opt(jail_pile_quota);
+                if jail_external_rctl {
+                    backend.rctl_rules.clear();
+                }
                 Ok(Box::new(backend))
             }
         }
@@ -271,6 +279,10 @@ struct McpHttpArgs {
     /// `--jail-host` is ignored).
     #[arg(long, default_value_t = false)]
     jail_local: bool,
+    /// Jail backend: do not call rctl(8) from this process. The physical host
+    /// must predeclare the fixed rules for every deterministic child jail name.
+    #[arg(long, default_value_t = false)]
+    jail_external_rctl: bool,
     /// Jail backend: ZFS `refquota` (size string, e.g. `10G`) set on each
     /// per-tenant clone so a tenant cannot fill the host pool. `0`/empty
     /// disables. (repair #4 storage bound)
@@ -352,6 +364,10 @@ struct UserBackendArgs {
     /// over SSH (server-side hosting on the FreeBSD jail host itself).
     #[arg(long, default_value_t = false)]
     jail_local: bool,
+    /// Jail backend: per-child RCTL rules are owned by the physical host (the
+    /// provider itself runs inside a parent jail and cannot change them).
+    #[arg(long, default_value_t = false)]
+    jail_external_rctl: bool,
     /// Jail backend: ZFS `refquota` set on each per-tenant clone at provision
     /// (size string, e.g. `10G`; `0`/empty disables). (repair #4 storage bound)
     #[arg(long, default_value = "10G")]
@@ -384,6 +400,9 @@ impl UserBackendArgs {
                 backend.bootstrap_pile = self.jail_bootstrap_pile.clone();
                 backend.clone_refquota = quota_opt(self.jail_clone_refquota.clone());
                 backend.pile_root_quota = quota_opt(self.jail_pile_quota.clone());
+                if self.jail_external_rctl {
+                    backend.rctl_rules.clear();
+                }
                 Ok(Box::new(backend))
             }
             McpBackendKind::Lima => {
@@ -449,6 +468,8 @@ enum UserCommand {
     Create(UserCreateArgs),
     #[command(about = "List the tenants known to the token store (and whether their jail is live)")]
     List(UserListArgs),
+    #[command(about = "Print a tenant's deterministic jail name for host-owned RCTL rules")]
+    JailName(UserJailNameArgs),
     #[command(about = "Destroy a tenant's sandbox and remove its tokens")]
     Destroy(UserDestroyArgs),
     #[command(subcommand, about = "Show or reset a tenant's bearer token")]
@@ -482,11 +503,27 @@ struct UserListArgs {
 
 #[cfg(feature = "mcp-http")]
 #[derive(Args, Debug, Clone)]
+struct UserJailNameArgs {
+    /// Tenant label whose deterministic jail name should be printed.
+    name: String,
+    /// Prefix configured on the jail backend.
+    #[arg(long, default_value = "playground")]
+    jail_prefix: String,
+    /// Global name of the enclosing parent jail as seen by the physical host.
+    /// When supplied, output is the child's fully-qualified global name.
+    #[arg(long)]
+    parent_jail_name: Option<String>,
+}
+
+#[cfg(feature = "mcp-http")]
+#[derive(Args, Debug, Clone)]
 struct UserDestroyArgs {
     /// Tenant label to destroy (its sandbox is torn down, tokens removed).
     name: String,
     #[command(flatten)]
     backend: UserBackendArgs,
+    #[command(flatten)]
+    oauth: UserOauthRevocationArgs,
 }
 
 #[cfg(feature = "mcp-http")]
@@ -505,6 +542,17 @@ struct UserTokenResetArgs {
     name: String,
     #[command(flatten)]
     backend: UserBackendArgs,
+    #[command(flatten)]
+    oauth: UserOauthRevocationArgs,
+}
+
+#[cfg(feature = "mcp-http")]
+#[derive(Args, Debug, Clone)]
+struct UserOauthRevocationArgs {
+    /// OAuth state whose tenant-bound invites, access tokens, and refresh
+    /// tokens should also be revoked. Omit when OAuth is not configured.
+    #[arg(long, env = "PLAYGROUND_MCP_OAUTH_STATE")]
+    oauth_state: Option<PathBuf>,
 }
 
 #[cfg(feature = "mcp-http")]
@@ -567,6 +615,7 @@ fn main() -> Result<()> {
         CommandMode::User { command } => match command {
             UserCommand::Create(args) => run_user_create(args),
             UserCommand::List(args) => run_user_list(args),
+            UserCommand::JailName(args) => run_user_jail_name(args),
             UserCommand::Destroy(args) => run_user_destroy(args),
             UserCommand::Token(command) => match command {
                 UserTokenCommand::Show(args) => run_user_token_show(args),
@@ -599,6 +648,7 @@ fn run_mcp(args: McpArgs) -> Result<()> {
         args.faculties_src,
         args.jail_host,
         args.jail_local,
+        args.jail_external_rctl,
         args.jail_prefix,
         args.jail_template_snapshot,
         args.jail_dataset_parent,
@@ -629,6 +679,7 @@ fn run_mcp_http(args: McpHttpArgs) -> Result<()> {
         args.faculties_src,
         args.jail_host,
         args.jail_local,
+        args.jail_external_rctl,
         args.jail_prefix,
         args.jail_template_snapshot,
         args.jail_dataset_parent,
@@ -680,12 +731,12 @@ fn run_mcp_http(args: McpHttpArgs) -> Result<()> {
         _ => None,
     };
 
-    // Startup reattach sweep: after a host reboot the on-disk state survives but
-    // the running contexts are gone (jail: in-kernel jail records and dynamic
-    // RCTL rules; lima: the VMs are stopped). Bring every provisioned sandbox
-    // back up before serving so a reconnecting tenant finds its box live. This
-    // is fail-closed: listening after a partial sweep could expose a jail whose
-    // mandatory RCTL rules were not restored.
+    // Startup reattach sweep: after a reboot the on-disk state survives but the
+    // running contexts are gone (jail records or Lima VMs). Bring every
+    // provisioned sandbox back before serving. Internal-RCTL mode reapplies its
+    // own rules during this sweep; external-RCTL mode deliberately relies on
+    // the physical host's preloaded name-keyed rules, which this jailed process
+    // cannot inspect.
     let reattached = backend
         .reattach_all()
         .context("reattach persistent sandboxes before starting HTTP service")?;
@@ -791,6 +842,34 @@ fn run_user_list(args: UserListArgs) -> Result<()> {
     Ok(())
 }
 
+/// Print the exact jail identity before provisioning so a physical-host
+/// operator can predeclare name-keyed RCTL rules without duplicating the
+/// sanitisation or digest algorithm in shell.
+#[cfg(feature = "mcp-http")]
+fn run_user_jail_name(args: UserJailNameArgs) -> Result<()> {
+    sandbox::jail::JailBackend::validate_label(&args.name)?;
+    let mut backend = sandbox::jail::JailBackend::local();
+    backend.jail_prefix = args.jail_prefix;
+    let local_name = backend.jail_name(&args.name);
+    match args.parent_jail_name {
+        Some(parent) => {
+            let parent = parent.trim();
+            anyhow::ensure!(
+                !parent.is_empty()
+                    && !parent.starts_with('.')
+                    && !parent.ends_with('.')
+                    && parent
+                        .chars()
+                        .all(|c| { c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') }),
+                "--parent-jail-name must contain only ASCII letters, digits, '.', '-', or '_'"
+            );
+            println!("{parent}.{local_name}");
+        }
+        None => println!("{local_name}"),
+    }
+    Ok(())
+}
+
 /// `user destroy <name>`: tear the tenant's sandbox down (permanent — jail:
 /// `jail -r` + devfs unmount + `zfs destroy`; lima: `limactl stop` +
 /// `limactl delete`) and remove every token bound to it.
@@ -798,6 +877,16 @@ fn run_user_list(args: UserListArgs) -> Result<()> {
 fn run_user_destroy(args: UserDestroyArgs) -> Result<()> {
     let backend = args.backend.build_backend()?;
     let session = args.backend.session_id_for(&args.name);
+    // Revoke OAuth first. If its local state is unavailable, leave the
+    // sandbox and static credentials untouched so the operator can fix the
+    // file and retry instead of creating a half-destroyed tenant whose OAuth
+    // credentials silently survive.
+    let oauth_revoked = args
+        .oauth
+        .oauth_state
+        .as_deref()
+        .map(|path| oauth::revoke_tenant_locked(path, &args.name))
+        .transpose()?;
     backend
         .destroy_session(&session)
         .with_context(|| format!("destroy sandbox for tenant '{}'", args.name))?;
@@ -813,6 +902,17 @@ fn run_user_destroy(args: UserDestroyArgs) -> Result<()> {
         args.name,
         args.backend.tokens.display(),
     );
+    if let (Some(path), Some(revoked)) = (&args.oauth.oauth_state, oauth_revoked) {
+        eprintln!(
+            "revoked {} OAuth invite(s), {} access token(s), and {} refresh token(s) for tenant \
+             '{}' from {}; pending authorization codes were invalidated",
+            revoked.invites,
+            revoked.access_tokens,
+            revoked.refresh_tokens,
+            args.name,
+            path.display(),
+        );
+    }
     Ok(())
 }
 
@@ -844,6 +944,15 @@ fn run_user_token_show(args: UserTokenShowArgs) -> Result<()> {
 #[cfg(feature = "mcp-http")]
 fn run_user_token_reset(args: UserTokenResetArgs) -> Result<()> {
     let backend_name = args.backend.backend.name();
+    // Do the fallible OAuth revocation before replacing the static token. A
+    // bad/unavailable OAuth file must not strand an unprinted freshly-minted
+    // static secret while every old OAuth credential remains usable.
+    let oauth_revoked = args
+        .oauth
+        .oauth_state
+        .as_deref()
+        .map(|path| oauth::revoke_tenant_locked(path, &args.name))
+        .transpose()?;
     let mut store = mcp_http::TokenStore::load(&args.backend.tokens)?;
     let before = store.tokens.len();
     store.tokens.retain(|_, entry| entry.tenant != args.name);
@@ -857,6 +966,17 @@ fn run_user_token_reset(args: UserTokenResetArgs) -> Result<()> {
         backend_name,
         args.backend.tokens.display(),
     );
+    if let (Some(path), Some(revoked)) = (&args.oauth.oauth_state, oauth_revoked) {
+        eprintln!(
+            "revoked {} OAuth invite(s), {} access token(s), and {} refresh token(s) for tenant \
+             '{}' from {}; pending authorization codes were invalidated",
+            revoked.invites,
+            revoked.access_tokens,
+            revoked.refresh_tokens,
+            args.name,
+            path.display(),
+        );
+    }
     println!("{token}");
     Ok(())
 }
@@ -918,4 +1038,110 @@ fn run_token_invite(args: TokenInviteArgs) -> Result<()> {
     );
     println!("{invite}");
     Ok(())
+}
+
+#[cfg(all(test, feature = "mcp-http"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oauth_revocation_path_is_scoped_to_reset_and_destroy() {
+        let destroy = Cli::try_parse_from([
+            "playground",
+            "user",
+            "destroy",
+            "alice",
+            "--tokens",
+            "tokens.json",
+            "--oauth-state",
+            "oauth.json",
+        ])
+        .unwrap();
+        let Some(CommandMode::User {
+            command: UserCommand::Destroy(args),
+        }) = destroy.command
+        else {
+            panic!("destroy command did not parse");
+        };
+        assert_eq!(args.oauth.oauth_state, Some(PathBuf::from("oauth.json")));
+
+        let reset = Cli::try_parse_from([
+            "playground",
+            "user",
+            "token",
+            "reset",
+            "alice",
+            "--tokens",
+            "tokens.json",
+            "--oauth-state",
+            "oauth.json",
+        ])
+        .unwrap();
+        let Some(CommandMode::User {
+            command: UserCommand::Token(UserTokenCommand::Reset(args)),
+        }) = reset.command
+        else {
+            panic!("token reset command did not parse");
+        };
+        assert_eq!(args.oauth.oauth_state, Some(PathBuf::from("oauth.json")));
+
+        let show = Cli::try_parse_from([
+            "playground",
+            "user",
+            "token",
+            "show",
+            "alice",
+            "--tokens",
+            "tokens.json",
+            "--oauth-state",
+            "oauth.json",
+        ]);
+        assert!(
+            show.is_err(),
+            "read-only token show must not accept revocation flags"
+        );
+    }
+
+    #[test]
+    fn external_rctl_flags_and_name_helper_parse_explicitly() {
+        let name = Cli::try_parse_from([
+            "playground",
+            "user",
+            "jail-name",
+            "alice",
+            "--jail-prefix",
+            "box",
+            "--parent-jail-name",
+            "playground",
+        ])
+        .unwrap();
+        let Some(CommandMode::User {
+            command: UserCommand::JailName(args),
+        }) = name.command
+        else {
+            panic!("jail-name command did not parse");
+        };
+        assert_eq!(args.name, "alice");
+        assert_eq!(args.jail_prefix, "box");
+        assert_eq!(args.parent_jail_name.as_deref(), Some("playground"));
+
+        let create = Cli::try_parse_from([
+            "playground",
+            "user",
+            "create",
+            "alice",
+            "--tokens",
+            "tokens.json",
+            "--jail-local",
+            "--jail-external-rctl",
+        ])
+        .unwrap();
+        let Some(CommandMode::User {
+            command: UserCommand::Create(args),
+        }) = create.command
+        else {
+            panic!("user create command did not parse");
+        };
+        assert!(args.backend.jail_external_rctl);
+    }
 }

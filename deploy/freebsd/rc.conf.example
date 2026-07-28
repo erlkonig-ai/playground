@@ -1,0 +1,23 @@
+# Copy these assignments into /etc/rc.conf or the matching files under
+# /etc/rc.conf.d after installing the playground_mcp and caddy rc services.
+#
+# Caddy intentionally uses the FreeBSD port's root:wheel default for this
+# minimal pilot. It already lives inside the dedicated parent jail; running it
+# as www while retaining ports 80/443 requires a physical-host portacl policy
+# that this repository cannot safely infer. That remains a real least-privilege
+# improvement, but it should be made with the host operator rather than encoded
+# as a pretend self-contained jail setting.
+
+playground_mcp_enable="YES"
+playground_mcp_bind="127.0.0.1:8377"
+playground_mcp_tokens="/var/db/playground/tokens.json"
+playground_mcp_logfile="/var/log/playground_mcp.log"
+playground_mcp_flags="--jail-external-rctl --jail-template-snapshot airoot/jails/playground/jails/template@base --jail-dataset-parent airoot/jails/playground/jails --jail-pile-root /var/db/playground/piles --jail-bootstrap-pile /var/db/playground/bootstrap.pile --jail-clone-refquota 10G --jail-pile-quota 50G --public-url https://mcp.bultmann.eu --oauth-state /var/db/playground/oauth.json"
+
+caddy_enable="YES"
+caddy_config="/usr/local/etc/caddy/Caddyfile"
+
+# There is deliberately no ai.bultmann.eu origin: no UI/product exists yet.
+# Do not add permissive --allow-origin values. MCP clients without an Origin
+# header work normally; add an exact origin only after observing a real client
+# that needs browser CORS.

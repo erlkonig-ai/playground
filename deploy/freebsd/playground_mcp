@@ -35,7 +35,7 @@ load_rc_config $name
 
 : ${playground_mcp_enable:="NO"}
 : ${playground_mcp_bind:="127.0.0.1:8377"}
-: ${playground_mcp_tokens:="/usr/local/etc/playground/tokens.json"}
+: ${playground_mcp_tokens:="/var/db/playground/tokens.json"}
 : ${playground_mcp_binary:="/usr/local/bin/playground"}
 : ${playground_mcp_logfile:="/var/log/playground_mcp.log"}
 : ${playground_mcp_flags:=""}
@@ -46,11 +46,41 @@ export PATH="/usr/local/sbin:/usr/local/bin:${PATH}"
 
 pidfile="/var/run/${name}.pid"
 command="/usr/sbin/daemon"
-command_args="-f -R 5 -P ${pidfile} -o ${playground_mcp_logfile} \
+required_files="${playground_mcp_binary} ${playground_mcp_tokens}"
+start_precmd="${name}_prestart"
+command_args="-f -H -P ${pidfile} -o ${playground_mcp_logfile} \
     ${playground_mcp_binary} mcp-http \
     --backend jail --jail-local \
     --bind ${playground_mcp_bind} \
     --tokens ${playground_mcp_tokens} \
     ${playground_mcp_flags}"
+
+playground_mcp_prestart()
+{
+	# This public profile is allowed to be root only inside the dedicated
+	# parent jail and only when RACCT exists. The enclosing jail cannot inspect
+	# the physical host's RCTL rules; the operator must separately prove the
+	# exact globally-qualified per-child rules documented in the deployment guide.
+	if [ "$(/sbin/sysctl -n security.jail.jailed 2>/dev/null)" != 1 ]; then
+		echo "playground_mcp refuses to run outside its dedicated parent jail" >&2
+		return 1
+	fi
+	securelevel=$(/sbin/sysctl -n kern.securelevel 2>/dev/null) || return 1
+	if [ "${securelevel}" -lt 1 ]; then
+		echo "playground_mcp requires kern.securelevel >= 1" >&2
+		return 1
+	fi
+	if [ "$(/sbin/sysctl -n kern.racct.enable 2>/dev/null)" != 1 ]; then
+		echo "playground_mcp requires RACCT/RCTL (kern.racct.enable=1)" >&2
+		return 1
+	fi
+
+	# The process holds bearer/OAuth material in memory. Make the inherited
+	# core limit explicit and ensure daemon-created logs are private.
+	umask 077
+	ulimit -c 0
+	/usr/bin/touch "${playground_mcp_logfile}"
+	/bin/chmod 0600 "${playground_mcp_logfile}"
+}
 
 run_rc_command "$1"

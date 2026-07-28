@@ -188,6 +188,27 @@ pub struct OauthStore {
     pub access_tokens: HashMap<String, AccessTokenEntry>,
     #[serde(default)]
     pub refresh_tokens: HashMap<String, RefreshTokenEntry>,
+    /// Monotonic tenant generation captured by pending authorization codes.
+    /// Advancing it invalidates codes already issued for that tenant without
+    /// having to persist the short-lived codes themselves.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub tenant_generations: HashMap<String, u64>,
+}
+
+/// Tenant-scoped OAuth credentials removed by [`OauthStore::revoke_tenant`].
+///
+/// Dynamic client registrations are deliberately absent: a client is not
+/// tenant-owned and may have authorized more than one tenant. Invites, access
+/// tokens, and refresh tokens are tenant-bound and are all credentials capable
+/// of reaching that tenant, so revocation removes all three kinds.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct TenantRevocation {
+    pub invites: usize,
+    pub access_tokens: usize,
+    pub refresh_tokens: usize,
+    /// The new generation; authorization codes carrying an older value can no
+    /// longer be exchanged for tokens.
+    pub authorization_generation: u64,
 }
 
 /// Outcome of presenting a refresh token (see [`OauthStore::rotate_refresh`]).
@@ -390,6 +411,47 @@ impl OauthStore {
         self.refresh_tokens.retain(|_, e| e.family_id != family_id);
     }
 
+    /// Revoke every persisted OAuth credential bound to `tenant`.
+    ///
+    /// This includes unredeemed invites: retaining one would let its bearer
+    /// mint a new token family immediately after an operator reset/destroy.
+    /// Client registrations remain because they carry no tenant identity.
+    pub fn revoke_tenant(&mut self, tenant: &str) -> TenantRevocation {
+        let invites_before = self.invites.len();
+        self.invites.retain(|_, entry| entry.tenant != tenant);
+
+        let access_before = self.access_tokens.len();
+        self.access_tokens.retain(|_, entry| entry.tenant != tenant);
+
+        let refresh_before = self.refresh_tokens.len();
+        self.refresh_tokens
+            .retain(|_, entry| entry.tenant != tenant);
+
+        // This deliberately advances even if the persisted credential counts
+        // are zero: a single-use invite may already have become an in-memory
+        // authorization code in the running daemon. The generation is the
+        // durable revocation signal for that otherwise invisible credential.
+        let generation = self
+            .tenant_generations
+            .entry(tenant.to_string())
+            .or_default();
+        *generation = generation
+            .checked_add(1)
+            .expect("tenant OAuth revocation generation exhausted");
+
+        TenantRevocation {
+            invites: invites_before - self.invites.len(),
+            access_tokens: access_before - self.access_tokens.len(),
+            refresh_tokens: refresh_before - self.refresh_tokens.len(),
+            authorization_generation: *generation,
+        }
+    }
+
+    /// Current generation captured by a newly-issued authorization code.
+    pub fn tenant_generation(&self, tenant: &str) -> u64 {
+        self.tenant_generations.get(tenant).copied().unwrap_or(0)
+    }
+
     /// Resolve an access token to a [`TokenEntry`], enforcing expiry (expired
     /// tokens are removed — lazy reaping, no timer thread). `Err` carries the
     /// 401 message and whether the store was mutated (needs saving).
@@ -431,6 +493,14 @@ pub struct OauthConfig {
     pub access_ttl: Duration,
 }
 
+/// Tenant identity and durable revocation generation captured atomically when
+/// an invite is consumed.
+#[derive(Debug, Clone)]
+struct TenantGrant {
+    label: String,
+    generation: u64,
+}
+
 /// A pending authorization code: single-use, 10-minute, bound to the client,
 /// redirect URI and PKCE challenge of the authorize request plus the tenant
 /// the invite granted. In-memory only (see module docs).
@@ -440,6 +510,8 @@ pub struct AuthCode {
     pub redirect_uri: String,
     pub code_challenge: String,
     pub tenant: String,
+    /// Must still equal the tenant's persistent generation when exchanged.
+    pub tenant_generation: u64,
     pub scope: String,
     pub expires_at: u64,
 }
@@ -449,6 +521,7 @@ pub enum CodeTake {
     Ok(AuthCode),
     Expired,
     Unknown,
+    StoreUnavailable,
 }
 
 /// Live OAuth state hung off `HttpState` when the feature is configured.
@@ -458,6 +531,10 @@ pub struct OauthRuntime {
     state_path: PathBuf,
     pub access_ttl: Duration,
     pub store: Mutex<OauthStore>,
+    /// Fingerprint of the state file mirrored by `store`. The atomic writer
+    /// replaces the inode, so the fingerprint detects CLI revocations even on
+    /// filesystems whose mtime resolution is coarse.
+    disk_fingerprint: Mutex<Option<FileFingerprint>>,
     codes: Mutex<HashMap<String, AuthCode>>,
 }
 
@@ -476,12 +553,22 @@ impl OauthRuntime {
                 config.public_url
             );
         }
-        let store = OauthStore::load(&config.state_path)?;
+        // Pair the initial snapshot with its fingerprint under the same lock
+        // every cooperating writer uses; otherwise a CLI rename between load
+        // and stat could make an old snapshot look current forever.
+        let (store, disk_fingerprint) = {
+            let _lock = FileLock::acquire(&config.state_path)?;
+            (
+                OauthStore::load(&config.state_path)?,
+                file_fingerprint(&config.state_path),
+            )
+        };
         Ok(OauthRuntime {
             public_url: config.public_url.trim_end_matches('/').to_string(),
             state_path: config.state_path,
             access_ttl: config.access_ttl,
             store: Mutex::new(store),
+            disk_fingerprint: Mutex::new(disk_fingerprint),
             codes: Mutex::new(HashMap::new()),
         })
     }
@@ -493,6 +580,7 @@ impl OauthRuntime {
     /// is refreshed with the freshly-written state so the hot-path access-token
     /// lookups stay consistent. Holds the in-memory `store` mutex for the whole
     /// critical section, so server-internal callers also serialise.
+    #[cfg(test)]
     fn with_locked_store<R>(&self, mutate: impl FnOnce(&mut OauthStore) -> R) -> Result<R> {
         // Callers of this method always mutate (mint/rotate-success), so the
         // write is unconditional here. No-op/error paths use
@@ -511,20 +599,34 @@ impl OauthRuntime {
         &self,
         mutate: impl FnOnce(&mut OauthStore) -> (bool, R),
     ) -> Result<R> {
+        // Lock order throughout this type is fingerprint → store → codes.
+        // Keeping the fingerprint guard through the disk transaction prevents
+        // a concurrent request from tagging a stale mirror as current.
+        let mut fingerprint = self
+            .disk_fingerprint
+            .lock()
+            .expect("oauth disk fingerprint poisoned");
         let mut mirror = self.store.lock().expect("oauth store poisoned");
-        let (fresh, result) = mutate_state_locked(&self.state_path, mutate)?;
+        let (fresh, fresh_fingerprint, result) = mutate_state_locked(&self.state_path, mutate)?;
         *mirror = fresh;
+        let mut codes = self.codes.lock().expect("codes poisoned");
+        codes.retain(|_, code| mirror.tenant_generation(&code.tenant) == code.tenant_generation);
+        // This fingerprint was sampled while the same file lock still guarded
+        // `fresh`. If an external CLI writer commits immediately afterward,
+        // its new inode differs and the next lookup reloads it; an older mirror
+        // can never be tagged with a newer writer's fingerprint.
+        *fingerprint = fresh_fingerprint;
         Ok(result)
     }
 
     /// Mint and remember an authorization code. Expired leftovers are purged
     /// opportunistically so the map stays bounded without a reaper.
-    pub fn issue_code(
+    fn issue_code(
         &self,
         client_id: &str,
         redirect_uri: &str,
         code_challenge: &str,
-        tenant: &str,
+        tenant: &TenantGrant,
         scope: &str,
         now: u64,
     ) -> String {
@@ -537,7 +639,8 @@ impl OauthRuntime {
                 client_id: client_id.to_string(),
                 redirect_uri: redirect_uri.to_string(),
                 code_challenge: code_challenge.to_string(),
-                tenant: tenant.to_string(),
+                tenant: tenant.label.clone(),
+                tenant_generation: tenant.generation,
                 scope: scope.to_string(),
                 expires_at: now + AUTH_CODE_TTL.as_secs(),
             },
@@ -549,6 +652,13 @@ impl OauthRuntime {
     /// *any* redemption attempt — even one that subsequently fails PKCE —
     /// per RFC 6749 §4.1.2's replay guidance.
     pub fn take_code(&self, code: &str, now: u64) -> CodeTake {
+        // A CLI reset/destroy is out-of-process. Refreshing first both updates
+        // the access-token mirror and drops codes invalidated by its tenant
+        // generation before one can reach the exchange path.
+        if let Err(e) = self.refresh_if_changed() {
+            eprintln!("warning: failed to refresh oauth state before code exchange: {e:#}");
+            return CodeTake::StoreUnavailable;
+        }
         let mut codes = self.codes.lock().expect("codes poisoned");
         match codes.remove(code) {
             None => CodeTake::Unknown,
@@ -565,6 +675,10 @@ impl OauthRuntime {
     /// impossible by construction rather than by case analysis.
     pub fn lookup_access(&self, token: &str) -> std::result::Result<TokenEntry, &'static str> {
         let now = unix_now();
+        if let Err(e) = self.refresh_if_changed() {
+            eprintln!("warning: failed to refresh oauth state before access lookup: {e:#}");
+            return Err("oauth state unavailable");
+        }
         {
             let store = self.store.lock().expect("oauth store poisoned");
             if let Some(entry) = store.access_tokens.get(token) {
@@ -597,6 +711,31 @@ impl OauthRuntime {
             }
         }
     }
+
+    /// Reload an OAuth state file changed by an out-of-process CLI operation.
+    /// The steady state is one `stat`; a changed atomic-write inode triggers a
+    /// locked load and mirror swap. Pending codes whose tenant generation moved
+    /// are dropped in the same refresh.
+    fn refresh_if_changed(&self) -> Result<()> {
+        let mut loaded = self
+            .disk_fingerprint
+            .lock()
+            .expect("oauth disk fingerprint poisoned");
+        if file_fingerprint(&self.state_path) == *loaded {
+            return Ok(());
+        }
+
+        let _lock = FileLock::acquire(&self.state_path)?;
+        let fresh = OauthStore::load(&self.state_path)?;
+        let current = file_fingerprint(&self.state_path);
+
+        let mut mirror = self.store.lock().expect("oauth store poisoned");
+        *mirror = fresh;
+        let mut codes = self.codes.lock().expect("codes poisoned");
+        codes.retain(|_, code| mirror.tenant_generation(&code.tenant) == code.tenant_generation);
+        *loaded = current;
+        Ok(())
+    }
 }
 
 /// Seconds since the Unix epoch — the store's clock (persists across
@@ -619,6 +758,34 @@ fn unix_now() -> u64 {
 // serialises every writer; each holds the lock across the whole re-read →
 // mutate → write, so the on-disk state a writer overwrites is always the one it
 // just read — never a stale copy.
+
+/// Identity of the atomically-written OAuth state file mirrored in memory.
+/// `atomic_write_0600` renames a newly-created sibling over the live path, so
+/// `(device, inode)` is the strongest Unix signal; length + mtime retain useful
+/// behaviour on other targets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileFingerprint {
+    len: u64,
+    modified: Option<SystemTime>,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+fn file_fingerprint(path: &Path) -> Option<FileFingerprint> {
+    let metadata = std::fs::metadata(path).ok()?;
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt as _;
+    Some(FileFingerprint {
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+        #[cfg(unix)]
+        device: metadata.dev(),
+        #[cfg(unix)]
+        inode: metadata.ino(),
+    })
+}
 
 /// RAII `flock(LOCK_EX)` on a lock file; released (`LOCK_UN` + close) on drop.
 /// Unix-only, which is the deployment target (the state file is mode 0600 via
@@ -691,19 +858,20 @@ fn lock_path_for(state_path: &Path) -> PathBuf {
 /// a stale snapshot can never clobber a newer one. The `dirty` half of the
 /// closure's return lets no-op/error paths skip the (O(N), fsyncing) write
 /// entirely so they cannot be turned into a write-amplification lever. Returns
-/// the freshly-read store (so callers can refresh their in-memory cache) and the
-/// closure's own return value.
+/// the freshly-read store, its fingerprint sampled under the same lock, and
+/// the closure's own return value.
 fn mutate_state_locked<R>(
     state_path: &Path,
     mutate: impl FnOnce(&mut OauthStore) -> (bool, R),
-) -> Result<(OauthStore, R)> {
+) -> Result<(OauthStore, Option<FileFingerprint>, R)> {
     let _lock = FileLock::acquire(state_path)?;
     let mut store = OauthStore::load(state_path)?;
     let (dirty, result) = mutate(&mut store);
     if dirty {
         store.save(state_path)?;
     }
-    Ok((store, result))
+    let fingerprint = file_fingerprint(state_path);
+    Ok((store, fingerprint, result))
 }
 
 /// Mint an invite from the `token invite` CLI under the same file lock the
@@ -719,7 +887,7 @@ pub fn mint_invite_locked(
     redirect_uri: Option<String>,
     now: u64,
 ) -> Result<String> {
-    let (_store, code) = mutate_state_locked(state_path, |store| {
+    let (_store, _fingerprint, code) = mutate_state_locked(state_path, |store| {
         (
             true,
             store.mint_invite(
@@ -732,6 +900,21 @@ pub fn mint_invite_locked(
         )
     })?;
     Ok(code)
+}
+
+/// Revoke all persisted OAuth credentials for `tenant` under the same
+/// cross-process lock used by the server and invite CLI.
+///
+/// The store is re-read after locking, so this cannot overwrite a concurrent
+/// refresh rotation or invite mint with a stale snapshot. The generation is
+/// always advanced—even when no persisted entry remains—because an invite may
+/// already have become a pending in-memory authorization code in the daemon.
+pub fn revoke_tenant_locked(state_path: &Path, tenant: &str) -> Result<TenantRevocation> {
+    let (_store, _fingerprint, revoked) = mutate_state_locked(state_path, |store| {
+        let revoked = store.revoke_tenant(tenant);
+        (true, revoked)
+    })?;
+    Ok(revoked)
 }
 
 /// PKCE S256 (RFC 7636): `BASE64URL(SHA256(ascii(verifier))) == challenge`.
@@ -1143,15 +1326,19 @@ async fn authorize_submit(State(state): State<Arc<HttpState>>, body: Bytes) -> R
             let tenant = store
                 .consume_invite(&invite_code)
                 .expect("invite present, just peeked");
+            let grant = TenantGrant {
+                generation: store.tenant_generation(&tenant),
+                label: tenant,
+            };
             if let Some(client) = store.clients.get_mut(&expected_client) {
                 client.authorized_at = Some(now);
             }
-            (true, Ok(tenant))
+            (true, Ok(grant))
         })
     })
     .await;
     let tenant = match consumed {
-        Ok(Ok(tenant)) => tenant,
+        Ok(Ok(consumed)) => consumed,
         Ok(Err(InviteRejection::Unknown)) => return authorize_error_page("invalid invite code"),
         Ok(Err(InviteRejection::ClientMismatch)) => {
             return authorize_error_page("this invite is bound to a different client_id");
@@ -1207,6 +1394,12 @@ async fn token(State(state): State<Arc<HttpState>>, body: Bytes) -> Response {
                 CodeTake::Unknown => {
                     return token_error("invalid_grant", "unknown or already-used code");
                 }
+                CodeTake::StoreUnavailable => {
+                    return http_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "OAuth state is temporarily unavailable",
+                    );
+                }
             };
             // The code is bound to the client and redirect URI it was minted
             // for (RFC 6749 §4.1.3)...
@@ -1231,20 +1424,33 @@ async fn token(State(state): State<Arc<HttpState>>, body: Bytes) -> Response {
             let backend_name = state.config.backend_name.clone();
             let code_tenant = code.tenant.clone();
             let code_client = code.client_id.clone();
+            let code_generation = code.tenant_generation;
             let minted = run_store_write(&state, move |oauth| {
-                oauth.with_locked_store(|store| {
-                    store.mint_token_pair(
-                        &code_tenant,
-                        &backend_name,
-                        &code_client,
-                        oauth.access_ttl,
-                        now,
+                oauth.with_locked_store_if(|store| {
+                    if store.tenant_generation(&code_tenant) != code_generation {
+                        return (false, None);
+                    }
+                    (
+                        true,
+                        Some(store.mint_token_pair(
+                            &code_tenant,
+                            &backend_name,
+                            &code_client,
+                            oauth.access_ttl,
+                            now,
+                        )),
                     )
                 })
             })
             .await;
             let (access, refresh) = match minted {
-                Ok(pair) => pair,
+                Ok(Some(pair)) => pair,
+                Ok(None) => {
+                    return token_error(
+                        "invalid_grant",
+                        "authorization code was revoked by a tenant reset",
+                    );
+                }
                 Err(e) => {
                     return http_error(
                         StatusCode::INTERNAL_SERVER_ERROR,
@@ -1614,14 +1820,18 @@ mod tests {
             access_ttl: Duration::from_secs(3600),
         })
         .unwrap();
+        let alice = TenantGrant {
+            label: "alice".to_string(),
+            generation: 0,
+        };
 
         // Single-use: first take wins, second take finds nothing.
-        let code = runtime.issue_code("client-1", "https://a/cb", "chal", "alice", "", 1_000);
+        let code = runtime.issue_code("client-1", "https://a/cb", "chal", &alice, "", 1_000);
         assert!(matches!(runtime.take_code(&code, 1_001), CodeTake::Ok(c) if c.tenant == "alice"));
         assert!(matches!(runtime.take_code(&code, 1_001), CodeTake::Unknown));
 
         // Expiry: a code is dead AUTH_CODE_TTL after issuance...
-        let code = runtime.issue_code("client-1", "https://a/cb", "chal", "alice", "", 1_000);
+        let code = runtime.issue_code("client-1", "https://a/cb", "chal", &alice, "", 1_000);
         let expired_at = 1_000 + AUTH_CODE_TTL.as_secs();
         assert!(matches!(
             runtime.take_code(&code, expired_at),
@@ -1716,6 +1926,123 @@ mod tests {
             store.lookup_access("never-issued", 0).err(),
             Some(("unknown token", false))
         );
+    }
+
+    /// Tenant revocation removes every tenant-bound credential (including
+    /// invites) while preserving unrelated tenants and shared client records.
+    #[test]
+    fn tenant_revocation_is_complete_and_scoped() {
+        let ttl = Duration::from_secs(3600);
+        let mut store = OauthStore::default();
+        let client = store.register_client(vec!["https://a/cb".to_string()], None, 1_000);
+        store.mint_invite("alice", false, None, None, 1_000);
+        store.mint_invite("alice", true, None, None, 1_000);
+        let bob_invite = store.mint_invite("bob", false, None, None, 1_000);
+        let (alice_access, alice_refresh) =
+            store.mint_token_pair("alice", "mock", &client, ttl, 1_000);
+        let (bob_access, bob_refresh) = store.mint_token_pair("bob", "mock", &client, ttl, 1_000);
+
+        let revoked = store.revoke_tenant("alice");
+        assert_eq!(revoked.invites, 2);
+        assert_eq!(revoked.access_tokens, 1);
+        assert_eq!(revoked.refresh_tokens, 1);
+        assert_eq!(revoked.authorization_generation, 1);
+        assert!(!store.access_tokens.contains_key(&alice_access));
+        assert!(!store.refresh_tokens.contains_key(&alice_refresh));
+        assert!(store.invites.contains_key(&bob_invite));
+        assert!(store.access_tokens.contains_key(&bob_access));
+        assert!(store.refresh_tokens.contains_key(&bob_refresh));
+        assert!(
+            store.clients.contains_key(&client),
+            "clients are not tenant-owned"
+        );
+
+        // Even with no persisted Alice credential left, another revoke moves
+        // the generation so any still-pending authorization code stays dead.
+        let again = store.revoke_tenant("alice");
+        assert_eq!(
+            again.invites + again.access_tokens + again.refresh_tokens,
+            0
+        );
+        assert_eq!(again.authorization_generation, 2);
+    }
+
+    /// A separate CLI process can rewrite the OAuth file and the already-live
+    /// runtime rejects the old access token and pending code on its next use,
+    /// without a daemon restart. The refreshed mirror drops refresh tokens too.
+    #[test]
+    fn locked_tenant_revocation_is_live_in_running_runtime() {
+        let dir = scratch_dir("tenant_revoke_live");
+        let path = dir.join("oauth.json");
+        let (access, refresh) = {
+            let mut store = OauthStore::default();
+            let pair = store.mint_token_pair(
+                "alice",
+                "mock",
+                "client-1",
+                Duration::from_secs(3600),
+                unix_now(),
+            );
+            store.save(&path).unwrap();
+            pair
+        };
+        let runtime = OauthRuntime::new(OauthConfig {
+            public_url: "https://mcp.example.test".to_string(),
+            state_path: path.clone(),
+            access_ttl: Duration::from_secs(3600),
+        })
+        .unwrap();
+        let access_runtime = OauthRuntime::new(OauthConfig {
+            public_url: "https://mcp.example.test".to_string(),
+            state_path: path.clone(),
+            access_ttl: Duration::from_secs(3600),
+        })
+        .unwrap();
+        assert!(access_runtime.lookup_access(&access).is_ok());
+        let stale_alice = TenantGrant {
+            label: "alice".to_string(),
+            generation: 0,
+        };
+        let code_before = runtime.issue_code(
+            "client-1",
+            "https://a/cb",
+            "chal",
+            &stale_alice,
+            "",
+            unix_now(),
+        );
+
+        let revoked = revoke_tenant_locked(&path, "alice").unwrap();
+        assert_eq!((revoked.access_tokens, revoked.refresh_tokens), (1, 1));
+        // Models the tight race where authorize consumed the invite before the
+        // CLI revoke, but only inserts its in-memory code afterward: the code
+        // still carries the old generation and must be just as dead.
+        let code_after = runtime.issue_code(
+            "client-1",
+            "https://a/cb",
+            "chal",
+            &stale_alice,
+            "",
+            unix_now(),
+        );
+
+        assert!(matches!(
+            runtime.take_code(&code_before, unix_now()),
+            CodeTake::Unknown
+        ));
+        assert!(matches!(
+            runtime.take_code(&code_after, unix_now()),
+            CodeTake::Unknown
+        ));
+        assert!(matches!(
+            access_runtime.lookup_access(&access),
+            Err("unknown token")
+        ));
+        let mirror = access_runtime.store.lock().unwrap();
+        assert!(!mirror.refresh_tokens.contains_key(&refresh));
+        assert_eq!(mirror.tenant_generation("alice"), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // -- Invites ------------------------------------------------------------
@@ -2666,7 +2993,7 @@ mod tests {
 
         // Unknown refresh token: rotate_refresh returns Unknown, no mutation.
         {
-            let (_store, result) = mutate_state_locked(&path, |store| {
+            let (_store, _fingerprint, result) = mutate_state_locked(&path, |store| {
                 match store.rotate_refresh("never-issued", None, Duration::from_secs(3600), 2_000) {
                     Ok(r) => (true, Ok(r)),
                     Err(RotateError::ReuseRevoked) => (true, Err(RotateError::ReuseRevoked)),
@@ -2685,7 +3012,7 @@ mod tests {
 
         // Invalid invite consume: consume_invite returns None, no mutation.
         {
-            let (_store, wrote) = mutate_state_locked(&path, |store| {
+            let (_store, _fingerprint, wrote) = mutate_state_locked(&path, |store| {
                 let consumed = store.consume_invite("never-minted");
                 (consumed.is_some(), consumed)
             })

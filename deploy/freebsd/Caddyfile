@@ -1,0 +1,18 @@
+# The playground has one public origin. Caddy terminates TLS and forwards every
+# MCP and OAuth route to the provider's loopback-only listener. There is
+# intentionally no ai.bultmann.eu site until an actual UI exists.
+mcp.bultmann.eu {
+	reverse_proxy 127.0.0.1:8377
+
+	# Caddy's file writer rotates this log itself. Authorization headers are not
+	# included in the default access-log fields.
+	log {
+		output file /var/log/caddy/playground_access.log {
+			mode 0600
+			roll_size 10MiB
+			roll_keep 7
+			roll_keep_for 168h
+		}
+		format json
+	}
+}
