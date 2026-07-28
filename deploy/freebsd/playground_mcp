@@ -74,6 +74,13 @@ playground_mcp_prestart()
 		echo "playground_mcp requires RACCT/RCTL (kern.racct.enable=1)" >&2
 		return 1
 	fi
+	# The provider must enumerate and unmount its own single-file nullfs mounts.
+	# A nested jail with enforce_statfs=1 redacts those entries (including FSID),
+	# making safe teardown impossible even though mount(8) can create them.
+	if [ "$(/sbin/sysctl -n security.jail.enforce_statfs 2>/dev/null)" != 0 ]; then
+		echo "playground_mcp requires the trusted parent jail to use enforce_statfs=0" >&2
+		return 1
+	fi
 
 	# The process holds bearer/OAuth material in memory. Make the inherited
 	# core limit explicit and ensure daemon-created logs are private.

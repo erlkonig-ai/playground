@@ -1354,6 +1354,65 @@ fi
         Ok(String::from_utf8_lossy(&out.stdout).trim() == "1")
     }
 
+    /// Require complete child-mount visibility when this backend itself runs
+    /// inside a parent jail.
+    ///
+    /// With `security.jail.enforce_statfs=1`, FreeBSD can successfully create a
+    /// single-file nullfs mount for a child while hiding that mount from the
+    /// parent's `getfsstat(2)` view. That breaks both halves of our lifecycle
+    /// invariant: the exact `(source,target,nullfs)` post-check cannot see the
+    /// mount, and a later `unmount(2)` by that target can return `EINVAL`.
+    /// Accepting a weaker path-existence/statfs approximation would therefore
+    /// make provisioning appear successful while leaving fail-cleanup and
+    /// destroy unable to prove what they removed.
+    ///
+    /// Physical hosts (including SSH-driven ones) report `jailed=0` and need no
+    /// exception. A nested local deployment must explicitly set the parent
+    /// jail's `enforce_statfs=0`; otherwise fail before any clone/mount/jail
+    /// lifecycle mutation.
+    fn require_mount_lifecycle_visibility(&self) -> Result<()> {
+        let jailed = self.run(
+            &["sysctl", "-n", "security.jail.jailed"],
+            None,
+            ADMIN_TIMEOUT,
+        )?;
+        if !jailed.success() {
+            bail!(
+                "sysctl security.jail.jailed failed: {}",
+                jailed.stderr_lossy()
+            );
+        }
+        match String::from_utf8_lossy(&jailed.stdout).trim() {
+            "0" => Ok(()),
+            "1" => {
+                let visibility = self.run(
+                    &["sysctl", "-n", "security.jail.enforce_statfs"],
+                    None,
+                    ADMIN_TIMEOUT,
+                )?;
+                if !visibility.success() {
+                    bail!(
+                        "sysctl security.jail.enforce_statfs failed: {}",
+                        visibility.stderr_lossy()
+                    );
+                }
+                let value = String::from_utf8_lossy(&visibility.stdout);
+                if value.trim() != "0" {
+                    bail!(
+                        "nested FreeBSD jail requires security.jail.enforce_statfs=0 for exact \
+                         child mount verification and teardown (got '{}'; refusing before any \
+                         lifecycle mutation)",
+                        value.trim()
+                    );
+                }
+                Ok(())
+            }
+            other => {
+                bail!("sysctl security.jail.jailed returned unexpected value '{other}' (refusing)")
+            }
+        }
+    }
+
     /// Apply the configured per-jail `rctl(8)` rules IF host RACCT is enabled.
     /// Called after `jail -c` and whenever an already-running jail is reused:
     /// dynamic rules vanish on reboot, while FreeBSD's `rctl -a` semantics make
@@ -1636,29 +1695,83 @@ fi
         Ok(mp)
     }
 
-    /// Best-effort teardown of any leftovers from a previous session with the
-    /// same name (mirrors Lima's stale-instance delete before start). Errors
-    /// are ignored: on a clean host every step is a no-op failure.
-    fn cleanup_leftovers(&self, jail: &str) {
+    /// Fail-closed teardown of the clone created by the current provisioning
+    /// operation. This is not a general stale-instance sweeper: callers invoke
+    /// it only after their own `zfs clone` succeeded, so every surviving mount
+    /// and the dataset itself are operation-owned and must be proven gone.
+    fn cleanup_leftovers(&self, jail: &str, known_root: Option<&str>) -> Result<()> {
         let dataset = self.dataset(jail);
-        let _ = self.run(&["sudo", "-n", "jail", "-r", jail], None, ADMIN_TIMEOUT);
-        if let Ok(mp) = self.mountpoint(&dataset) {
-            // Unmount everything mounted under the (possibly half-made) clone —
-            // the two single-file pile mounts plus devfs — so the zfs destroy
-            // below is not blocked. Host pile files themselves are never removed.
-            for guest in [Self::GUEST_SELF_PILE, Self::GUEST_SHARED_PILE, "/dev"] {
-                let _ = self.run(
-                    &["sudo", "-n", "umount", "-f", &format!("{mp}{guest}")],
-                    None,
-                    ADMIN_TIMEOUT,
+        let removed = self.run(&["sudo", "-n", "jail", "-r", jail], None, ADMIN_TIMEOUT)?;
+        if !removed.success() {
+            let probe = self.run(&["sudo", "-n", "jls", "-n", "name"], None, ADMIN_TIMEOUT)?;
+            if !probe.success() {
+                bail!(
+                    "cleanup cannot prove jail '{jail}' absent after jail -r failed: {}",
+                    probe.stderr_lossy()
+                );
+            }
+            let expected = format!("name={jail}");
+            if String::from_utf8_lossy(&probe.stdout)
+                .split_whitespace()
+                .any(|field| field == expected)
+            {
+                bail!(
+                    "cleanup jail -r {jail} failed and jail remains live: {}",
+                    removed.stderr_lossy()
                 );
             }
         }
-        let _ = self.run(
+
+        let root = match known_root {
+            Some(root) => root.to_string(),
+            None => self.mountpoint(&dataset)?,
+        };
+        // Unmount everything mounted under the half-made clone. Exact mount
+        // enumeration is available because lifecycle preflight required it.
+        // An unmounted target is already clean; a mounted one must disappear
+        // from a separately-read table after the unmount attempt.
+        for guest in [Self::GUEST_SELF_PILE, Self::GUEST_SHARED_PILE, "/dev"] {
+            let target = format!("{root}{guest}");
+            let before = self.mount_listing()?;
+            if !before
+                .lines()
+                .any(|line| Self::line_target_is(line, &target))
+            {
+                continue;
+            }
+            let unmounted = self.run(
+                &["sudo", "-n", "umount", "-f", &target],
+                None,
+                ADMIN_TIMEOUT,
+            )?;
+            let after = self.mount_listing()?;
+            if after
+                .lines()
+                .any(|line| Self::line_target_is(line, &target))
+            {
+                bail!(
+                    "cleanup could not unmount {target}: {}",
+                    unmounted.stderr_lossy()
+                );
+            }
+        }
+
+        let destroyed = self.run(
             &["sudo", "-n", "zfs", "destroy", &dataset],
             None,
             ADMIN_TIMEOUT,
-        );
+        )?;
+        match self.dataset_state(&dataset) {
+            DatasetState::Absent => Ok(()),
+            DatasetState::Exists => bail!(
+                "cleanup zfs destroy {dataset} did not remove the operation-owned clone: {}",
+                destroyed.stderr_lossy()
+            ),
+            DatasetState::Unknown => bail!(
+                "cleanup cannot prove operation-owned dataset {dataset} absent after zfs destroy: {}",
+                destroyed.stderr_lossy()
+            ),
+        }
     }
 
     /// True iff a jail with this name currently exists (a running jail context).
@@ -1817,6 +1930,8 @@ fi
     /// belt-and-suspenders on the label-known paths (the leaf must derive from
     /// its own provenance regardless of who asked).
     fn reattach(&self, jail: &str, dataset: &str) -> Result<()> {
+        self.require_mount_lifecycle_visibility()?;
+
         // Prove ownership before ANY mount / `jail -c`: the stored provenance
         // must hash back to this exact leaf. Fails closed (unset/unreadable
         // property, or a stored label that derives a different jail).
@@ -2029,6 +2144,8 @@ impl SandboxBackend for JailBackend {
         // probe + operation-owned cleanup below, a concurrent create can neither
         // clone-over nor destroy a valid dataset.
         self.lifecycle.with_lock(&jail, || {
+            self.require_mount_lifecycle_visibility()?;
+
             // Idempotent: a tenant whose dataset already exists is already
             // provisioned. Don't clone or re-seed; just ensure the jail is up so
             // `provision` doubles as "converge to running" (reattach if the jail
@@ -2092,6 +2209,7 @@ impl SandboxBackend for JailBackend {
             // dataset), `created_clone` stays false, and the winner's valid dataset
             // is left untouched.
             let mut created_clone = false;
+            let mut provision_root: Option<String> = None;
 
             // Brand-new tenant: clone the template, then set up /dev, cwd, and
             // /etc/profile from scratch, then `jail -c`.
@@ -2132,6 +2250,7 @@ impl SandboxBackend for JailBackend {
                     .with_context(|| format!("set refquota on clone {dataset}"))?;
 
                 let root = self.mountpoint(&dataset)?;
+                provision_root = Some(root.clone());
 
                 // devfs, mounted manually (not via jail(8) params) so lifecycle
                 // stays explicit and destroy_session can unmount symmetrically.
@@ -2367,7 +2486,11 @@ impl SandboxBackend for JailBackend {
                     // stops the jail, unmounts, and `zfs destroy`s the dataset we
                     // just made — never a pre-existing one, because we only reach
                     // here with `created_clone == true`.
-                    self.cleanup_leftovers(&jail);
+                    if let Err(cleanup) = self.cleanup_leftovers(&jail, provision_root.as_deref()) {
+                        return Err(e.context(format!(
+                            "cleanup of operation-owned clone also failed: {cleanup:#}"
+                        )));
+                    }
                 } else {
                     // We failed AT or BEFORE the clone (e.g. the clone lost an
                     // EEXIST race to a concurrent provision, or the tri-state probe
@@ -2389,6 +2512,8 @@ impl SandboxBackend for JailBackend {
     }
 
     fn reattach_all(&self) -> Result<usize> {
+        self.require_mount_lifecycle_visibility()?;
+
         // Enumerate the direct children of the parent dataset (`-d 1`), so a
         // session's own child datasets (if any) don't masquerade as sessions.
         let out = self.run(
@@ -2595,6 +2720,8 @@ impl SandboxBackend for JailBackend {
         // (blocker #3): a concurrent provision/open of the SAME box cannot
         // interleave with this destroy.
         self.lifecycle.with_lock(jail, || {
+            self.require_mount_lifecycle_visibility()?;
+
             // PROVENANCE GATE (sol's reopened review, 2026-07-24): prove the
             // dataset's recorded tenant re-derives THIS leaf before we tear
             // anything down. The namespace guard above only proves the id LOOKS
@@ -2882,6 +3009,14 @@ mod tests {
             // Stateful mount table for the unscripted mount family.
             let a: Vec<&str> = argv.iter().map(String::as_str).collect();
             match a.as_slice() {
+                // The ordinary test host is physical. Nested-jail visibility
+                // tests override either sysctl through the explicit script.
+                ["sysctl", "-n", "security.jail.jailed"] => {
+                    return Ok(ok_with_stdout("0\n"));
+                }
+                ["sysctl", "-n", "security.jail.enforce_statfs"] => {
+                    return Ok(ok_with_stdout("0\n"));
+                }
                 // bare `mount` (possibly with sudo -n): render the live table.
                 ["sudo", "-n", "mount"] | ["mount"] => return Ok(self.render_mounts()),
                 // `mount -t <fstype> <src> <target>`: record it (once per exact
@@ -3394,6 +3529,93 @@ mod tests {
                 .iter()
                 .any(|c| c.iter().any(|a| a.starts_with("refquota="))),
             "no refquota set must be issued when disabled: {calls:?}"
+        );
+    }
+
+    /// A provider running inside a parent jail must see the child mounts it is
+    /// responsible for verifying and later removing. `enforce_statfs=1` hides
+    /// single-file nullfs entries and can make target unmount return EINVAL, so
+    /// reject that host shape before even probing/cloning a tenant dataset.
+    #[test]
+    fn nested_restricted_statfs_fails_before_lifecycle_mutation() {
+        let (backend, mock) = mock_provision_ready()
+            .reply(
+                &["sysctl", "-n", "security.jail.jailed"],
+                ok_with_stdout("1\n"),
+            )
+            .reply(
+                &["sysctl", "-n", "security.jail.enforce_statfs"],
+                ok_with_stdout("1\n"),
+            )
+            .into_backend();
+
+        let err = backend
+            .provision_sandbox(&spec("alice"))
+            .expect_err("restricted nested mount visibility must fail closed");
+        assert!(
+            format!("{err:#}").contains("security.jail.enforce_statfs=0"),
+            "{err:#}"
+        );
+        let calls = mock.calls();
+        assert!(
+            !calls.iter().any(|call| {
+                call.windows(2).any(|w| w == ["zfs", "clone"])
+                    || call.windows(2).any(|w| w == ["jail", "-c"])
+                    || call.windows(2).any(|w| w == ["mount", "-t"])
+            }),
+            "preflight failure must precede every lifecycle mutation: {calls:?}"
+        );
+    }
+
+    /// The supported nested shape is accepted: once the parent exposes its
+    /// child mount table, provisioning retains the same exact-tuple lifecycle
+    /// checks as a physical host.
+    #[test]
+    fn nested_visible_statfs_allows_provision() {
+        let (backend, mock) = mock_provision_ready()
+            .reply(
+                &["sysctl", "-n", "security.jail.jailed"],
+                ok_with_stdout("1\n"),
+            )
+            .reply(
+                &["sysctl", "-n", "security.jail.enforce_statfs"],
+                ok_with_stdout("0\n"),
+            )
+            .reply(&["sudo", "-n", "jls", "-j"], fail())
+            .reply(&["sudo", "-n", "zfs", "list"], dataset_absent())
+            .into_backend();
+
+        backend
+            .provision_sandbox(&spec("alice"))
+            .expect("visible nested mounts support exact lifecycle checks");
+        assert!(
+            mock.calls()
+                .iter()
+                .any(|call| call.windows(2).any(|w| w == ["zfs", "clone"])),
+            "accepted nested provision must reach clone"
+        );
+    }
+
+    /// Physical (including SSH-driven) hosts do not need a relaxed statfs jail
+    /// policy, and must not even query the nested-only knob.
+    #[test]
+    fn physical_host_skips_nested_statfs_requirement() {
+        let (backend, mock) = mock_provision_ready()
+            .reply(&["sudo", "-n", "jls", "-j"], fail())
+            .reply(&["sudo", "-n", "zfs", "list"], dataset_absent())
+            .into_backend();
+        backend
+            .provision_sandbox(&spec("alice"))
+            .expect("physical host provision");
+        assert!(
+            !mock.calls().iter().any(|call| {
+                call == &[
+                    "sysctl".to_string(),
+                    "-n".into(),
+                    "security.jail.enforce_statfs".into(),
+                ]
+            }),
+            "jailed=0 must not consult the nested-only setting"
         );
     }
 
@@ -4014,6 +4236,44 @@ mod tests {
         );
     }
 
+    /// Operation-owned cleanup is part of the provision result, not a
+    /// best-effort side effect. If a later provision step fails and an attached
+    /// mount cannot be removed, surface both the original failure and the
+    /// cleanup failure instead of claiming the half-created clone was handled.
+    #[test]
+    fn failed_provision_surfaces_cleanup_failure() {
+        let (backend, _mock) = mock_provision_ready()
+            .reply(&["sudo", "-n", "zfs", "list"], dataset_absent())
+            .reply(
+                &["sudo", "-n", "jail", "-c"],
+                HostOutput {
+                    exit_code: Some(1),
+                    stderr: b"jail create rejected\n".to_vec(),
+                    ..Default::default()
+                },
+            )
+            .reply(
+                &["sudo", "-n", "umount", "-f"],
+                HostOutput {
+                    exit_code: Some(1),
+                    stderr: b"device busy\n".to_vec(),
+                    ..Default::default()
+                },
+            )
+            .into_backend();
+
+        let err = backend
+            .provision_sandbox(&spec("alice"))
+            .expect_err("cleanup failure must be part of provision failure");
+        let message = format!("{err:#}");
+        assert!(message.contains("jail create rejected"), "{message}");
+        assert!(
+            message.contains("cleanup of operation-owned clone also failed")
+                && message.contains("could not unmount"),
+            "{message}"
+        );
+    }
+
     /// (d) FAIL-CLOSED MOUNT: a pile mount that reports success but does not
     /// actually appear in the mount table (a silently-failed mount) must abort
     /// the provision — never boot a jail whose PILE points at empty clone-local
@@ -4117,6 +4377,15 @@ mod tests {
                 _t: Duration,
             ) -> Result<HostOutput> {
                 self.calls.lock().unwrap().push(argv.to_vec());
+                if argv
+                    == [
+                        "sysctl".to_string(),
+                        "-n".to_string(),
+                        "security.jail.jailed".to_string(),
+                    ]
+                {
+                    return Ok(ok_with_stdout("0\n"));
+                }
                 if argv.get(2).map(String::as_str) == Some("zfs")
                     && argv.get(3).map(String::as_str) == Some("list")
                 {
