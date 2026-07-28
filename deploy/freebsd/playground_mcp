@@ -40,8 +40,8 @@ load_rc_config $name
 : ${playground_mcp_logfile:="/var/log/playground_mcp.log"}
 : ${playground_mcp_flags:=""}
 
-# The jail backend shells out to `sudo -n zfs/jail/jexec ...`; sudo is a
-# package binary (/usr/local/bin), which the rc environment's PATH lacks.
+# Keep package binaries available to any child tooling. The root-only local
+# backend itself strips its operator-facing `sudo -n` prefix before spawning.
 export PATH="/usr/local/sbin:/usr/local/bin:${PATH}"
 
 pidfile="/var/run/${name}.pid"
