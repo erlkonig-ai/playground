@@ -72,9 +72,10 @@ struct McpArgs {
     #[arg(long, env = "PLAYGROUND_FACULTIES_SRC")]
     faculties_src: Option<PathBuf>,
     /// Jail backend: SSH host that runs the jails (needs BatchMode keys +
-    /// non-interactive root via `sudo -n`).
+    /// non-interactive root via `sudo -n`). Required only for a remote jail
+    /// backend; Lima and `--jail-local` do not use it.
     #[arg(long, env = "PLAYGROUND_JAIL_HOST")]
-    jail_host: String,
+    jail_host: Option<String>,
     /// Jail backend: ZFS template snapshot cloned per session.
     #[arg(long, default_value = "aitemp/playground/template@base")]
     jail_template_snapshot: String,
@@ -128,7 +129,7 @@ impl McpBackendKind {
         state_root: Option<PathBuf>,
         template: Option<PathBuf>,
         faculties_src: Option<PathBuf>,
-        jail_host: String,
+        jail_host: Option<String>,
         jail_local: bool,
         jail_prefix: String,
         jail_template_snapshot: String,
@@ -161,7 +162,7 @@ impl McpBackendKind {
                 let mut backend = if jail_local {
                     sandbox::jail::JailBackend::local()
                 } else {
-                    sandbox::jail::JailBackend::ssh(jail_host)
+                    sandbox::jail::JailBackend::ssh(require_jail_host(jail_host)?)
                 };
                 backend.jail_prefix = jail_prefix;
                 backend.template_snapshot = jail_template_snapshot;
@@ -174,6 +175,12 @@ impl McpBackendKind {
             }
         }
     }
+}
+
+fn require_jail_host(jail_host: Option<String>) -> Result<String> {
+    jail_host
+        .filter(|host| !host.trim().is_empty())
+        .context("remote jail backend requires --jail-host or PLAYGROUND_JAIL_HOST")
 }
 
 /// Normalise a quota CLI value: an empty / `0` / `none` string disables the
@@ -237,9 +244,10 @@ struct McpHttpArgs {
     #[arg(long, env = "PLAYGROUND_FACULTIES_SRC")]
     faculties_src: Option<PathBuf>,
     /// Jail backend: SSH host that runs the jails (needs BatchMode keys +
-    /// non-interactive root via `sudo -n`).
+    /// non-interactive root via `sudo -n`). Required only for a remote jail
+    /// backend; Lima and `--jail-local` do not use it.
     #[arg(long, env = "PLAYGROUND_JAIL_HOST")]
-    jail_host: String,
+    jail_host: Option<String>,
     /// Jail backend: ZFS template snapshot cloned per session.
     #[arg(long, default_value = "aitemp/playground/template@base")]
     jail_template_snapshot: String,
@@ -328,9 +336,10 @@ struct UserBackendArgs {
     #[arg(long, env = "PLAYGROUND_FACULTIES_SRC")]
     faculties_src: Option<PathBuf>,
     /// Jail backend: SSH host that runs the jails (needs BatchMode keys +
-    /// non-interactive root via `sudo -n`).
+    /// non-interactive root via `sudo -n`). Required only for a remote jail
+    /// backend; Lima and `--jail-local` do not use it.
     #[arg(long, env = "PLAYGROUND_JAIL_HOST")]
-    jail_host: String,
+    jail_host: Option<String>,
     /// Jail backend: ZFS template snapshot cloned per session.
     #[arg(long, default_value = "aitemp/playground/template@base")]
     jail_template_snapshot: String,
@@ -375,7 +384,7 @@ impl UserBackendArgs {
                 let mut backend = if self.jail_local {
                     sandbox::jail::JailBackend::local()
                 } else {
-                    sandbox::jail::JailBackend::ssh(self.jail_host.clone())
+                    sandbox::jail::JailBackend::ssh(require_jail_host(self.jail_host.clone())?)
                 };
                 backend.jail_prefix = self.jail_prefix.clone();
                 backend.template_snapshot = self.jail_template_snapshot.clone();
@@ -425,20 +434,20 @@ impl UserBackendArgs {
 
     /// Best-effort liveness probe for `user list`: is the tenant's box currently
     /// running? Both persistent backends can answer.
-    fn running_for_label(&self, label: &str) -> bool {
-        match self.backend {
+    fn running_for_label(&self, label: &str) -> Result<bool> {
+        Ok(match self.backend {
             McpBackendKind::Jail => {
                 let mut b = if self.jail_local {
                     sandbox::jail::JailBackend::local()
                 } else {
-                    sandbox::jail::JailBackend::ssh(self.jail_host.clone())
+                    sandbox::jail::JailBackend::ssh(require_jail_host(self.jail_host.clone())?)
                 };
                 b.jail_prefix = self.jail_prefix.clone();
                 b.jail_running_for_label(label)
             }
             McpBackendKind::Lima => sandbox::lima::LimaBackend::new(self.instance_prefix.clone())
                 .instance_running_for_label(label),
-        }
+        })
     }
 }
 
@@ -790,7 +799,7 @@ fn run_user_list(args: UserListArgs) -> Result<()> {
     }
 
     for tenant in &tenants {
-        let live = args.backend.running_for_label(tenant);
+        let live = args.backend.running_for_label(tenant)?;
         println!("{tenant}\t{}", if live { "live" } else { "down" });
     }
     Ok(())
