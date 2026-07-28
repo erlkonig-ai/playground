@@ -7,7 +7,7 @@ running provider has no host transport: `playground mcp-http --backend jail
 `zfs/jail/jexec ...` directly ([`LocalRunner`], no ssh hop; when the daemon is
 root it strips the operator-facing `sudo -n` prefix before spawning);
 sessions are ZFS clones of
-`airoot/jails/playground/jails/template@base`, jails are `playground-*`, and
+`airoot/jails/playground/jails/template-faculties-df087a2@base`, jails are `playground-*`, and
 the parent jail is delegated only that ZFS subtree.
 
 The trusted parent must set `enforce_statfs = 0`. FreeBSD otherwise allows it
@@ -16,14 +16,14 @@ their FSIDs) from the parent afterward, which prevents exact verification and
 safe unmount. This setting applies only to the operator-controlled parent;
 tenant child jails retain their restricted/default view.
 
-**Deployment status (2026-07-28): not live.** This directory now contains the
-minimal candidate service, Caddy, rotation, configuration, and smoke-test
-artifacts. They have not been applied to a host. The public
-`mcp.bultmann.eu` AAAA record exists but ports 80/443 currently refuse;
-`mcp.bultmann.eu` has no public A record and the local resolver does not return
-the public record. `ai.bultmann.eu` points at a different host, has no working
-TLS service, and has no playground UI to deploy, so this profile deliberately
-does not claim that origin.
+**Deployment status (2026-07-28): private staging.** The exact provider,
+useful child template, generic bootstrap, pilot tenant, and loopback service are
+installed on the intended host. The private smoke, public Caddy/TLS edge,
+end-to-end OAuth flow, and real-client flows are not yet proven, so this profile
+does not claim public go-live. The `mcp.bultmann.eu` AAAA record already points
+at the sandbox host; there is no public A record. The current administration
+path is `ssh -6 jp@ai.bultmann.eu`: that hostname's IPv4 address is a different
+SSH host, so do not allow SSH or rsync to fall back to IPv4.
 
 Two hosting modes exist and stay interchangeable:
 
@@ -81,16 +81,19 @@ separate artifact.
 # one-time toolchain: rust 1.96 as of 2026-07; rsync for the source sync
 sudo pkg install -y rust rsync
 
+# The current administration path is IPv6-only. IPv4 is a different host.
+JAIL_HOST='jp@ai.bultmann.eu'
+
 # From the local playground checkout, sync only this repository. NOTE the
 # --exclude='*.pile': no operator pile may land on this server, ever.
-rsync -a --delete \
+rsync -a -e 'ssh -6' --delete \
   --exclude 'target/' --exclude '.git/' --exclude '.claude/' \
   --exclude '*.pile' --exclude 'models/' --exclude 'weights/' \
   --exclude '__pycache__/' \
   ./ $JAIL_HOST:playground-build/playground/
 
 # verify the pile rail held before anything else:
-ssh $JAIL_HOST "find playground-build -name '*.pile'"   # must print nothing
+ssh -6 "$JAIL_HOST" "find playground-build -name '*.pile'"   # must print nothing
 
 cd ~/playground-build/playground
 cargo build --release --locked --no-default-features --features mcp-http
@@ -138,19 +141,31 @@ sudo install -o root -g wheel -m 0444 <generic-bootstrap.pile> \
 # root cannot add them after the child exists. `user create` then provisions
 # the persistent jail and mints its token; --jail-local uses no ssh hop.
 test "$(sysctl -n security.jail.enforce_statfs)" = 0
-sudo playground user create <label> --backend jail --jail-local \
-  --jail-external-rctl \
-  --jail-template-snapshot airoot/jails/playground/jails/template@base \
-  --jail-dataset-parent airoot/jails/playground/jails \
-  --jail-pile-root /var/db/playground/piles \
-  --jail-bootstrap-pile /var/db/playground/bootstrap.pile \
-  --tokens /var/db/playground/tokens.json
-# the token is printed exactly once — hand it to the tenant out of band
+TENANT='<label>'
+sudo env TENANT="$TENANT" sh -c '
+  umask 077
+  install -o root -g wheel -m 0600 /dev/null "/var/db/playground/$TENANT.token"
+  exec /usr/local/bin/playground user create "$TENANT" \
+    --backend jail --jail-local --jail-external-rctl \
+    --jail-template-snapshot airoot/jails/playground/jails/template-faculties-df087a2@base \
+    --jail-dataset-parent airoot/jails/playground/jails \
+    --jail-pile-root /var/db/playground/piles \
+    --jail-bootstrap-pile /var/db/playground/bootstrap.pile \
+    --tokens /var/db/playground/tokens.json \
+    > "/var/db/playground/$TENANT.token"
+'
+# The one-time token is now in a root-only file. Never print it; transfer it to
+# the tenant out of band.
 
 # Browser connectors use OAuth instead. Mint a single-use human-gate code and
-# hand that code to the same tenant out of band:
-sudo playground invite --tenant <label> \
-  --oauth-state /var/db/playground/oauth.json
+# capture it in another root-only file for out-of-band delivery:
+sudo env TENANT="$TENANT" sh -c '
+  umask 077
+  install -o root -g wheel -m 0600 /dev/null "/var/db/playground/$TENANT.invite"
+  exec /usr/local/bin/playground invite --tenant "$TENANT" \
+    --oauth-state /var/db/playground/oauth.json \
+    > "/var/db/playground/$TENANT.invite"
+'
 
 # Any later administrative reset/destroy must include this same OAuth path, or
 # PLAYGROUND_MCP_OAUTH_STATE, so every credential family is revoked together:
@@ -158,16 +173,16 @@ sudo playground invite --tenant <label> \
 #   playground user destroy <label> ... --oauth-state /var/db/playground/oauth.json
 
 # Review deploy/freebsd/rc.conf.example, then install those exact assignments
-# (the long flags value pins this parent jail's delegated dataset topology).
+# (the long args value pins this parent jail's delegated dataset topology).
 sudo sysrc playground_mcp_bind='127.0.0.1:8377'
 sudo sysrc playground_mcp_tokens='/var/db/playground/tokens.json'
-sudo sysrc playground_mcp_args='--jail-external-rctl --jail-template-snapshot airoot/jails/playground/jails/template@base --jail-dataset-parent airoot/jails/playground/jails --jail-pile-root /var/db/playground/piles --jail-bootstrap-pile /var/db/playground/bootstrap.pile --jail-clone-refquota 10G --jail-pile-quota 50G --public-url https://mcp.bultmann.eu --oauth-state /var/db/playground/oauth.json'
+sudo sysrc playground_mcp_args='--jail-external-rctl --jail-template-snapshot airoot/jails/playground/jails/template-faculties-df087a2@base --jail-dataset-parent airoot/jails/playground/jails --jail-pile-root /var/db/playground/piles --jail-bootstrap-pile /var/db/playground/bootstrap.pile --jail-clone-refquota 10G --jail-pile-quota 50G --public-url https://mcp.bultmann.eu --oauth-state /var/db/playground/oauth.json'
 sudo sysrc caddy_config='/usr/local/etc/caddy/Caddyfile'
-# Validate both services before enabling either public listener.
-sudo service caddy configtest
-sudo sysrc playground_mcp_enable=YES caddy_enable=YES
+# Validate Caddy without requiring it to be enabled, but keep the public edge
+# off until both private smoke passes below succeed.
+sudo service caddy oneconfigtest
+sudo sysrc playground_mcp_enable=YES caddy_enable=NO
 sudo service playground_mcp start
-sudo service caddy start
 ```
 
 The service runs as root (jail(8)/zfs(8) need it; `LocalRunner` removes the
@@ -189,44 +204,37 @@ pile or any other pile on the host. Append-only (`chflags sappnd`,
 malicious-proof once `securelevel>=1`) bounds the damage to appends, not
 truncation.
 
-## Verify (loopback round-trip)
+## Verify privately before enabling Caddy
 
 ```sh
-TOK=<token>
-H='Content-Type: application/json'
-A="Authorization: Bearer $TOK"
+TENANT='<label>'
 
-# initialize — note the mcp-session-id response header
-SID=$(curl -si -H "$A" -H "$H" -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}' \
-  http://127.0.0.1:8377/mcp | tr -d '\r' | awk 'tolower($1)=="mcp-session-id:"{print $2}')
+# The harness writes only a disposable /tmp marker in the persistent jail. It
+# closes its handle, reconnects, and cleans the marker; it neither mutates a
+# pile nor calls destroy_session. The token remains inside the root shell.
+sudo env TENANT="$TENANT" sh -c '
+  export PLAYGROUND_TOKEN="$(cat "/var/db/playground/$TENANT.token")"
+  PLAYGROUND_BASE_URL=http://127.0.0.1:8377 \
+    PLAYGROUND_PRIVATE_HTTP=YES \
+    /usr/local/libexec/playground_mcp-smoke
+'
 
-# open a jail session; HTTP auth supplies the tenant and the jail backend uses
-# its server-born self.pile, so the public tool exposes no host path argument
-curl -s -H "$A" -H "$H" -H "Mcp-Session-Id: $SID" -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"open_session","arguments":{}}}' http://127.0.0.1:8377/mcp
+# Then prove exact job cancellation on FreeBSD using the same private endpoint.
+sudo env TENANT="$TENANT" sh -c '
+  export PLAYGROUND_TOKEN="$(cat "/var/db/playground/$TENANT.token")"
+  PLAYGROUND_BASE_URL=http://127.0.0.1:8377 \
+    PLAYGROUND_PRIVATE_HTTP=YES \
+    PLAYGROUND_FREEBSD_JOB_SMOKE=YES \
+    /usr/local/libexec/playground_mcp-smoke
+'
 
-# Copy the exact opaque session id returned above. It includes a hash of the
-# tenant identity; deriving it from a display label is deliberately unsupported.
-BOX='<session-id-returned-by-open_session>'
-
-# Run something in the jail; also prove the pile mounts are live and append-only
-# (append lands, truncate is refused).
-curl -s -H "$A" -H "$H" -H "Mcp-Session-Id: $SID" -d "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"exec\",\"arguments\":{\"session\":\"$BOX\",\"command\":\"uname -a; id; ls -la /pile /shared; echo APPEND-OK >> /pile/self.pile && echo appended; (: > /pile/self.pile) 2>/dev/null || echo truncate-blocked\"}}}" http://127.0.0.1:8377/mcp
-
-# detach this client handle; the persistent jail deliberately remains
-curl -s -H "$A" -H "$H" -H "Mcp-Session-Id: $SID" -d "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"close_session\",\"arguments\":{\"session\":\"$BOX\"}}}" http://127.0.0.1:8377/mcp
-
-# permanent removal is explicit (open again first if the prior close detached
-# the provider registry), and removes the jail + clone but NOT host piles:
-curl -s -H "$A" -H "$H" -H "Mcp-Session-Id: $SID" -d '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"open_session","arguments":{}}}' http://127.0.0.1:8377/mcp
-curl -s -H "$A" -H "$H" -H "Mcp-Session-Id: $SID" -d "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"tools/call\",\"params\":{\"name\":\"destroy_session\",\"arguments\":{\"session\":\"$BOX\"}}}" http://127.0.0.1:8377/mcp
-
-jls name | grep '^playground-' || echo "no live playground jails"
-zfs list -r airoot/jails/playground/jails   # removed tenant clone is absent
-ls /var/db/playground/piles                # tenant + shared piles persist
+# Only after both private passes may Caddy become public.
+sudo sysrc caddy_enable=YES
+sudo service caddy start
 ```
 
 Interim remote use without any exposure decision: an SSH port-forward
-(`ssh -L 8377:127.0.0.1:8377 $JAIL_HOST`) gives an operator with an
+(`ssh -6 -L 8377:127.0.0.1:8377 "$JAIL_HOST"`) gives an operator with an
 ssh account the full service on their own loopback.
 
 ## Resource limits (repair #4 — bound every tenant-controllable resource)
@@ -370,11 +378,10 @@ waits on evidence from the actual host; documentation is not that evidence.
 
 Required before opening ports 80/443:
 
-1. **Recover the real administration path and re-audit the target.** The host
-   reached through the current Ansible alias no longer exposes the previously
-   observed `playground` parent jail, while direct SSH to the public IPv6
-   address currently refuses. Confirm the intended physical host and parent
-   jail before copying anything.
+1. **Use and re-audit the real administration path.** Force
+   `ssh -6 jp@ai.bultmann.eu`; its IPv4 address is a different SSH host. Confirm
+   the intended physical host and `playground` parent jail before copying
+   anything, and never accept an IPv4 host-key change as part of this deploy.
 2. **Prove the parent boundary.** Version or inspect the real parent-jail and
    physical-host PF configuration: the service must be root only inside that
    parent, delegated only `airoot/jails/playground/jails`, with child networking
