@@ -391,12 +391,13 @@ measured on the real FreeBSD 15.1 host rather than inferred from configuration:
   disabled, `securelevel=1`, a 10 GiB ZFS refquota, six host-owned RCTL rules,
   and exact single-file append-only self/shared pile mounts. The pile dataset has
   a 50 GiB quota.
-- A physical reboot proved RACCT, the parent's `enforce_statfs=0`, provider rc
-  startup, persistent tenant discovery, exactly one reconstructed devfs, both
-  exact pile mounts, and child reattachment without manual intervention. The
-  static tenant token and filesystem state survived. Private smoke then proved
-  all seven MCP tools, close/reopen persistence, and exact cancellation of a
-  daemonized TERM-ignoring descendant while an unrelated process survived.
+- Physical reboots proved RACCT, the parent's `enforce_statfs=0`, provider and
+  Caddy rc startup, persisted-certificate reuse, persistent tenant discovery,
+  exactly one reconstructed devfs, both exact pile mounts, and child reattachment
+  without manual intervention. The static tenant token and filesystem state
+  survived. Private smoke then proved all seven MCP tools, close/reopen
+  persistence, and exact cancellation of a daemonized TERM-ignoring descendant
+  while an unrelated process survived.
 - Through the public hostname, the static-bearer smoke proved TLS, MCP
   initialization, the seven-tool surface, synchronous execution, and persistent
   reconnect. A real asynchronous job was started, incrementally polled through
