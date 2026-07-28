@@ -622,7 +622,10 @@ async fn post_mcp(
     match response {
         // Notification (no `id`): accepted, nothing to say. Per spec, 202.
         None => StatusCode::ACCEPTED.into_response(),
-        Some(value) => {
+        Some(mut value) => {
+            if method == "tools/list" && state.config.backend_name == "jail" {
+                specialize_host_owned_jail_tools(&mut value);
+            }
             let mut response = (
                 StatusCode::OK,
                 [(header::CONTENT_TYPE, "application/json")],
@@ -640,6 +643,37 @@ async fn post_mcp(
             response
         }
     }
+}
+
+/// The public jail service derives identity and pile placement from the bearer
+/// credential and its host-owned storage topology. Keep those implementation
+/// details off the model-visible tool schema: a client opens *its* persistent
+/// sandbox, optionally choosing only process-local cwd/env settings.
+fn specialize_host_owned_jail_tools(response: &mut Value) {
+    let Some(tools) = response
+        .get_mut("result")
+        .and_then(|result| result.get_mut("tools"))
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    let Some(open) = tools
+        .iter_mut()
+        .find(|tool| tool.get("name").and_then(Value::as_str) == Some("open_session"))
+    else {
+        return;
+    };
+    open["description"] = json!(
+        "Open or reattach your persistent sandbox and return its session id. Identity and piles come from your authenticated account."
+    );
+    open["inputSchema"] = json!({
+        "type": "object",
+        "properties": {
+            "cwd": { "type": "string", "description": "Working directory the shell starts in." },
+            "env": { "type": "object", "description": "Extra environment variables.", "additionalProperties": { "type": "string" } }
+        },
+        "additionalProperties": false
+    });
 }
 
 /// `GET /mcp`: the SSE seam, deliberately unimplemented in v1.
@@ -842,7 +876,9 @@ fn validate_session(
 /// Pin `tools/call` to the token's tenant, before dispatch.
 ///
 /// - `open_session`: an explicit `tenant` argument must match the token's; a
-///   missing one is filled in from it (clients need not know their label).
+///   missing one is filled in from it (clients need not know their label). For
+///   the host-owned jail backend the ignored pile path is also synthesized, so
+///   its public tool accepts `{}` and exposes no host-storage plumbing.
 /// - `exec`/`job_exec`/`close_session`/`destroy_session`: the sandbox session named in `arguments.session`
 ///   must belong to the token's tenant. Unknown sessions fall through — the
 ///   provider reports those as tool errors itself, and telling a prober
@@ -867,22 +903,41 @@ fn enforce_tenant_scope(
 
     match name {
         "open_session" => {
-            let args = request
-                .get_mut("params")
-                .and_then(|p| p.get_mut("arguments"));
-            match args
-                .as_ref()
-                .and_then(|a| a.get("tenant"))
-                .and_then(Value::as_str)
-            {
+            let Some(params) = request.get_mut("params").and_then(Value::as_object_mut) else {
+                return Ok(());
+            };
+            let args = params
+                .entry("arguments".to_string())
+                .or_insert_with(|| json!({}));
+            if args.is_null() {
+                *args = json!({});
+            }
+            let Some(map) = args.as_object_mut() else {
+                return Ok(());
+            };
+            match map.get("tenant").and_then(Value::as_str) {
                 Some(tenant) if tenant != token.tenant => Err(http_error(
                     StatusCode::FORBIDDEN,
                     &format!("token is not authorized for tenant '{tenant}'"),
                 )),
-                Some(_) => Ok(()),
+                Some(_) => {
+                    if state.config.backend_name == "jail" {
+                        map.insert(
+                            "pile_host_path".to_string(),
+                            json!("/host-owned/by-jail-backend/self.pile"),
+                        );
+                        map.remove("pile_guest_path");
+                    }
+                    Ok(())
+                }
                 None => {
-                    if let Some(Value::Object(map)) = args {
-                        map.insert("tenant".to_string(), json!(token.tenant));
+                    map.insert("tenant".to_string(), json!(token.tenant));
+                    if state.config.backend_name == "jail" {
+                        map.insert(
+                            "pile_host_path".to_string(),
+                            json!("/host-owned/by-jail-backend/self.pile"),
+                        );
+                        map.remove("pile_guest_path");
                     }
                     Ok(())
                 }
@@ -985,12 +1040,20 @@ pub(crate) mod tests {
         allowed_origins: Vec<String>,
         idle_timeout: Duration,
     ) -> Arc<HttpState> {
+        test_state_for_backend(allowed_origins, idle_timeout, "mock")
+    }
+
+    fn test_state_for_backend(
+        allowed_origins: Vec<String>,
+        idle_timeout: Duration,
+        backend_name: &str,
+    ) -> Arc<HttpState> {
         let provider = SandboxProvider::new(Box::new(MockBackend::default()));
         let server = McpServer::new(provider);
         let mut tokens = HashMap::new();
         for (token, tenant, backend) in [
-            ("tok-alice", "alice", "mock"),
-            ("tok-bob", "bob", "mock"),
+            ("tok-alice", "alice", backend_name),
+            ("tok-bob", "bob", backend_name),
             ("tok-carol-lima", "carol", "lima"),
         ] {
             tokens.insert(
@@ -1008,7 +1071,7 @@ pub(crate) mod tests {
             oauth: None,
             config: HttpServerConfig {
                 bind: "127.0.0.1:0".parse().unwrap(),
-                backend_name: "mock".to_string(),
+                backend_name: backend_name.to_string(),
                 allowed_origins,
                 idle_timeout,
                 max_body_bytes: DEFAULT_MAX_BODY_BYTES,
@@ -1274,6 +1337,85 @@ pub(crate) mod tests {
             &rpc(8, "tools/list", json!({})),
         );
         assert_eq!(gone.status, 404);
+    }
+
+    /// The public jail profile carries no caller-selected tenant or host path:
+    /// auth supplies identity and Model B supplies the host-owned piles.
+    #[test]
+    fn jail_http_open_session_schema_and_call_hide_host_plumbing() {
+        let state = test_state_for_backend(vec![], Duration::from_secs(3600), "jail");
+        let token = state.tokens.resolve("tok-alice").expect("alice token");
+        let mut hostile = rpc(
+            0,
+            "tools/call",
+            json!({
+                "name": "open_session",
+                "arguments": {
+                    "pile_host_path": "/attacker/chosen.pile",
+                    "pile_guest_path": "/attacker/chosen-guest",
+                }
+            }),
+        );
+        enforce_tenant_scope(&state, &token, &mut hostile).expect("scope synthesis");
+        assert_eq!(hostile["params"]["arguments"]["tenant"], "alice");
+        assert_eq!(
+            hostile["params"]["arguments"]["pile_host_path"],
+            "/host-owned/by-jail-backend/self.pile"
+        );
+        assert!(
+            hostile["params"]["arguments"]
+                .get("pile_guest_path")
+                .is_none(),
+            "caller-controlled guest path must be removed"
+        );
+
+        let addr = spawn_server(state);
+        let agent = agent();
+        let tok = Some("tok-alice");
+        let init = post(
+            &agent,
+            addr,
+            tok,
+            None,
+            None,
+            &rpc(1, "initialize", json!({ "protocolVersion": "2025-06-18" })),
+        );
+        let session = init.session.expect("initialize must issue a session");
+
+        let listed = post(
+            &agent,
+            addr,
+            tok,
+            Some(&session),
+            None,
+            &rpc(2, "tools/list", json!({})),
+        );
+        let open = listed.body["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "open_session")
+            .expect("open_session schema");
+        let properties = open["inputSchema"]["properties"].as_object().unwrap();
+        assert!(!properties.contains_key("tenant"));
+        assert!(!properties.contains_key("pile_host_path"));
+        assert!(open["inputSchema"].get("required").is_none());
+
+        let opened = post(
+            &agent,
+            addr,
+            tok,
+            Some(&session),
+            None,
+            &rpc(
+                3,
+                "tools/call",
+                json!({ "name": "open_session", "arguments": {} }),
+            ),
+        );
+        assert_eq!(opened.status, 200);
+        assert_eq!(opened.body["result"]["isError"], false);
+        assert_eq!(opened.body["result"]["content"][0]["text"], "mock-alice");
     }
 
     #[test]

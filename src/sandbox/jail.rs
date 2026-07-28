@@ -709,22 +709,16 @@ impl JailBackend {
     }
 
     /// Host-PRIVATE staging directory (mode 0700, root-owned) where the bootstrap
-    /// `cp` writes the pile temp before it is published into place. DERIVED as a
-    /// sibling of `pile_root` (`<pile_root>/../staging`) so it stays on the SAME
-    /// ZFS filesystem — the publish is a hardlink, which requires same-FS — and
-    /// automatically tracks a `--jail-pile-root` override instead of diverging
-    /// from it. It is NEVER nullfs-mounted into any jail, so no tenant can
-    /// pre-place a symlink at the temp path and trick the privileged `cp` into
-    /// following it (the 2026-07-24 symlink confused-deputy class).
+    /// `cp` writes the pile temp before it is published into place. It lives
+    /// inside `pile_root` (`<pile_root>/.staging`) so it is necessarily on the
+    /// SAME ZFS filesystem — the publish is a hardlink, which requires same-FS —
+    /// even when `pile_root` is its own quota-bearing dataset. Only the pile
+    /// FILES are nullfs-mounted into jails; this private root-owned directory is
+    /// never mounted, so no tenant can pre-place a symlink at the temp path and
+    /// trick the privileged `cp` into following it (the 2026-07-24 symlink
+    /// confused-deputy class).
     fn staging_root(&self) -> String {
-        // Sibling of pile_root: strip the last path component and append
-        // `/staging`. `pile_root` is always an absolute path with at least one
-        // component (default `/aitemp/playground/piles`), so `rfind('/')`
-        // succeeds; a degenerate root falls back to a `.staging` suffix.
-        match self.pile_root.rfind('/') {
-            Some(i) if i > 0 => format!("{}/staging", &self.pile_root[..i]),
-            _ => format!("{}.staging", self.pile_root),
-        }
+        format!("{}/.staging", self.pile_root.trim_end_matches('/'))
     }
 
     /// Per-provision staging path inside the host-PRIVATE staging dir. Namespaced
@@ -4235,7 +4229,7 @@ mod tests {
         let self_pile = format!("{self_dir}/self.pile");
         let shared_dir = "/aitemp/playground/piles/shared";
         let shared_pile = format!("{shared_dir}/shared.pile");
-        let staging_root = "/aitemp/playground/staging";
+        let staging_root = "/aitemp/playground/piles/.staging";
         let staging_tmp = format!("{staging_root}/{jail}.pile.tmp");
 
         // Host per-coworker pile dir is created.
@@ -4625,7 +4619,7 @@ mod tests {
             backend.provision_sandbox(&spec(label)).expect("provision");
             let calls = mock.calls();
             let shared_pile = "/aitemp/playground/piles/shared/shared.pile";
-            let staging_tmp = format!("/aitemp/playground/staging/{jail}.pile.tmp");
+            let staging_tmp = format!("/aitemp/playground/piles/.staging/{jail}.pile.tmp");
             // Shared dir mkdir is idempotent (`-p`).
             assert!(
                 calls.iter().any(|c| c
@@ -4720,7 +4714,7 @@ mod tests {
         for c in &cps {
             let dest = c.last().map(String::as_str).unwrap_or("");
             assert!(
-                dest.starts_with("/aitemp/playground/staging/"),
+                dest.starts_with("/aitemp/playground/piles/.staging/"),
                 "every bootstrap cp must target the host-private staging dir, got {dest:?}: {c:?}"
             );
             // And it must be seeded FROM bootstrap.pile (not some other source).
@@ -4736,7 +4730,7 @@ mod tests {
                 c.ends_with(&[
                     "chmod".into(),
                     "700".into(),
-                    "/aitemp/playground/staging".into(),
+                    "/aitemp/playground/piles/.staging".into(),
                 ] as &[String])
             })
             .expect("staging chmod 700 issued");
@@ -4932,29 +4926,22 @@ mod tests {
         }
     }
 
-    /// Security repair #2: the host-private staging dir is DERIVED as a sibling
-    /// of `pile_root`, so a `--jail-pile-root` override moves staging with it
-    /// (same ZFS filesystem — the hardlink publish requires same-FS) instead of
-    /// diverging to a stale hardcoded path. The default lands at
-    /// `/aitemp/playground/staging`, a sibling of the default pile root and NOT
-    /// under it (so it is never mounted into a jail).
+    /// Security repair #2: the host-private staging dir is DERIVED inside
+    /// `pile_root`, so a `--jail-pile-root` override moves staging with it and a
+    /// quota-bearing pile dataset cannot put the hardlink source and destination
+    /// on different filesystems. The directory itself is never mounted into a
+    /// jail; only individual pile files are.
     #[test]
-    fn staging_root_tracks_pile_root_as_a_sibling() {
+    fn staging_root_tracks_pile_root_on_the_same_filesystem() {
         let mut b = JailBackend::local();
-        assert_eq!(b.staging_root(), "/aitemp/playground/staging");
-        // The staging dir must be a SIBLING of pile_root, never under it (under
-        // it would risk being reachable if pile_root's parent were mounted).
-        assert!(
-            !b.staging_root().starts_with(&format!("{}/", b.pile_root)),
-            "staging must not live under pile_root: {}",
-            b.staging_root()
-        );
-        // Override pile_root: staging follows to the same parent.
+        assert_eq!(b.staging_root(), "/aitemp/playground/piles/.staging");
+        assert!(b.staging_root().starts_with(&format!("{}/", b.pile_root)));
+        // Override pile_root: staging remains inside that exact filesystem.
         b.pile_root = "/tank/pg/piles".to_string();
-        assert_eq!(b.staging_root(), "/tank/pg/staging");
+        assert_eq!(b.staging_root(), "/tank/pg/piles/.staging");
         assert_eq!(
             b.staging_pile_tmp("playground-x"),
-            "/tank/pg/staging/playground-x.pile.tmp"
+            "/tank/pg/piles/.staging/playground-x.pile.tmp"
         );
     }
 
@@ -6263,7 +6250,7 @@ echo "PASS: playground:tenant provenance property round-trips"
             .provision_sandbox(&spec("alice"))
             .expect("provision");
         let calls = mock.calls();
-        let staging_root = "/aitemp/playground/staging";
+        let staging_root = "/aitemp/playground/piles/.staging";
         assert!(
             calls.iter().any(|c| c
                 == &[

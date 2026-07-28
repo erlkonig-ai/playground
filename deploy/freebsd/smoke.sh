@@ -169,7 +169,7 @@ for tool in open_session exec job_exec job_poll job_cancel close_session destroy
 		'.result.tools | any(.name == $tool)' >/dev/null || die "tools/list omitted $tool"
 done
 
-BOX=$(tool_call open_session '{"pile_host_path":"/ignored/by/jail-backend"}')
+BOX=$(tool_call open_session '{}')
 [ -n "$BOX" ] || die "open_session returned an empty sandbox id"
 
 EXEC_ARGS=$(jq -cn --arg session "$BOX" \

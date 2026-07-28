@@ -4,7 +4,8 @@ Runs the sandbox provider *inside* the dedicated `playground` parent jail
 (FreeBSD 15.1). Operator-side copy/install examples use `$JAIL_HOST`, but the
 running provider has no host transport: `playground mcp-http --backend jail
 --jail-local` binds to loopback and executes
-`sudo -n zfs/jail/jexec ...` directly ([`LocalRunner`], no ssh hop);
+`zfs/jail/jexec ...` directly ([`LocalRunner`], no ssh hop; when the daemon is
+root it strips the operator-facing `sudo -n` prefix before spawning);
 sessions are ZFS clones of
 `airoot/jails/playground/jails/template@base`, jails are `playground-*`, and
 the parent jail is delegated only that ZFS subtree.
@@ -46,8 +47,9 @@ Two hosting modes exist and stay interchangeable:
   dir — closing the symlink confused-deputy class where a pre-placed
   `shared.pile.<jail>.tmp` symlink tricked the privileged provision `cp` into
   overwriting a chosen host file. The bootstrap `cp` also stages only into a
-  host-PRIVATE `0700` dir (`--jail-pile-root`'s sibling `…/staging`, never
-  mounted into a jail) and publishes with a no-follow / create-only hardlink,
+  host-PRIVATE `0700` dir (`<jail-pile-root>/.staging`, inside the same quota
+  dataset but never mounted into a jail) and publishes with a no-follow /
+  create-only hardlink,
   so the privileged copy can never follow a tenant-planted symlink. FreeBSD
   nullfs single-file mounts and concurrent multi-writer append were verified on
   the deploy host's 15.1 kernel.
@@ -161,8 +163,8 @@ sudo service playground_mcp start
 sudo service caddy start
 ```
 
-The service runs as root (jail(8)/zfs(8) need it; `sudo -n` is a
-pass-through for root). It binds `127.0.0.1:8377` and logs to
+The service runs as root (jail(8)/zfs(8) need it; `LocalRunner` removes the
+operator-facing `sudo -n` prefix for root). It binds `127.0.0.1:8377` and logs to
 `/var/log/playground_mcp.log`. It deliberately does **not** auto-restart after
 an unexplained daemon exit. A loss of command-tree control deliberately exits
 nonzero and leaves the affected jail untouched for operator inspection; an
@@ -191,9 +193,9 @@ A="Authorization: Bearer $TOK"
 SID=$(curl -si -H "$A" -H "$H" -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}' \
   http://127.0.0.1:8377/mcp | tr -d '\r' | awk 'tolower($1)=="mcp-session-id:"{print $2}')
 
-# open a jail session (the caller pile_host_path is ignored; the jail
-# uses its own server-born self.pile at guest /pile, seeded on `user create`)
-curl -s -H "$A" -H "$H" -H "Mcp-Session-Id: $SID" -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"open_session","arguments":{"pile_host_path":"/ignored/by/jail-backend"}}}' http://127.0.0.1:8377/mcp
+# open a jail session; HTTP auth supplies the tenant and the jail backend uses
+# its server-born self.pile, so the public tool exposes no host path argument
+curl -s -H "$A" -H "$H" -H "Mcp-Session-Id: $SID" -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"open_session","arguments":{}}}' http://127.0.0.1:8377/mcp
 
 # Copy the exact opaque session id returned above. It includes a hash of the
 # tenant identity; deriving it from a display label is deliberately unsupported.
@@ -208,7 +210,7 @@ curl -s -H "$A" -H "$H" -H "Mcp-Session-Id: $SID" -d "{\"jsonrpc\":\"2.0\",\"id\
 
 # permanent removal is explicit (open again first if the prior close detached
 # the provider registry), and removes the jail + clone but NOT host piles:
-curl -s -H "$A" -H "$H" -H "Mcp-Session-Id: $SID" -d '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"open_session","arguments":{"pile_host_path":"/ignored/by/jail-backend"}}}' http://127.0.0.1:8377/mcp
+curl -s -H "$A" -H "$H" -H "Mcp-Session-Id: $SID" -d '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"open_session","arguments":{}}}' http://127.0.0.1:8377/mcp
 curl -s -H "$A" -H "$H" -H "Mcp-Session-Id: $SID" -d "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"tools/call\",\"params\":{\"name\":\"destroy_session\",\"arguments\":{\"session\":\"$BOX\"}}}" http://127.0.0.1:8377/mcp
 
 jls name | grep '^playground-' || echo "no live playground jails"
@@ -284,7 +286,10 @@ On the **physical host**, first enable RACCT and its boot-time rule loader:
 
 ```sh
 # 1. Turn on kernel resource accounting and its boot-time rule loader.
-sudo sysrc -f /boot/loader.conf kern.racct.enable=1
+# `sysrc` variable names cannot contain dots, so add this exact loader line
+# with sudoedit (do not spell it as kern_racct_enable):
+#     kern.racct.enable="1"
+sudoedit /boot/loader.conf
 sudo sysrc rctl_enable=YES
 
 # Confirm the parent's GLOBAL name as seen by the physical host.

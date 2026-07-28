@@ -154,6 +154,10 @@ pub struct AccessTokenEntry {
     pub backend: String,
     /// Client the token was issued to.
     pub client_id: String,
+    /// RFC 8707 audience. Empty only for legacy on-disk entries, which are
+    /// deliberately rejected rather than accepted as audience-free tokens.
+    #[serde(default)]
+    pub resource: String,
     /// Unix seconds after which the token is dead (removed lazily on use).
     pub expires_at: u64,
     /// Refresh-token family this access token descends from; family
@@ -169,6 +173,16 @@ pub struct RefreshTokenEntry {
     pub tenant: String,
     pub backend: String,
     pub client_id: String,
+    /// RFC 8707 audience. Empty legacy entries remain readable but cannot be
+    /// rotated into an audience-bound family without a fresh authorization.
+    #[serde(default)]
+    pub resource: String,
+    /// Scope granted by the authorization that created this family. Older
+    /// on-disk entries predate scope persistence; rotating one keeps working
+    /// but omits `scope` from the token response rather than claiming an
+    /// incorrect empty scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
     /// All rotations of one authorization share this id.
     pub family_id: String,
     /// `true` for the newest rotation only; presenting a `false` one revokes
@@ -218,6 +232,10 @@ pub enum RotateError {
     Unknown,
     /// Token exists but was issued to a different client.
     ClientMismatch,
+    /// The request named a different protected resource than this family.
+    InvalidTarget,
+    /// A refresh request tried to alter the authorization's scope set.
+    InvalidScope,
     /// Token was already rotated out — theft evidence; the family has now
     /// been revoked.
     ReuseRevoked,
@@ -320,11 +338,15 @@ impl OauthStore {
         tenant: &str,
         backend: &str,
         client_id: &str,
+        resource: &str,
+        scope: Option<&str>,
         access_ttl: Duration,
         now: u64,
     ) -> (String, String) {
         let family_id = random_urlsafe(16);
-        self.mint_pair_in_family(tenant, backend, client_id, &family_id, access_ttl, now)
+        self.mint_pair_in_family(
+            tenant, backend, client_id, resource, scope, &family_id, access_ttl, now,
+        )
     }
 
     /// Mint an access + refresh pair inside an existing family (rotation).
@@ -333,6 +355,8 @@ impl OauthStore {
         tenant: &str,
         backend: &str,
         client_id: &str,
+        resource: &str,
+        scope: Option<&str>,
         family_id: &str,
         access_ttl: Duration,
         now: u64,
@@ -344,6 +368,7 @@ impl OauthStore {
                 tenant: tenant.to_string(),
                 backend: backend.to_string(),
                 client_id: client_id.to_string(),
+                resource: resource.to_string(),
                 expires_at: now + access_ttl.as_secs(),
                 family_id: family_id.to_string(),
             },
@@ -355,6 +380,8 @@ impl OauthStore {
                 tenant: tenant.to_string(),
                 backend: backend.to_string(),
                 client_id: client_id.to_string(),
+                resource: resource.to_string(),
+                scope: scope.filter(|scope| !scope.is_empty()).map(str::to_owned),
                 family_id: family_id.to_string(),
                 current: true,
             },
@@ -369,6 +396,8 @@ impl OauthStore {
         &mut self,
         token: &str,
         client_id: Option<&str>,
+        resource: &str,
+        requested_scope: Option<&str>,
         access_ttl: Duration,
         now: u64,
     ) -> std::result::Result<(String, String, RefreshTokenEntry), RotateError> {
@@ -384,6 +413,12 @@ impl OauthStore {
                 return Err(RotateError::ClientMismatch);
             }
         }
+        if resource != entry.resource {
+            return Err(RotateError::InvalidTarget);
+        }
+        if requested_scope.is_some_and(|scope| entry.scope.as_deref() != Some(scope)) {
+            return Err(RotateError::InvalidScope);
+        }
         if !entry.current {
             // Rotated-out token presented again: someone replayed it. Burn
             // the family — attacker and victim both lose, victim re-auths.
@@ -398,6 +433,8 @@ impl OauthStore {
             &entry.tenant,
             &entry.backend,
             &entry.client_id,
+            &entry.resource,
+            entry.scope.as_deref(),
             &entry.family_id,
             access_ttl,
             now,
@@ -458,6 +495,7 @@ impl OauthStore {
     pub fn lookup_access(
         &mut self,
         token: &str,
+        resource: &str,
         now: u64,
     ) -> std::result::Result<TokenEntry, (&'static str, bool)> {
         let Some(entry) = self.access_tokens.get(token) else {
@@ -466,6 +504,9 @@ impl OauthStore {
         if entry.expires_at <= now {
             self.access_tokens.remove(token);
             return Err(("access token expired", true));
+        }
+        if entry.resource != resource {
+            return Err(("access token is for a different resource", false));
         }
         let entry = entry.clone();
         Ok(TokenEntry {
@@ -512,6 +553,8 @@ pub struct AuthCode {
     pub tenant: String,
     /// Must still equal the tenant's persistent generation when exchanged.
     pub tenant_generation: u64,
+    /// Exact RFC 8707 protected-resource identifier this grant targets.
+    pub resource: String,
     pub scope: String,
     pub expires_at: u64,
 }
@@ -528,6 +571,9 @@ pub enum CodeTake {
 pub struct OauthRuntime {
     /// `OauthConfig::public_url`, normalized (no trailing slash).
     pub public_url: String,
+    /// Canonical protected resource served by this process. MCP lives at the
+    /// fixed `/mcp` endpoint beneath `public_url`.
+    pub resource: String,
     state_path: PathBuf,
     pub access_ttl: Duration,
     pub store: Mutex<OauthStore>,
@@ -563,8 +609,11 @@ impl OauthRuntime {
                 file_fingerprint(&config.state_path),
             )
         };
+        let public_url = config.public_url.trim_end_matches('/').to_string();
+        let resource = format!("{public_url}/mcp");
         Ok(OauthRuntime {
-            public_url: config.public_url.trim_end_matches('/').to_string(),
+            public_url,
+            resource,
             state_path: config.state_path,
             access_ttl: config.access_ttl,
             store: Mutex::new(store),
@@ -627,6 +676,7 @@ impl OauthRuntime {
         redirect_uri: &str,
         code_challenge: &str,
         tenant: &TenantGrant,
+        resource: &str,
         scope: &str,
         now: u64,
     ) -> String {
@@ -641,6 +691,7 @@ impl OauthRuntime {
                 code_challenge: code_challenge.to_string(),
                 tenant: tenant.label.clone(),
                 tenant_generation: tenant.generation,
+                resource: resource.to_string(),
                 scope: scope.to_string(),
                 expires_at: now + AUTH_CODE_TTL.as_secs(),
             },
@@ -684,6 +735,9 @@ impl OauthRuntime {
             if let Some(entry) = store.access_tokens.get(token) {
                 if entry.expires_at > now {
                     let entry = entry.clone();
+                    if entry.resource != self.resource {
+                        return Err("access token is for a different resource");
+                    }
                     return Ok(TokenEntry {
                         tenant: entry.tenant,
                         backend: entry.backend,
@@ -698,10 +752,12 @@ impl OauthRuntime {
         // (`OauthStore::lookup_access` reports that via the `mutated` bool), so
         // a token another writer already cleaned up doesn't trigger a redundant
         // full-file rewrite.
-        let outcome = self.with_locked_store_if(|store| match store.lookup_access(token, now) {
-            Ok(entry) => (false, Ok(entry)),
-            Err((message, mutated)) => (mutated, Err(message)),
-        });
+        let resource = self.resource.clone();
+        let outcome =
+            self.with_locked_store_if(|store| match store.lookup_access(token, &resource, now) {
+                Ok(entry) => (false, Ok(entry)),
+                Err((message, mutated)) => (mutated, Err(message)),
+            });
         match outcome {
             Ok(Ok(entry)) => Ok(entry), // Refreshed on another writer; still valid.
             Ok(Err(message)) => Err(message),
@@ -980,10 +1036,12 @@ where
 /// `GET /.well-known/oauth-protected-resource` (RFC 9728): tells a connector
 /// that got a 401 *who* can authorize it — this same server.
 async fn protected_resource_metadata(State(state): State<Arc<HttpState>>) -> Response {
-    let base = &oauth(&state).public_url;
+    let oauth = oauth(&state);
+    let base = &oauth.public_url;
     json_ok(json!({
-        "resource": base,
+        "resource": oauth.resource,
         "authorization_servers": [base],
+        "scopes_supported": ["mcp", "offline_access"],
     }))
 }
 
@@ -1000,6 +1058,7 @@ async fn authorization_server_metadata(State(state): State<Arc<HttpState>>) -> R
         "registration_endpoint": format!("{base}/oauth/register"),
         "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code", "refresh_token"],
+        "scopes_supported": ["mcp", "offline_access"],
         "code_challenge_methods_supported": ["S256"],
         "token_endpoint_auth_methods_supported": ["none"],
     }))
@@ -1175,6 +1234,7 @@ struct AuthorizeParams {
     code_challenge: String,
     code_challenge_method: String,
     state: String,
+    resource: String,
     scope: String,
 }
 
@@ -1188,6 +1248,7 @@ impl AuthorizeParams {
             code_challenge: get("code_challenge"),
             code_challenge_method: get("code_challenge_method"),
             state: get("state"),
+            resource: get("resource"),
             scope: get("scope"),
         }
     }
@@ -1226,7 +1287,10 @@ fn validate_client_and_redirect(
 /// hands a victim an authorize URL with a bad grant param to bounce them off
 /// this trusted origin). Only a request that has cleared the invite gate has
 /// earned a redirect — and by then the only remaining outcome is success.
-fn validate_grant_shape(params: &AuthorizeParams) -> std::result::Result<(), Response> {
+fn validate_grant_shape(
+    params: &AuthorizeParams,
+    expected_resource: &str,
+) -> std::result::Result<String, Response> {
     if params.response_type != "code" {
         return Err(authorize_error_page("only response_type=code is supported"));
     }
@@ -1238,7 +1302,38 @@ fn validate_grant_shape(params: &AuthorizeParams) -> std::result::Result<(), Res
             "only code_challenge_method=S256 is supported",
         ));
     }
-    Ok(())
+    if params.resource != expected_resource {
+        return Err(authorize_error_page(
+            "resource must exactly match this MCP protected resource",
+        ));
+    }
+    canonicalize_scope(&params.scope).map_err(authorize_error_page)
+}
+
+/// Parse the OAuth space-delimited scope set and return the one canonical
+/// spelling persisted in grants. The MCP capability is the default and is
+/// always required; `offline_access` is the only optional extension.
+fn canonicalize_scope(scope: &str) -> std::result::Result<String, &'static str> {
+    if scope.trim().is_empty() {
+        return Ok("mcp".to_string());
+    }
+    let mut mcp = false;
+    let mut offline = false;
+    for item in scope.split_whitespace() {
+        match item {
+            "mcp" => mcp = true,
+            "offline_access" => offline = true,
+            _ => return Err("scope contains an unsupported value"),
+        }
+    }
+    if !mcp {
+        return Err("scope must include mcp");
+    }
+    Ok(if offline {
+        "mcp offline_access".to_string()
+    } else {
+        "mcp".to_string()
+    })
 }
 
 /// `GET /oauth/authorize`: serve the invite-code form. The request is
@@ -1246,14 +1341,15 @@ fn validate_grant_shape(params: &AuthorizeParams) -> std::result::Result<(), Res
 /// invite into a doomed form; the POST re-validates from scratch anyway
 /// because hidden form fields are attacker-editable.
 async fn authorize_form(State(state): State<Arc<HttpState>>, uri: Uri) -> Response {
-    let params = AuthorizeParams::from_map(&parse_form(uri.query().unwrap_or("")));
+    let mut params = AuthorizeParams::from_map(&parse_form(uri.query().unwrap_or("")));
     let client_name = match validate_client_and_redirect(&state, &params) {
         Ok(name) => name,
         Err(response) => return response,
     };
-    if let Err(response) = validate_grant_shape(&params) {
-        return response;
-    }
+    params.scope = match validate_grant_shape(&params, &oauth(&state).resource) {
+        Ok(scope) => scope,
+        Err(response) => return response,
+    };
     // Anti-framing (repair #5 HIGH): the consent page must not be embeddable, so
     // a clickjacking overlay can't trick the human into submitting the invite.
     (
@@ -1277,14 +1373,15 @@ async fn authorize_submit(State(state): State<Arc<HttpState>>, body: Bytes) -> R
         return authorize_error_page("form body is not UTF-8");
     };
     let form = parse_form(body);
-    let params = AuthorizeParams::from_map(&form);
+    let mut params = AuthorizeParams::from_map(&form);
 
     if let Err(response) = validate_client_and_redirect(&state, &params) {
         return response;
     }
-    if let Err(response) = validate_grant_shape(&params) {
-        return response;
-    }
+    params.scope = match validate_grant_shape(&params, &oauth.resource) {
+        Ok(scope) => scope,
+        Err(response) => return response,
+    };
 
     // The human gate: a valid invite code names the tenant. Consumption, the
     // client's `authorized_at` stamp (so GC keeps it — it has now completed an
@@ -1359,6 +1456,7 @@ async fn authorize_submit(State(state): State<Arc<HttpState>>, body: Bytes) -> R
         &params.redirect_uri,
         &params.code_challenge,
         &tenant,
+        &params.resource,
         &params.scope,
         now,
     );
@@ -1409,6 +1507,12 @@ async fn token(State(state): State<Arc<HttpState>>, body: Bytes) -> Response {
             if get("redirect_uri") != code.redirect_uri {
                 return token_error("invalid_grant", "redirect_uri does not match code");
             }
+            if get("resource") != code.resource || code.resource != oauth.resource {
+                return token_error(
+                    "invalid_target",
+                    "resource does not match the authorization grant",
+                );
+            }
             // ...and to the browser session that started the flow, via PKCE.
             let verifier = get("code_verifier");
             if !(43..=128).contains(&verifier.len()) {
@@ -1424,6 +1528,8 @@ async fn token(State(state): State<Arc<HttpState>>, body: Bytes) -> Response {
             let backend_name = state.config.backend_name.clone();
             let code_tenant = code.tenant.clone();
             let code_client = code.client_id.clone();
+            let code_resource = code.resource.clone();
+            let code_scope = code.scope.clone();
             let code_generation = code.tenant_generation;
             let minted = run_store_write(&state, move |oauth| {
                 oauth.with_locked_store_if(|store| {
@@ -1436,6 +1542,8 @@ async fn token(State(state): State<Arc<HttpState>>, body: Bytes) -> Response {
                             &code_tenant,
                             &backend_name,
                             &code_client,
+                            &code_resource,
+                            Some(&code_scope),
                             oauth.access_ttl,
                             now,
                         )),
@@ -1458,12 +1566,26 @@ async fn token(State(state): State<Arc<HttpState>>, body: Bytes) -> Response {
                     );
                 }
             };
-            (access, refresh, code.scope)
+            (access, refresh, Some(code.scope))
         }
         // --- refresh_token rotation -----------------------------------
         "refresh_token" => {
             let client_id = form.get("client_id").cloned();
             let refresh_token = get("refresh_token").to_string();
+            let resource = get("resource").to_string();
+            if resource != oauth.resource {
+                return token_error(
+                    "invalid_target",
+                    "resource must exactly match this MCP protected resource",
+                );
+            }
+            let requested_scope = match form.get("scope") {
+                Some(scope) => match canonicalize_scope(scope) {
+                    Ok(scope) => Some(scope),
+                    Err(message) => return token_error("invalid_scope", message),
+                },
+                None => None,
+            };
             // The rotation itself (including the family-revoke on reuse) is a
             // store mutation, so it runs inside the file lock: re-read the
             // latest on-disk state, rotate, write. This is exactly the path M2
@@ -1480,6 +1602,8 @@ async fn token(State(state): State<Arc<HttpState>>, body: Bytes) -> Response {
                     match store.rotate_refresh(
                         &refresh_token,
                         client_id.as_deref(),
+                        &resource,
+                        requested_scope.as_deref(),
                         oauth.access_ttl,
                         now,
                     ) {
@@ -1487,7 +1611,12 @@ async fn token(State(state): State<Arc<HttpState>>, body: Bytes) -> Response {
                         // ReuseRevoked mutated (burned the family); Unknown /
                         // ClientMismatch did not.
                         Err(RotateError::ReuseRevoked) => (true, Err(RotateError::ReuseRevoked)),
-                        Err(other) => (false, Err(other)),
+                        Err(
+                            other @ (RotateError::Unknown
+                            | RotateError::ClientMismatch
+                            | RotateError::InvalidTarget
+                            | RotateError::InvalidScope),
+                        ) => (false, Err(other)),
                     }
                 })
             })
@@ -1505,7 +1634,7 @@ async fn token(State(state): State<Arc<HttpState>>, body: Bytes) -> Response {
                 // The rotated grant keeps its tenant/backend (copied from the
                 // spent entry into the minted ones); scope was recorded at
                 // authorize time and is not re-negotiated on refresh.
-                Ok((access, refresh, _spent)) => (access, refresh, String::new()),
+                Ok((access, refresh, spent)) => (access, refresh, spent.scope),
                 Err(RotateError::ReuseRevoked) => {
                     // The family-revoke was already persisted inside the lock.
                     return token_error(
@@ -1515,6 +1644,18 @@ async fn token(State(state): State<Arc<HttpState>>, body: Bytes) -> Response {
                 }
                 Err(RotateError::ClientMismatch) => {
                     return token_error("invalid_grant", "refresh token belongs to another client");
+                }
+                Err(RotateError::InvalidTarget) => {
+                    return token_error(
+                        "invalid_target",
+                        "refresh token belongs to another resource",
+                    );
+                }
+                Err(RotateError::InvalidScope) => {
+                    return token_error(
+                        "invalid_scope",
+                        "refresh scope differs from the original grant",
+                    );
                 }
                 Err(RotateError::Unknown) => {
                     return token_error("invalid_grant", "unknown refresh token");
@@ -1529,20 +1670,23 @@ async fn token(State(state): State<Arc<HttpState>>, body: Bytes) -> Response {
         }
     };
 
+    let mut body = json!({
+        "access_token": access,
+        "token_type": "Bearer",
+        "expires_in": oauth.access_ttl.as_secs(),
+        "refresh_token": refresh,
+    });
+    if let Some(scope) = scope.filter(|scope| !scope.is_empty()) {
+        body["scope"] = json!(scope);
+    }
+
     (
         StatusCode::OK,
         [
             (header::CONTENT_TYPE, "application/json"),
             (header::CACHE_CONTROL, "no-store"),
         ],
-        json!({
-            "access_token": access,
-            "token_type": "Bearer",
-            "expires_in": oauth.access_ttl.as_secs(),
-            "refresh_token": refresh,
-            "scope": scope,
-        })
-        .to_string(),
+        body.to_string(),
     )
         .into_response()
 }
@@ -1582,6 +1726,7 @@ fn authorize_page(params: &AuthorizeParams, client_name: Option<&str>) -> String
         ("code_challenge", &params.code_challenge),
         ("code_challenge_method", &params.code_challenge_method),
         ("state", &params.state),
+        ("resource", &params.resource),
         ("scope", &params.scope),
     ]
     .iter()
@@ -1777,6 +1922,8 @@ mod tests {
     use super::*;
     use crate::mcp_http::tests::{post, rpc, spawn_server, test_state_with_oauth};
 
+    const TEST_RESOURCE: &str = "https://mcp.example.test/mcp";
+
     /// Fresh scratch dir for a test's state file.
     fn scratch_dir(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -1808,6 +1955,24 @@ mod tests {
         assert!(!verify_pkce_s256(verifier, verifier));
     }
 
+    #[test]
+    fn scopes_are_validated_and_canonicalized() {
+        assert_eq!(canonicalize_scope("").unwrap(), "mcp");
+        assert_eq!(canonicalize_scope("mcp").unwrap(), "mcp");
+        assert_eq!(
+            canonicalize_scope("offline_access  mcp mcp").unwrap(),
+            "mcp offline_access"
+        );
+        assert_eq!(
+            canonicalize_scope("offline_access").unwrap_err(),
+            "scope must include mcp"
+        );
+        assert_eq!(
+            canonicalize_scope("mcp admin").unwrap_err(),
+            "scope contains an unsupported value"
+        );
+    }
+
     // -- Authorization codes ------------------------------------------------
 
     /// Codes redeem exactly once (even the failed take consumes) and expire.
@@ -1826,12 +1991,28 @@ mod tests {
         };
 
         // Single-use: first take wins, second take finds nothing.
-        let code = runtime.issue_code("client-1", "https://a/cb", "chal", &alice, "", 1_000);
+        let code = runtime.issue_code(
+            "client-1",
+            "https://a/cb",
+            "chal",
+            &alice,
+            TEST_RESOURCE,
+            "",
+            1_000,
+        );
         assert!(matches!(runtime.take_code(&code, 1_001), CodeTake::Ok(c) if c.tenant == "alice"));
         assert!(matches!(runtime.take_code(&code, 1_001), CodeTake::Unknown));
 
         // Expiry: a code is dead AUTH_CODE_TTL after issuance...
-        let code = runtime.issue_code("client-1", "https://a/cb", "chal", &alice, "", 1_000);
+        let code = runtime.issue_code(
+            "client-1",
+            "https://a/cb",
+            "chal",
+            &alice,
+            TEST_RESOURCE,
+            "",
+            1_000,
+        );
         let expired_at = 1_000 + AUTH_CODE_TTL.as_secs();
         assert!(matches!(
             runtime.take_code(&code, expired_at),
@@ -1851,13 +2032,28 @@ mod tests {
     fn refresh_rotation_and_reuse_revokes_family() {
         let ttl = Duration::from_secs(3600);
         let mut store = OauthStore::default();
-        let (access1, refresh1) = store.mint_token_pair("alice", "mock", "client-1", ttl, 1_000);
+        let (access1, refresh1) = store.mint_token_pair(
+            "alice",
+            "mock",
+            "client-1",
+            TEST_RESOURCE,
+            Some("mcp offline_access"),
+            ttl,
+            1_000,
+        );
 
         // Normal rotation: new pair in the same family, old refresh spent.
         let (access2, refresh2, spent) = store
-            .rotate_refresh(&refresh1, Some("client-1"), ttl, 2_000)
+            .rotate_refresh(&refresh1, Some("client-1"), TEST_RESOURCE, None, ttl, 2_000)
             .expect("first rotation");
         assert_eq!(spent.tenant, "alice");
+        assert_eq!(spent.resource, TEST_RESOURCE);
+        assert_eq!(spent.scope.as_deref(), Some("mcp offline_access"));
+        assert_eq!(
+            store.refresh_tokens[&refresh2].scope.as_deref(),
+            Some("mcp offline_access"),
+            "rotation preserves the originally granted scope"
+        );
         assert!(!store.refresh_tokens[&refresh1].current);
         assert!(store.refresh_tokens[&refresh2].current);
         assert_eq!(
@@ -1868,15 +2064,49 @@ mod tests {
         // Wrong client on a valid token: rejected without side effects.
         assert_eq!(
             store
-                .rotate_refresh(&refresh2, Some("client-2"), ttl, 2_500)
+                .rotate_refresh(&refresh2, Some("client-2"), TEST_RESOURCE, None, ttl, 2_500,)
                 .err(),
             Some(RotateError::ClientMismatch)
+        );
+        assert_eq!(
+            store
+                .rotate_refresh(
+                    &refresh2,
+                    Some("client-1"),
+                    "https://other.example.test/mcp",
+                    None,
+                    ttl,
+                    2_500,
+                )
+                .err(),
+            Some(RotateError::InvalidTarget)
+        );
+        assert!(
+            store.refresh_tokens[&refresh2].current,
+            "wrong audience must not spend the refresh token"
+        );
+        assert_eq!(
+            store
+                .rotate_refresh(
+                    &refresh2,
+                    Some("client-1"),
+                    TEST_RESOURCE,
+                    Some("mcp"),
+                    ttl,
+                    2_500,
+                )
+                .err(),
+            Some(RotateError::InvalidScope)
+        );
+        assert!(
+            store.refresh_tokens[&refresh2].current,
+            "scope substitution must not spend the refresh token"
         );
 
         // Replay of the spent refresh1: the whole family burns.
         assert_eq!(
             store
-                .rotate_refresh(&refresh1, Some("client-1"), ttl, 3_000)
+                .rotate_refresh(&refresh1, Some("client-1"), TEST_RESOURCE, None, ttl, 3_000,)
                 .err(),
             Some(RotateError::ReuseRevoked)
         );
@@ -1892,7 +2122,7 @@ mod tests {
         // The current-at-revocation refresh2 is now unknown.
         assert_eq!(
             store
-                .rotate_refresh(&refresh2, Some("client-1"), ttl, 3_100)
+                .rotate_refresh(&refresh2, Some("client-1"), TEST_RESOURCE, None, ttl, 3_100,)
                 .err(),
             Some(RotateError::Unknown)
         );
@@ -1905,25 +2135,34 @@ mod tests {
     fn access_token_lookup_enforces_expiry() {
         let ttl = Duration::from_secs(100);
         let mut store = OauthStore::default();
-        let (access, _refresh) = store.mint_token_pair("alice", "mock", "client-1", ttl, 1_000);
+        let (access, _refresh) =
+            store.mint_token_pair("alice", "mock", "client-1", TEST_RESOURCE, None, ttl, 1_000);
 
-        let entry = store.lookup_access(&access, 1_050).expect("still valid");
+        let entry = store
+            .lookup_access(&access, TEST_RESOURCE, 1_050)
+            .expect("still valid");
         assert_eq!(
             (entry.tenant.as_str(), entry.backend.as_str()),
             ("alice", "mock")
         );
+        assert_eq!(
+            store
+                .lookup_access(&access, "https://other.example.test/mcp", 1_050)
+                .err(),
+            Some(("access token is for a different resource", false))
+        );
 
         assert_eq!(
-            store.lookup_access(&access, 1_100).err(),
+            store.lookup_access(&access, TEST_RESOURCE, 1_100).err(),
             Some(("access token expired", true))
         );
         // The expired token was removed: a retry is now just unknown.
         assert_eq!(
-            store.lookup_access(&access, 1_100).err(),
+            store.lookup_access(&access, TEST_RESOURCE, 1_100).err(),
             Some(("unknown token", false))
         );
         assert_eq!(
-            store.lookup_access("never-issued", 0).err(),
+            store.lookup_access("never-issued", TEST_RESOURCE, 0).err(),
             Some(("unknown token", false))
         );
     }
@@ -1939,8 +2178,9 @@ mod tests {
         store.mint_invite("alice", true, None, None, 1_000);
         let bob_invite = store.mint_invite("bob", false, None, None, 1_000);
         let (alice_access, alice_refresh) =
-            store.mint_token_pair("alice", "mock", &client, ttl, 1_000);
-        let (bob_access, bob_refresh) = store.mint_token_pair("bob", "mock", &client, ttl, 1_000);
+            store.mint_token_pair("alice", "mock", &client, TEST_RESOURCE, None, ttl, 1_000);
+        let (bob_access, bob_refresh) =
+            store.mint_token_pair("bob", "mock", &client, TEST_RESOURCE, None, ttl, 1_000);
 
         let revoked = store.revoke_tenant("alice");
         assert_eq!(revoked.invites, 2);
@@ -1980,6 +2220,8 @@ mod tests {
                 "alice",
                 "mock",
                 "client-1",
+                TEST_RESOURCE,
+                None,
                 Duration::from_secs(3600),
                 unix_now(),
             );
@@ -2008,6 +2250,7 @@ mod tests {
             "https://a/cb",
             "chal",
             &stale_alice,
+            TEST_RESOURCE,
             "",
             unix_now(),
         );
@@ -2022,6 +2265,7 @@ mod tests {
             "https://a/cb",
             "chal",
             &stale_alice,
+            TEST_RESOURCE,
             "",
             unix_now(),
         );
@@ -2082,8 +2326,15 @@ mod tests {
             1_000,
         );
         let invite = store.mint_invite("alice", false, None, None, 1_001);
-        let (access, refresh) =
-            store.mint_token_pair("alice", "mock", &client_id, Duration::from_secs(60), 1_002);
+        let (access, refresh) = store.mint_token_pair(
+            "alice",
+            "mock",
+            &client_id,
+            TEST_RESOURCE,
+            Some("mcp offline_access"),
+            Duration::from_secs(60),
+            1_002,
+        );
         store.save(&path).expect("save");
 
         #[cfg(unix)]
@@ -2109,11 +2360,14 @@ mod tests {
             .get(&access)
             .expect("access persisted");
         assert_eq!(access_entry.expires_at, 1_062);
+        assert_eq!(access_entry.resource, TEST_RESOURCE);
         let refresh_entry = reloaded
             .refresh_tokens
             .get(&refresh)
             .expect("refresh persisted");
         assert!(refresh_entry.current);
+        assert_eq!(refresh_entry.resource, TEST_RESOURCE);
+        assert_eq!(refresh_entry.scope.as_deref(), Some("mcp offline_access"));
         assert_eq!(refresh_entry.family_id, access_entry.family_id);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -2171,6 +2425,63 @@ mod tests {
         serde_json::from_str(&text).unwrap_or(Value::String(text))
     }
 
+    /// Refresh tokens minted before scope persistence remain rotatable, but
+    /// their response omits `scope`: absence truthfully means the server did
+    /// not restate the grant, while an empty string would incorrectly claim an
+    /// empty grant.
+    #[test]
+    fn legacy_refresh_without_scope_omits_scope_from_response() {
+        let dir = scratch_dir("legacy_refresh_scope");
+        let state_path = dir.join("oauth.json");
+        let legacy: RefreshTokenEntry = serde_json::from_value(json!({
+            "tenant": "alice",
+            "backend": "mock",
+            "client_id": "client-1",
+            "resource": TEST_RESOURCE,
+            "family_id": "family-1",
+            "current": true,
+        }))
+        .expect("legacy refresh entry deserializes");
+        assert_eq!(legacy.scope, None);
+
+        let mut store = OauthStore::default();
+        store
+            .refresh_tokens
+            .insert("legacy-refresh".to_string(), legacy);
+        store.save(&state_path).expect("seed legacy OAuth state");
+
+        let state = test_state_with_oauth(
+            "https://mcp.example.test",
+            &state_path,
+            Duration::from_secs(3600),
+        );
+        let addr = spawn_server(state);
+        let agent = no_redirect_agent();
+        let mut response = agent
+            .post(format!("http://{addr}/oauth/token"))
+            .send_form([
+                ("grant_type", "refresh_token"),
+                ("refresh_token", "legacy-refresh"),
+                ("client_id", "client-1"),
+                ("resource", TEST_RESOURCE),
+            ])
+            .expect("rotate legacy refresh token");
+        assert_eq!(response.status().as_u16(), 200);
+        let body = read_json(&mut response);
+        assert!(
+            body.get("scope").is_none(),
+            "unknown legacy scope is omitted rather than emitted as empty"
+        );
+        let successor = body["refresh_token"].as_str().expect("successor refresh");
+        assert_eq!(
+            OauthStore::load(&state_path).unwrap().refresh_tokens[successor].scope,
+            None,
+            "an unknown scope remains unknown across rotation"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Discovery → register → authorize (form + invite) → PKCE token exchange
     /// → authenticated MCP handshake, plus the negative space: code reuse,
     /// wrong verifier, invite reuse, expired token, refresh-replay revocation,
@@ -2180,6 +2491,7 @@ mod tests {
         let dir = scratch_dir("flow");
         let state_path = dir.join("oauth.json");
         let issuer = "https://mcp.example.test";
+        let protected_resource = format!("{issuer}/mcp");
         let state = test_state_with_oauth(issuer, &state_path, Duration::from_secs(3600));
         let addr = spawn_server(state.clone());
         let agent = no_redirect_agent();
@@ -2220,8 +2532,12 @@ mod tests {
             .call()
             .expect("resource metadata");
         let resource = read_json(&mut resource);
-        assert_eq!(resource["resource"], issuer);
+        assert_eq!(resource["resource"], protected_resource);
         assert_eq!(resource["authorization_servers"], json!([issuer]));
+        assert_eq!(
+            resource["scopes_supported"],
+            json!(["mcp", "offline_access"])
+        );
 
         let mut auth_server = agent
             .get(format!(
@@ -2250,6 +2566,10 @@ mod tests {
         assert_eq!(
             auth_server["token_endpoint_auth_methods_supported"],
             json!(["none"])
+        );
+        assert_eq!(
+            auth_server["scopes_supported"],
+            json!(["mcp", "offline_access"])
         );
 
         // --- Dynamic client registration.
@@ -2281,12 +2601,15 @@ mod tests {
         let verifier = random_urlsafe(32); // 43 chars, valid verifier charset
         let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(Sha256::digest(verifier.as_bytes()));
+        let requested_scope = "mcp offline_access";
         let authorize_query = |challenge: &str| {
             format!(
-                "response_type=code&client_id={}&redirect_uri={}&code_challenge={}&code_challenge_method=S256&state=xyz-123&scope=mcp",
+                "response_type=code&client_id={}&redirect_uri={}&code_challenge={}&code_challenge_method=S256&state=xyz-123&resource={}&scope={}",
                 url_encode(&client_id),
                 url_encode(redirect_uri),
                 url_encode(challenge),
+                url_encode(&protected_resource),
+                url_encode(requested_scope),
             )
         };
 
@@ -2308,7 +2631,30 @@ mod tests {
             html.contains(&format!("value=\"{challenge}\"")),
             "challenge round-trips"
         );
+        assert!(
+            html.contains(&format!("value=\"{protected_resource}\"")),
+            "resource round-trips through the consent form"
+        );
         assert!(!html.contains("http-equiv"), "no external/refresh tricks");
+
+        for resource_query in [
+            String::new(),
+            "&resource=https%3A%2F%2Fother.example%2Fmcp".into(),
+        ] {
+            let mut wrong_resource = agent
+                .get(format!(
+                    "http://{addr}/oauth/authorize?response_type=code&client_id={}&redirect_uri={}&code_challenge={}&code_challenge_method=S256{}",
+                    url_encode(&client_id),
+                    url_encode(redirect_uri),
+                    url_encode(&challenge),
+                    resource_query,
+                ))
+                .call()
+                .expect("invalid resource authorize response");
+            assert_eq!(wrong_resource.status().as_u16(), 400);
+            assert!(wrong_resource.headers().get("location").is_none());
+            let _ = wrong_resource.body_mut().read_to_string();
+        }
 
         // Unknown client_id gets a 400 page, not a redirect (open-redirect defence).
         let mut bad_client = agent
@@ -2364,7 +2710,8 @@ mod tests {
                     ("code_challenge", challenge),
                     ("code_challenge_method", "S256"),
                     ("state", "xyz-123"),
-                    ("scope", "mcp"),
+                    ("resource", protected_resource.as_str()),
+                    ("scope", requested_scope),
                     ("invite_code", invite),
                 ])
                 .expect("authorize submit")
@@ -2375,6 +2722,11 @@ mod tests {
         assert_eq!(base, redirect_uri);
         assert_eq!(query["state"], "xyz-123", "state passes through");
         let code = query["code"].clone();
+        assert_eq!(
+            oauth.codes.lock().unwrap()[&code].resource,
+            protected_resource,
+            "authorization code is audience-bound"
+        );
         let _ = granted.body_mut().read_to_string();
 
         // A wrong invite is a pre-redirect failure → 400 page, not a bounce
@@ -2393,7 +2745,7 @@ mod tests {
         let _ = reused_invite.body_mut().read_to_string();
 
         // --- Token exchange with PKCE.
-        let exchange = |code: &str, verifier: &str| {
+        let exchange_for = |code: &str, verifier: &str, resource: &str| {
             agent
                 .post(format!("http://{addr}/oauth/token"))
                 .send_form([
@@ -2402,15 +2754,18 @@ mod tests {
                     ("client_id", client_id.as_str()),
                     ("redirect_uri", redirect_uri),
                     ("code_verifier", verifier),
+                    ("resource", resource),
                 ])
                 .expect("token exchange")
         };
+        let exchange =
+            |code: &str, verifier: &str| exchange_for(code, verifier, protected_resource.as_str());
         let mut tokens = exchange(&code, &verifier);
         assert_eq!(tokens.status().as_u16(), 200);
         let tokens = read_json(&mut tokens);
         assert_eq!(tokens["token_type"], "Bearer");
         assert_eq!(tokens["expires_in"], 3600);
-        assert_eq!(tokens["scope"], "mcp");
+        assert_eq!(tokens["scope"], requested_scope);
         let access = tokens["access_token"].as_str().unwrap().to_string();
         let refresh = tokens["refresh_token"].as_str().unwrap().to_string();
 
@@ -2474,13 +2829,36 @@ mod tests {
         assert_eq!(burned.status().as_u16(), 400);
         assert_eq!(read_json(&mut burned)["error"], "invalid_grant");
 
+        // The token request must repeat the exact RFC 8707 audience captured
+        // by authorize. A substituted audience fails and consumes the code.
+        let invite3 = oauth
+            .with_locked_store(|store| store.mint_invite("carol", false, None, None, unix_now()))
+            .expect("mint invite3");
+        let mut granted3 = submit(&invite3, &challenge);
+        let (_, query) = location_query(&granted3);
+        let code3 = query["code"].clone();
+        let _ = granted3.body_mut().read_to_string();
+        let mut wrong_target = exchange_for(&code3, &verifier, "https://other.example.test/mcp");
+        assert_eq!(wrong_target.status().as_u16(), 400);
+        assert_eq!(read_json(&mut wrong_target)["error"], "invalid_target");
+        let mut burned = exchange(&code3, &verifier);
+        assert_eq!(read_json(&mut burned)["error"], "invalid_grant");
+
         // --- Expired access tokens 401 with the discovery challenge.
         // Minted at now=0 (expired an hour past the epoch), through the locked
         // path so it survives the mirror-refresh that every server write does.
         let stale = oauth
             .with_locked_store(|store| {
                 store
-                    .mint_token_pair("alice", "mock", &client_id, Duration::from_secs(3600), 0)
+                    .mint_token_pair(
+                        "alice",
+                        "mock",
+                        &client_id,
+                        TEST_RESOURCE,
+                        None,
+                        Duration::from_secs(3600),
+                        0,
+                    )
                     .0
             })
             .expect("mint stale token");
@@ -2511,19 +2889,28 @@ mod tests {
         let _ = expired_raw.body_mut().read_to_string();
 
         // --- Refresh rotation, then replay → family revocation.
-        let rotate = |refresh: &str| {
+        let rotate_for = |refresh: &str, resource: &str| {
             agent
                 .post(format!("http://{addr}/oauth/token"))
                 .send_form([
                     ("grant_type", "refresh_token"),
                     ("refresh_token", refresh),
                     ("client_id", client_id.as_str()),
+                    ("resource", resource),
                 ])
                 .expect("refresh")
         };
+        let rotate = |refresh: &str| rotate_for(refresh, protected_resource.as_str());
+        let mut wrong_target = rotate_for(&refresh, "https://other.example.test/mcp");
+        assert_eq!(wrong_target.status().as_u16(), 400);
+        assert_eq!(read_json(&mut wrong_target)["error"], "invalid_target");
         let mut rotated = rotate(&refresh);
         assert_eq!(rotated.status().as_u16(), 200);
         let rotated = read_json(&mut rotated);
+        assert_eq!(
+            rotated["scope"], requested_scope,
+            "refresh rotation preserves the authorization's offline_access scope"
+        );
         let access2 = rotated["access_token"].as_str().unwrap().to_string();
         let refresh2 = rotated["refresh_token"].as_str().unwrap().to_string();
         assert_ne!(refresh2, refresh, "refresh token rotates");
@@ -2616,6 +3003,7 @@ mod tests {
             .send_form([
                 ("grant_type", "refresh_token"),
                 ("refresh_token", "never-issued"),
+                ("resource", TEST_RESOURCE),
             ])
             .expect("bogus refresh");
         assert_eq!(bogus_refresh.status().as_u16(), 400);
@@ -2792,6 +3180,8 @@ mod tests {
                 "alice",
                 "mock",
                 "client-1",
+                TEST_RESOURCE,
+                None,
                 Duration::from_secs(3600),
                 1_000,
             );
@@ -2808,10 +3198,23 @@ mod tests {
         // The server revokes the family on refresh-reuse, through the lock.
         mutate_state_locked(&path, |store| {
             // Spend then replay: replay revokes the whole family.
-            let _ =
-                store.rotate_refresh(&refresh, Some("client-1"), Duration::from_secs(3600), 2_000);
+            let _ = store.rotate_refresh(
+                &refresh,
+                Some("client-1"),
+                TEST_RESOURCE,
+                None,
+                Duration::from_secs(3600),
+                2_000,
+            );
             let err = store
-                .rotate_refresh(&refresh, Some("client-1"), Duration::from_secs(3600), 2_100)
+                .rotate_refresh(
+                    &refresh,
+                    Some("client-1"),
+                    TEST_RESOURCE,
+                    None,
+                    Duration::from_secs(3600),
+                    2_100,
+                )
                 .err();
             assert_eq!(err, Some(RotateError::ReuseRevoked));
             (true, ())
@@ -2978,6 +3381,8 @@ mod tests {
                 "alice",
                 "mock",
                 "client-1",
+                TEST_RESOURCE,
+                None,
                 Duration::from_secs(3600),
                 1_000,
             );
@@ -2994,7 +3399,14 @@ mod tests {
         // Unknown refresh token: rotate_refresh returns Unknown, no mutation.
         {
             let (_store, _fingerprint, result) = mutate_state_locked(&path, |store| {
-                match store.rotate_refresh("never-issued", None, Duration::from_secs(3600), 2_000) {
+                match store.rotate_refresh(
+                    "never-issued",
+                    None,
+                    TEST_RESOURCE,
+                    None,
+                    Duration::from_secs(3600),
+                    2_000,
+                ) {
                     Ok(r) => (true, Ok(r)),
                     Err(RotateError::ReuseRevoked) => (true, Err(RotateError::ReuseRevoked)),
                     Err(other) => (false, Err(other)),
@@ -3081,6 +3493,7 @@ mod tests {
                     ("code_challenge", challenge),
                     ("code_challenge_method", "S256"),
                     ("state", "s"),
+                    ("resource", TEST_RESOURCE),
                     ("scope", "mcp"),
                     ("invite_code", invite.as_str()),
                 ])
@@ -3158,10 +3571,11 @@ mod tests {
         let challenge = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
         let mut form_page = agent
             .get(format!(
-                "http://{addr}/oauth/authorize?response_type=code&client_id={}&redirect_uri={}&code_challenge={}&code_challenge_method=S256",
+                "http://{addr}/oauth/authorize?response_type=code&client_id={}&redirect_uri={}&code_challenge={}&code_challenge_method=S256&resource={}",
                 url_encode(&client_id),
                 url_encode(redirect_uri),
                 url_encode(challenge),
+                url_encode(TEST_RESOURCE),
             ))
             .call()
             .expect("authorize form");
