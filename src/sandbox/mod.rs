@@ -29,6 +29,7 @@ pub mod proc;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -166,6 +167,107 @@ pub struct ExecRequest {
     pub timeout: Option<Duration>,
 }
 
+/// Which output pipe produced a streamed execution chunk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecStream {
+    Stdout,
+    Stderr,
+}
+
+/// Receives output while a command is still running.
+///
+/// Implementations must do only bounded, in-memory work here: the callback is
+/// invoked directly by the stdout/stderr drain threads. When a sink is present
+/// it owns output retention and the terminal [`ExecResult`] does not duplicate
+/// stdout/stderr; callers that need a captured result omit the sink.
+pub trait ExecOutputSink: Send + Sync {
+    fn on_output(&self, stream: ExecStream, chunk: &[u8]);
+}
+
+/// Cloneable control plane for one execution.
+///
+/// Every clone shares the same cancellation flag and optional output sink. A
+/// job table can therefore retain one clone to cancel/poll while a blocking
+/// backend owns another for the duration of [`SandboxBackend::exec`].
+#[derive(Clone)]
+pub struct ExecControl {
+    cancelled: Arc<AtomicBool>,
+    output_sink: Option<Arc<dyn ExecOutputSink>>,
+    capture_output: bool,
+    output_open: Arc<Mutex<bool>>,
+}
+
+impl Default for ExecControl {
+    fn default() -> Self {
+        Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            output_sink: None,
+            capture_output: true,
+            output_open: Arc::new(Mutex::new(true)),
+        }
+    }
+}
+
+impl std::fmt::Debug for ExecControl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExecControl")
+            .field("cancelled", &self.is_cancelled())
+            .field("has_output_sink", &self.output_sink.is_some())
+            .field("capture_output", &self.capture_output)
+            .finish()
+    }
+}
+
+impl ExecControl {
+    pub fn with_output_sink(output_sink: Arc<dyn ExecOutputSink>) -> Self {
+        Self {
+            output_sink: Some(output_sink),
+            // The sink owns bounded retention. Keeping a second full copy in
+            // each drain thread would both double memory and couple process
+            // lifetime to the retained-log ceiling.
+            capture_output: false,
+            ..Self::default()
+        }
+    }
+
+    /// Request cooperative cancellation. The process driver observes this at
+    /// its short polling cadence and then kills and reaps the transported child.
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn emit(&self, stream: ExecStream, chunk: &[u8]) {
+        let open = self
+            .output_open
+            .lock()
+            .expect("execution output gate poisoned");
+        if !*open {
+            return;
+        }
+        if let Some(sink) = &self.output_sink {
+            sink.on_output(stream, chunk);
+        }
+    }
+
+    /// Close the streaming side before a job publishes its terminal state.
+    /// Taking the same gate as [`Self::emit`] waits for any in-flight callback,
+    /// so detached drain threads can never append after terminal publication.
+    pub(crate) fn seal_output(&self) {
+        *self
+            .output_open
+            .lock()
+            .expect("execution output gate poisoned") = false;
+    }
+
+    pub(crate) fn captures_output(&self) -> bool {
+        self.capture_output
+    }
+}
+
 /// The terminal result of an [`ExecRequest`].
 ///
 /// Mirrors the fields the exec worker already records into the pile
@@ -175,8 +277,38 @@ pub struct ExecResult {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     pub exit_code: Option<i32>,
-    /// Present iff the command was killed by the timeout / an error occurred.
+    /// True iff an [`ExecControl`] cancellation request killed this execution.
+    pub cancelled: bool,
+    /// Present iff the command was killed by cancellation/timeout or an error
+    /// occurred.
     pub error: Option<String>,
+}
+
+/// The backend has lost the ability to prove that a cancellable command and
+/// all of its descendants are gone. This is not an ordinary command/backend
+/// failure: a server that receives it must stop global admission and exit so an
+/// operator can recover the host explicitly.
+#[derive(Debug)]
+pub(crate) struct SandboxControlLost {
+    reason: String,
+}
+
+impl std::fmt::Display for SandboxControlLost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "sandbox execution control lost: {}", self.reason)
+    }
+}
+
+impl std::error::Error for SandboxControlLost {}
+
+pub(crate) fn sandbox_control_lost(reason: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(SandboxControlLost {
+        reason: reason.into(),
+    })
+}
+
+pub(crate) fn is_sandbox_control_lost(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<SandboxControlLost>().is_some()
 }
 
 /// A backend that can provision isolated shells and run commands in them.
@@ -192,6 +324,14 @@ pub struct ExecResult {
 pub trait SandboxBackend: Send + Sync {
     /// Human-readable backend name for diagnostics ("lima", "seatbelt", ...).
     fn name(&self) -> &'static str;
+
+    /// Whether this backend can prove prompt cancellation and reaping for a
+    /// retained background job. The public `job_*` surface is intentionally
+    /// narrower than synchronous execution: unsupported backends keep `exec`
+    /// but do not pretend that killing a local transport killed remote work.
+    fn supports_background_jobs(&self) -> bool {
+        false
+    }
 
     /// The CANONICAL physical key for a tenant: the stable identity that maps
     /// two aliasing labels to ONE sandbox. The provider uses it to pick a
@@ -230,7 +370,12 @@ pub trait SandboxBackend: Send + Sync {
 
     /// Run one command inside an open session. Blocks until the command exits,
     /// times out, or is killed.
-    fn exec(&self, session: &SessionId, request: &ExecRequest) -> Result<ExecResult>;
+    fn exec(
+        &self,
+        session: &SessionId,
+        request: &ExecRequest,
+        control: &ExecControl,
+    ) -> Result<ExecResult>;
 
     /// Release a session. On the shipped persistent backends (jail, lima) this
     /// only DETACHES — the box stays alive so the same tenant can reconnect. Use

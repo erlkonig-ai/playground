@@ -68,7 +68,7 @@
 //! ## Pile provisioning (Model B: host-owned, server-born piles)
 //!
 //! This backend does NOT use the caller-supplied `tenant.pile.host_path` (that
-//! field is only logged); every tenant jail is given its OWN piles, created on
+//! field is ignored); every tenant jail is given its OWN piles, created on
 //! the server under `pile_root`. Two host-owned pile FILES are mounted in via
 //! single-FILE `nullfs` (FreeBSD nullfs mounts a plain file onto a plain file,
 //! verified on 15.1 — NOT only directories). Each pile file is mounted directly
@@ -126,8 +126,14 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 
-use super::proc::{DEFAULT_MAX_OUTPUT_BYTES, drive_child, drive_child_capped};
-use super::{ExecRequest, ExecResult, LifecycleLocks, SandboxBackend, SessionId, SessionSpec};
+use super::proc::{
+    DEFAULT_MAX_OUTPUT_BYTES, drive_child, drive_child_capped_controlled,
+    drive_child_capped_controlled_process_group,
+};
+use super::{
+    ExecControl, ExecRequest, ExecResult, LifecycleLocks, SandboxBackend, SessionId, SessionSpec,
+    sandbox_control_lost,
+};
 
 /// Output of one host command, however it was transported. Local-backstop
 /// timeouts set `timed_out`; server-side `timeout(1)` expiry shows up as
@@ -150,10 +156,12 @@ const ADMIN_TIMEOUT: Duration = Duration::from_secs(120);
 /// server kill is authoritative; the local kill only fires if SSH itself
 /// wedges.
 const LOCAL_TIMEOUT_GRACE: Duration = Duration::from_secs(20);
-/// Per-stream output ceiling for a tenant `exec` (see
+/// Per-stream output ceiling for a directly captured tenant `exec` (see
 /// [`super::proc::DEFAULT_MAX_OUTPUT_BYTES`]). Each of stdout/stderr is capped
-/// independently and the jail process is killed the instant either exceeds it,
-/// so a runaway producer cannot make the daemon accumulate unbounded memory.
+/// independently and the jail process is killed the instant either exceeds it.
+/// Streamed jobs instead drain continuously into the bounded job output ring,
+/// so they do not need to kill a healthy command merely because old output was
+/// evicted.
 const MAX_EXEC_OUTPUT_BYTES: usize = DEFAULT_MAX_OUTPUT_BYTES;
 /// Default ZFS `refquota` for a per-tenant clone (a ZFS size string). Bounds how
 /// much a tenant can write into its own dataset so it cannot fill the host pool.
@@ -162,12 +170,13 @@ const DEFAULT_CLONE_REFQUOTA: &str = "10G";
 /// across all tenants' piles (self + shared) so pile writes cannot fill the pool.
 const DEFAULT_PILE_ROOT_QUOTA: &str = "50G";
 /// Default per-jail `rctl(8)` rules (the `<resource>:<action>=<amount>` tails).
-/// Applied ONLY when host RACCT is enabled (probed at runtime); a no-op on the
-/// current RACCT-off deploy box. These clamp the fork/thread/FD/RAM/CPU pressure
-/// the review flagged as reaching host-global resources: cap processes and
-/// threads (fork-bomb), resident + swap memory (RAM exhaustion), open files (FD
-/// exhaustion), and CPU-seconds (runaway spin). Deny actions fail the offending
-/// syscall; the CPU rule signals the process.
+/// Applied whenever a jail is created or reused while host RACCT is enabled;
+/// dynamic RCTL rules do not survive a reboot, and repeated `rctl -a` calls for
+/// these deny rules replace the matching rule instead of stacking duplicates.
+/// These clamp fork/thread/FD/RAM/CPU pressure that reaches host-global
+/// resources: cap processes and threads (fork-bomb), resident + swap memory
+/// (RAM exhaustion), open files (FD exhaustion), and CPU percentage. Deny
+/// actions fail the offending syscall; the CPU rule signals the process.
 const DEFAULT_RCTL_RULES: &[&str] = &[
     "maxproc:deny=512",
     "openfiles:deny=8192",
@@ -213,11 +222,18 @@ pub trait HostRunner: Send + Sync {
     /// construction (zfs/jail/mount).
     fn run(&self, argv: &[String], stdin: Option<&[u8]>, timeout: Duration) -> Result<HostOutput>;
 
-    /// Like [`run`](Self::run) but caps each of stdout/stderr at
-    /// `max_output_bytes` and KILLS the transported child the instant either
-    /// exceeds it (`ChildOutput::output_truncated` is then set). This is the
-    /// path for a TENANT `exec`, whose output is attacker-controlled: it must
-    /// not accumulate unbounded memory in the daemon. The default is unbounded
+    /// True only when this runner can prove cancellation of the command tree,
+    /// not merely termination of a local transport wrapper.
+    fn supports_background_jobs(&self) -> bool {
+        false
+    }
+
+    /// Like [`run`](Self::run), but with an output policy suitable for a tenant
+    /// command. When `control` has no streaming sink, implementations cap each
+    /// captured stream at `max_output_bytes` and kill the transported child on
+    /// breach (`ChildOutput::output_truncated` is then set). With a sink, they
+    /// continuously drain output into the separately bounded job ring and do
+    /// not duplicate it in these returned buffers. The default is unbounded
     /// (delegates to `run`), correct only for a runner that never carries a
     /// tenant command; the production runners override it.
     fn run_capped(
@@ -226,7 +242,14 @@ pub trait HostRunner: Send + Sync {
         stdin: Option<&[u8]>,
         timeout: Duration,
         _max_output_bytes: usize,
+        control: &ExecControl,
     ) -> Result<HostOutput> {
+        if control.is_cancelled() {
+            return Ok(HostOutput {
+                cancelled: true,
+                ..Default::default()
+            });
+        }
         self.run(argv, stdin, timeout)
     }
 
@@ -261,7 +284,11 @@ impl SshRunner {
 
 impl HostRunner for SshRunner {
     fn run(&self, argv: &[String], stdin: Option<&[u8]>, timeout: Duration) -> Result<HostOutput> {
-        let remote = argv.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" ");
+        let remote = argv
+            .iter()
+            .map(|a| shell_quote(a))
+            .collect::<Vec<_>>()
+            .join(" ");
         let mut cmd = Command::new("ssh");
         cmd.arg("-o")
             .arg("BatchMode=yes")
@@ -270,7 +297,11 @@ impl HostRunner for SshRunner {
             .arg(&self.host)
             .arg(remote);
 
-        cmd.stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() });
+        cmd.stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        });
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
 
@@ -289,8 +320,13 @@ impl HostRunner for SshRunner {
         stdin: Option<&[u8]>,
         timeout: Duration,
         max_output_bytes: usize,
+        control: &ExecControl,
     ) -> Result<HostOutput> {
-        let remote = argv.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" ");
+        let remote = argv
+            .iter()
+            .map(|a| shell_quote(a))
+            .collect::<Vec<_>>()
+            .join(" ");
         let mut cmd = Command::new("ssh");
         cmd.arg("-o")
             .arg("BatchMode=yes")
@@ -298,7 +334,11 @@ impl HostRunner for SshRunner {
             .arg(format!("ConnectTimeout={}", self.connect_timeout.as_secs()))
             .arg(&self.host)
             .arg(remote);
-        cmd.stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() });
+        cmd.stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        });
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
         let child = cmd.spawn().context("spawn ssh")?;
@@ -306,7 +346,13 @@ impl HostRunner for SshRunner {
         // remote; the authoritative remote-side kill of the jail process tree is
         // the backend's `timeout(1)` wrapper (server-side, exit 124). The cap is
         // the daemon-memory bound; the timeout is the process-tree bound.
-        drive_child_capped(child, stdin.map(|b| b.to_vec()), timeout, max_output_bytes)
+        drive_child_capped_controlled(
+            child,
+            stdin.map(|b| b.to_vec()),
+            timeout,
+            max_output_bytes,
+            control,
+        )
     }
 
     fn transport_error_exit(&self) -> Option<i32> {
@@ -323,13 +369,27 @@ impl HostRunner for SshRunner {
 pub struct LocalRunner;
 
 impl HostRunner for LocalRunner {
+    fn supports_background_jobs(&self) -> bool {
+        // The proof boundary is FreeBSD timeout(1) itself. When the daemon is
+        // root we exec it directly; a preceding sudo wrapper would make the
+        // observed group leader ambiguous, so fail closed in that mode. Other
+        // Unix timeout implementations do not promise FreeBSD's PROC_REAP
+        // descendant semantics, even when this process happens to be root.
+        cfg!(target_os = "freebsd") && running_as_root()
+    }
+
     fn run(&self, argv: &[String], stdin: Option<&[u8]>, timeout: Duration) -> Result<HostOutput> {
+        let argv = local_argv(argv, running_as_root());
         let Some((program, args)) = argv.split_first() else {
             bail!("empty argv");
         };
         let mut cmd = Command::new(program);
         cmd.args(args);
-        cmd.stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() });
+        cmd.stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        });
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
 
@@ -343,18 +403,63 @@ impl HostRunner for LocalRunner {
         stdin: Option<&[u8]>,
         timeout: Duration,
         max_output_bytes: usize,
+        control: &ExecControl,
     ) -> Result<HostOutput> {
+        let argv = local_argv(argv, running_as_root());
         let Some((program, args)) = argv.split_first() else {
             bail!("empty argv");
         };
         let mut cmd = Command::new(program);
         cmd.args(args);
-        cmd.stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() });
+        cmd.stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        });
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
+        // Make the FreeBSD timeout(1) descendant reaper the leader of a fresh
+        // host process group, so cancellation targets exactly this exec tree.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
         let child = cmd.spawn().with_context(|| format!("spawn {program}"))?;
-        drive_child_capped(child, stdin.map(|b| b.to_vec()), timeout, max_output_bytes)
+        drive_child_capped_controlled_process_group(
+            child,
+            stdin.map(|b| b.to_vec()),
+            timeout,
+            max_output_bytes,
+            control,
+        )
     }
+}
+
+/// When the daemon itself is root, `sudo -n` is redundant and would obscure
+/// the timeout process-group/reaper boundary. Retain it for non-root hosts.
+fn local_argv(argv: &[String], is_root: bool) -> &[String] {
+    if is_root
+        && argv.first().map(String::as_str) == Some("sudo")
+        && argv.get(1).map(String::as_str) == Some("-n")
+    {
+        &argv[2..]
+    } else {
+        argv
+    }
+}
+
+#[cfg(unix)]
+fn running_as_root() -> bool {
+    unsafe extern "C" {
+        fn geteuid() -> u32;
+    }
+    unsafe { geteuid() == 0 }
+}
+
+#[cfg(not(unix))]
+fn running_as_root() -> bool {
+    false
 }
 
 /// POSIX single-quote escaping: `it's` -> `'it'\''s'`. Safe for any byte
@@ -417,14 +522,16 @@ pub struct JailBackend {
     /// follow-up; this global cap already stops the fill-the-pool attack. `None`
     /// disables it.
     pub pile_root_quota: Option<String>,
-    /// Per-jail `rctl(8)` resource rules applied at provision, but ONLY when the
-    /// host has RACCT enabled (`kern.racct.enable=1`, probed at runtime). Each
-    /// entry is the `<resource>:<action>=<amount>` tail of a
+    /// Per-jail `rctl(8)` resource rules applied whenever a jail is created or
+    /// reused, but ONLY when the host has RACCT enabled
+    /// (`kern.racct.enable=1`, probed at runtime). Each entry is the
+    /// `<resource>:<action>=<amount>` tail of a
     /// `jail:<name>:<resource>:<action>=<amount>` rule (e.g. `maxproc:deny=512`).
-    /// Host RACCT is currently OFF on the deploy box, so these are a NO-OP there
-    /// with a clear operator note (deploy/freebsd/README.md) on enabling it;
-    /// once enabled they clamp per-jail process/RAM/CPU/FD pressure without any
-    /// code change. Empty disables the programmatic path.
+    /// Reapplication is intentional: dynamic RCTL rules vanish on reboot, while
+    /// FreeBSD's `rctl -a` replacement semantics make this idempotent. If RACCT
+    /// is enabled, every configured rule is mandatory; failure aborts the
+    /// lifecycle operation rather than handing out an under-limited jail. Empty
+    /// disables the programmatic path.
     pub rctl_rules: Vec<String>,
     /// Per-canonical-tenant (jail-name-keyed) lifecycle lock. Serializes
     /// provision / open / destroy for one tenant WITHIN this process, so two
@@ -465,9 +572,9 @@ impl JailBackend {
             // Sane default: 50 GiB across ALL tenants' piles (self + shared).
             // Tune with `--jail-pile-quota` (`0`/empty disables).
             pile_root_quota: Some(DEFAULT_PILE_ROOT_QUOTA.to_string()),
-            // Default per-jail rctl rules — applied ONLY when host RACCT is on
-            // (probed at runtime; a no-op on the current RACCT-off deploy box).
-            // Bounds process count, RAM, swap, open files, and CPU per jail.
+            // Default per-jail rctl rules — reapplied on every create/reuse when
+            // host RACCT is on. Bounds process count, RAM, swap, open files, and
+            // CPU per jail; any application failure is fail-closed.
             rctl_rules: DEFAULT_RCTL_RULES.iter().map(|s| s.to_string()).collect(),
             lifecycle: LifecycleLocks::new(),
         }
@@ -639,7 +746,10 @@ impl JailBackend {
             ADMIN_TIMEOUT,
         )?;
         if !mkdir.success() {
-            bail!("mkdir staging root {staging_root} failed: {}", mkdir.stderr_lossy());
+            bail!(
+                "mkdir staging root {staging_root} failed: {}",
+                mkdir.stderr_lossy()
+            );
         }
         // Force the intended ownership + mode explicitly (root-owned, 0700):
         // `chown` closes a pre-existing dir that mkdir -p left with foreign
@@ -651,7 +761,10 @@ impl JailBackend {
             ADMIN_TIMEOUT,
         )?;
         if !chown.success() {
-            bail!("chown root:wheel staging root {staging_root} failed: {}", chown.stderr_lossy());
+            bail!(
+                "chown root:wheel staging root {staging_root} failed: {}",
+                chown.stderr_lossy()
+            );
         }
         let chmod = self.run(
             &["sudo", "-n", "chmod", "700", &staging_root],
@@ -659,7 +772,10 @@ impl JailBackend {
             ADMIN_TIMEOUT,
         )?;
         if !chmod.success() {
-            bail!("chmod 700 staging root {staging_root} failed: {}", chmod.stderr_lossy());
+            bail!(
+                "chmod 700 staging root {staging_root} failed: {}",
+                chmod.stderr_lossy()
+            );
         }
         // STAGING PROVENANCE (sol's reopened review of repair #2, 2026-07-24):
         // before trusting the private staging dir, PROVE two things about it —
@@ -807,7 +923,11 @@ fi
             })?;
             // Clean up the staging temp now that both inodes are captured: on the
             // success path it is the redundant second name of the published inode.
-            let _ = self.run(&["sudo", "-n", "rm", "-f", &staging_tmp], None, ADMIN_TIMEOUT);
+            let _ = self.run(
+                &["sudo", "-n", "rm", "-f", &staging_tmp],
+                None,
+                ADMIN_TIMEOUT,
+            );
             if staging_ino != dest_ino {
                 bail!(
                     "publish pile -> {dest} succeeded but the dest inode ({dest_ino}) does not \
@@ -822,12 +942,18 @@ fi
             // lstat/no-follow check turns a silent follow into a loud publish
             // failure, so the caller never mounts something a tenant redirected.
             self.assert_regular_nonsymlink(dest).with_context(|| {
-                format!("publish pile -> {dest} succeeded but the destination is not a \
-                     regular non-symlink file at the expected path (refusing)")
+                format!(
+                    "publish pile -> {dest} succeeded but the destination is not a \
+                     regular non-symlink file at the expected path (refusing)"
+                )
             })?;
         } else {
             // Clean up the staging temp: on this no-op path it is our leftover copy.
-            let _ = self.run(&["sudo", "-n", "rm", "-f", &staging_tmp], None, ADMIN_TIMEOUT);
+            let _ = self.run(
+                &["sudo", "-n", "rm", "-f", &staging_tmp],
+                None,
+                ADMIN_TIMEOUT,
+            );
             // `ln -h` failed. The ONLY acceptable reason is "destination already
             // exists as a regular, non-symlink file" — the create-if-absent
             // no-op. Verify that with a no-follow test; anything else (symlink,
@@ -870,8 +996,13 @@ fi
     fn assert_regular_nonsymlink(&self, path: &str) -> Result<()> {
         let out = self.run(
             &[
-                "sudo", "-n", "sh", "-c",
-                "test -f \"$1\" && test ! -L \"$1\"", "sh", path,
+                "sudo",
+                "-n",
+                "sh",
+                "-c",
+                "test -f \"$1\" && test ! -L \"$1\"",
+                "sh",
+                path,
             ],
             None,
             ADMIN_TIMEOUT,
@@ -1012,11 +1143,17 @@ fi
         };
         let mkdir = self.run(&["sudo", "-n", "mkdir", "-p", parent], None, ADMIN_TIMEOUT)?;
         if !mkdir.success() {
-            bail!("mkdir guest mount parent {parent} failed: {}", mkdir.stderr_lossy());
+            bail!(
+                "mkdir guest mount parent {parent} failed: {}",
+                mkdir.stderr_lossy()
+            );
         }
         let touch = self.run(&["sudo", "-n", "touch", &target], None, ADMIN_TIMEOUT)?;
         if !touch.success() {
-            bail!("touch guest mount target {target} failed: {}", touch.stderr_lossy());
+            bail!(
+                "touch guest mount target {target} failed: {}",
+                touch.stderr_lossy()
+            );
         }
         let mount = self.run(
             &["sudo", "-n", "mount", "-t", "nullfs", host_file, &target],
@@ -1024,7 +1161,10 @@ fi
             ADMIN_TIMEOUT,
         )?;
         if !mount.success() {
-            bail!("nullfs mount {host_file} -> {target} failed: {}", mount.stderr_lossy());
+            bail!(
+                "nullfs mount {host_file} -> {target} failed: {}",
+                mount.stderr_lossy()
+            );
         }
         // Post-condition: re-read the table and confirm the EXACT tuple is live.
         // A silently-failed mount (exit 0, nothing mounted) would leave the guest
@@ -1072,19 +1212,21 @@ fi
         self.runner.run(&argv, stdin, timeout)
     }
 
-    /// `run` for a TENANT command: caps each output stream at `max_output_bytes`
-    /// and kills the transported child on breach (see
-    /// [`HostRunner::run_capped`]). Used only by `exec`, never by the admin
-    /// commands (whose output is bounded by construction).
+    /// `run` for a TENANT command: either caps captured output or streams it
+    /// into the bounded job ring (see [`HostRunner::run_capped`]). Used only by
+    /// `exec`, never by the admin commands (whose output is bounded by
+    /// construction).
     fn run_capped(
         &self,
         argv: &[&str],
         stdin: Option<&[u8]>,
         timeout: Duration,
         max_output_bytes: usize,
+        control: &ExecControl,
     ) -> Result<HostOutput> {
         let argv: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
-        self.runner.run_capped(&argv, stdin, timeout, max_output_bytes)
+        self.runner
+            .run_capped(&argv, stdin, timeout, max_output_bytes, control)
     }
 
     /// Record the ORIGINAL tenant label on a freshly-cloned dataset as a ZFS
@@ -1157,7 +1299,16 @@ fi
         // the quota when the path's dataset mountpoint IS the pile root, so we
         // never clamp an unrelated ancestor dataset.
         let name = self.run(
-            &["sudo", "-n", "zfs", "list", "-H", "-o", "name", &self.pile_root],
+            &[
+                "sudo",
+                "-n",
+                "zfs",
+                "list",
+                "-H",
+                "-o",
+                "name",
+                &self.pile_root,
+            ],
             None,
             ADMIN_TIMEOUT,
         );
@@ -1194,54 +1345,52 @@ fi
     }
 
     /// Is host RACCT/RCTL enabled? Probes `sysctl -n kern.racct.enable`; a value
-    /// of `1` means `rctl(8)` rules can be set. Any failure (sysctl missing,
-    /// transport error) is read conservatively as DISABLED, so we never try to
-    /// set a rule that would error. Cheap and side-effect-free.
-    fn racct_enabled(&self) -> bool {
-        match self.run(&["sysctl", "-n", "kern.racct.enable"], None, ADMIN_TIMEOUT) {
-            Ok(out) if out.success() => {
-                String::from_utf8_lossy(&out.stdout).trim() == "1"
-            }
-            _ => false,
+    /// of `1` means `rctl(8)` rules can be set. A successful value other than
+    /// `1` is the explicit disabled state. Probe/transport failure is UNKNOWN,
+    /// not disabled, and therefore propagates to fail lifecycle readiness
+    /// closed rather than silently skipping mandatory limits.
+    fn racct_enabled(&self) -> Result<bool> {
+        let out = self
+            .run(&["sysctl", "-n", "kern.racct.enable"], None, ADMIN_TIMEOUT)
+            .context("probe kern.racct.enable")?;
+        if !out.success() {
+            bail!("sysctl kern.racct.enable failed: {}", out.stderr_lossy());
         }
+        Ok(String::from_utf8_lossy(&out.stdout).trim() == "1")
     }
 
     /// Apply the configured per-jail `rctl(8)` rules IF host RACCT is enabled.
-    /// This is the guarded programmatic path the review asks for: on the current
-    /// RACCT-off deploy box `racct_enabled()` returns false and this is a no-op
-    /// (with a one-line operator hint); once the operator sets
-    /// `kern.racct.enable=1` the same rules clamp per-jail resource pressure with
-    /// no code change. Best-effort per rule: a rule that fails to apply is logged
-    /// and the rest proceed (partial limits beat none). Called AFTER `jail -c`,
-    /// since a `jail:<name>:...` rule needs the jail to exist.
-    fn apply_rctl_rules(&self, jail: &str) {
+    /// Called after `jail -c` and whenever an already-running jail is reused:
+    /// dynamic rules vanish on reboot, while FreeBSD's `rctl -a` semantics make
+    /// repeated application of these deny rules an idempotent replacement.
+    ///
+    /// RACCT-off hosts remain supported as an explicit no-op. Once RACCT is on,
+    /// however, every configured rule is mandatory: a transport error or
+    /// non-zero `rctl` exit aborts the lifecycle operation so an under-limited
+    /// jail is never reported ready.
+    fn apply_rctl_rules(&self, jail: &str) -> Result<()> {
         if self.rctl_rules.is_empty() {
-            return;
+            return Ok(());
         }
-        if !self.racct_enabled() {
+        if !self.racct_enabled()? {
             eprintln!(
                 "[{}] host RACCT is disabled (kern.racct.enable=0); skipping per-jail rctl \
-                 limits for '{jail}'. Enable RACCT + reprovision to clamp CPU/RAM/maxproc/FDs \
+                 limits for '{jail}'. Enable RACCT to clamp CPU/RAM/maxproc/FDs \
                  (see deploy/freebsd/README.md).",
                 self.name()
             );
-            return;
+            return Ok(());
         }
         for tail in &self.rctl_rules {
             let rule = format!("jail:{jail}:{tail}");
-            match self.run(&["sudo", "-n", "rctl", "-a", &rule], None, ADMIN_TIMEOUT) {
-                Ok(out) if out.success() => {}
-                Ok(out) => eprintln!(
-                    "[{}] rctl -a {rule} failed: {} (continuing with remaining rules)",
-                    self.name(),
-                    out.stderr_lossy()
-                ),
-                Err(e) => eprintln!(
-                    "[{}] rctl -a {rule} errored: {e:#} (continuing)",
-                    self.name()
-                ),
+            let out = self
+                .run(&["sudo", "-n", "rctl", "-a", &rule], None, ADMIN_TIMEOUT)
+                .with_context(|| format!("apply RCTL rule '{rule}'"))?;
+            if !out.success() {
+                bail!("rctl -a {rule} failed: {}", out.stderr_lossy());
             }
         }
+        Ok(())
     }
 
     /// Read the recorded tenant label off `dataset`'s `playground:tenant` ZFS
@@ -1253,7 +1402,17 @@ fi
     /// check ([`verify_tenant_property_derives_leaf`]).
     fn read_tenant_property(&self, dataset: &str) -> Result<String> {
         let out = self.run(
-            &["sudo", "-n", "zfs", "get", "-H", "-o", "value", Self::TENANT_PROPERTY, dataset],
+            &[
+                "sudo",
+                "-n",
+                "zfs",
+                "get",
+                "-H",
+                "-o",
+                "value",
+                Self::TENANT_PROPERTY,
+                dataset,
+            ],
             None,
             ADMIN_TIMEOUT,
         )?;
@@ -1336,11 +1495,21 @@ fi
             ADMIN_TIMEOUT,
         )?;
         if !tee.success() {
-            bail!("write tenant marker {marker} failed: {}", tee.stderr_lossy());
+            bail!(
+                "write tenant marker {marker} failed: {}",
+                tee.stderr_lossy()
+            );
         }
-        let chmod = self.run(&["sudo", "-n", "chmod", "600", &marker], None, ADMIN_TIMEOUT)?;
+        let chmod = self.run(
+            &["sudo", "-n", "chmod", "600", &marker],
+            None,
+            ADMIN_TIMEOUT,
+        )?;
         if !chmod.success() {
-            bail!("chmod 600 tenant marker {marker} failed: {}", chmod.stderr_lossy());
+            bail!(
+                "chmod 600 tenant marker {marker} failed: {}",
+                chmod.stderr_lossy()
+            );
         }
         let chown = self.run(
             &["sudo", "-n", "chown", "root:wheel", &marker],
@@ -1348,7 +1517,10 @@ fi
             ADMIN_TIMEOUT,
         )?;
         if !chown.success() {
-            bail!("chown tenant marker {marker} failed: {}", chown.stderr_lossy());
+            bail!(
+                "chown tenant marker {marker} failed: {}",
+                chown.stderr_lossy()
+            );
         }
         Ok(())
     }
@@ -1457,7 +1629,10 @@ fi
             ADMIN_TIMEOUT,
         )?;
         if !out.success() {
-            bail!("zfs get mountpoint {dataset} failed: {}", out.stderr_lossy());
+            bail!(
+                "zfs get mountpoint {dataset} failed: {}",
+                out.stderr_lossy()
+            );
         }
         let mp = String::from_utf8_lossy(&out.stdout).trim().to_string();
         if !mp.starts_with('/') {
@@ -1484,7 +1659,11 @@ fi
                 );
             }
         }
-        let _ = self.run(&["sudo", "-n", "zfs", "destroy", &dataset], None, ADMIN_TIMEOUT);
+        let _ = self.run(
+            &["sudo", "-n", "zfs", "destroy", &dataset],
+            None,
+            ADMIN_TIMEOUT,
+        );
     }
 
     /// True iff a jail with this name currently exists (a running jail context).
@@ -1527,7 +1706,8 @@ fi
         }
         // A local wall-clock kill or the transport's own error exit (ssh 255)
         // means we never got ZFS's real answer — Unknown, not Absent.
-        if out.timed_out || (out.exit_code.is_some() && out.exit_code == self.runner.transport_error_exit())
+        if out.timed_out
+            || (out.exit_code.is_some() && out.exit_code == self.runner.transport_error_exit())
         {
             return DatasetState::Unknown;
         }
@@ -1651,7 +1831,9 @@ fi
         // host-owned pile's OWN marker must also derive this leaf. Covers the
         // boot sweep, which has no requester label to check the marker against.
         self.verify_pile_marker_derives_leaf(jail)
-            .with_context(|| format!("verify persistent pile marker before reattaching '{jail}'"))?;
+            .with_context(|| {
+                format!("verify persistent pile marker before reattaching '{jail}'")
+            })?;
         let root = self.mountpoint(dataset)?;
         // devfs: re-mount and VERIFY it is live. A re-mount over a still-live
         // devfs fails "already mounted", so we do not gate on the mount's own
@@ -1662,7 +1844,14 @@ fi
         let dev_target = format!("{root}/dev");
         let _ = self.run(
             &[
-                "sudo", "-n", "mount", "-t", "devfs", "-o", "ruleset=4", "devfs",
+                "sudo",
+                "-n",
+                "mount",
+                "-t",
+                "devfs",
+                "-o",
+                "ruleset=4",
+                "devfs",
                 &dev_target,
             ],
             None,
@@ -1712,6 +1901,8 @@ fi
         if !created.success() {
             bail!("jail -c {jail} failed: {}", created.stderr_lossy());
         }
+        self.apply_rctl_rules(jail)
+            .with_context(|| format!("apply resource limits while reattaching '{jail}'"))?;
         Ok(())
     }
 }
@@ -1719,6 +1910,10 @@ fi
 impl SandboxBackend for JailBackend {
     fn name(&self) -> &'static str {
         "jail"
+    }
+
+    fn supports_background_jobs(&self) -> bool {
+        self.runner.supports_background_jobs()
     }
 
     /// The canonical key IS the injective jail name (repair #1): the provider's
@@ -1742,11 +1937,12 @@ impl SandboxBackend for JailBackend {
         // This backend does not use the caller-supplied `spec.tenant.pile`
         // path: the session operates on its own server-born pile, provisioned
         // under `pile_root` and mounted at /pile/self.pile by provision_sandbox.
+        // Do not echo the ignored caller path into service logs: it is neither
+        // authority nor useful provenance in Model B, only untrusted text.
         eprintln!(
             "[{}] session operates on its server-born pile under pile_root \
-             (caller pile_host_path '{}' is not used by this backend)",
-            self.name(),
-            spec.tenant.pile.host_path.display()
+             (caller pile_host_path is ignored by this backend)",
+            self.name()
         );
 
         // Serialize the whole reuse/reattach decision under the per-canonical-
@@ -1769,7 +1965,11 @@ impl SandboxBackend for JailBackend {
                 // the host-owned pile survives dataset destroy, so it must prove
                 // its OWN tenant, not just trust the dataset's ZFS property.
                 self.verify_persistent_pile_provenance(&jail, &spec.tenant.label)
-                    .with_context(|| format!("verify persistent pile provenance for jail '{jail}'"))?;
+                    .with_context(|| {
+                        format!("verify persistent pile provenance for jail '{jail}'")
+                    })?;
+                self.apply_rctl_rules(&jail)
+                    .with_context(|| format!("apply resource limits while reusing '{jail}'"))?;
                 eprintln!("[{}] reusing persistent sandbox '{}'", self.name(), jail);
                 return Ok(SessionId::new(jail.clone()));
             }
@@ -1791,8 +1991,14 @@ impl SandboxBackend for JailBackend {
                         .with_context(|| format!("verify tenant provenance for jail '{jail}'"))?;
                     // Independent persistent-pile provenance (repair #1 reopened).
                     self.verify_persistent_pile_provenance(&jail, &spec.tenant.label)
-                        .with_context(|| format!("verify persistent pile provenance for jail '{jail}'"))?;
-                    eprintln!("[{}] reattaching persistent sandbox '{}'", self.name(), jail);
+                        .with_context(|| {
+                            format!("verify persistent pile provenance for jail '{jail}'")
+                        })?;
+                    eprintln!(
+                        "[{}] reattaching persistent sandbox '{}'",
+                        self.name(),
+                        jail
+                    );
                     self.reattach(&jail, &dataset)
                         .with_context(|| format!("reattach jail '{jail}'"))?;
                     Ok(SessionId::new(jail.clone()))
@@ -1828,332 +2034,362 @@ impl SandboxBackend for JailBackend {
         // probe + operation-owned cleanup below, a concurrent create can neither
         // clone-over nor destroy a valid dataset.
         self.lifecycle.with_lock(&jail, || {
-        // Idempotent: a tenant whose dataset already exists is already
-        // provisioned. Don't clone or re-seed; just ensure the jail is up so
-        // `provision` doubles as "converge to running" (reattach if the jail
-        // context is gone). VERIFY the recorded tenant first (authoritative
-        // injectivity check), same as `open_session`'s reuse arms.
-        //
-        // TRI-STATE probe: we only proceed to CLONE on a definite `Absent`. An
-        // `Unknown` (transport/permission/timeout) must NOT fall through to the
-        // clone path — a clone into a name whose real state is unknown, followed
-        // by a failure, is exactly the situation that used to `zfs destroy` a
-        // valid dataset. Fail closed instead.
-        match self.dataset_state(&dataset) {
-            DatasetState::Exists => {
-                self.verify_tenant_property(&dataset, &spec.tenant.label)
-                    .with_context(|| format!("verify tenant provenance for jail '{jail}'"))?;
-                // Independent persistent-pile provenance (repair #1 reopened).
-                self.verify_persistent_pile_provenance(&jail, &spec.tenant.label)
-                    .with_context(|| format!("verify persistent pile provenance for jail '{jail}'"))?;
-                eprintln!(
-                    "[{}] sandbox '{}' already provisioned; ensuring it is up",
-                    self.name(),
-                    jail
-                );
-                if !self.jail_running(&jail) {
-                    self.reattach(&jail, &dataset)
-                        .with_context(|| format!("reattach existing jail '{jail}'"))?;
+            // Idempotent: a tenant whose dataset already exists is already
+            // provisioned. Don't clone or re-seed; just ensure the jail is up so
+            // `provision` doubles as "converge to running" (reattach if the jail
+            // context is gone). VERIFY the recorded tenant first (authoritative
+            // injectivity check), same as `open_session`'s reuse arms.
+            //
+            // TRI-STATE probe: we only proceed to CLONE on a definite `Absent`. An
+            // `Unknown` (transport/permission/timeout) must NOT fall through to the
+            // clone path — a clone into a name whose real state is unknown, followed
+            // by a failure, is exactly the situation that used to `zfs destroy` a
+            // valid dataset. Fail closed instead.
+            match self.dataset_state(&dataset) {
+                DatasetState::Exists => {
+                    self.verify_tenant_property(&dataset, &spec.tenant.label)
+                        .with_context(|| format!("verify tenant provenance for jail '{jail}'"))?;
+                    // Independent persistent-pile provenance (repair #1 reopened).
+                    self.verify_persistent_pile_provenance(&jail, &spec.tenant.label)
+                        .with_context(|| {
+                            format!("verify persistent pile provenance for jail '{jail}'")
+                        })?;
+                    eprintln!(
+                        "[{}] sandbox '{}' already provisioned; ensuring it is up",
+                        self.name(),
+                        jail
+                    );
+                    if self.jail_running(&jail) {
+                        self.apply_rctl_rules(&jail).with_context(|| {
+                            format!("apply resource limits while reusing existing jail '{jail}'")
+                        })?;
+                    } else {
+                        self.reattach(&jail, &dataset)
+                            .with_context(|| format!("reattach existing jail '{jail}'"))?;
+                    }
+                    return Ok(());
                 }
-                return Ok(());
-            }
-            DatasetState::Unknown => bail!(
-                "cannot determine sandbox state for tenant '{}' (dataset {} probe was \
+                DatasetState::Unknown => bail!(
+                    "cannot determine sandbox state for tenant '{}' (dataset {} probe was \
                  inconclusive — transport/permission/timeout); refusing to provision \
                  (would risk cloning over or destroying an existing workspace)",
-                spec.tenant.label,
+                    spec.tenant.label,
+                    dataset
+                ),
+                // Definitely absent: safe to clone a fresh box below.
+                DatasetState::Absent => {}
+            }
+
+            eprintln!(
+                "[{}] provisioning new persistent sandbox '{}' (dataset {})",
+                self.name(),
+                jail,
                 dataset
-            ),
-            // Definitely absent: safe to clone a fresh box below.
-            DatasetState::Absent => {}
-        }
+            );
 
-        eprintln!(
-            "[{}] provisioning new persistent sandbox '{}' (dataset {})",
-            self.name(),
-            jail,
-            dataset
-        );
+            // OPERATION-OWNED CLEANUP: a failed provision may only tear down what
+            // THIS operation created. `created_clone` flips true the instant our own
+            // `zfs clone` succeeds; on failure we only `zfs destroy` when it is set,
+            // so a provision that fails BEFORE (or AT) the clone never destroys a
+            // dataset it did not make. This closes the concurrent-create data-loss
+            // race: even if two provisions somehow both proceed past the tri-state
+            // probe, the loser's `zfs clone` fails EEXIST (it did not create the
+            // dataset), `created_clone` stays false, and the winner's valid dataset
+            // is left untouched.
+            let mut created_clone = false;
 
-        // OPERATION-OWNED CLEANUP: a failed provision may only tear down what
-        // THIS operation created. `created_clone` flips true the instant our own
-        // `zfs clone` succeeds; on failure we only `zfs destroy` when it is set,
-        // so a provision that fails BEFORE (or AT) the clone never destroys a
-        // dataset it did not make. This closes the concurrent-create data-loss
-        // race: even if two provisions somehow both proceed past the tri-state
-        // probe, the loser's `zfs clone` fails EEXIST (it did not create the
-        // dataset), `created_clone` stays false, and the winner's valid dataset
-        // is left untouched.
-        let mut created_clone = false;
+            // Brand-new tenant: clone the template, then set up /dev, cwd, and
+            // /etc/profile from scratch, then `jail -c`.
+            let provision = (|created_clone: &mut bool| -> Result<()> {
+                let clone = self.run(
+                    &[
+                        "sudo",
+                        "-n",
+                        "zfs",
+                        "clone",
+                        &self.template_snapshot,
+                        &dataset,
+                    ],
+                    None,
+                    ADMIN_TIMEOUT,
+                )?;
+                if !clone.success() {
+                    bail!(
+                        "zfs clone {} -> {dataset} failed: {}",
+                        self.template_snapshot,
+                        clone.stderr_lossy()
+                    );
+                }
+                // Our clone succeeded: from here on, teardown of THIS dataset is
+                // ours to do on failure (and only ours).
+                *created_clone = true;
 
-        // Brand-new tenant: clone the template, then set up /dev, cwd, and
-        // /etc/profile from scratch, then `jail -c`.
-        let provision = (|created_clone: &mut bool| -> Result<()> {
-            let clone = self.run(
-                &["sudo", "-n", "zfs", "clone", &self.template_snapshot, &dataset],
-                None,
-                ADMIN_TIMEOUT,
-            )?;
-            if !clone.success() {
-                bail!(
-                    "zfs clone {} -> {dataset} failed: {}",
-                    self.template_snapshot,
-                    clone.stderr_lossy()
-                );
-            }
-            // Our clone succeeded: from here on, teardown of THIS dataset is
-            // ours to do on failure (and only ours).
-            *created_clone = true;
+                // Record the ORIGINAL tenant label on the dataset immediately after
+                // the clone: this is the authoritative provenance the reuse/reattach
+                // arms verify against (defence-in-depth over the jail-name digest).
+                self.set_tenant_property(&dataset, &spec.tenant.label)?;
 
-            // Record the ORIGINAL tenant label on the dataset immediately after
-            // the clone: this is the authoritative provenance the reuse/reattach
-            // arms verify against (defence-in-depth over the jail-name digest).
-            self.set_tenant_property(&dataset, &spec.tenant.label)?;
+                // STORAGE BOUND (repair #4): cap the tenant clone's referenced data
+                // with a ZFS refquota so it cannot fill the host pool. Set right
+                // after the clone, before the jail is even started, so the bound is
+                // live for every byte the tenant ever writes into its dataset.
+                self.set_clone_refquota(&dataset)
+                    .with_context(|| format!("set refquota on clone {dataset}"))?;
 
-            // STORAGE BOUND (repair #4): cap the tenant clone's referenced data
-            // with a ZFS refquota so it cannot fill the host pool. Set right
-            // after the clone, before the jail is even started, so the bound is
-            // live for every byte the tenant ever writes into its dataset.
-            self.set_clone_refquota(&dataset)
-                .with_context(|| format!("set refquota on clone {dataset}"))?;
+                let root = self.mountpoint(&dataset)?;
 
-            let root = self.mountpoint(&dataset)?;
+                // devfs, mounted manually (not via jail(8) params) so lifecycle
+                // stays explicit and destroy_session can unmount symmetrically.
+                // Ruleset 4 = devfsrules_jail: the standard, minimal jail /dev.
+                let devfs = self.run(
+                    &[
+                        "sudo",
+                        "-n",
+                        "mount",
+                        "-t",
+                        "devfs",
+                        "-o",
+                        "ruleset=4",
+                        "devfs",
+                        &format!("{root}/dev"),
+                    ],
+                    None,
+                    ADMIN_TIMEOUT,
+                )?;
+                if !devfs.success() {
+                    bail!("mount devfs failed: {}", devfs.stderr_lossy());
+                }
 
-            // devfs, mounted manually (not via jail(8) params) so lifecycle
-            // stays explicit and destroy_session can unmount symmetrically.
-            // Ruleset 4 = devfsrules_jail: the standard, minimal jail /dev.
-            let devfs = self.run(
-                &[
-                    "sudo", "-n", "mount", "-t", "devfs", "-o", "ruleset=4", "devfs",
-                    &format!("{root}/dev"),
-                ],
-                None,
-                ADMIN_TIMEOUT,
-            )?;
-            if !devfs.success() {
-                bail!("mount devfs failed: {}", devfs.stderr_lossy());
-            }
+                // The session workdir (guest path), default /workspace.
+                let cwd = spec
+                    .cwd
+                    .as_deref()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "/workspace".to_string());
+                let mkdir = self.run(
+                    &["sudo", "-n", "mkdir", "-p", &format!("{root}{cwd}")],
+                    None,
+                    ADMIN_TIMEOUT,
+                )?;
+                if !mkdir.success() {
+                    bail!("mkdir session cwd failed: {}", mkdir.stderr_lossy());
+                }
 
-            // The session workdir (guest path), default /workspace.
-            let cwd = spec
-                .cwd
-                .as_deref()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "/workspace".to_string());
-            let mkdir = self.run(
-                &["sudo", "-n", "mkdir", "-p", &format!("{root}{cwd}")],
-                None,
-                ADMIN_TIMEOUT,
-            )?;
-            if !mkdir.success() {
-                bail!("mkdir session cwd failed: {}", mkdir.stderr_lossy());
-            }
+                // Model-B pile provisioning: two HOST-OWNED pile FILES single-file-
+                // mounted into the jail, decoupled from the dataset lifecycle.
+                //
+                //   host <pile_root>/<jail>/self.pile  -> nullfs rw -> guest /pile/self.pile
+                //   host <pile_root>/shared/shared.pile -> nullfs rw -> guest /shared/shared.pile
+                //
+                // These live OUTSIDE the ZFS clone tree, so destroy_session (which
+                // destroys the dataset) never touches them. The `self.pile` is the
+                // tenant's server-born pile under `pile_root`, distinct from the
+                // caller-supplied `spec.tenant.pile` path (not used by this backend).
+                //
+                // SYMLINK CONFUSED-DEPUTY FIX (2026-07-24): the bootstrap `cp` NEVER
+                // writes to a tenant-reachable path. Every seed is `cp`'d into a
+                // host-PRIVATE 0700 staging dir (`staging_root`, never mounted into a
+                // jail) and then PUBLISHED into place with a no-follow / create-only
+                // rename that refuses to overwrite through an existing entry or a
+                // symlink (`stage_and_publish_pile`). Even if the destination dir were
+                // somehow tenant-writable, a pre-placed symlink at the destination
+                // cannot redirect the privileged copy onto a chosen host file.
+                let self_dir = self.self_pile_dir(&jail);
+                let self_pile = self.self_pile_file(&jail);
+                let shared_dir = self.shared_pile_dir();
+                let shared_pile = self.shared_pile_file();
 
-            // Model-B pile provisioning: two HOST-OWNED pile FILES single-file-
-            // mounted into the jail, decoupled from the dataset lifecycle.
-            //
-            //   host <pile_root>/<jail>/self.pile  -> nullfs rw -> guest /pile/self.pile
-            //   host <pile_root>/shared/shared.pile -> nullfs rw -> guest /shared/shared.pile
-            //
-            // These live OUTSIDE the ZFS clone tree, so destroy_session (which
-            // destroys the dataset) never touches them. The `self.pile` is the
-            // tenant's server-born pile under `pile_root`, distinct from the
-            // caller-supplied `spec.tenant.pile` path (not used by this backend).
-            //
-            // SYMLINK CONFUSED-DEPUTY FIX (2026-07-24): the bootstrap `cp` NEVER
-            // writes to a tenant-reachable path. Every seed is `cp`'d into a
-            // host-PRIVATE 0700 staging dir (`staging_root`, never mounted into a
-            // jail) and then PUBLISHED into place with a no-follow / create-only
-            // rename that refuses to overwrite through an existing entry or a
-            // symlink (`stage_and_publish_pile`). Even if the destination dir were
-            // somehow tenant-writable, a pre-placed symlink at the destination
-            // cannot redirect the privileged copy onto a chosen host file.
-            let self_dir = self.self_pile_dir(&jail);
-            let self_pile = self.self_pile_file(&jail);
-            let shared_dir = self.shared_pile_dir();
-            let shared_pile = self.shared_pile_file();
+                // Per-coworker pile dir + seed self.pile from bootstrap if absent.
+                let mkdir_self = self.run(
+                    &["sudo", "-n", "mkdir", "-p", &self_dir],
+                    None,
+                    ADMIN_TIMEOUT,
+                )?;
+                if !mkdir_self.success() {
+                    bail!("mkdir self pile dir failed: {}", mkdir_self.stderr_lossy());
+                }
+                // PERSISTENT-PILE PROVENANCE (repair #1 reopened, 2026-07-24): the
+                // host pile dir DECOUPLES from the ZFS dataset (Model B), so a fresh
+                // clone can land on a pile dir that SURVIVED a previous tenant's
+                // dataset destroy. Verify the persistent-pile marker BEFORE seeding:
+                // a marker recording a DIFFERENT label means a foreign pile is about
+                // to be handed to this new tenant — refuse. (A brand-new pile dir has
+                // no marker and no pile file yet, so this is a clean pass and the
+                // marker is written just below.)
+                self.verify_persistent_pile_provenance(&jail, &spec.tenant.label)
+                    .with_context(|| {
+                        format!("verify persistent pile provenance before seeding jail '{jail}'")
+                    })?;
+                // Seed self.pile create-if-absent via host-private staging + a
+                // no-follow / create-only publish (see `stage_and_publish_pile`): a
+                // reprovision keeps the coworker's accumulated pile, and the
+                // privileged copy never follows a symlink at the destination.
+                self.stage_and_publish_pile(&jail, &self_pile)
+                    .context("seed self.pile from bootstrap")?;
+                // Write the host-private tenant marker (0600 root-owned) recording
+                // this pile's canonical owner — the persistent pile's OWN provenance,
+                // verified on every future reuse/reattach independent of the dataset's
+                // ZFS property.
+                self.write_tenant_marker(&jail, &spec.tenant.label)
+                    .context("write persistent-pile .tenant marker")?;
+                // Make the host self.pile APPEND-ONLY (`chflags sappnd`): a process
+                // inside the jail can O_APPEND but not O_TRUNC/unlink/rename it, so a
+                // buggy or stale tool cannot truncate the pile (the 2026-07-03
+                // truncation incident class). Idempotent — sappnd on an already-flagged
+                // file is a no-op — and only set on first provision (reattach skips
+                // the seed). NOTE: at the current `securelevel=-1` this blocks
+                // ACCIDENTAL truncation; deliberate truncation by a jail-root would
+                // still need `securelevel>=1` (then the same flag becomes malicious-
+                // proof with no code change). A rare crash-torn tail is repaired
+                // host-side: `chflags nosappnd` -> amputate -> re-flag.
+                let protect_self = self.run(
+                    &["sudo", "-n", "chflags", "sappnd", &self_pile],
+                    None,
+                    ADMIN_TIMEOUT,
+                )?;
+                if !protect_self.success() {
+                    bail!(
+                        "chflags sappnd self.pile failed: {}",
+                        protect_self.stderr_lossy()
+                    );
+                }
 
-            // Per-coworker pile dir + seed self.pile from bootstrap if absent.
-            let mkdir_self = self.run(
-                &["sudo", "-n", "mkdir", "-p", &self_dir],
-                None,
-                ADMIN_TIMEOUT,
-            )?;
-            if !mkdir_self.success() {
-                bail!("mkdir self pile dir failed: {}", mkdir_self.stderr_lossy());
-            }
-            // PERSISTENT-PILE PROVENANCE (repair #1 reopened, 2026-07-24): the
-            // host pile dir DECOUPLES from the ZFS dataset (Model B), so a fresh
-            // clone can land on a pile dir that SURVIVED a previous tenant's
-            // dataset destroy. Verify the persistent-pile marker BEFORE seeding:
-            // a marker recording a DIFFERENT label means a foreign pile is about
-            // to be handed to this new tenant — refuse. (A brand-new pile dir has
-            // no marker and no pile file yet, so this is a clean pass and the
-            // marker is written just below.)
-            self.verify_persistent_pile_provenance(&jail, &spec.tenant.label)
-                .with_context(|| {
-                    format!("verify persistent pile provenance before seeding jail '{jail}'")
-                })?;
-            // Seed self.pile create-if-absent via host-private staging + a
-            // no-follow / create-only publish (see `stage_and_publish_pile`): a
-            // reprovision keeps the coworker's accumulated pile, and the
-            // privileged copy never follows a symlink at the destination.
-            self.stage_and_publish_pile(&jail, &self_pile)
-                .context("seed self.pile from bootstrap")?;
-            // Write the host-private tenant marker (0600 root-owned) recording
-            // this pile's canonical owner — the persistent pile's OWN provenance,
-            // verified on every future reuse/reattach independent of the dataset's
-            // ZFS property.
-            self.write_tenant_marker(&jail, &spec.tenant.label)
-                .context("write persistent-pile .tenant marker")?;
-            // Make the host self.pile APPEND-ONLY (`chflags sappnd`): a process
-            // inside the jail can O_APPEND but not O_TRUNC/unlink/rename it, so a
-            // buggy or stale tool cannot truncate the pile (the 2026-07-03
-            // truncation incident class). Idempotent — sappnd on an already-flagged
-            // file is a no-op — and only set on first provision (reattach skips
-            // the seed). NOTE: at the current `securelevel=-1` this blocks
-            // ACCIDENTAL truncation; deliberate truncation by a jail-root would
-            // still need `securelevel>=1` (then the same flag becomes malicious-
-            // proof with no code change). A rare crash-torn tail is repaired
-            // host-side: `chflags nosappnd` -> amputate -> re-flag.
-            let protect_self = self.run(
-                &["sudo", "-n", "chflags", "sappnd", &self_pile],
-                None,
-                ADMIN_TIMEOUT,
-            )?;
-            if !protect_self.success() {
-                bail!("chflags sappnd self.pile failed: {}", protect_self.stderr_lossy());
-            }
+                // Shared pile dir + shared.pile: a SINGLE file shared by ALL jails.
+                // Create-if-absent and race-safe against concurrent provisions — and
+                // the seed must be ATOMIC (a coworker must never mount a partial
+                // shared.pile). `stage_and_publish_pile` copies bootstrap into the
+                // host-private staging dir, then publishes with a no-follow /
+                // create-only rename: the winner installs a complete file in one
+                // atomic rename; a loser no-ops on the existing target. No reader ever
+                // observes a partial file, and no tenant-reachable path is ever
+                // written through. (`mkdir -p` stays idempotent; same append-only
+                // semantics as self.pile — many concurrent appenders on one pile file
+                // is fine, verified on FreeBSD 15.1.)
+                let mkdir_shared = self.run(
+                    &["sudo", "-n", "mkdir", "-p", &shared_dir],
+                    None,
+                    ADMIN_TIMEOUT,
+                )?;
+                if !mkdir_shared.success() {
+                    bail!(
+                        "mkdir shared pile dir failed: {}",
+                        mkdir_shared.stderr_lossy()
+                    );
+                }
+                // STORAGE BOUND (repair #4): ensure the global pile-storage quota is
+                // set on the pile-root dataset so no tenant can fill the pool via
+                // pile appends. Best-effort + idempotent (see the helper).
+                self.ensure_pile_root_quota();
+                self.stage_and_publish_pile(&jail, &shared_pile)
+                    .context("seed shared.pile from bootstrap")?;
+                // Same append-only protection on the SHARED pile — the higher-stakes
+                // one, since a truncation here would corrupt org-wide data for every
+                // coworker, not just the one who did it.
+                let protect_shared = self.run(
+                    &["sudo", "-n", "chflags", "sappnd", &shared_pile],
+                    None,
+                    ADMIN_TIMEOUT,
+                )?;
+                if !protect_shared.success() {
+                    bail!(
+                        "chflags sappnd shared.pile failed: {}",
+                        protect_shared.stderr_lossy()
+                    );
+                }
 
-            // Shared pile dir + shared.pile: a SINGLE file shared by ALL jails.
-            // Create-if-absent and race-safe against concurrent provisions — and
-            // the seed must be ATOMIC (a coworker must never mount a partial
-            // shared.pile). `stage_and_publish_pile` copies bootstrap into the
-            // host-private staging dir, then publishes with a no-follow /
-            // create-only rename: the winner installs a complete file in one
-            // atomic rename; a loser no-ops on the existing target. No reader ever
-            // observes a partial file, and no tenant-reachable path is ever
-            // written through. (`mkdir -p` stays idempotent; same append-only
-            // semantics as self.pile — many concurrent appenders on one pile file
-            // is fine, verified on FreeBSD 15.1.)
-            let mkdir_shared = self.run(
-                &["sudo", "-n", "mkdir", "-p", &shared_dir],
-                None,
-                ADMIN_TIMEOUT,
-            )?;
-            if !mkdir_shared.success() {
-                bail!("mkdir shared pile dir failed: {}", mkdir_shared.stderr_lossy());
-            }
-            // STORAGE BOUND (repair #4): ensure the global pile-storage quota is
-            // set on the pile-root dataset so no tenant can fill the pool via
-            // pile appends. Best-effort + idempotent (see the helper).
-            self.ensure_pile_root_quota();
-            self.stage_and_publish_pile(&jail, &shared_pile)
-                .context("seed shared.pile from bootstrap")?;
-            // Same append-only protection on the SHARED pile — the higher-stakes
-            // one, since a truncation here would corrupt org-wide data for every
-            // coworker, not just the one who did it.
-            let protect_shared = self.run(
-                &["sudo", "-n", "chflags", "sappnd", &shared_pile],
-                None,
-                ADMIN_TIMEOUT,
-            )?;
-            if !protect_shared.success() {
-                bail!("chflags sappnd shared.pile failed: {}", protect_shared.stderr_lossy());
-            }
+                // single-file-nullfs-mount BOTH pile files rw via the one shared
+                // FAIL-CLOSED primitive (same one reattach uses). The mounts do not
+                // survive a jail restart (re-established by `reattach`), but they must
+                // be live and EXACTLY correct for this first `jail -c`: a silently-
+                // failed mount would leave guest /pile on the EMPTY file baked into
+                // the clone, so PILE=/pile/self.pile writes into the clone, which
+                // destroy_session then `zfs destroy`s — silent data loss. A bail! here
+                // triggers the operation-owned cleanup (we created the clone, so it is
+                // ours to tear down).
+                self.mount_piles(&jail, &root)?;
 
-            // single-file-nullfs-mount BOTH pile files rw via the one shared
-            // FAIL-CLOSED primitive (same one reattach uses). The mounts do not
-            // survive a jail restart (re-established by `reattach`), but they must
-            // be live and EXACTLY correct for this first `jail -c`: a silently-
-            // failed mount would leave guest /pile on the EMPTY file baked into
-            // the clone, so PILE=/pile/self.pile writes into the clone, which
-            // destroy_session then `zfs destroy`s — silent data loss. A bail! here
-            // triggers the operation-owned cleanup (we created the clone, so it is
-            // ours to tear down).
-            self.mount_piles(&jail, &root)?;
+                // Seed session env + default cwd via /etc/profile, which `sh -l`
+                // sources on every exec (same mechanism as the Lima template's
+                // __SESSION_ENV__). Only on first create — the persisted dataset
+                // already carries its profile. PATH picks up the baked
+                // /opt/faculties bins; PILE points at the mounted self.pile so a
+                // faculty run in the jail operates on the coworker's own pile.
+                let mut profile = String::new();
+                profile.push_str("\n# playground session seed\n");
+                profile.push_str(&format!("cd {} 2>/dev/null || true\n", shell_quote(&cwd)));
+                profile.push_str("export PATH=/opt/faculties:$PATH\n");
+                profile.push_str(&format!(
+                    "export PILE={}\n",
+                    shell_quote(Self::GUEST_SELF_PILE)
+                ));
+                for (k, v) in &spec.env {
+                    profile.push_str(&format!("export {}={}\n", k, shell_quote(v)));
+                }
+                let seed = self.run(
+                    &["sudo", "-n", "tee", "-a", &format!("{root}/etc/profile")],
+                    Some(profile.as_bytes()),
+                    ADMIN_TIMEOUT,
+                )?;
+                if !seed.success() {
+                    bail!("seed /etc/profile failed: {}", seed.stderr_lossy());
+                }
 
-            // Seed session env + default cwd via /etc/profile, which `sh -l`
-            // sources on every exec (same mechanism as the Lima template's
-            // __SESSION_ENV__). Only on first create — the persisted dataset
-            // already carries its profile. PATH picks up the baked
-            // /opt/faculties bins; PILE points at the mounted self.pile so a
-            // faculty run in the jail operates on the coworker's own pile.
-            let mut profile = String::new();
-            profile.push_str("\n# playground session seed\n");
-            profile.push_str(&format!("cd {} 2>/dev/null || true\n", shell_quote(&cwd)));
-            profile.push_str("export PATH=/opt/faculties:$PATH\n");
-            profile.push_str(&format!(
-                "export PILE={}\n",
-                shell_quote(Self::GUEST_SELF_PILE)
-            ));
-            for (k, v) in &spec.env {
-                profile.push_str(&format!("export {}={}\n", k, shell_quote(v)));
-            }
-            let seed = self.run(
-                &["sudo", "-n", "tee", "-a", &format!("{root}/etc/profile")],
-                Some(profile.as_bytes()),
-                ADMIN_TIMEOUT,
-            )?;
-            if !seed.success() {
-                bail!("seed /etc/profile failed: {}", seed.stderr_lossy());
-            }
+                // Create the jail context: persistent (no processes yet), no
+                // network at all (default-deny v1), minimal params.
+                let created = self.run(
+                    &[
+                        "sudo",
+                        "-n",
+                        "jail",
+                        "-c",
+                        &format!("name={jail}"),
+                        &format!("path={root}"),
+                        &format!("host.hostname={jail}"),
+                        "persist",
+                        "ip4=disable",
+                        "ip6=disable",
+                    ],
+                    None,
+                    ADMIN_TIMEOUT,
+                )?;
+                if !created.success() {
+                    bail!("jail -c {jail} failed: {}", created.stderr_lossy());
+                }
 
-            // Create the jail context: persistent (no processes yet), no
-            // network at all (default-deny v1), minimal params.
-            let created = self.run(
-                &[
-                    "sudo",
-                    "-n",
-                    "jail",
-                    "-c",
-                    &format!("name={jail}"),
-                    &format!("path={root}"),
-                    &format!("host.hostname={jail}"),
-                    "persist",
-                    "ip4=disable",
-                    "ip6=disable",
-                ],
-                None,
-                ADMIN_TIMEOUT,
-            )?;
-            if !created.success() {
-                bail!("jail -c {jail} failed: {}", created.stderr_lossy());
-            }
+                // RESOURCE BOUND (repair #4): apply every per-jail RCTL rule now
+                // that the jail exists. RACCT-off hosts explicitly no-op; when RACCT
+                // is on, a missing rule fails the provision closed. The same helper
+                // runs on reattach/reuse because dynamic rules vanish on reboot.
+                self.apply_rctl_rules(&jail)
+                    .with_context(|| format!("apply resource limits to new jail '{jail}'"))?;
+                Ok(())
+            })(&mut created_clone);
 
-            // RESOURCE BOUND (repair #4): apply per-jail rctl rules now that the
-            // jail exists — but only if host RACCT is enabled (a no-op otherwise,
-            // with an operator hint). This clamps fork/thread/FD/RAM/CPU pressure
-            // per jail once the operator turns RACCT on; see deploy README.
-            self.apply_rctl_rules(&jail);
-            Ok(())
-        })(&mut created_clone);
-
-        if let Err(e) = provision {
-            if created_clone {
-                // THIS operation created the clone and then failed part-way: it
-                // is ours to tear down, and only this dataset. `cleanup_leftovers`
-                // stops the jail, unmounts, and `zfs destroy`s the dataset we
-                // just made — never a pre-existing one, because we only reach
-                // here with `created_clone == true`.
-                self.cleanup_leftovers(&jail);
-            } else {
-                // We failed AT or BEFORE the clone (e.g. the clone lost an
-                // EEXIST race to a concurrent provision, or the tri-state probe
-                // path let us in but the clone still refused). We did NOT create
-                // this dataset, so we destroy NOTHING — the existing/winning
-                // dataset stays intact. This is the operation-owned-cleanup
-                // invariant that makes concurrent creates non-destructive.
-                eprintln!(
-                    "[{}] provision '{}' failed before creating the dataset; \
+            if let Err(e) = provision {
+                if created_clone {
+                    // THIS operation created the clone and then failed part-way: it
+                    // is ours to tear down, and only this dataset. `cleanup_leftovers`
+                    // stops the jail, unmounts, and `zfs destroy`s the dataset we
+                    // just made — never a pre-existing one, because we only reach
+                    // here with `created_clone == true`.
+                    self.cleanup_leftovers(&jail);
+                } else {
+                    // We failed AT or BEFORE the clone (e.g. the clone lost an
+                    // EEXIST race to a concurrent provision, or the tri-state probe
+                    // path let us in but the clone still refused). We did NOT create
+                    // this dataset, so we destroy NOTHING — the existing/winning
+                    // dataset stays intact. This is the operation-owned-cleanup
+                    // invariant that makes concurrent creates non-destructive.
+                    eprintln!(
+                        "[{}] provision '{}' failed before creating the dataset; \
                      destroying nothing (operation-owned cleanup)",
-                    self.name(),
-                    jail
-                );
+                        self.name(),
+                        jail
+                    );
+                }
+                return Err(e.context(format!("provision jail '{jail}'")));
             }
-            return Err(e.context(format!("provision jail '{jail}'")));
-        }
-        Ok(())
+            Ok(())
         })
     }
 
@@ -2162,7 +2398,16 @@ impl SandboxBackend for JailBackend {
         // session's own child datasets (if any) don't masquerade as sessions.
         let out = self.run(
             &[
-                "sudo", "-n", "zfs", "list", "-H", "-o", "name", "-d", "1", "-r",
+                "sudo",
+                "-n",
+                "zfs",
+                "list",
+                "-H",
+                "-o",
+                "name",
+                "-d",
+                "1",
+                "-r",
                 &self.dataset_parent,
             ],
             None,
@@ -2194,23 +2439,28 @@ impl SandboxBackend for JailBackend {
             }
             let jail = leaf;
             if self.jail_running(jail) {
-                continue; // already up — nothing to do
+                // A daemon restart can find a jail already running. Reapply its
+                // rules anyway: `rctl -a` replacement is idempotent and this
+                // makes the sweep converge after any loss of dynamic RCTL state.
+                self.apply_rctl_rules(jail).with_context(|| {
+                    format!("apply resource limits to running jail '{jail}' during startup sweep")
+                })?;
+                continue;
             }
-            match self.reattach(jail, dataset) {
-                Ok(()) => {
-                    eprintln!("[{}] reattached persistent sandbox '{}'", self.name(), jail);
-                    reattached += 1;
-                }
-                Err(e) => {
-                    // Log and keep sweeping — one bad box must not strand the rest.
-                    eprintln!("[{}] reattach '{}' failed: {e:#}", self.name(), jail);
-                }
-            }
+            self.reattach(jail, dataset)
+                .with_context(|| format!("reattach '{jail}' during startup sweep"))?;
+            eprintln!("[{}] reattached persistent sandbox '{}'", self.name(), jail);
+            reattached += 1;
         }
         Ok(reattached)
     }
 
-    fn exec(&self, session: &SessionId, request: &ExecRequest) -> Result<ExecResult> {
+    fn exec(
+        &self,
+        session: &SessionId,
+        request: &ExecRequest,
+        control: &ExecControl,
+    ) -> Result<ExecResult> {
         let jail = session.as_str();
 
         // Per-call cwd override; the session default cwd comes from the
@@ -2238,47 +2488,50 @@ impl SandboxBackend for JailBackend {
             "sudo", "-n", "timeout", "-k", "5", &secs, "jexec", jail, "/bin/sh", "-lc", &script,
         ];
 
-        // Tenant output is attacker-controlled: cap each stream and kill the
-        // transported child on breach (bounds daemon memory; see MAX_EXEC_OUTPUT_BYTES).
+        // Tenant output is attacker-controlled. Direct capture caps each stream
+        // and kills on breach; job execution continuously drains into its
+        // bounded ring (see MAX_EXEC_OUTPUT_BYTES and HostRunner::run_capped).
         let out = self.run_capped(
             &argv,
             request.stdin.as_deref(),
             timeout + LOCAL_TIMEOUT_GRACE,
             MAX_EXEC_OUTPUT_BYTES,
+            control,
         )?;
 
-        // REAP the jail's process tree on ANY early kill (local timeout backstop
-        // or output-cap breach). The server-side `timeout(1)` reaps the tree it
-        // launched on a clean server-side expiry (exit 124), but if the LOCAL
-        // side gave up first — an ssh/transport wedge, or a cap kill that tore
-        // down only the local ssh — the `jexec`'d command (and any background
-        // processes it spawned inside the jail) can still be alive on the host.
-        // A jailed process can only be signalled from OUTSIDE the jail, so we
-        // ask the host to kill every process in this jail. Best-effort: on a
-        // clean exit there is nothing to kill and this is skipped.
-        if out.timed_out || out.output_truncated {
-            // `jexec <jail> kill -TERM -1` signals every process inside the jail
-            // (PID -1 = all processes the caller may signal; as jail-root that is
-            // the whole jail), then a short grace and SIGKILL for stragglers.
-            let _ = self.run(
-                &["sudo", "-n", "jexec", jail, "/bin/kill", "-TERM", "-1"],
-                None,
-                ADMIN_TIMEOUT,
-            );
-            let _ = self.run(
-                &["sudo", "-n", "jexec", jail, "/bin/kill", "-KILL", "-1"],
-                None,
-                ADMIN_TIMEOUT,
-            );
+        // In the root-local FreeBSD deployment, `timeout(1)` is the kernel
+        // descendant reaper and a natural exit proves the complete command tree
+        // is gone. If a capable runner ever returns after force-killing that
+        // reaper, the daemon must fail-stop; resetting and reattaching the whole
+        // jail adds another fallible state machine and destroys unrelated work.
+        // Unsupported/remote runners do not expose `job_cancel`; their ordinary
+        // transport failures remain retryable and the server-side timeout still
+        // bounds remote work.
+        let cleanup_unproven = out.timed_out
+            || out.output_truncated
+            || (out.cancelled && !out.cancelled_process_group);
+        if cleanup_unproven && self.runner.supports_background_jobs() {
+            return Err(sandbox_control_lost(format!(
+                "FreeBSD command reaper returned without descendant-cleanup proof for jail '{jail}'"
+            )));
         }
 
         let mut result = ExecResult {
             stdout: out.stdout,
             stderr: out.stderr,
             exit_code: out.exit_code,
+            cancelled: out.cancelled,
             error: None,
         };
-        if out.timed_out || out.exit_code == Some(124) {
+        if out.cancelled {
+            result.error = Some(if out.cancelled_process_group {
+                "command cancelled; command process group reaped".to_string()
+            } else {
+                "command transport cancelled without descendant-cleanup proof; this backend does \
+                 not support retained background jobs"
+                    .to_string()
+            });
+        } else if out.timed_out || out.exit_code == Some(124) {
             // Mirror LimaBackend: timeouts surface as exit 124 + error text.
             result.exit_code = Some(124);
             let ceiling = if requested > MAX_EXEC_TIMEOUT {
@@ -2288,21 +2541,29 @@ impl SandboxBackend for JailBackend {
             } else {
                 String::new()
             };
+            let cleanup = if cleanup_unproven {
+                "local transport ended without observing the remote reaper; server-side timeout remains the cleanup bound"
+            } else {
+                "command tree reaped by server timeout"
+            };
             result.error = Some(format!(
-                "command timed out after {timeout:?}{ceiling}; jail process tree killed"
+                "command timed out after {timeout:?}{ceiling}; {cleanup}"
             ));
         } else if out.output_truncated {
-            // Output ceiling breached: the process was KILLED at the cap, its
-            // tree reaped, and the captured bytes stop at the ceiling.
+            // This arm is reachable only on a runner that does not advertise
+            // proven background-job cleanup. Its remote timeout remains the
+            // process bound after the local transport is killed at the cap.
             result.error = Some(format!(
                 "output truncated at {MAX_EXEC_OUTPUT_BYTES} bytes per stream; \
-                 process killed and jail tree reaped"
+                 local transport killed and remote work remains bounded by the server timeout"
             ));
         } else if out.exit_code.is_some() && out.exit_code == self.runner.transport_error_exit() {
             // Transport failure (e.g. ssh's reserved exit 255), not the host
             // command's own exit code. Never fires for LocalRunner.
-            result.error = Some(format!("transport error: {}",
-                String::from_utf8_lossy(&result.stderr).trim()));
+            result.error = Some(format!(
+                "transport error: {}",
+                String::from_utf8_lossy(&result.stderr).trim()
+            ));
         }
         Ok(result)
     }
@@ -2325,8 +2586,7 @@ impl SandboxBackend for JailBackend {
         // open/provision time; here we validate the session-id string itself is
         // non-empty / control-char-free before it reaches argv, and enforce the
         // namespace guard below.
-        Self::validate_label(session.as_str())
-            .context("invalid destroy_session session id")?;
+        Self::validate_label(session.as_str()).context("invalid destroy_session session id")?;
         let jail = session.as_str();
         if !jail.starts_with(&format!("{}-", self.jail_prefix)) {
             bail!(
@@ -2354,25 +2614,36 @@ impl SandboxBackend for JailBackend {
             self.verify_tenant_property_derives_leaf(&dataset, jail)
                 .with_context(|| format!("verify tenant provenance before destroying '{jail}'"))?;
 
-            // Remove the jail (kills its processes). Failure is tolerated — the
-            // jail may already be gone — but is surfaced on stderr.
+            // Remove the jail (kills its processes), and do not continue until
+            // its absence is proven. `jail -r` success is authoritative. A
+            // non-zero exit can also mean the jail was already absent, so in
+            // that case list all jail names with a separately-successful `jls`
+            // and prove this exact name is missing. Transport, privilege, or
+            // timeout uncertainty must not reach dataset or RCTL teardown.
             let removed = self.run(&["sudo", "-n", "jail", "-r", jail], None, ADMIN_TIMEOUT)?;
             if !removed.success() {
+                let probe = self.run(&["sudo", "-n", "jls", "-n", "name"], None, ADMIN_TIMEOUT)?;
+                if !probe.success() {
+                    bail!(
+                        "cannot prove jail '{jail}' is gone after jail -r failed: {}",
+                        probe.stderr_lossy()
+                    );
+                }
+                let expected = format!("name={jail}");
+                let still_running = String::from_utf8_lossy(&probe.stdout)
+                    .lines()
+                    .flat_map(str::split_whitespace)
+                    .any(|field| field == expected);
+                if still_running {
+                    bail!(
+                        "jail -r {jail} failed and the jail is still running: {}",
+                        removed.stderr_lossy()
+                    );
+                }
                 eprintln!(
-                    "[{}] jail -r {jail}: {} (continuing to dataset teardown)",
+                    "[{}] jail '{}' was already absent; continuing proven teardown",
                     self.name(),
-                    removed.stderr_lossy()
-                );
-            }
-
-            // Remove any per-jail rctl rules (keyed by jail NAME, so they would
-            // otherwise linger and re-bind if the name were ever reused). Only
-            // meaningful when RACCT is on; a no-op / tolerated failure otherwise.
-            if !self.rctl_rules.is_empty() && self.racct_enabled() {
-                let _ = self.run(
-                    &["sudo", "-n", "rctl", "-r", &format!("jail:{jail}")],
-                    None,
-                    ADMIN_TIMEOUT,
+                    jail
                 );
             }
 
@@ -2394,15 +2665,48 @@ impl SandboxBackend for JailBackend {
             // Destroy the dataset. This MUST succeed or we leak the session
             // dataset; one retry covers transient "dataset is busy" races after
             // jail -r.
-            let mut destroy =
-                self.run(&["sudo", "-n", "zfs", "destroy", &dataset], None, ADMIN_TIMEOUT)?;
+            let mut destroy = self.run(
+                &["sudo", "-n", "zfs", "destroy", &dataset],
+                None,
+                ADMIN_TIMEOUT,
+            )?;
             if !destroy.success() {
                 std::thread::sleep(Duration::from_secs(2));
-                destroy =
-                    self.run(&["sudo", "-n", "zfs", "destroy", &dataset], None, ADMIN_TIMEOUT)?;
+                destroy = self.run(
+                    &["sudo", "-n", "zfs", "destroy", &dataset],
+                    None,
+                    ADMIN_TIMEOUT,
+                )?;
             }
             if !destroy.success() {
                 bail!("zfs destroy {dataset} failed: {}", destroy.stderr_lossy());
+            }
+
+            // Only now discard the name-keyed RCTL rules. If jail or dataset
+            // teardown fails, the rules MUST remain so a still-live jail or a
+            // later reattach of the persistent dataset stays bounded. A
+            // successful `zfs destroy` is the final teardown proof; after that,
+            // stale rules would only linger and re-bind if this deterministic
+            // jail name were provisioned again. Rule removal itself remains
+            // best-effort because the protected sandbox is already gone, and a
+            // future provision idempotently replaces each configured deny rule.
+            if !self.rctl_rules.is_empty() {
+                match self.racct_enabled() {
+                    Ok(true) => {
+                        let _ = self.run(
+                            &["sudo", "-n", "rctl", "-r", &format!("jail:{jail}")],
+                            None,
+                            ADMIN_TIMEOUT,
+                        );
+                    }
+                    Ok(false) => {}
+                    Err(e) => eprintln!(
+                        "[{}] could not probe RACCT after destroying '{}'; retaining any stale \
+                         name-keyed rules for safe idempotent replacement on reprovision: {e:#}",
+                        self.name(),
+                        jail
+                    ),
+                }
             }
             Ok(())
         })
@@ -2467,15 +2771,29 @@ mod tests {
         /// `SYMLINK-COMPONENT` marker) returns a failure — models a symlinked
         /// staging component / bad owner without hardcoding the whole script.
         fail_staging_provenance: bool,
+        /// Model the root-local FreeBSD runner's proven cancellation
+        /// capability. Most lifecycle tests leave this false; execution-control
+        /// tests opt in explicitly.
+        background_jobs: bool,
     }
 
     impl MockRunner {
+        fn with_background_jobs(mut self) -> Self {
+            self.background_jobs = true;
+            self
+        }
+
         fn reply(mut self, prefix: &[&'static str], out: HostOutput) -> Self {
             self.script.push((prefix.to_vec(), out));
             self
         }
         fn calls(&self) -> Vec<Vec<String>> {
-            self.calls.lock().unwrap().iter().map(|(a, _)| a.clone()).collect()
+            self.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(a, _)| a.clone())
+                .collect()
         }
         /// Seed a mount into the stateful table (e.g. to model a jail whose pile
         /// mounts are already live for a reattach test).
@@ -2545,15 +2863,23 @@ mod tests {
     }
 
     impl HostRunner for Arc<MockRunner> {
-        fn run(&self, argv: &[String], stdin: Option<&[u8]>, _timeout: Duration) -> Result<HostOutput> {
+        fn supports_background_jobs(&self) -> bool {
+            self.background_jobs
+        }
+
+        fn run(
+            &self,
+            argv: &[String],
+            stdin: Option<&[u8]>,
+            _timeout: Duration,
+        ) -> Result<HostOutput> {
             self.calls
                 .lock()
                 .unwrap()
                 .push((argv.to_vec(), stdin.map(|b| b.to_vec())));
             // Explicit scripts win, so a test can force any command to fail.
             for (prefix, out) in &self.script {
-                if argv.len() >= prefix.len()
-                    && argv.iter().zip(prefix.iter()).all(|(a, p)| a == p)
+                if argv.len() >= prefix.len() && argv.iter().zip(prefix.iter()).all(|(a, p)| a == p)
                 {
                     return Ok(out.clone());
                 }
@@ -2578,19 +2904,23 @@ mod tests {
                     // shadow; either way our validator must catch the mismatch),
                     // so record the new one and let the exact-tuple check decide.
                     mounts.push((src.to_string(), target.to_string(), fstype.to_string()));
-                    return Ok(HostOutput { exit_code: Some(0), ..Default::default() });
+                    return Ok(HostOutput {
+                        exit_code: Some(0),
+                        ..Default::default()
+                    });
                 }
                 // `umount -f <target>`: drop every mount at that target.
                 ["sudo", "-n", "umount", "-f", target] | ["umount", "-f", target] => {
                     self.mounts.lock().unwrap().retain(|(_, t, _)| t != target);
-                    return Ok(HostOutput { exit_code: Some(0), ..Default::default() });
+                    return Ok(HostOutput {
+                        exit_code: Some(0),
+                        ..Default::default()
+                    });
                 }
                 // Staging-provenance walk (`sh -c <script> sh <staging_root>`):
                 // recognised by its SYMLINK-COMPONENT marker. Fails iff the test
                 // asked for it; otherwise the default success below applies.
-                ["sudo", "-n", "sh", "-c", script, ..]
-                    if script.contains("SYMLINK-COMPONENT") =>
-                {
+                ["sudo", "-n", "sh", "-c", script, ..] if script.contains("SYMLINK-COMPONENT") => {
                     return Ok(if self.fail_staging_provenance {
                         HostOutput {
                             exit_code: Some(3),
@@ -2598,7 +2928,10 @@ mod tests {
                             ..Default::default()
                         }
                     } else {
-                        HostOutput { exit_code: Some(0), ..Default::default() }
+                        HostOutput {
+                            exit_code: Some(0),
+                            ..Default::default()
+                        }
                     });
                 }
                 // `cp <src> <dest>`: model a fresh file at dest (mint a new inode).
@@ -2606,7 +2939,10 @@ mod tests {
                 ["sudo", "-n", "cp", _src, dest] => {
                     let ino = self.mint_inode();
                     self.inodes.lock().unwrap().insert(dest.to_string(), ino);
-                    return Ok(HostOutput { exit_code: Some(0), ..Default::default() });
+                    return Ok(HostOutput {
+                        exit_code: Some(0),
+                        ..Default::default()
+                    });
                 }
                 // `ln -h <src> <dest>`: create-only hardlink. If dest already
                 // exists, fail (EEXIST) — the create-if-absent no-op. Otherwise
@@ -2625,7 +2961,10 @@ mod tests {
                         return Ok(fail()); // EEXIST: dest already present
                     }
                     inodes.insert(dest.to_string(), src_ino);
-                    return Ok(HostOutput { exit_code: Some(0), ..Default::default() });
+                    return Ok(HostOutput {
+                        exit_code: Some(0),
+                        ..Default::default()
+                    });
                 }
                 // `stat -f %i <path>`: the inode number, or ENOENT if absent.
                 ["sudo", "-n", "stat", "-f", "%i", path] => {
@@ -2642,19 +2981,28 @@ mod tests {
                 ["sudo", "-n", "rm", "-f", path] => {
                     self.inodes.lock().unwrap().remove(*path);
                     self.files.lock().unwrap().remove(*path);
-                    return Ok(HostOutput { exit_code: Some(0), ..Default::default() });
+                    return Ok(HostOutput {
+                        exit_code: Some(0),
+                        ..Default::default()
+                    });
                 }
                 // `tee <marker>` (no `-a`): write stdin as the file's contents +
                 // mint an inode. This backs the `.tenant` marker write. The
                 // `-a`-appended /etc/profile seed is left to the default success.
                 ["sudo", "-n", "tee", marker] => {
                     let contents = stdin.map(|b| b.to_vec()).unwrap_or_default();
-                    self.files.lock().unwrap().insert(marker.to_string(), contents);
+                    self.files
+                        .lock()
+                        .unwrap()
+                        .insert(marker.to_string(), contents);
                     if !self.inodes.lock().unwrap().contains_key(*marker) {
                         let ino = self.mint_inode();
                         self.inodes.lock().unwrap().insert(marker.to_string(), ino);
                     }
-                    return Ok(HostOutput { exit_code: Some(0), ..Default::default() });
+                    return Ok(HostOutput {
+                        exit_code: Some(0),
+                        ..Default::default()
+                    });
                 }
                 // `cat <path>`: return the file's contents, or ENOENT if absent.
                 ["sudo", "-n", "cat", path] => {
@@ -2675,7 +3023,10 @@ mod tests {
                 ["sudo", "-n", "test", "-f", path] => {
                     let present = self.inodes.lock().unwrap().contains_key(*path);
                     return Ok(if present {
-                        HostOutput { exit_code: Some(0), ..Default::default() }
+                        HostOutput {
+                            exit_code: Some(0),
+                            ..Default::default()
+                        }
                     } else {
                         fail()
                     });
@@ -2693,11 +3044,24 @@ mod tests {
                         .lock()
                         .unwrap()
                         .insert(dataset.to_string(), label);
-                    return Ok(HostOutput { exit_code: Some(0), ..Default::default() });
+                    return Ok(HostOutput {
+                        exit_code: Some(0),
+                        ..Default::default()
+                    });
                 }
                 // `zfs get -H -o value playground:tenant <dataset>`: read the
                 // recorded property, or the `-` "unset" sentinel if none.
-                ["sudo", "-n", "zfs", "get", "-H", "-o", "value", "playground:tenant", dataset] => {
+                [
+                    "sudo",
+                    "-n",
+                    "zfs",
+                    "get",
+                    "-H",
+                    "-o",
+                    "value",
+                    "playground:tenant",
+                    dataset,
+                ] => {
                     let val = self
                         .zfs_props
                         .lock()
@@ -2706,6 +3070,19 @@ mod tests {
                         .cloned()
                         .unwrap_or_else(|| "-".to_string());
                     return Ok(ok_with_stdout(&format!("{val}\n")));
+                }
+                // Successful all-name listing used to prove a removed jail is
+                // absent without conflating "not found" with command failure.
+                ["sudo", "-n", "jls", "-n", "name"] => {
+                    let listing = self
+                        .running_jails
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .map(|jail| format!("name={jail}"))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    return Ok(ok_with_stdout(&format!("{listing}\n")));
                 }
                 // `jls -j <jail>`: exit 0 iff the name is in the running set.
                 ["sudo", "-n", "jls", "-j", jail] => {
@@ -2812,7 +3189,16 @@ mod tests {
                 ok_with_stdout(&format!("{}\n", alice_root())),
             )
             .reply(
-                &["sudo", "-n", "zfs", "get", "-H", "-o", "value", "playground:tenant"],
+                &[
+                    "sudo",
+                    "-n",
+                    "zfs",
+                    "get",
+                    "-H",
+                    "-o",
+                    "value",
+                    "playground:tenant",
+                ],
                 ok_with_stdout("alice\n"),
             )
     }
@@ -2901,7 +3287,11 @@ mod tests {
             timeout: None,
         };
         let result = backend
-            .exec(&SessionId::new("playground-alice"), &req)
+            .exec(
+                &SessionId::new("playground-alice"),
+                &req,
+                &ExecControl::default(),
+            )
             .expect("exec");
         assert_eq!(result.exit_code, Some(255));
         assert!(result.error.is_none(), "no transport, no transport error");
@@ -2917,23 +3307,33 @@ mod tests {
             .reply(&["sudo", "-n", "jls", "-j"], fail())
             .reply(&["sudo", "-n", "zfs", "list"], dataset_absent())
             .into_backend();
-        backend.provision_sandbox(&spec("alice")).expect("provision");
+        backend
+            .provision_sandbox(&spec("alice"))
+            .expect("provision");
 
         let calls = mock.calls();
         let jail = alice_jail();
 
         // Must clone the template into the namespaced (injective) dataset...
         assert!(calls.iter().any(|c| c.starts_with(&[
-            "sudo".into(), "-n".into(), "zfs".into(), "clone".into(),
+            "sudo".into(),
+            "-n".into(),
+            "zfs".into(),
+            "clone".into(),
             "aitemp/playground/template@base".into(),
             alice_dataset(),
         ] as &[String])));
         // ...record the tenant provenance right after the clone...
         assert!(
-            calls.iter().any(|c| c == &[
-                "sudo".to_string(), "-n".into(), "zfs".into(), "set".into(),
-                "playground:tenant=alice".into(), alice_dataset(),
-            ]),
+            calls.iter().any(|c| c
+                == &[
+                    "sudo".to_string(),
+                    "-n".into(),
+                    "zfs".into(),
+                    "set".into(),
+                    "playground:tenant=alice".into(),
+                    alice_dataset(),
+                ]),
             "must `zfs set playground:tenant=alice` on the fresh dataset: {calls:?}"
         );
         // ...and create a jail with no network, correct name/path.
@@ -2962,14 +3362,21 @@ mod tests {
             .reply(&["sudo", "-n", "jls", "-j"], fail())
             .reply(&["sudo", "-n", "zfs", "list"], dataset_absent())
             .into_backend();
-        backend.provision_sandbox(&spec("alice")).expect("provision");
+        backend
+            .provision_sandbox(&spec("alice"))
+            .expect("provision");
 
         let calls = mock.calls();
         assert!(
-            calls.iter().any(|c| c == &[
-                "sudo".to_string(), "-n".into(), "zfs".into(), "set".into(),
-                "refquota=10G".into(), alice_dataset(),
-            ]),
+            calls.iter().any(|c| c
+                == &[
+                    "sudo".to_string(),
+                    "-n".into(),
+                    "zfs".into(),
+                    "set".into(),
+                    "refquota=10G".into(),
+                    alice_dataset(),
+                ]),
             "must `zfs set refquota=10G` on the fresh clone: {calls:?}"
         );
     }
@@ -2983,17 +3390,21 @@ mod tests {
             .reply(&["sudo", "-n", "zfs", "list"], dataset_absent())
             .into_backend();
         backend.clone_refquota = None;
-        backend.provision_sandbox(&spec("alice")).expect("provision");
+        backend
+            .provision_sandbox(&spec("alice"))
+            .expect("provision");
         let calls = mock.calls();
         assert!(
-            !calls.iter().any(|c| c.iter().any(|a| a.starts_with("refquota="))),
+            !calls
+                .iter()
+                .any(|c| c.iter().any(|a| a.starts_with("refquota="))),
             "no refquota set must be issued when disabled: {calls:?}"
         );
     }
 
     /// With host RACCT OFF (the mock's `sysctl kern.racct.enable` yields empty →
-    /// not "1"), provision must NOT attempt any `rctl -a` rule — it fails closed
-    /// on the probe and only emits the operator hint.
+    /// not "1"), provision must NOT attempt any `rctl -a` rule; this is the
+    /// explicit disabled state, not a failed/unknown probe.
     #[test]
     fn provision_skips_rctl_when_racct_off() {
         let (backend, mock) = mock_provision_ready()
@@ -3001,11 +3412,46 @@ mod tests {
             .reply(&["sudo", "-n", "zfs", "list"], dataset_absent())
             // sysctl returns empty stdout by the mock default → racct_enabled() == false.
             .into_backend();
-        backend.provision_sandbox(&spec("alice")).expect("provision");
+        backend
+            .provision_sandbox(&spec("alice"))
+            .expect("provision");
         let calls = mock.calls();
         assert!(
-            !calls.iter().any(|c| c.get(2).map(String::as_str) == Some("rctl")),
+            !calls
+                .iter()
+                .any(|c| c.get(2).map(String::as_str) == Some("rctl")),
             "no rctl rule may be applied while RACCT is off: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn provision_fails_closed_when_racct_probe_is_unknown() {
+        let (backend, mock) = mock_provision_ready()
+            .reply(&["sudo", "-n", "jls", "-j"], fail())
+            .reply(&["sudo", "-n", "zfs", "list"], dataset_absent())
+            .reply(
+                &["sysctl", "-n", "kern.racct.enable"],
+                HostOutput {
+                    exit_code: Some(1),
+                    stderr: b"permission denied".to_vec(),
+                    ..Default::default()
+                },
+            )
+            .into_backend();
+
+        let err = backend
+            .provision_sandbox(&spec("alice"))
+            .expect_err("an unknown RACCT state must not be treated as disabled");
+        assert!(
+            format!("{err:#}").contains("sysctl kern.racct.enable failed"),
+            "{err:#}"
+        );
+        assert!(
+            !mock.calls().iter().any(|c| {
+                c.get(2).map(String::as_str) == Some("rctl")
+                    && c.get(3).map(String::as_str) == Some("-a")
+            }),
+            "an unknown probe cannot safely attempt rule installation"
         );
     }
 
@@ -3016,19 +3462,142 @@ mod tests {
         let (backend, mock) = mock_provision_ready()
             .reply(&["sudo", "-n", "jls", "-j"], fail())
             .reply(&["sudo", "-n", "zfs", "list"], dataset_absent())
-            .reply(&["sysctl", "-n", "kern.racct.enable"], ok_with_stdout("1\n"))
+            .reply(
+                &["sysctl", "-n", "kern.racct.enable"],
+                ok_with_stdout("1\n"),
+            )
             .into_backend();
-        backend.provision_sandbox(&spec("alice")).expect("provision");
+        backend
+            .provision_sandbox(&spec("alice"))
+            .expect("provision");
 
         let calls = mock.calls();
         let jail = alice_jail();
         // At least the maxproc rule must be applied, keyed on alice's jail name.
         assert!(
-            calls.iter().any(|c| c == &[
-                "sudo".to_string(), "-n".into(), "rctl".into(), "-a".into(),
-                format!("jail:{jail}:maxproc:deny=512"),
-            ]),
+            calls.iter().any(|c| c
+                == &[
+                    "sudo".to_string(),
+                    "-n".into(),
+                    "rctl".into(),
+                    "-a".into(),
+                    format!("jail:{jail}:maxproc:deny=512"),
+                ]),
             "must apply the maxproc rctl rule when RACCT is on: {calls:?}"
+        );
+    }
+
+    /// RACCT-on means every configured rule is mandatory. A failed `rctl -a`
+    /// must fail fresh provision instead of reporting an under-limited jail as
+    /// ready; operation-owned cleanup then removes the clone we just created.
+    #[test]
+    fn provision_fails_closed_when_rctl_rule_fails() {
+        let (backend, mock) = mock_provision_ready()
+            .reply(&["sudo", "-n", "jls", "-j"], fail())
+            .reply(&["sudo", "-n", "zfs", "list"], dataset_absent())
+            .reply(
+                &["sysctl", "-n", "kern.racct.enable"],
+                ok_with_stdout("1\n"),
+            )
+            .reply(
+                &["sudo", "-n", "rctl", "-a"],
+                HostOutput {
+                    exit_code: Some(1),
+                    stderr: b"invalid rule".to_vec(),
+                    ..Default::default()
+                },
+            )
+            .into_backend();
+
+        let err = backend
+            .provision_sandbox(&spec("alice"))
+            .expect_err("an RCTL failure must fail provision closed");
+        assert!(format!("{err:#}").contains("rctl -a"), "{err:#}");
+
+        let calls = mock.calls();
+        assert!(
+            calls.iter().any(|c| {
+                c.get(2).map(String::as_str) == Some("zfs")
+                    && c.get(3).map(String::as_str) == Some("destroy")
+            }),
+            "failed fresh provision must clean up its own clone: {calls:?}"
+        );
+    }
+
+    /// Reattach recreates both the jail context and its reboot-volatile RCTL
+    /// rules. The rules are applied only after `jail -c` has created the named
+    /// RCTL subject.
+    #[test]
+    fn reattach_reapplies_rctl_rules_after_jail_creation() {
+        let (backend, mock) = mock_with_mountpoint()
+            .reply(
+                &["sysctl", "-n", "kern.racct.enable"],
+                ok_with_stdout("1\n"),
+            )
+            .into_backend();
+
+        backend.open_session(&spec("alice")).expect("reattach");
+        let calls = mock.calls();
+        let jail = alice_jail();
+        let maxproc_rule = format!("jail:{jail}:maxproc:deny=512");
+        let jail_create = calls
+            .iter()
+            .position(|c| {
+                c.get(2).map(String::as_str) == Some("jail")
+                    && c.get(3).map(String::as_str) == Some("-c")
+            })
+            .expect("jail -c");
+        let rctl_add = calls
+            .iter()
+            .position(|c| {
+                c.get(2).map(String::as_str) == Some("rctl")
+                    && c.get(3).map(String::as_str) == Some("-a")
+                    && c.last() == Some(&maxproc_rule)
+            })
+            .expect("maxproc RCTL rule");
+        assert!(
+            jail_create < rctl_add,
+            "RCTL needs an existing jail: {calls:?}"
+        );
+    }
+
+    /// Running-jail reuse deliberately repeats `rctl -a`: FreeBSD replaces the
+    /// matching deny rule, so this converges without a remove/re-add gap or
+    /// duplicate stacking.
+    #[test]
+    fn running_jail_reuse_idempotently_reapplies_rctl_rules() {
+        let jail = alice_jail();
+        let (backend, mock) = mock_with_mountpoint()
+            .with_running_jail(&jail)
+            .reply(
+                &["sysctl", "-n", "kern.racct.enable"],
+                ok_with_stdout("1\n"),
+            )
+            .into_backend();
+
+        backend.open_session(&spec("alice")).expect("first reuse");
+        backend.open_session(&spec("alice")).expect("second reuse");
+
+        let calls = mock.calls();
+        let maxproc = format!("jail:{jail}:maxproc:deny=512");
+        let applications = calls
+            .iter()
+            .filter(|c| {
+                c.get(2).map(String::as_str) == Some("rctl")
+                    && c.get(3).map(String::as_str) == Some("-a")
+                    && c.last() == Some(&maxproc)
+            })
+            .count();
+        assert_eq!(
+            applications, 2,
+            "each reuse must converge the rule: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| {
+                c.get(2).map(String::as_str) == Some("rctl")
+                    && c.get(3).map(String::as_str) == Some("-r")
+            }),
+            "idempotent replacement needs no unbounded remove/add window: {calls:?}"
         );
     }
 
@@ -3046,7 +3615,11 @@ mod tests {
             timeout: Some(Duration::from_secs(10 * 3600)),
         };
         backend
-            .exec(&SessionId::new("playground-alice"), &req)
+            .exec(
+                &SessionId::new("playground-alice"),
+                &req,
+                &ExecControl::default(),
+            )
             .expect("exec");
         let calls = mock.calls();
         // Find the `timeout(1)` argv and read the seconds arg (index after -k 5).
@@ -3074,22 +3647,31 @@ mod tests {
             timeout: Some(Duration::from_secs(5)),
         };
         backend
-            .exec(&SessionId::new("playground-alice"), &req)
+            .exec(
+                &SessionId::new("playground-alice"),
+                &req,
+                &ExecControl::default(),
+            )
             .expect("exec");
         let calls = mock.calls();
         let tcall = calls
             .iter()
             .find(|c| c.get(2).map(String::as_str) == Some("timeout"))
             .expect("timeout(1) issued");
-        assert_eq!(tcall[5], "5", "a sub-ceiling timeout passes through: {calls:?}");
+        assert_eq!(
+            tcall[5], "5",
+            "a sub-ceiling timeout passes through: {calls:?}"
+        );
     }
 
-    /// On an output-cap breach the jail process tree is reaped (best-effort
-    /// `jexec <jail> kill -TERM/-KILL -1`) and the result carries the truncation
-    /// error, so a runaway producer's background procs cannot outlive the exec.
+    /// A capable local runner must never hide loss of its descendant reaper
+    /// behind an automatic whole-jail reset. It reports the typed fatal marker;
+    /// the serving boundary exits and leaves the jail for operator inspection.
     #[test]
-    fn exec_reaps_tree_on_output_truncation() {
+    fn capable_exec_control_loss_is_fatal_without_jail_reset() {
+        let jail = alice_jail();
         let (backend, mock) = MockRunner::default()
+            .with_background_jobs()
             .reply(
                 &["sudo", "-n", "timeout"],
                 HostOutput {
@@ -3106,28 +3688,167 @@ mod tests {
             stdin: None,
             timeout: None,
         };
-        let result = backend
-            .exec(&SessionId::new("playground-alice"), &req)
-            .expect("exec");
+        let error = backend
+            .exec(&SessionId::new(jail.clone()), &req, &ExecControl::default())
+            .expect_err("lost descendant cleanup must be process-fatal");
         assert!(
-            result.error.as_deref().unwrap_or("").contains("output truncated"),
-            "truncation must be signalled: {:?}",
-            result.error
+            crate::sandbox::is_sandbox_control_lost(&error),
+            "typed fatal marker was lost: {error:#}"
         );
         let calls = mock.calls();
-        // The kill -TERM -1 and kill -KILL -1 reap calls were issued.
         assert!(
-            calls.iter().any(|c| c
-                == &["sudo".to_string(), "-n".into(), "jexec".into(),
-                     "playground-alice".into(), "/bin/kill".into(), "-TERM".into(), "-1".into()]),
-            "must SIGTERM the jail tree on truncation: {calls:?}"
+            !calls.iter().any(|call| {
+                call.get(2).map(String::as_str) == Some("jail")
+                    && matches!(call.get(3).map(String::as_str), Some("-r" | "-c"))
+            }),
+            "fatal execution loss must not mutate the jail lifecycle: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn unsupported_transport_failure_is_reported_without_sticky_recovery_state() {
+        let jail = alice_jail();
+        let (backend, mock) = MockRunner::default()
+            .reply(
+                &["sudo", "-n", "timeout"],
+                HostOutput {
+                    output_truncated: true,
+                    ..Default::default()
+                },
+            )
+            .into_backend();
+        let result = backend
+            .exec(
+                &SessionId::new(jail.clone()),
+                &ExecRequest {
+                    command: "yes".to_string(),
+                    cwd: None,
+                    stdin: None,
+                    timeout: None,
+                },
+                &ExecControl::default(),
+            )
+            .expect("unsupported transport failure remains an ordinary result");
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("server timeout")
         );
         assert!(
-            calls.iter().any(|c| c
-                == &["sudo".to_string(), "-n".into(), "jexec".into(),
-                     "playground-alice".into(), "/bin/kill".into(), "-KILL".into(), "-1".into()]),
-            "must SIGKILL stragglers on truncation: {calls:?}"
+            !mock.calls().iter().any(|call| call
+                == &[
+                    "sudo".to_string(),
+                    "-n".into(),
+                    "jail".into(),
+                    "-r".into(),
+                    jail.clone()
+                ]),
+            "a transient unsupported transport failure must not mutate persistent state"
         );
+    }
+
+    #[test]
+    fn job_scoped_local_cancellation_does_not_reap_the_whole_jail() {
+        let jail = alice_jail();
+        let (backend, mock) = MockRunner::default()
+            .with_background_jobs()
+            .reply(
+                &["sudo", "-n", "timeout"],
+                HostOutput {
+                    cancelled: true,
+                    cancelled_process_group: true,
+                    ..Default::default()
+                },
+            )
+            .into_backend();
+        let req = ExecRequest {
+            command: "sleep 30".to_string(),
+            cwd: None,
+            stdin: None,
+            timeout: None,
+        };
+        let result = backend
+            .exec(&SessionId::new(jail.clone()), &req, &ExecControl::default())
+            .expect("exec");
+        assert!(result.cancelled);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("process group reaped")
+        );
+        let calls = mock.calls();
+        assert!(
+            !calls.iter().any(|call| call
+                == &[
+                    "sudo".to_string(),
+                    "-n".into(),
+                    "jail".into(),
+                    "-r".into(),
+                    jail.clone()
+                ]),
+            "job-scoped cancellation must not reset the whole jail: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|call| {
+                call.get(2).map(String::as_str) == Some("jail")
+                    && call.get(3).map(String::as_str) == Some("-c")
+            }),
+            "job-scoped cancellation must not reattach a reset jail: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn unproven_capable_cancellation_is_fatal_without_jail_reset() {
+        let jail = alice_jail();
+        let (backend, mock) = MockRunner::default()
+            .with_background_jobs()
+            .reply(
+                &["sudo", "-n", "timeout"],
+                HostOutput {
+                    cancelled: true,
+                    ..Default::default()
+                },
+            )
+            .into_backend();
+        let req = ExecRequest {
+            command: "sleep 30".to_string(),
+            cwd: None,
+            stdin: None,
+            timeout: None,
+        };
+        let error = backend
+            .exec(&SessionId::new(jail.clone()), &req, &ExecControl::default())
+            .expect_err("unproven capable cancellation must be fatal");
+        assert!(crate::sandbox::is_sandbox_control_lost(&error));
+        let calls = mock.calls();
+        assert!(
+            !calls.iter().any(|call| call
+                == &[
+                    "sudo".to_string(),
+                    "-n".into(),
+                    "jail".into(),
+                    "-r".into(),
+                    jail.clone()
+                ]),
+            "fatal cancellation must leave the jail untouched for operator recovery: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn root_local_runner_elides_redundant_sudo_prefix() {
+        let argv = vec!["sudo".to_string(), "-n".to_string(), "timeout".to_string()];
+        assert_eq!(local_argv(&argv, true), &argv[2..]);
+        assert_eq!(local_argv(&argv, false), argv.as_slice());
+    }
+
+    #[cfg(not(target_os = "freebsd"))]
+    #[test]
+    fn non_freebsd_local_runner_never_advertises_background_jobs() {
+        assert!(!LocalRunner.supports_background_jobs());
     }
 
     // ---- blocker #3: lifecycle uncertainty must never destroy valid data ----
@@ -3139,16 +3860,26 @@ mod tests {
     #[test]
     fn dataset_state_distinguishes_absent_from_error() {
         let cases: &[(HostOutput, DatasetState)] = &[
-            (ok_with_stdout("aitemp/playground/x\n"), DatasetState::Exists),
+            (
+                ok_with_stdout("aitemp/playground/x\n"),
+                DatasetState::Exists,
+            ),
             (dataset_absent(), DatasetState::Absent),
             (dataset_probe_error(), DatasetState::Unknown),
             (fail(), DatasetState::Unknown), // bare non-zero, no stderr
             (
-                HostOutput { exit_code: Some(255), ..Default::default() },
+                HostOutput {
+                    exit_code: Some(255),
+                    ..Default::default()
+                },
                 DatasetState::Unknown,
             ),
             (
-                HostOutput { timed_out: true, exit_code: None, ..Default::default() },
+                HostOutput {
+                    timed_out: true,
+                    exit_code: None,
+                    ..Default::default()
+                },
                 DatasetState::Unknown,
             ),
         ];
@@ -3189,13 +3920,17 @@ mod tests {
         );
         let calls = mock.calls();
         assert!(
-            !calls.iter().any(|c| c.get(2).map(String::as_str) == Some("zfs")
-                && c.get(3).map(String::as_str) == Some("clone")),
+            !calls
+                .iter()
+                .any(|c| c.get(2).map(String::as_str) == Some("zfs")
+                    && c.get(3).map(String::as_str) == Some("clone")),
             "an Unknown probe must NOT clone: {calls:?}"
         );
         assert!(
-            !calls.iter().any(|c| c.get(2).map(String::as_str) == Some("zfs")
-                && c.get(3).map(String::as_str) == Some("destroy")),
+            !calls
+                .iter()
+                .any(|c| c.get(2).map(String::as_str) == Some("zfs")
+                    && c.get(3).map(String::as_str) == Some("destroy")),
             "an Unknown probe must NEVER destroy: {calls:?}"
         );
     }
@@ -3240,8 +3975,10 @@ mod tests {
         assert!(format!("{err:#}").contains("zfs clone"), "{err:#}");
         let calls = mock.calls();
         assert!(
-            !calls.iter().any(|c| c.get(2).map(String::as_str) == Some("zfs")
-                && c.get(3).map(String::as_str) == Some("destroy")),
+            !calls
+                .iter()
+                .any(|c| c.get(2).map(String::as_str) == Some("zfs")
+                    && c.get(3).map(String::as_str) == Some("destroy")),
             "a provision that did not create the dataset must destroy NOTHING: {calls:?}"
         );
     }
@@ -3293,7 +4030,10 @@ mod tests {
             // never records it -> the exact-tuple post-verify must catch it.
             .reply(
                 &["sudo", "-n", "mount", "-t", "nullfs"],
-                HostOutput { exit_code: Some(0), ..Default::default() },
+                HostOutput {
+                    exit_code: Some(0),
+                    ..Default::default()
+                },
             )
             .into_backend();
         let err = backend
@@ -3306,8 +4046,10 @@ mod tests {
         // And because the clone WAS created, operation-owned cleanup destroys it.
         let calls = mock.calls();
         assert!(
-            calls.iter().any(|c| c.get(2).map(String::as_str) == Some("zfs")
-                && c.get(3).map(String::as_str) == Some("destroy")),
+            calls
+                .iter()
+                .any(|c| c.get(2).map(String::as_str) == Some("zfs")
+                    && c.get(3).map(String::as_str) == Some("destroy")),
             "the created-but-unusable clone must be torn down: {calls:?}"
         );
     }
@@ -3357,8 +4099,8 @@ mod tests {
     /// finishes.
     #[test]
     fn lifecycle_lock_serializes_same_tenant_ops() {
-        use std::sync::mpsc;
         use std::sync::Arc;
+        use std::sync::mpsc;
 
         // A runner whose FIRST `zfs list` (dataset probe) blocks on a channel, so
         // the op that grabs the tenant lock first stalls inside the critical
@@ -3394,7 +4136,10 @@ mod tests {
                     // Fail the clone so neither op does real work past the probe.
                     return Ok(fail());
                 }
-                Ok(HostOutput { exit_code: Some(0), ..Default::default() })
+                Ok(HostOutput {
+                    exit_code: Some(0),
+                    ..Default::default()
+                })
             }
         }
 
@@ -3429,8 +4174,10 @@ mod tests {
             .lock()
             .unwrap()
             .iter()
-            .filter(|c| c.get(2).map(String::as_str) == Some("zfs")
-                && c.get(3).map(String::as_str) == Some("list"))
+            .filter(|c| {
+                c.get(2).map(String::as_str) == Some("zfs")
+                    && c.get(3).map(String::as_str) == Some("list")
+            })
             .count();
         assert_eq!(
             probes_before, 1,
@@ -3446,10 +4193,15 @@ mod tests {
             .lock()
             .unwrap()
             .iter()
-            .filter(|c| c.get(2).map(String::as_str) == Some("zfs")
-                && c.get(3).map(String::as_str) == Some("list"))
+            .filter(|c| {
+                c.get(2).map(String::as_str) == Some("zfs")
+                    && c.get(3).map(String::as_str) == Some("list")
+            })
             .count();
-        assert_eq!(probes_after, 2, "op2 runs its probe only after op1 releases");
+        assert_eq!(
+            probes_after, 2,
+            "op2 runs its probe only after op1 releases"
+        );
     }
 
     /// Model-B pile provisioning: a brand-new tenant gets BOTH host-owned pile
@@ -3464,7 +4216,9 @@ mod tests {
         let (backend, mock) = mock_provision_ready()
             .reply(&["sudo", "-n", "zfs", "list"], dataset_absent())
             .into_backend();
-        backend.provision_sandbox(&spec("alice")).expect("provision");
+        backend
+            .provision_sandbox(&spec("alice"))
+            .expect("provision");
         let calls = mock.calls();
         let jail = alice_jail();
         let root = alice_root();
@@ -3481,40 +4235,39 @@ mod tests {
 
         // Host per-coworker pile dir is created.
         assert!(
-            calls.iter().any(|c| c.ends_with(&[
-                "mkdir".into(), "-p".into(), self_dir.into()
-            ] as &[String])),
+            calls
+                .iter()
+                .any(|c| c.ends_with(&["mkdir".into(), "-p".into(), self_dir.into()] as &[String])),
             "must mkdir the per-coworker pile dir: {calls:?}"
         );
         // The host-private staging dir is created AND locked down to 0700.
         assert!(
-            calls.iter().any(|c| c.ends_with(&[
-                "mkdir".into(), "-p".into(), staging_root.into()
-            ] as &[String])),
+            calls
+                .iter()
+                .any(|c| c
+                    .ends_with(&["mkdir".into(), "-p".into(), staging_root.into()] as &[String])),
             "must mkdir the host-private staging dir: {calls:?}"
         );
         assert!(
-            calls.iter().any(|c| c.ends_with(&[
-                "chmod".into(), "700".into(), staging_root.into()
-            ] as &[String])),
+            calls
+                .iter()
+                .any(|c| c
+                    .ends_with(&["chmod".into(), "700".into(), staging_root.into()] as &[String])),
             "must chmod 700 the host-private staging dir: {calls:?}"
         );
         // Both piles are made append-only (`chflags sappnd`) after seeding: an
         // in-jail process can append but not truncate them.
         for pile in [&self_pile, &shared_pile] {
             assert!(
-                calls.iter().any(|c| c.ends_with(&[
-                    "chflags".into(),
-                    "sappnd".into(),
-                    pile.clone(),
-                ] as &[String])),
+                calls.iter().any(|c| c
+                    .ends_with(&["chflags".into(), "sappnd".into(), pile.clone(),] as &[String])),
                 "must chflags sappnd {pile}: {calls:?}"
             );
         }
         assert!(
-            calls.iter().any(|c| c.ends_with(&[
-                "mkdir".into(), "-p".into(), shared_dir.into()
-            ] as &[String])),
+            calls.iter().any(
+                |c| c.ends_with(&["mkdir".into(), "-p".into(), shared_dir.into()] as &[String])
+            ),
             "must mkdir the shared pile dir: {calls:?}"
         );
 
@@ -3535,10 +4288,15 @@ mod tests {
             // no-follow). `-h` is required so a symlink-to-a-DIRECTORY dest is
             // NOT followed (sol's review of repair #2).
             assert!(
-                calls.iter().any(|c| c == &[
-                    "sudo".to_string(), "-n".into(), "ln".into(), "-h".into(),
-                    staging_tmp.clone(), dest.clone(),
-                ]),
+                calls.iter().any(|c| c
+                    == &[
+                        "sudo".to_string(),
+                        "-n".into(),
+                        "ln".into(),
+                        "-h".into(),
+                        staging_tmp.clone(),
+                        dest.clone(),
+                    ]),
                 "must publish {dest} via no-follow/create-only `ln -h` from staging: {calls:?}"
             );
         }
@@ -3556,30 +4314,42 @@ mod tests {
 
         // BOTH single-file nullfs mounts: host pile FILE -> guest pile FILE.
         assert!(
-            calls.iter().any(|c| c == &[
-                "sudo".to_string(), "-n".into(), "mount".into(), "-t".into(),
-                "nullfs".into(), self_pile.clone(), format!("{root}/pile/self.pile"),
-            ]),
+            calls.iter().any(|c| c
+                == &[
+                    "sudo".to_string(),
+                    "-n".into(),
+                    "mount".into(),
+                    "-t".into(),
+                    "nullfs".into(),
+                    self_pile.clone(),
+                    format!("{root}/pile/self.pile"),
+                ]),
             "must single-file-nullfs-mount self.pile at /pile/self.pile: {calls:?}"
         );
         assert!(
-            calls.iter().any(|c| c == &[
-                "sudo".to_string(), "-n".into(), "mount".into(), "-t".into(),
-                "nullfs".into(), shared_pile.clone(), format!("{root}/shared/shared.pile"),
-            ]),
+            calls.iter().any(|c| c
+                == &[
+                    "sudo".to_string(),
+                    "-n".into(),
+                    "mount".into(),
+                    "-t".into(),
+                    "nullfs".into(),
+                    shared_pile.clone(),
+                    format!("{root}/shared/shared.pile"),
+                ]),
             "must single-file-nullfs-mount shared.pile at /shared/shared.pile: {calls:?}"
         );
         // The guest target FILES are touched (created empty) before the mount.
         assert!(
-            calls.iter().any(|c| c.ends_with(&[
-                "touch".into(), format!("{root}/pile/self.pile"),
-            ] as &[String])),
+            calls
+                .iter()
+                .any(|c| c
+                    .ends_with(&["touch".into(), format!("{root}/pile/self.pile"),] as &[String])),
             "must touch the guest self.pile target before mounting: {calls:?}"
         );
         assert!(
-            calls.iter().any(|c| c.ends_with(&[
-                "touch".into(), format!("{root}/shared/shared.pile"),
-            ] as &[String])),
+            calls.iter().any(|c| c
+                .ends_with(&["touch".into(), format!("{root}/shared/shared.pile"),] as &[String])),
             "must touch the guest shared.pile target before mounting: {calls:?}"
         );
 
@@ -3609,10 +4379,13 @@ mod tests {
         );
 
         // The caller-supplied pile path is NEVER referenced by any host
-        // command (only logged): the mounted pile is the coworker's server-born
+        // command (ignored): the mounted pile is the coworker's server-born
         // artifact under pile_root.
         assert!(
-            calls.iter().flatten().all(|a| !a.contains("/caller/supplied/arbitrary.pile")),
+            calls
+                .iter()
+                .flatten()
+                .all(|a| !a.contains("/caller/supplied/arbitrary.pile")),
             "must never reference the caller-supplied pile path: {calls:?}"
         );
     }
@@ -3626,15 +4399,15 @@ mod tests {
             .reply(&["sudo", "-n", "zfs", "list"], dataset_absent())
             .into_backend();
         let err = backend.open_session(&spec("alice")).expect_err("must bail");
-        assert!(
-            err.to_string().contains("not provisioned"),
-            "err: {err}"
-        );
+        assert!(err.to_string().contains("not provisioned"), "err: {err}");
         assert!(err.to_string().contains("playground user create alice"));
         // Crucially: no clone was attempted.
         assert!(
-            !mock.calls().iter().any(|c| c.get(2).map(String::as_str) == Some("zfs")
-                && c.get(3).map(String::as_str) == Some("clone")),
+            !mock
+                .calls()
+                .iter()
+                .any(|c| c.get(2).map(String::as_str) == Some("zfs")
+                    && c.get(3).map(String::as_str) == Some("clone")),
             "open must not zfs clone"
         );
     }
@@ -3661,13 +4434,17 @@ mod tests {
         );
         // ...but nothing was cloned or re-seeded.
         assert!(
-            !calls.iter().any(|c| c.get(2).map(String::as_str) == Some("zfs")
-                && c.get(3).map(String::as_str) == Some("clone")),
+            !calls
+                .iter()
+                .any(|c| c.get(2).map(String::as_str) == Some("zfs")
+                    && c.get(3).map(String::as_str) == Some("clone")),
             "reattach must not zfs clone"
         );
         assert!(
-            !calls.iter().any(|c| c.get(3).map(String::as_str) == Some("tee")
-                || c.get(2).map(String::as_str) == Some("tee")),
+            !calls
+                .iter()
+                .any(|c| c.get(3).map(String::as_str) == Some("tee")
+                    || c.get(2).map(String::as_str) == Some("tee")),
             "reattach must not re-seed /etc/profile"
         );
     }
@@ -3689,26 +4466,36 @@ mod tests {
         let root = root.as_str();
 
         assert!(
-            calls.iter().any(|c| c == &[
-                "sudo".to_string(), "-n".into(), "mount".into(), "-t".into(),
-                "nullfs".into(),
-                format!("/aitemp/playground/piles/{jail}/self.pile"),
-                format!("{root}/pile/self.pile"),
-            ]),
+            calls.iter().any(|c| c
+                == &[
+                    "sudo".to_string(),
+                    "-n".into(),
+                    "mount".into(),
+                    "-t".into(),
+                    "nullfs".into(),
+                    format!("/aitemp/playground/piles/{jail}/self.pile"),
+                    format!("{root}/pile/self.pile"),
+                ]),
             "reattach must re-mount the self.pile at /pile/self.pile: {calls:?}"
         );
         assert!(
-            calls.iter().any(|c| c == &[
-                "sudo".to_string(), "-n".into(), "mount".into(), "-t".into(),
-                "nullfs".into(),
-                "/aitemp/playground/piles/shared/shared.pile".into(),
-                format!("{root}/shared/shared.pile"),
-            ]),
+            calls.iter().any(|c| c
+                == &[
+                    "sudo".to_string(),
+                    "-n".into(),
+                    "mount".into(),
+                    "-t".into(),
+                    "nullfs".into(),
+                    "/aitemp/playground/piles/shared/shared.pile".into(),
+                    format!("{root}/shared/shared.pile"),
+                ]),
             "reattach must re-mount the shared.pile at /shared/shared.pile: {calls:?}"
         );
         // Reattach seeds nothing: no bootstrap copy.
         assert!(
-            !calls.iter().any(|c| c.get(2).map(String::as_str) == Some("cp")),
+            !calls
+                .iter()
+                .any(|c| c.get(2).map(String::as_str) == Some("cp")),
             "reattach must not re-seed a pile: {calls:?}"
         );
     }
@@ -3724,7 +4511,9 @@ mod tests {
         let (backend, mock) = mock_reattached_alice()
             .reply(&["sudo", "-n", "jls", "-j"], fail()) // not running -> reattach
             .into_backend();
-        let id = backend.open_session(&spec("alice")).expect("reattach no-op");
+        let id = backend
+            .open_session(&spec("alice"))
+            .expect("reattach no-op");
         assert_eq!(id.as_str(), alice_jail());
         // The jail is (re)started even though the mounts were already live.
         let calls = mock.calls();
@@ -3779,9 +4568,7 @@ mod tests {
             })
             .expect("zfs destroy issued");
         assert!(
-            self_umount < destroy_idx
-                && shared_umount < destroy_idx
-                && dev_umount < destroy_idx,
+            self_umount < destroy_idx && shared_umount < destroy_idx && dev_umount < destroy_idx,
             "all pile/devfs unmounts must precede zfs destroy: {calls:?}"
         );
 
@@ -3806,8 +4593,9 @@ mod tests {
             })
             .collect();
         assert!(
-            destroys.iter().all(|c| c.last().map(String::as_str)
-                == Some(alice_dataset().as_str())),
+            destroys
+                .iter()
+                .all(|c| c.last().map(String::as_str) == Some(alice_dataset().as_str())),
             "only the session dataset may be destroyed: {destroys:?}"
         );
     }
@@ -3837,7 +4625,10 @@ mod tests {
             assert!(
                 calls.iter().any(|c| c
                     == &[
-                        "sudo".to_string(), "-n".into(), "mkdir".into(), "-p".into(),
+                        "sudo".to_string(),
+                        "-n".into(),
+                        "mkdir".into(),
+                        "-p".into(),
                         "/aitemp/playground/piles/shared".into(),
                     ]),
                 "shared dir mkdir must be idempotent (-p): {calls:?}"
@@ -3859,7 +4650,11 @@ mod tests {
                         && c.get(2).map(String::as_str) == Some("ln")
                 })
                 .collect();
-            assert_eq!(shared_lns.len(), 1, "one create-only shared-pile publish: {calls:?}");
+            assert_eq!(
+                shared_lns.len(),
+                1,
+                "one create-only shared-pile publish: {calls:?}"
+            );
             assert!(
                 shared_lns[0].iter().any(|a| a == staging_tmp.as_str()),
                 "publish must hardlink the host-private staging temp: {:?}",
@@ -3885,8 +4680,7 @@ mod tests {
             // historical symlink confused-deputy sink this fix removes.
             assert!(
                 !calls.iter().any(|c| {
-                    c.last().map(String::as_str) == Some(shared_pile)
-                        && c.iter().any(|a| a == "cp")
+                    c.last().map(String::as_str) == Some(shared_pile) && c.iter().any(|a| a == "cp")
                 }),
                 "must not cp directly into shared.pile (non-atomic + unsafe): {calls:?}"
             );
@@ -3904,7 +4698,9 @@ mod tests {
         let (backend, mock) = mock_provision_ready()
             .reply(&["sudo", "-n", "zfs", "list"], dataset_absent())
             .into_backend();
-        backend.provision_sandbox(&spec("alice")).expect("provision");
+        backend
+            .provision_sandbox(&spec("alice"))
+            .expect("provision");
         let calls = mock.calls();
 
         // Every bootstrap `cp` must land under the staging root and nowhere else.
@@ -3912,7 +4708,10 @@ mod tests {
             .iter()
             .filter(|c| c.iter().any(|a| a == "cp"))
             .collect();
-        assert!(!cps.is_empty(), "at least one bootstrap cp expected: {calls:?}");
+        assert!(
+            !cps.is_empty(),
+            "at least one bootstrap cp expected: {calls:?}"
+        );
         for c in &cps {
             let dest = c.last().map(String::as_str).unwrap_or("");
             assert!(
@@ -3928,9 +4727,13 @@ mod tests {
         // The staging dir is locked to 0700 before any cp reaches it.
         let chmod_idx = calls
             .iter()
-            .position(|c| c.ends_with(&[
-                "chmod".into(), "700".into(), "/aitemp/playground/staging".into(),
-            ] as &[String]))
+            .position(|c| {
+                c.ends_with(&[
+                    "chmod".into(),
+                    "700".into(),
+                    "/aitemp/playground/staging".into(),
+                ] as &[String])
+            })
             .expect("staging chmod 700 issued");
         let first_cp_idx = calls
             .iter()
@@ -3979,7 +4782,13 @@ mod tests {
             .reply(&["sudo", "-n", "zfs", "list"], dataset_absent())
             .reply(&["sudo", "-n", "ln"], fail())
             .reply(
-                &["sudo", "-n", "sh", "-c", "test -f \"$1\" && test ! -L \"$1\""],
+                &[
+                    "sudo",
+                    "-n",
+                    "sh",
+                    "-c",
+                    "test -f \"$1\" && test ! -L \"$1\"",
+                ],
                 fail(),
             )
             .into_backend();
@@ -4035,7 +4844,13 @@ mod tests {
             // Fail ONLY the no-follow regular-file validator (its exact script);
             // the staging-provenance walk (a different `sh -c`) still passes.
             .reply(
-                &["sudo", "-n", "sh", "-c", "test -f \"$1\" && test ! -L \"$1\""],
+                &[
+                    "sudo",
+                    "-n",
+                    "sh",
+                    "-c",
+                    "test -f \"$1\" && test ! -L \"$1\"",
+                ],
                 fail(),
             )
             .into_backend();
@@ -4053,8 +4868,10 @@ mod tests {
         // followed into. A plain `ln` would have followed and created a file.
         let calls = mock.calls();
         assert!(
-            calls.iter().any(|c| c.get(2).map(String::as_str) == Some("ln")
-                && c.get(3).map(String::as_str) == Some("-h")),
+            calls
+                .iter()
+                .any(|c| c.get(2).map(String::as_str) == Some("ln")
+                    && c.get(3).map(String::as_str) == Some("-h")),
             "publish must use `ln -h` (no-follow) so a symlink-to-dir dest is \
              refused not followed: {calls:?}"
         );
@@ -4078,7 +4895,9 @@ mod tests {
         let (backend, mock) = mock_provision_ready()
             .reply(&["sudo", "-n", "zfs", "list"], dataset_absent())
             .into_backend();
-        backend.provision_sandbox(&spec("alice")).expect("provision");
+        backend
+            .provision_sandbox(&spec("alice"))
+            .expect("provision");
         let calls = mock.calls();
 
         // Every nullfs mount's SOURCE (5th argv token) must be a pile FILE, never
@@ -4086,11 +4905,13 @@ mod tests {
         let nullfs_mounts: Vec<_> = calls
             .iter()
             .filter(|c| {
-                c.get(2).map(String::as_str) == Some("mount")
-                    && c.iter().any(|a| a == "nullfs")
+                c.get(2).map(String::as_str) == Some("mount") && c.iter().any(|a| a == "nullfs")
             })
             .collect();
-        assert!(!nullfs_mounts.is_empty(), "expected nullfs mounts: {calls:?}");
+        assert!(
+            !nullfs_mounts.is_empty(),
+            "expected nullfs mounts: {calls:?}"
+        );
         for m in &nullfs_mounts {
             // argv shape: sudo -n mount -t nullfs <source> <target>
             let source = m.get(5).map(String::as_str).unwrap_or("");
@@ -4126,7 +4947,10 @@ mod tests {
         // Override pile_root: staging follows to the same parent.
         b.pile_root = "/tank/pg/piles".to_string();
         assert_eq!(b.staging_root(), "/tank/pg/staging");
-        assert_eq!(b.staging_pile_tmp("playground-x"), "/tank/pg/staging/playground-x.pile.tmp");
+        assert_eq!(
+            b.staging_pile_tmp("playground-x"),
+            "/tank/pg/staging/playground-x.pile.tmp"
+        );
     }
 
     /// Security repair #2 — LIVE on the real FreeBSD host. Proves the two
@@ -4257,7 +5081,8 @@ echo "PASS: single-file nullfs concurrent append kept all 100 lines"
             "missing no-follow/create-only symlink-to-FILE proof: {stdout}"
         );
         assert!(
-            stdout.contains("PASS: ln -h refused symlink-to-DIRECTORY destination, nothing planted"),
+            stdout
+                .contains("PASS: ln -h refused symlink-to-DIRECTORY destination, nothing planted"),
             "missing no-follow/create-only symlink-to-DIRECTORY proof (sol's review): {stdout}"
         );
         assert!(
@@ -4560,7 +5385,10 @@ echo "PASS: playground:tenant provenance property round-trips"
             "PASS: legacy nullfs dir mount force-unmounted, target token exact",
             "PASS: playground:tenant provenance property round-trips",
         ] {
-            assert!(stdout.contains(marker), "missing live proof '{marker}': {stdout}");
+            assert!(
+                stdout.contains(marker),
+                "missing live proof '{marker}': {stdout}"
+            );
         }
     }
 
@@ -4572,7 +5400,9 @@ echo "PASS: playground:tenant provenance property round-trips"
         let (backend, mock) = mock_provision_ready()
             .reply(&["sudo", "-n", "zfs", "list"], dataset_absent())
             .into_backend();
-        backend.provision_sandbox(&spec("li ora/x")).expect("provision");
+        backend
+            .provision_sandbox(&spec("li ora/x"))
+            .expect("provision");
         let calls = mock.calls();
         let jail = backend.jail_name("li ora/x");
         // The jail -c call carries the injective name...
@@ -4584,7 +5414,11 @@ echo "PASS: playground:tenant provenance property round-trips"
             "name must keep the readable sanitisation: {jail}"
         );
         let digest = jail.strip_prefix("playground-li-ora-x-").unwrap();
-        assert_eq!(digest.len(), 64, "digest is the full 64-hex SHA-256: {jail}");
+        assert_eq!(
+            digest.len(),
+            64,
+            "digest is the full 64-hex SHA-256: {jail}"
+        );
         assert!(digest.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
@@ -4603,7 +5437,10 @@ echo "PASS: playground:tenant provenance property round-trips"
 
         // All three share the readable prefix but differ overall.
         for n in [&ab_slash, &ab_question, &ab_dash] {
-            assert!(n.starts_with("playground-a-b-"), "shared readable part: {n}");
+            assert!(
+                n.starts_with("playground-a-b-"),
+                "shared readable part: {n}"
+            );
         }
         assert_ne!(ab_slash, ab_question, "a/b and a?b must differ");
         assert_ne!(ab_slash, ab_dash, "a/b and a-b must differ");
@@ -4662,11 +5499,22 @@ echo "PASS: playground:tenant provenance property round-trips"
                 ok_with_stdout(&format!("{}\n", alice_root())),
             )
             .reply(
-                &["sudo", "-n", "zfs", "get", "-H", "-o", "value", "playground:tenant"],
+                &[
+                    "sudo",
+                    "-n",
+                    "zfs",
+                    "get",
+                    "-H",
+                    "-o",
+                    "value",
+                    "playground:tenant",
+                ],
                 ok_with_stdout("someone-else\n"),
             )
             .into_backend();
-        let err = backend.open_session(&spec("alice")).expect_err("must refuse");
+        let err = backend
+            .open_session(&spec("alice"))
+            .expect_err("must refuse");
         assert!(
             err.to_string().contains("tenant mismatch")
                 || format!("{err:#}").contains("tenant mismatch"),
@@ -4684,14 +5532,27 @@ echo "PASS: playground:tenant provenance property round-trips"
             timeout: Some(Duration::from_secs(7)),
         };
         backend
-            .exec(&SessionId::new("playground-alice"), &req)
+            .exec(
+                &SessionId::new("playground-alice"),
+                &req,
+                &ExecControl::default(),
+            )
             .expect("exec");
         let (argv, stdin) = mock.calls.lock().unwrap()[0].clone();
         assert_eq!(
             argv,
             vec![
-                "sudo", "-n", "timeout", "-k", "5", "7", "jexec", "playground-alice",
-                "/bin/sh", "-lc", "echo hello"
+                "sudo",
+                "-n",
+                "timeout",
+                "-k",
+                "5",
+                "7",
+                "jexec",
+                "playground-alice",
+                "/bin/sh",
+                "-lc",
+                "echo hello"
             ]
         );
         assert_eq!(stdin.as_deref(), Some(b"in-bytes" as &[u8]));
@@ -4715,7 +5576,11 @@ echo "PASS: playground:tenant provenance property round-trips"
             timeout: Some(Duration::from_secs(1)),
         };
         let result = backend
-            .exec(&SessionId::new("playground-alice"), &req)
+            .exec(
+                &SessionId::new("playground-alice"),
+                &req,
+                &ExecControl::default(),
+            )
             .expect("exec");
         assert_eq!(result.exit_code, Some(124));
         assert!(result.error.as_deref().unwrap_or("").contains("timed out"));
@@ -4731,7 +5596,11 @@ echo "PASS: playground:tenant provenance property round-trips"
             timeout: None,
         };
         backend
-            .exec(&SessionId::new("playground-alice"), &req)
+            .exec(
+                &SessionId::new("playground-alice"),
+                &req,
+                &ExecControl::default(),
+            )
             .expect("exec");
         let (argv, _) = mock.calls.lock().unwrap()[0].clone();
         let script = argv.last().unwrap();
@@ -4756,15 +5625,23 @@ echo "PASS: playground:tenant provenance property round-trips"
         // back the box.
         assert!(
             calls.iter().any(|c| c.starts_with(&[
-                "sudo".to_string(), "-n".into(), "zfs".into(), "get".into(),
-                "-H".into(), "-o".into(), "value".into(), "playground:tenant".into(),
+                "sudo".to_string(),
+                "-n".into(),
+                "zfs".into(),
+                "get".into(),
+                "-H".into(),
+                "-o".into(),
+                "value".into(),
+                "playground:tenant".into(),
             ] as &[String])),
             "reuse must verify playground:tenant provenance: {calls:?}"
         );
         // Reuse must not provision anything: no clone, no jail -c.
         assert!(
-            !calls.iter().any(|c| c.get(2).map(String::as_str) == Some("zfs")
-                && c.get(3).map(String::as_str) == Some("clone")),
+            !calls
+                .iter()
+                .any(|c| c.get(2).map(String::as_str) == Some("zfs")
+                    && c.get(3).map(String::as_str) == Some("clone")),
             "reuse must not zfs clone"
         );
         assert!(
@@ -4798,7 +5675,10 @@ echo "PASS: playground:tenant provenance property round-trips"
         );
         let (backend, mock) = MockRunner::default()
             // The enumeration query (more specific than a bare `zfs list`).
-            .reply(&["sudo", "-n", "zfs", "list", "-H"], ok_with_stdout(&listing))
+            .reply(
+                &["sudo", "-n", "zfs", "list", "-H"],
+                ok_with_stdout(&listing),
+            )
             // Mountpoint for bob (the one being reattached).
             .reply(
                 &["zfs", "get", "-H", "-o", "value", "mountpoint"],
@@ -4829,8 +5709,10 @@ echo "PASS: playground:tenant provenance property round-trips"
         // them, and no zfs clone anywhere — reattach never clones).
         assert!(!jail_creates[0].contains(&"name=aitemp/playground/template".to_string()));
         assert!(
-            !calls.iter().any(|c| c.get(2).map(String::as_str) == Some("zfs")
-                && c.get(3).map(String::as_str) == Some("clone")),
+            !calls
+                .iter()
+                .any(|c| c.get(2).map(String::as_str) == Some("zfs")
+                    && c.get(3).map(String::as_str) == Some("clone")),
             "sweep must not clone"
         );
 
@@ -4838,22 +5720,70 @@ echo "PASS: playground:tenant provenance property round-trips"
         // jail (bob), mirroring the open-reattach mount assertions — mount
         // coverage is now pinned on the sweep arm too.
         assert!(
-            calls.iter().any(|c| c == &[
-                "sudo".to_string(), "-n".into(), "mount".into(), "-t".into(),
-                "nullfs".into(),
-                format!("/aitemp/playground/piles/{bob}/self.pile"),
-                format!("{bob_root}/pile/self.pile"),
-            ]),
+            calls.iter().any(|c| c
+                == &[
+                    "sudo".to_string(),
+                    "-n".into(),
+                    "mount".into(),
+                    "-t".into(),
+                    "nullfs".into(),
+                    format!("/aitemp/playground/piles/{bob}/self.pile"),
+                    format!("{bob_root}/pile/self.pile"),
+                ]),
             "sweep must single-file-nullfs-mount the self.pile at /pile/self.pile for the down jail: {calls:?}"
         );
         assert!(
-            calls.iter().any(|c| c == &[
-                "sudo".to_string(), "-n".into(), "mount".into(), "-t".into(),
-                "nullfs".into(),
-                "/aitemp/playground/piles/shared/shared.pile".into(),
-                format!("{bob_root}/shared/shared.pile"),
-            ]),
+            calls.iter().any(|c| c
+                == &[
+                    "sudo".to_string(),
+                    "-n".into(),
+                    "mount".into(),
+                    "-t".into(),
+                    "nullfs".into(),
+                    "/aitemp/playground/piles/shared/shared.pile".into(),
+                    format!("{bob_root}/shared/shared.pile"),
+                ]),
             "sweep must single-file-nullfs-mount the shared.pile at /shared/shared.pile for the down jail: {calls:?}"
+        );
+    }
+
+    /// The startup sweep also converges rules for a jail that is already up.
+    /// If that mandatory convergence fails, the sweep returns `Err`; the HTTP
+    /// startup path must not proceed to listen with an under-limited jail.
+    #[test]
+    fn reattach_all_fails_closed_when_running_jail_rctl_fails() {
+        let jail = alice_jail();
+        let listing = format!("aitemp/playground\naitemp/playground/{jail}\n");
+        let (backend, mock) = MockRunner::default()
+            .reply(
+                &["sudo", "-n", "zfs", "list", "-H"],
+                ok_with_stdout(&listing),
+            )
+            .with_running_jail(&jail)
+            .reply(
+                &["sysctl", "-n", "kern.racct.enable"],
+                ok_with_stdout("1\n"),
+            )
+            .reply(
+                &["sudo", "-n", "rctl", "-a"],
+                HostOutput {
+                    exit_code: Some(1),
+                    stderr: b"cannot install rule".to_vec(),
+                    ..Default::default()
+                },
+            )
+            .into_backend();
+
+        let err = backend
+            .reattach_all()
+            .expect_err("startup sweep must surface an RCTL failure");
+        assert!(format!("{err:#}").contains("rctl -a"), "{err:#}");
+        assert!(
+            mock.calls().iter().any(|c| {
+                c.get(2).map(String::as_str) == Some("rctl")
+                    && c.get(3).map(String::as_str) == Some("-a")
+            }),
+            "running jail must be converged during startup"
         );
     }
 
@@ -4863,18 +5793,47 @@ echo "PASS: playground:tenant provenance property round-trips"
         // provenance gate (`playground:tenant` re-derives THIS leaf) passes: the
         // mock records the property as "alice", and `jail_name("alice")` is
         // exactly this leaf.
-        let (backend, mock) = mock_with_mountpoint().into_backend();
+        let (backend, mock) = mock_with_mountpoint()
+            .reply(
+                &["sysctl", "-n", "kern.racct.enable"],
+                ok_with_stdout("1\n"),
+            )
+            .into_backend();
         let jail = alice_jail();
         backend
             .destroy_session(&SessionId::new(jail.clone()))
             .expect("destroy");
         let calls = mock.calls();
-        assert!(calls.iter().any(|c| c.ends_with(&[
-            "jail".into(), "-r".into(), jail.clone()
-        ] as &[String])));
-        assert!(calls.iter().any(|c| c.ends_with(&[
-            "zfs".into(), "destroy".into(), alice_dataset()
-        ] as &[String])));
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.ends_with(&["jail".into(), "-r".into(), jail.clone()] as &[String]))
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| c
+                    .ends_with(&["zfs".into(), "destroy".into(), alice_dataset()] as &[String]))
+        );
+
+        let destroy = calls
+            .iter()
+            .position(|c| {
+                c.get(2).map(String::as_str) == Some("zfs")
+                    && c.get(3).map(String::as_str) == Some("destroy")
+            })
+            .expect("zfs destroy");
+        let remove_rules = calls
+            .iter()
+            .position(|c| {
+                c.get(2).map(String::as_str) == Some("rctl")
+                    && c.get(3).map(String::as_str) == Some("-r")
+            })
+            .expect("RCTL cleanup");
+        assert!(
+            destroy < remove_rules,
+            "RCTL rules must survive until dataset teardown succeeds: {calls:?}"
+        );
     }
 
     /// close_session on the persistent jail backend DETACHES: the box lives on,
@@ -4888,13 +5847,17 @@ echo "PASS: playground:tenant provenance property round-trips"
         let calls = mock.calls();
         assert!(
             !calls.iter().any(|c| c.ends_with(&[
-                "jail".into(), "-r".into(), "playground-alice".into()
+                "jail".into(),
+                "-r".into(),
+                "playground-alice".into()
             ] as &[String])),
             "detach must not jail -r"
         );
         assert!(
-            !calls.iter().any(|c| c.get(2).map(String::as_str) == Some("zfs")
-                && c.get(3).map(String::as_str) == Some("destroy")),
+            !calls
+                .iter()
+                .any(|c| c.get(2).map(String::as_str) == Some("zfs")
+                    && c.get(3).map(String::as_str) == Some("destroy")),
             "detach must not zfs destroy"
         );
     }
@@ -4905,14 +5868,21 @@ echo "PASS: playground:tenant provenance property round-trips"
         let err = backend
             .destroy_session(&SessionId::new("trible.bultmann.eu"))
             .expect_err("must refuse");
-        assert!(err.to_string().contains("outside the 'playground-' namespace"));
+        assert!(
+            err.to_string()
+                .contains("outside the 'playground-' namespace")
+        );
         // And crucially: no host command was issued at all.
         assert!(mock.calls().is_empty());
     }
 
     #[test]
     fn destroy_session_fails_loud_when_destroy_fails() {
-        let (backend, _mock) = mock_with_mountpoint()
+        let (backend, mock) = mock_with_mountpoint()
+            .reply(
+                &["sysctl", "-n", "kern.racct.enable"],
+                ok_with_stdout("1\n"),
+            )
             .reply(
                 &["sudo", "-n", "zfs", "destroy"],
                 HostOutput {
@@ -4926,6 +5896,91 @@ echo "PASS: playground:tenant provenance property round-trips"
             .destroy_session(&SessionId::new(alice_jail()))
             .expect_err("destroy failure must surface");
         assert!(err.to_string().contains("zfs destroy"));
+        let calls = mock.calls();
+        assert!(
+            !calls.iter().any(|c| {
+                c.get(2).map(String::as_str) == Some("rctl")
+                    && c.get(3).map(String::as_str) == Some("-r")
+            }),
+            "a reattachable dataset must retain its RCTL rules after failed teardown: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn destroy_retains_rctl_rules_when_jail_removal_is_unproven() {
+        let jail = alice_jail();
+        let (backend, mock) = mock_with_mountpoint()
+            .with_running_jail(&jail)
+            .reply(
+                &["sudo", "-n", "jail", "-r"],
+                HostOutput {
+                    exit_code: Some(1),
+                    stderr: b"operation failed".to_vec(),
+                    ..Default::default()
+                },
+            )
+            .reply(
+                &["sysctl", "-n", "kern.racct.enable"],
+                ok_with_stdout("1\n"),
+            )
+            .into_backend();
+
+        backend
+            .destroy_session(&SessionId::new(jail))
+            .expect_err("a still-running jail must stop teardown");
+        let calls = mock.calls();
+        assert!(
+            !calls.iter().any(|c| {
+                c.get(2).map(String::as_str) == Some("zfs")
+                    && c.get(3).map(String::as_str) == Some("destroy")
+            }),
+            "unproven jail removal must stop before dataset destruction: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| {
+                c.get(2).map(String::as_str) == Some("rctl")
+                    && c.get(3).map(String::as_str) == Some("-r")
+            }),
+            "unproven jail removal must retain its limits: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn destroy_stops_when_absence_probe_fails() {
+        let jail = alice_jail();
+        let (backend, mock) = mock_with_mountpoint()
+            .reply(
+                &["sudo", "-n", "jail", "-r"],
+                HostOutput {
+                    exit_code: Some(1),
+                    stderr: b"operation failed".to_vec(),
+                    ..Default::default()
+                },
+            )
+            .reply(
+                &["sudo", "-n", "jls", "-n", "name"],
+                HostOutput {
+                    exit_code: Some(1),
+                    stderr: b"temporary privilege failure".to_vec(),
+                    ..Default::default()
+                },
+            )
+            .into_backend();
+
+        let err = backend
+            .destroy_session(&SessionId::new(jail))
+            .expect_err("an unavailable absence proof must stop teardown");
+        assert!(format!("{err:#}").contains("cannot prove jail"), "{err:#}");
+        let calls = mock.calls();
+        assert!(
+            !calls.iter().any(|c| {
+                (c.get(2).map(String::as_str) == Some("zfs")
+                    && c.get(3).map(String::as_str) == Some("destroy"))
+                    || (c.get(2).map(String::as_str) == Some("rctl")
+                        && c.get(3).map(String::as_str) == Some("-r"))
+            }),
+            "uncertain jail state must preserve both dataset and rules: {calls:?}"
+        );
     }
 
     // ==== sol's REOPENED review (2026-07-24): repairs #1 and #2 gaps ==========
@@ -4945,8 +6000,10 @@ echo "PASS: playground:tenant provenance property round-trips"
             assert!(name.len() < 255, "under the ZFS component limit: {name}");
         }
         // Injectivity across the three colliding labels survives the full digest.
-        let distinct: std::collections::HashSet<_> =
-            ["a/b", "a?b", "a-b"].into_iter().map(|l| b.jail_name(l)).collect();
+        let distinct: std::collections::HashSet<_> = ["a/b", "a?b", "a-b"]
+            .into_iter()
+            .map(|l| b.jail_name(l))
+            .collect();
         assert_eq!(distinct.len(), 3, "three colliding labels -> three names");
         // Determinism (reattach/destroy re-find the box).
         assert_eq!(b.jail_name("alice"), b.jail_name("alice"));
@@ -4975,13 +6032,17 @@ echo "PASS: playground:tenant provenance property round-trips"
         );
         let calls = mock.calls();
         assert!(
-            !calls.iter().any(|c| c.get(2).map(String::as_str) == Some("jail")
-                && c.get(3).map(String::as_str) == Some("-r")),
+            !calls
+                .iter()
+                .any(|c| c.get(2).map(String::as_str) == Some("jail")
+                    && c.get(3).map(String::as_str) == Some("-r")),
             "a refused destroy must not `jail -r`: {calls:?}"
         );
         assert!(
-            !calls.iter().any(|c| c.get(2).map(String::as_str) == Some("zfs")
-                && c.get(3).map(String::as_str) == Some("destroy")),
+            !calls
+                .iter()
+                .any(|c| c.get(2).map(String::as_str) == Some("zfs")
+                    && c.get(3).map(String::as_str) == Some("destroy")),
             "a refused destroy must not `zfs destroy`: {calls:?}"
         );
     }
@@ -5025,8 +6086,10 @@ echo "PASS: playground:tenant provenance property round-trips"
             "a refused reattach must not mount any pile: {calls:?}"
         );
         assert!(
-            !calls.iter().any(|c| c.get(2).map(String::as_str) == Some("jail")
-                && c.get(3).map(String::as_str) == Some("-c")),
+            !calls
+                .iter()
+                .any(|c| c.get(2).map(String::as_str) == Some("jail")
+                    && c.get(3).map(String::as_str) == Some("-c")),
             "a refused reattach must not `jail -c`: {calls:?}"
         );
     }
@@ -5068,7 +6131,9 @@ echo "PASS: playground:tenant provenance property round-trips"
         let (backend, mock) = mock_provision_ready()
             .reply(&["sudo", "-n", "zfs", "list"], dataset_absent())
             .into_backend();
-        backend.provision_sandbox(&spec("alice")).expect("provision");
+        backend
+            .provision_sandbox(&spec("alice"))
+            .expect("provision");
         let marker = format!("/aitemp/playground/piles/{jail}/.tenant");
         let calls = mock.calls();
         // The marker was written (plain `tee <marker>` with the label as stdin)
@@ -5078,15 +6143,26 @@ echo "PASS: playground:tenant provenance property round-trips"
             .lock()
             .unwrap()
             .iter()
-            .find(|(argv, _)| argv.last().map(String::as_str) == Some(marker.as_str())
-                && argv.iter().any(|a| a == "tee"))
+            .find(|(argv, _)| {
+                argv.last().map(String::as_str) == Some(marker.as_str())
+                    && argv.iter().any(|a| a == "tee")
+            })
             .cloned()
             .expect("marker tee issued");
-        assert_eq!(stdin.as_deref(), Some(b"alice".as_slice()), "marker records the label");
+        assert_eq!(
+            stdin.as_deref(),
+            Some(b"alice".as_slice()),
+            "marker records the label"
+        );
         assert!(
-            calls.iter().any(|c| c == &[
-                "sudo".to_string(), "-n".into(), "chmod".into(), "600".into(), marker.clone()
-            ]),
+            calls.iter().any(|c| c
+                == &[
+                    "sudo".to_string(),
+                    "-n".into(),
+                    "chmod".into(),
+                    "600".into(),
+                    marker.clone()
+                ]),
             "marker must be chmod 600: {calls:?}"
         );
         // Now the stored marker is "alice"; a matching reuse passes.
@@ -5112,7 +6188,10 @@ echo "PASS: playground:tenant provenance property round-trips"
             .reply(&["sudo", "-n", "zfs", "list"], dataset_absent())
             .reply(
                 &["sudo", "-n", "ln", "-h"],
-                HostOutput { exit_code: Some(0), ..Default::default() },
+                HostOutput {
+                    exit_code: Some(0),
+                    ..Default::default()
+                },
             )
             .with_file(&self_pile, b"pre-existing foreign pile")
             .into_backend();
@@ -5159,8 +6238,13 @@ echo "PASS: playground:tenant provenance property round-trips"
         );
         // The refusal happens BEFORE any bootstrap `cp` into staging.
         let calls = mock.calls();
-        let cp_before = calls.iter().position(|c| c.get(2).map(String::as_str) == Some("cp"));
-        assert!(cp_before.is_none(), "no bootstrap cp before the provenance gate: {calls:?}");
+        let cp_before = calls
+            .iter()
+            .position(|c| c.get(2).map(String::as_str) == Some("cp"));
+        assert!(
+            cp_before.is_none(),
+            "no bootstrap cp before the provenance gate: {calls:?}"
+        );
     }
 
     /// Repair #2 gap 6 — the staging root is forced root:wheel + 0700 and its
@@ -5170,27 +6254,41 @@ echo "PASS: playground:tenant provenance property round-trips"
         let (backend, mock) = mock_provision_ready()
             .reply(&["sudo", "-n", "zfs", "list"], dataset_absent())
             .into_backend();
-        backend.provision_sandbox(&spec("alice")).expect("provision");
+        backend
+            .provision_sandbox(&spec("alice"))
+            .expect("provision");
         let calls = mock.calls();
         let staging_root = "/aitemp/playground/staging";
         assert!(
-            calls.iter().any(|c| c == &[
-                "sudo".to_string(), "-n".into(), "chown".into(), "root:wheel".into(),
-                staging_root.to_string()
-            ]),
+            calls.iter().any(|c| c
+                == &[
+                    "sudo".to_string(),
+                    "-n".into(),
+                    "chown".into(),
+                    "root:wheel".into(),
+                    staging_root.to_string()
+                ]),
             "staging root must be chown root:wheel: {calls:?}"
         );
         assert!(
-            calls.iter().any(|c| c == &[
-                "sudo".to_string(), "-n".into(), "chmod".into(), "700".into(),
-                staging_root.to_string()
-            ]),
+            calls.iter().any(|c| c
+                == &[
+                    "sudo".to_string(),
+                    "-n".into(),
+                    "chmod".into(),
+                    "700".into(),
+                    staging_root.to_string()
+                ]),
             "staging root must be chmod 700: {calls:?}"
         );
         assert!(
-            calls.iter().any(|c| c.get(2).map(String::as_str) == Some("sh")
-                && c.get(3).map(String::as_str) == Some("-c")
-                && c.get(4).map(|s| s.contains("SYMLINK-COMPONENT")).unwrap_or(false)),
+            calls
+                .iter()
+                .any(|c| c.get(2).map(String::as_str) == Some("sh")
+                    && c.get(3).map(String::as_str) == Some("-c")
+                    && c.get(4)
+                        .map(|s| s.contains("SYMLINK-COMPONENT"))
+                        .unwrap_or(false)),
             "staging provenance walk (no-symlink + owner/mode) must run: {calls:?}"
         );
     }
@@ -5220,31 +6318,45 @@ echo "PASS: playground:tenant provenance property round-trips"
                 "nullfs",
             )
             .into_backend();
-        backend.reattach(&jail, &dataset).expect("legacy reattach migrates");
+        backend
+            .reattach(&jail, &dataset)
+            .expect("legacy reattach migrates");
         let calls = mock.calls();
         // The legacy DIRECTORY mounts were force-unmounted.
         assert!(
-            calls.iter().any(|c| c == &[
-                "sudo".to_string(), "-n".into(), "umount".into(), "-f".into(),
-                format!("{root}/pile")
-            ]),
+            calls.iter().any(|c| c
+                == &[
+                    "sudo".to_string(),
+                    "-n".into(),
+                    "umount".into(),
+                    "-f".into(),
+                    format!("{root}/pile")
+                ]),
             "must force-unmount the legacy /pile dir mount: {calls:?}"
         );
         assert!(
-            calls.iter().any(|c| c == &[
-                "sudo".to_string(), "-n".into(), "umount".into(), "-f".into(),
-                format!("{root}/shared")
-            ]),
+            calls.iter().any(|c| c
+                == &[
+                    "sudo".to_string(),
+                    "-n".into(),
+                    "umount".into(),
+                    "-f".into(),
+                    format!("{root}/shared")
+                ]),
             "must force-unmount the legacy /shared dir mount: {calls:?}"
         );
         // And the safe SINGLE-FILE mounts were established.
         assert!(
-            calls.iter().any(|c| c == &[
-                "sudo".to_string(), "-n".into(), "mount".into(), "-t".into(),
-                "nullfs".into(),
-                format!("/aitemp/playground/piles/{jail}/self.pile"),
-                format!("{root}/pile/self.pile"),
-            ]),
+            calls.iter().any(|c| c
+                == &[
+                    "sudo".to_string(),
+                    "-n".into(),
+                    "mount".into(),
+                    "-t".into(),
+                    "nullfs".into(),
+                    format!("/aitemp/playground/piles/{jail}/self.pile"),
+                    format!("{root}/pile/self.pile"),
+                ]),
             "must establish the single-file self.pile mount after migration: {calls:?}"
         );
     }

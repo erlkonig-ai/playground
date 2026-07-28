@@ -8,17 +8,33 @@ an isolated sandbox. This crate is only the provider.
 ## The MCP surface
 
 Because a shell is **stateful** (cwd, env, running processes), the surface is a
-session model, exposed as three tools:
+small session model, exposed as seven tools:
 
 - `open_session` — provision a sandbox bound to a pile (append-only) and a
   tenant, and return a session id.
-- `exec` — run a shell command inside an open session (cwd/env persist across
-  calls).
-- `close_session` — tear the sandbox down.
+- `exec` — run a short shell command and wait for its result.
+- `job_exec` — start a long-running command and return a job id immediately.
+- `job_poll` — read retry-safe pages of incremental stdout/stderr and terminal
+  state.
+- `job_cancel` — idempotently request cancellation of one job.
+- `close_session` — release this handle; the persistent sandbox remains.
+- `destroy_session` — permanently tear the sandbox down and free its storage.
 
-Every session a connection opens is torn down when the connection ends (client
-EOF/disconnect) or the process is signalled (SIGINT/SIGTERM), so a crashed or
-disconnected client can never leak a VM or jail.
+Synchronous and background commands use one bounded execution kernel. Jobs are
+kept in memory for reconnecting clients and expire after one hour; a daemon
+restart loses their handles. Provider shutdown cancels and reaps live jobs
+before detaching sandboxes. HTTP transport sessions are deliberately separate
+from persistent sandbox and job lifetimes.
+
+On the root-local FreeBSD path, losing the kernel descendant-reaping proof is
+a process-fatal invariant violation: the provider exits nonzero and stays down
+for explicit operator recovery. Ordinary command, SSH, and backend errors are
+per-job results and create no sticky tenant state.
+
+`job_poll` returns `next_cursor`, `has_more`, and (if a slow consumer fell
+behind the bounded ring) `gap` plus `dropped_bytes`. Advance to `next_cursor`
+and keep polling until the job is terminal **and** `has_more` is false. Reusing
+the old cursor is safe and replays the same retained chunks.
 
 ## Backends
 
@@ -27,7 +43,10 @@ disconnected client can never leak a VM or jail.
 - **Jail** (`--backend jail`): a FreeBSD jail per tenant on a remote host over
   SSH (or locally with `--jail-local`). Host-owned per-tenant piles (a seeded
   `self.pile` + a shared `shared.pile`) are mounted in append-only (Model B) —
-  see the pile-provisioning section in `src/sandbox/jail.rs`.
+  see the pile-provisioning section in `src/sandbox/jail.rs`. Background jobs
+  are enabled only for the root, jail-local FreeBSD deployment, where
+  cancellation has a descendant-reaping proof; remote SSH and Lima retain
+  synchronous `exec` and reject `job_exec`.
 
 ## Serving
 

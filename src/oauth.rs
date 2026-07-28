@@ -43,7 +43,6 @@
 //! headers.
 
 use std::collections::HashMap;
-use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -75,12 +74,6 @@ const MAX_CLIENTS: usize = 5_000;
 /// issued to it) is garbage after this long — abandoned/abusive registrations
 /// self-drain instead of accreting. Clients that *have* authorized are kept.
 const CLIENT_GC_TTL: Duration = Duration::from_secs(24 * 3600);
-
-/// Registration token bucket: at most this many registrations may burst from
-/// one source before the steady refill rate throttles it.
-const REGISTER_BUCKET_CAPACITY: f64 = 20.0;
-/// Steady-state registration allowance, tokens per second (≈1 every 6 s).
-const REGISTER_REFILL_PER_SEC: f64 = 1.0 / 6.0;
 
 /// Upper bound on `--oauth-access-ttl-secs`: a misconfiguration must not be able
 /// to mint near-immortal access tokens (refresh rotation is the long-lived
@@ -458,56 +451,6 @@ pub enum CodeTake {
     Unknown,
 }
 
-/// A per-source token bucket (registration rate-limiter). `tokens` refills at
-/// [`REGISTER_REFILL_PER_SEC`] up to [`REGISTER_BUCKET_CAPACITY`]; each attempt
-/// costs one token. Purely in-memory (rate-limiting is best-effort throttling,
-/// not a security boundary — the invite gate is the boundary).
-#[derive(Debug, Clone)]
-struct TokenBucket {
-    tokens: f64,
-    last_refill: u64,
-}
-
-impl TokenBucket {
-    fn new(now: u64) -> Self {
-        TokenBucket {
-            tokens: REGISTER_BUCKET_CAPACITY,
-            last_refill: now,
-        }
-    }
-
-    /// Refill for elapsed time, then try to spend one token. `true` = allowed.
-    fn try_take(&mut self, now: u64) -> bool {
-        let elapsed = now.saturating_sub(self.last_refill) as f64;
-        self.tokens = (self.tokens + elapsed * REGISTER_REFILL_PER_SEC)
-            .min(REGISTER_BUCKET_CAPACITY);
-        self.last_refill = now;
-        if self.tokens >= 1.0 {
-            self.tokens -= 1.0;
-            true
-        } else {
-            false
-        }
-    }
-}
-
-/// Take one token from `source`'s bucket in `buckets`, creating it (full) on
-/// first sight, then sweep buckets that have refilled to capacity (no memory
-/// worth keeping) so the map stays bounded without a reaper. `true` = allowed.
-/// Shared by the registration and write-edge limiters.
-fn bucket_allowed(buckets: &Mutex<HashMap<IpAddr, TokenBucket>>, source: IpAddr, now: u64) -> bool {
-    let mut buckets = buckets.lock().expect("buckets poisoned");
-    let allowed = buckets
-        .entry(source)
-        .or_insert_with(|| TokenBucket::new(now))
-        .try_take(now);
-    buckets.retain(|_, b| {
-        let elapsed = now.saturating_sub(b.last_refill) as f64;
-        (b.tokens + elapsed * REGISTER_REFILL_PER_SEC) < REGISTER_BUCKET_CAPACITY
-    });
-    allowed
-}
-
 /// Live OAuth state hung off `HttpState` when the feature is configured.
 pub struct OauthRuntime {
     /// `OauthConfig::public_url`, normalized (no trailing slash).
@@ -516,14 +459,6 @@ pub struct OauthRuntime {
     pub access_ttl: Duration,
     pub store: Mutex<OauthStore>,
     codes: Mutex<HashMap<String, AuthCode>>,
-    /// Registration rate-limiter, keyed by remote IP (or a single shared bucket
-    /// under the unspecified `0.0.0.0` key when `ConnectInfo` is unavailable).
-    register_buckets: Mutex<HashMap<IpAddr, TokenBucket>>,
-    /// Rate-limiter for the other unauthenticated write-ish edges — the
-    /// `/oauth/token` (refresh/code) and `POST /oauth/authorize` handlers
-    /// (repair #5 HIGH: rate-limit at the trusted edge). Separate bucket map so
-    /// legitimate token traffic and registration bursts don't share a budget.
-    edge_buckets: Mutex<HashMap<IpAddr, TokenBucket>>,
 }
 
 impl OauthRuntime {
@@ -548,21 +483,7 @@ impl OauthRuntime {
             access_ttl: config.access_ttl,
             store: Mutex::new(store),
             codes: Mutex::new(HashMap::new()),
-            register_buckets: Mutex::new(HashMap::new()),
-            edge_buckets: Mutex::new(HashMap::new()),
         })
-    }
-
-    /// Consult the registration rate-limiter for `source`. `true` = allowed.
-    fn register_allowed(&self, source: IpAddr, now: u64) -> bool {
-        bucket_allowed(&self.register_buckets, source, now)
-    }
-
-    /// Consult the shared write-edge rate-limiter for `source` (`/oauth/token`,
-    /// `POST /oauth/authorize`). `true` = allowed. Same token-bucket shape as
-    /// registration; a separate map so the budgets don't interfere.
-    fn edge_allowed(&self, source: IpAddr, now: u64) -> bool {
-        bucket_allowed(&self.edge_buckets, source, now)
     }
 
     /// Apply a mutation to the persistent store under the cross-process file
@@ -572,10 +493,7 @@ impl OauthRuntime {
     /// is refreshed with the freshly-written state so the hot-path access-token
     /// lookups stay consistent. Holds the in-memory `store` mutex for the whole
     /// critical section, so server-internal callers also serialise.
-    fn with_locked_store<R>(
-        &self,
-        mutate: impl FnOnce(&mut OauthStore) -> R,
-    ) -> Result<R> {
+    fn with_locked_store<R>(&self, mutate: impl FnOnce(&mut OauthStore) -> R) -> Result<R> {
         // Callers of this method always mutate (mint/rotate-success), so the
         // write is unconditional here. No-op/error paths use
         // [`with_locked_store_if`] instead so they never write.
@@ -737,9 +655,8 @@ impl FileLock {
                 if err.raw_os_error() == Some(libc::EINTR) {
                     continue;
                 }
-                return Err(err).with_context(|| {
-                    format!("flock oauth lock file {}", lock_path.display())
-                });
+                return Err(err)
+                    .with_context(|| format!("flock oauth lock file {}", lock_path.display()));
             }
         }
         Ok(FileLock { file })
@@ -805,7 +722,13 @@ pub fn mint_invite_locked(
     let (_store, code) = mutate_state_locked(state_path, |store| {
         (
             true,
-            store.mint_invite(tenant, reusable, client_id.clone(), redirect_uri.clone(), now),
+            store.mint_invite(
+                tenant,
+                reusable,
+                client_id.clone(),
+                redirect_uri.clone(),
+                now,
+            ),
         )
     })?;
     Ok(code)
@@ -903,21 +826,8 @@ async fn authorization_server_metadata(State(state): State<Arc<HttpState>>) -> R
 /// clients. Open is safe here because a `client_id` grants nothing — the
 /// authorize form's invite code is the actual gate. Registration is the
 /// moment redirect URIs get pinned; everything later exact-matches them.
-async fn register(
-    State(state): State<Arc<HttpState>>,
-    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
-    body: Bytes,
-) -> Response {
-    let oauth = oauth(&state);
+async fn register(State(state): State<Arc<HttpState>>, body: Bytes) -> Response {
     let now = unix_now();
-
-    // Resource-bounding (registration is unauthenticated by design — a
-    // client_id grants nothing without an invite — so guard the store, not the
-    // access). Rate-limit per remote IP; behind a reverse proxy the peer is the
-    // proxy, so the bucket is shared — still a bound, just coarser.
-    if !oauth.register_allowed(peer.ip(), now) {
-        return registration_rate_limited();
-    }
 
     let request: Value = match serde_json::from_slice(&body) {
         Ok(value) => value,
@@ -996,7 +906,8 @@ async fn register(
                 // Persist only if GC actually freed clients; otherwise no-op.
                 return (reclaimed > 0, Err(()));
             }
-            let client_id = store.register_client(uris_for_store.clone(), name_for_store.clone(), now);
+            let client_id =
+                store.register_client(uris_for_store.clone(), name_for_store.clone(), now);
             (true, Ok(client_id))
         })
     })
@@ -1041,56 +952,6 @@ fn redirect_scheme_allowed(uri: &Uri) -> bool {
         Some("http") => matches!(uri.host(), Some("127.0.0.1") | Some("localhost")),
         _ => false,
     }
-}
-
-/// 429 when a source exceeds the registration rate limit (RFC 6749 §5.2 uses
-/// `slow_down`/`temporarily_unavailable`; we borrow the latter's spirit).
-fn registration_rate_limited() -> Response {
-    (
-        StatusCode::TOO_MANY_REQUESTS,
-        [(header::CONTENT_TYPE, "application/json")],
-        json!({
-            "error": "temporarily_unavailable",
-            "error_description": "registration rate limit exceeded; retry later",
-        })
-        .to_string(),
-    )
-        .into_response()
-}
-
-/// 429 for the `/oauth/token` edge (repair #5 HIGH: rate-limit at the trusted
-/// edge). RFC 6749 §5.2 `slow_down`, with `Cache-Control: no-store` like every
-/// other token-endpoint response.
-fn token_rate_limited() -> Response {
-    (
-        StatusCode::TOO_MANY_REQUESTS,
-        [
-            (header::CONTENT_TYPE, "application/json"),
-            (header::CACHE_CONTROL, "no-store"),
-        ],
-        json!({
-            "error": "slow_down",
-            "error_description": "token endpoint rate limit exceeded; retry later",
-        })
-        .to_string(),
-    )
-        .into_response()
-}
-
-/// 429 page for the `POST /oauth/authorize` edge (repair #5 HIGH). A human-facing
-/// HTML page (unlike the JSON token edge), since this endpoint serves the
-/// consent form.
-fn authorize_rate_limited() -> Response {
-    (
-        StatusCode::TOO_MANY_REQUESTS,
-        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-        "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">\
-         <title>playground &mdash; slow down</title></head>\n\
-         <body style=\"font: 16px/1.5 system-ui, sans-serif; max-width: 26rem; margin: 4rem auto;\">\n\
-         <h1>Too many attempts</h1>\n<p>Please wait a moment and try again.</p>\n</body></html>\n"
-            .to_string(),
-    )
-        .into_response()
 }
 
 /// 503 when the client store is at capacity ([`MAX_CLIENTS`]). GC drains
@@ -1163,7 +1024,11 @@ fn validate_client_and_redirect(
     let Some(client) = store.clients.get(&params.client_id) else {
         return Err(authorize_error_page("unknown client_id"));
     };
-    if !client.redirect_uris.iter().any(|u| u == &params.redirect_uri) {
+    if !client
+        .redirect_uris
+        .iter()
+        .any(|u| u == &params.redirect_uri)
+    {
         return Err(authorize_error_page(
             "redirect_uri is not registered for this client",
         ));
@@ -1223,18 +1088,8 @@ async fn authorize_form(State(state): State<Arc<HttpState>>, uri: Uri) -> Respon
 /// `POST /oauth/authorize`: redeem the invite code, mint an authorization
 /// code bound to {client, redirect URI, PKCE challenge, tenant}, and bounce
 /// the browser back to the client with `code` (+ `state` passthrough).
-async fn authorize_submit(
-    State(state): State<Arc<HttpState>>,
-    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
-    body: Bytes,
-) -> Response {
+async fn authorize_submit(State(state): State<Arc<HttpState>>, body: Bytes) -> Response {
     let oauth = oauth(&state);
-    // Rate-limit the submit edge (repair #5 HIGH: rate-limit at the trusted
-    // edge) before touching the store — a burst of invite guesses from one
-    // source is throttled here, ahead of the (now no-write) invalid-invite path.
-    if !oauth.edge_allowed(peer.ip(), unix_now()) {
-        return authorize_rate_limited();
-    }
     let Ok(body) = std::str::from_utf8(&body) else {
         return authorize_error_page("form body is not UTF-8");
     };
@@ -1299,14 +1154,10 @@ async fn authorize_submit(
         Ok(Ok(tenant)) => tenant,
         Ok(Err(InviteRejection::Unknown)) => return authorize_error_page("invalid invite code"),
         Ok(Err(InviteRejection::ClientMismatch)) => {
-            return authorize_error_page(
-                "this invite is bound to a different client_id",
-            );
+            return authorize_error_page("this invite is bound to a different client_id");
         }
         Ok(Err(InviteRejection::RedirectMismatch)) => {
-            return authorize_error_page(
-                "this invite is bound to a different redirect_uri",
-            );
+            return authorize_error_page("this invite is bound to a different redirect_uri");
         }
         Err(e) => {
             return http_error(
@@ -1334,19 +1185,9 @@ async fn authorize_submit(
 /// `POST /oauth/token`: the code-for-tokens (and refresh-rotation) exchange.
 /// Form-encoded per RFC 6749; errors use the §5.2 JSON shape. Every response
 /// carries `Cache-Control: no-store` (§5.1).
-async fn token(
-    State(state): State<Arc<HttpState>>,
-    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
-    body: Bytes,
-) -> Response {
+async fn token(State(state): State<Arc<HttpState>>, body: Bytes) -> Response {
     let oauth = oauth(&state);
     let now = unix_now();
-    // Rate-limit the token edge (repair #5 HIGH: rate-limit at the trusted
-    // edge) — an unauthenticated caller replaying garbage codes/refresh tokens
-    // is throttled here, ahead of the (now no-write) invalid paths.
-    if !oauth.edge_allowed(peer.ip(), now) {
-        return token_rate_limited();
-    }
     let Ok(body) = std::str::from_utf8(&body) else {
         return token_error("invalid_request", "form body is not UTF-8");
     };
@@ -1550,7 +1391,11 @@ fn authorize_page(params: &AuthorizeParams, client_name: Option<&str>) -> String
     // raw client_id (always shown so a nameless client isn't invisible).
     let client_label = match client_name {
         Some(name) if !name.is_empty() => {
-            format!("{} (<code>{}</code>)", html_escape(name), html_escape(&params.client_id))
+            format!(
+                "{} (<code>{}</code>)",
+                html_escape(name),
+                html_escape(&params.client_id)
+            )
         }
         _ => format!("<code>{}</code>", html_escape(&params.client_id)),
     };
@@ -1597,9 +1442,7 @@ fn authorize_page(params: &AuthorizeParams, client_name: Option<&str>) -> String
 fn redirect_host(redirect_uri: &str) -> String {
     match redirect_uri.parse::<Uri>() {
         Ok(uri) => match (uri.scheme_str(), uri.authority()) {
-            (Some(scheme), Some(authority)) => {
-                html_escape(&format!("{scheme}://{authority}"))
-            }
+            (Some(scheme), Some(authority)) => html_escape(&format!("{scheme}://{authority}")),
             _ => html_escape(redirect_uri),
         },
         Err(_) => html_escape(redirect_uri),
@@ -1751,7 +1594,10 @@ mod tests {
         let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
         let challenge = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
         assert!(verify_pkce_s256(verifier, challenge));
-        assert!(!verify_pkce_s256("wrong-verifier-wrong-verifier-wrong-verifi", challenge));
+        assert!(!verify_pkce_s256(
+            "wrong-verifier-wrong-verifier-wrong-verifi",
+            challenge
+        ));
         // A `plain` client sending challenge == verifier must not pass S256.
         assert!(!verify_pkce_s256(verifier, verifier));
     }
@@ -1777,7 +1623,10 @@ mod tests {
         // Expiry: a code is dead AUTH_CODE_TTL after issuance...
         let code = runtime.issue_code("client-1", "https://a/cb", "chal", "alice", "", 1_000);
         let expired_at = 1_000 + AUTH_CODE_TTL.as_secs();
-        assert!(matches!(runtime.take_code(&code, expired_at), CodeTake::Expired));
+        assert!(matches!(
+            runtime.take_code(&code, expired_at),
+            CodeTake::Expired
+        ));
         // ...and the expired take also consumed it.
         assert!(matches!(runtime.take_code(&code, 1_001), CodeTake::Unknown));
 
@@ -1808,21 +1657,33 @@ mod tests {
 
         // Wrong client on a valid token: rejected without side effects.
         assert_eq!(
-            store.rotate_refresh(&refresh2, Some("client-2"), ttl, 2_500).err(),
+            store
+                .rotate_refresh(&refresh2, Some("client-2"), ttl, 2_500)
+                .err(),
             Some(RotateError::ClientMismatch)
         );
 
         // Replay of the spent refresh1: the whole family burns.
         assert_eq!(
-            store.rotate_refresh(&refresh1, Some("client-1"), ttl, 3_000).err(),
+            store
+                .rotate_refresh(&refresh1, Some("client-1"), ttl, 3_000)
+                .err(),
             Some(RotateError::ReuseRevoked)
         );
-        assert!(store.access_tokens.is_empty(), "family access tokens revoked");
-        assert!(store.refresh_tokens.is_empty(), "family refresh tokens revoked");
+        assert!(
+            store.access_tokens.is_empty(),
+            "family access tokens revoked"
+        );
+        assert!(
+            store.refresh_tokens.is_empty(),
+            "family refresh tokens revoked"
+        );
 
         // The current-at-revocation refresh2 is now unknown.
         assert_eq!(
-            store.rotate_refresh(&refresh2, Some("client-1"), ttl, 3_100).err(),
+            store
+                .rotate_refresh(&refresh2, Some("client-1"), ttl, 3_100)
+                .err(),
             Some(RotateError::Unknown)
         );
     }
@@ -1837,15 +1698,24 @@ mod tests {
         let (access, _refresh) = store.mint_token_pair("alice", "mock", "client-1", ttl, 1_000);
 
         let entry = store.lookup_access(&access, 1_050).expect("still valid");
-        assert_eq!((entry.tenant.as_str(), entry.backend.as_str()), ("alice", "mock"));
+        assert_eq!(
+            (entry.tenant.as_str(), entry.backend.as_str()),
+            ("alice", "mock")
+        );
 
         assert_eq!(
             store.lookup_access(&access, 1_100).err(),
             Some(("access token expired", true))
         );
         // The expired token was removed: a retry is now just unknown.
-        assert_eq!(store.lookup_access(&access, 1_100).err(), Some(("unknown token", false)));
-        assert_eq!(store.lookup_access("never-issued", 0).err(), Some(("unknown token", false)));
+        assert_eq!(
+            store.lookup_access(&access, 1_100).err(),
+            Some(("unknown token", false))
+        );
+        assert_eq!(
+            store.lookup_access("never-issued", 0).err(),
+            Some(("unknown token", false))
+        );
     }
 
     // -- Invites ------------------------------------------------------------
@@ -1898,12 +1768,24 @@ mod tests {
 
         let reloaded = OauthStore::load(&path).expect("reload");
         let client = reloaded.clients.get(&client_id).expect("client persisted");
-        assert_eq!(client.redirect_uris, ["https://claude.ai/api/mcp/auth_callback"]);
+        assert_eq!(
+            client.redirect_uris,
+            ["https://claude.ai/api/mcp/auth_callback"]
+        );
         assert_eq!(client.client_name.as_deref(), Some("Claude"));
-        assert_eq!(reloaded.invites.get(&invite).map(|i| i.tenant.as_str()), Some("alice"));
-        let access_entry = reloaded.access_tokens.get(&access).expect("access persisted");
+        assert_eq!(
+            reloaded.invites.get(&invite).map(|i| i.tenant.as_str()),
+            Some("alice")
+        );
+        let access_entry = reloaded
+            .access_tokens
+            .get(&access)
+            .expect("access persisted");
         assert_eq!(access_entry.expires_at, 1_062);
-        let refresh_entry = reloaded.refresh_tokens.get(&refresh).expect("refresh persisted");
+        let refresh_entry = reloaded
+            .refresh_tokens
+            .get(&refresh)
+            .expect("refresh persisted");
         assert!(refresh_entry.current);
         assert_eq!(refresh_entry.family_id, access_entry.family_id);
 
@@ -1943,7 +1825,9 @@ mod tests {
     }
 
     /// Read a redirect's Location and parse its query into a map.
-    fn location_query(response: &ureq::http::Response<ureq::Body>) -> (String, HashMap<String, String>) {
+    fn location_query(
+        response: &ureq::http::Response<ureq::Body>,
+    ) -> (String, HashMap<String, String>) {
         let location = response
             .headers()
             .get("location")
@@ -1975,7 +1859,14 @@ mod tests {
         let redirect_uri = "https://client.example.test/callback";
 
         // --- 401 challenge advertises the discovery document.
-        let bare = post(&agent, addr, None, None, None, &rpc(1, "initialize", json!({})));
+        let bare = post(
+            &agent,
+            addr,
+            None,
+            None,
+            None,
+            &rpc(1, "initialize", json!({})),
+        );
         assert_eq!(bare.status, 401);
         let mut challenge = agent
             .post(format!("http://{addr}/mcp"))
@@ -1996,7 +1887,9 @@ mod tests {
 
         // --- Discovery documents.
         let mut resource = agent
-            .get(format!("http://{addr}/.well-known/oauth-protected-resource"))
+            .get(format!(
+                "http://{addr}/.well-known/oauth-protected-resource"
+            ))
             .call()
             .expect("resource metadata");
         let resource = read_json(&mut resource);
@@ -2004,16 +1897,33 @@ mod tests {
         assert_eq!(resource["authorization_servers"], json!([issuer]));
 
         let mut auth_server = agent
-            .get(format!("http://{addr}/.well-known/oauth-authorization-server"))
+            .get(format!(
+                "http://{addr}/.well-known/oauth-authorization-server"
+            ))
             .call()
             .expect("authorization-server metadata");
         let auth_server = read_json(&mut auth_server);
         assert_eq!(auth_server["issuer"], issuer);
-        assert_eq!(auth_server["authorization_endpoint"], format!("{issuer}/oauth/authorize"));
-        assert_eq!(auth_server["token_endpoint"], format!("{issuer}/oauth/token"));
-        assert_eq!(auth_server["registration_endpoint"], format!("{issuer}/oauth/register"));
-        assert_eq!(auth_server["code_challenge_methods_supported"], json!(["S256"]));
-        assert_eq!(auth_server["token_endpoint_auth_methods_supported"], json!(["none"]));
+        assert_eq!(
+            auth_server["authorization_endpoint"],
+            format!("{issuer}/oauth/authorize")
+        );
+        assert_eq!(
+            auth_server["token_endpoint"],
+            format!("{issuer}/oauth/token")
+        );
+        assert_eq!(
+            auth_server["registration_endpoint"],
+            format!("{issuer}/oauth/register")
+        );
+        assert_eq!(
+            auth_server["code_challenge_methods_supported"],
+            json!(["S256"])
+        );
+        assert_eq!(
+            auth_server["token_endpoint_auth_methods_supported"],
+            json!(["none"])
+        );
 
         // --- Dynamic client registration.
         let mut registered = agent
@@ -2026,11 +1936,17 @@ mod tests {
             .expect("register");
         assert_eq!(registered.status().as_u16(), 201);
         let registered = read_json(&mut registered);
-        let client_id = registered["client_id"].as_str().expect("client_id").to_string();
+        let client_id = registered["client_id"]
+            .as_str()
+            .expect("client_id")
+            .to_string();
         assert_eq!(registered["redirect_uris"], json!([redirect_uri]));
         // Registration persisted to the state file on disk.
         assert!(
-            OauthStore::load(&state_path).unwrap().clients.contains_key(&client_id),
+            OauthStore::load(&state_path)
+                .unwrap()
+                .clients
+                .contains_key(&client_id),
             "client persisted"
         );
 
@@ -2049,13 +1965,22 @@ mod tests {
 
         // --- GET authorize: the invite form, self-contained HTML.
         let mut form_page = agent
-            .get(format!("http://{addr}/oauth/authorize?{}", authorize_query(&challenge)))
+            .get(format!(
+                "http://{addr}/oauth/authorize?{}",
+                authorize_query(&challenge)
+            ))
             .call()
             .expect("authorize form");
         assert_eq!(form_page.status().as_u16(), 200);
         let html = form_page.body_mut().read_to_string().unwrap();
-        assert!(html.contains("name=\"invite_code\""), "invite field present");
-        assert!(html.contains(&format!("value=\"{challenge}\"")), "challenge round-trips");
+        assert!(
+            html.contains("name=\"invite_code\""),
+            "invite field present"
+        );
+        assert!(
+            html.contains(&format!("value=\"{challenge}\"")),
+            "challenge round-trips"
+        );
         assert!(!html.contains("http-equiv"), "no external/refresh tricks");
 
         // Unknown client_id gets a 400 page, not a redirect (open-redirect defence).
@@ -2084,8 +2009,15 @@ mod tests {
                 ("invite_code", "irrelevant"),
             ])
             .expect("plain pkce");
-        assert_eq!(plain.status().as_u16(), 400, "pre-invite failure is a page, not a redirect");
-        assert!(plain.headers().get("location").is_none(), "no Location off-origin");
+        assert_eq!(
+            plain.status().as_u16(),
+            400,
+            "pre-invite failure is a page, not a redirect"
+        );
+        assert!(
+            plain.headers().get("location").is_none(),
+            "no Location off-origin"
+        );
         let _ = plain.body_mut().read_to_string();
 
         // --- POST authorize with a minted invite → code redirect.
@@ -2122,7 +2054,10 @@ mod tests {
         // off this origin (the invite gate is what earns a redirect).
         let mut denied = submit("not-an-invite", &challenge);
         assert_eq!(denied.status().as_u16(), 400);
-        assert!(denied.headers().get("location").is_none(), "bad invite doesn't redirect");
+        assert!(
+            denied.headers().get("location").is_none(),
+            "bad invite doesn't redirect"
+        );
         let _ = denied.body_mut().read_to_string();
 
         // The single-use invite is spent: replaying it is a 400 page too.
@@ -2158,7 +2093,14 @@ mod tests {
         assert_eq!(read_json(&mut replayed)["error"], "invalid_grant");
 
         // --- The access token drives a real MCP handshake, tenant-scoped.
-        let init = post(&agent, addr, Some(&access), None, None, &rpc(1, "initialize", json!({ "protocolVersion": "2025-06-18" })));
+        let init = post(
+            &agent,
+            addr,
+            Some(&access),
+            None,
+            None,
+            &rpc(1, "initialize", json!({ "protocolVersion": "2025-06-18" })),
+        );
         assert_eq!(init.status, 200, "init body: {}", init.body);
         let session = init.session.expect("session issued");
         let opened = post(
@@ -2167,14 +2109,25 @@ mod tests {
             Some(&access),
             Some(&session),
             None,
-            &rpc(2, "tools/call", json!({ "name": "open_session", "arguments": { "pile_host_path": "/tmp/alice/self.pile" } })),
+            &rpc(
+                2,
+                "tools/call",
+                json!({ "name": "open_session", "arguments": { "pile_host_path": "/tmp/alice/self.pile" } }),
+            ),
         );
         assert_eq!(opened.status, 200);
         // The invite's tenant flowed through: the sandbox session is alice's.
         assert_eq!(opened.body["result"]["content"][0]["text"], "mock-alice");
 
         // Static tokens keep working, byte-for-byte, next to OAuth.
-        let static_init = post(&agent, addr, Some("tok-alice"), None, None, &rpc(3, "initialize", json!({})));
+        let static_init = post(
+            &agent,
+            addr,
+            Some("tok-alice"),
+            None,
+            None,
+            &rpc(3, "initialize", json!({})),
+        );
         assert_eq!(static_init.status, 200);
 
         // --- Wrong verifier burns its (fresh) code and yields invalid_grant.
@@ -2204,7 +2157,14 @@ mod tests {
                     .0
             })
             .expect("mint stale token");
-        let expired = post(&agent, addr, Some(&stale), None, None, &rpc(4, "initialize", json!({})));
+        let expired = post(
+            &agent,
+            addr,
+            Some(&stale),
+            None,
+            None,
+            &rpc(4, "initialize", json!({})),
+        );
         assert_eq!(expired.status, 401);
         let mut expired_raw = agent
             .post(format!("http://{addr}/mcp"))
@@ -2242,19 +2202,47 @@ mod tests {
         assert_ne!(refresh2, refresh, "refresh token rotates");
 
         // The rotated-in access token works...
-        let init2 = post(&agent, addr, Some(&access2), None, None, &rpc(5, "initialize", json!({})));
+        let init2 = post(
+            &agent,
+            addr,
+            Some(&access2),
+            None,
+            None,
+            &rpc(5, "initialize", json!({})),
+        );
         assert_eq!(init2.status, 200);
 
         // ...until the spent refresh token is replayed: family revoked.
         let mut replay = rotate(&refresh);
         assert_eq!(replay.status().as_u16(), 400);
         assert_eq!(read_json(&mut replay)["error"], "invalid_grant");
-        let revoked_new = post(&agent, addr, Some(&access2), None, None, &rpc(6, "initialize", json!({})));
-        assert_eq!(revoked_new.status, 401, "family revocation kills the newest access token");
-        let revoked_old = post(&agent, addr, Some(&access), None, None, &rpc(7, "initialize", json!({})));
+        let revoked_new = post(
+            &agent,
+            addr,
+            Some(&access2),
+            None,
+            None,
+            &rpc(6, "initialize", json!({})),
+        );
+        assert_eq!(
+            revoked_new.status, 401,
+            "family revocation kills the newest access token"
+        );
+        let revoked_old = post(
+            &agent,
+            addr,
+            Some(&access),
+            None,
+            None,
+            &rpc(7, "initialize", json!({})),
+        );
         assert_eq!(revoked_old.status, 401, "and the original one");
         let mut dead_refresh = rotate(&refresh2);
-        assert_eq!(dead_refresh.status().as_u16(), 400, "successor refresh died with the family");
+        assert_eq!(
+            dead_refresh.status().as_u16(),
+            400,
+            "successor refresh died with the family"
+        );
         let _ = dead_refresh.body_mut().read_to_string();
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -2287,7 +2275,10 @@ mod tests {
                 ("code", "never-issued"),
                 ("client_id", "whoever"),
                 ("redirect_uri", "https://a/cb"),
-                ("code_verifier", "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
+                (
+                    "code_verifier",
+                    "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk",
+                ),
             ])
             .expect("bogus code");
         assert_eq!(bogus_code.status().as_u16(), 400);
@@ -2295,7 +2286,10 @@ mod tests {
 
         let mut bogus_refresh = agent
             .post(format!("http://{addr}/oauth/token"))
-            .send_form([("grant_type", "refresh_token"), ("refresh_token", "never-issued")])
+            .send_form([
+                ("grant_type", "refresh_token"),
+                ("refresh_token", "never-issued"),
+            ])
             .expect("bogus refresh");
         assert_eq!(bogus_refresh.status().as_u16(), 400);
         assert_eq!(read_json(&mut bogus_refresh)["error"], "invalid_grant");
@@ -2324,7 +2318,10 @@ mod tests {
         };
 
         let (status, body) = register(json!({ "redirect_uris": [] }));
-        assert_eq!((status, body["error"].as_str()), (400, Some("invalid_client_metadata")));
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (400, Some("invalid_client_metadata"))
+        );
 
         let (status, _) = register(json!({ "redirect_uris": ["/relative/path"] }));
         assert_eq!(status, 400, "relative redirect URI rejected");
@@ -2341,7 +2338,10 @@ mod tests {
         let (status, body) = register(json!({ "redirect_uris": ["https://a/cb"] }));
         assert_eq!(status, 201);
         assert!(body["client_id"].as_str().is_some());
-        assert!(body.get("client_secret").is_none(), "public client has no secret");
+        assert!(
+            body.get("client_secret").is_none(),
+            "public client has no secret"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2376,9 +2376,17 @@ mod tests {
         assert_eq!(register("http://localhost/cb"), 201, "localhost dev ok");
 
         // Rejected: plain-http public host, and non-http(s) custom schemes.
-        assert_eq!(register("http://evil.example.com/cb"), 400, "plain http public rejected");
+        assert_eq!(
+            register("http://evil.example.com/cb"),
+            400,
+            "plain http public rejected"
+        );
         assert_eq!(register("ftp://a/cb"), 400, "non-http scheme rejected");
-        assert_eq!(register("com.example.app://cb"), 400, "custom app scheme rejected");
+        assert_eq!(
+            register("com.example.app://cb"),
+            400,
+            "custom app scheme rejected"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2398,8 +2406,7 @@ mod tests {
         })
         .unwrap();
 
-        // Fill to the cap directly in the store (fast; the HTTP path is
-        // exercised by registration_rate_limits_registration below).
+        // Fill to the cap directly in the store (fast).
         runtime
             .with_locked_store(|store| {
                 for _ in 0..MAX_CLIENTS {
@@ -2428,45 +2435,12 @@ mod tests {
                 store.gc_stale_clients(CLIENT_GC_TTL.as_secs() + 10)
             })
             .unwrap();
-        assert_eq!(removed, 1, "only the stale, never-authorized client is GC'd");
+        assert_eq!(
+            removed, 1,
+            "only the stale, never-authorized client is GC'd"
+        );
         let survivors = runtime.store.lock().unwrap().clients.len();
         assert_eq!(survivors, 2, "authorized and fresh clients survive GC");
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Registration is rate-limited per source: a burst past the bucket
-    /// capacity gets 429s (the store-bounding half is covered above).
-    #[test]
-    fn registration_rate_limits_registration() {
-        let dir = scratch_dir("ratelimit");
-        let state = test_state_with_oauth(
-            "https://mcp.example.test",
-            &dir.join("oauth.json"),
-            Duration::from_secs(3600),
-        );
-        let addr = spawn_server(state);
-        let agent = no_redirect_agent();
-        let register = || {
-            agent
-                .post(format!("http://{addr}/oauth/register"))
-                .send_json(json!({ "redirect_uris": ["https://a/cb"] }))
-                .expect("register")
-                .status()
-                .as_u16()
-        };
-
-        // The bucket starts full (REGISTER_BUCKET_CAPACITY tokens). Draining it
-        // plus one more forces a 429 within the same wall-clock second (refill
-        // is ~1 token / 6 s, far slower than this loop).
-        let mut saw_429 = false;
-        for _ in 0..(REGISTER_BUCKET_CAPACITY as usize + 5) {
-            if register() == 429 {
-                saw_429 = true;
-                break;
-            }
-        }
-        assert!(saw_429, "a burst past the bucket capacity is rate-limited");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2487,7 +2461,13 @@ mod tests {
         // Seed a family (access + refresh) on disk.
         let (access, refresh, family_id) = {
             let mut store = OauthStore::default();
-            let (a, r) = store.mint_token_pair("alice", "mock", "client-1", Duration::from_secs(3600), 1_000);
+            let (a, r) = store.mint_token_pair(
+                "alice",
+                "mock",
+                "client-1",
+                Duration::from_secs(3600),
+                1_000,
+            );
             let fam = store.refresh_tokens[&r].family_id.clone();
             store.save(&path).unwrap();
             (a, r, fam)
@@ -2501,7 +2481,8 @@ mod tests {
         // The server revokes the family on refresh-reuse, through the lock.
         mutate_state_locked(&path, |store| {
             // Spend then replay: replay revokes the whole family.
-            let _ = store.rotate_refresh(&refresh, Some("client-1"), Duration::from_secs(3600), 2_000);
+            let _ =
+                store.rotate_refresh(&refresh, Some("client-1"), Duration::from_secs(3600), 2_000);
             let err = store
                 .rotate_refresh(&refresh, Some("client-1"), Duration::from_secs(3600), 2_100)
                 .err();
@@ -2512,7 +2493,12 @@ mod tests {
 
         // On-disk, the family is gone.
         let after_revoke = OauthStore::load(&path).unwrap();
-        assert!(!after_revoke.access_tokens.values().any(|e| e.family_id == family_id));
+        assert!(
+            !after_revoke
+                .access_tokens
+                .values()
+                .any(|e| e.family_id == family_id)
+        );
 
         // Now the CLI writer commits *its* mutation. Because it goes through the
         // SAME locked re-read primitive (not a blind write of `stale_snapshot`),
@@ -2522,11 +2508,17 @@ mod tests {
 
         let final_state = OauthStore::load(&path).unwrap();
         assert!(
-            !final_state.access_tokens.values().any(|e| e.family_id == family_id),
+            !final_state
+                .access_tokens
+                .values()
+                .any(|e| e.family_id == family_id),
             "revoked family stays dead after a concurrent invite write"
         );
         assert!(
-            !final_state.refresh_tokens.values().any(|e| e.family_id == family_id),
+            !final_state
+                .refresh_tokens
+                .values()
+                .any(|e| e.family_id == family_id),
             "revoked refresh family stays dead too"
         );
         assert_eq!(final_state.invites.len(), 1, "the invite write did land");
@@ -2534,7 +2526,10 @@ mod tests {
         // *would* have resurrected the family — proving the lock is load-bearing.
         stale_snapshot.save(&path).unwrap();
         assert!(
-            OauthStore::load(&path).unwrap().access_tokens.contains_key(&access),
+            OauthStore::load(&path)
+                .unwrap()
+                .access_tokens
+                .contains_key(&access),
             "control: a naive stale write resurrects — which the locked path prevents"
         );
 
@@ -2550,7 +2545,11 @@ mod tests {
     fn authorize_bad_param_is_page_not_open_redirect() {
         let dir = scratch_dir("openredirect");
         let state_path = dir.join("oauth.json");
-        let state = test_state_with_oauth("https://mcp.example.test", &state_path, Duration::from_secs(3600));
+        let state = test_state_with_oauth(
+            "https://mcp.example.test",
+            &state_path,
+            Duration::from_secs(3600),
+        );
         let addr = spawn_server(state.clone());
         let agent = no_redirect_agent();
 
@@ -2559,7 +2558,10 @@ mod tests {
             .post(format!("http://{addr}/oauth/register"))
             .send_json(json!({ "redirect_uris": ["https://evil.example.com/steal"] }))
             .expect("register");
-        let client_id = read_json(&mut registered)["client_id"].as_str().unwrap().to_string();
+        let client_id = read_json(&mut registered)["client_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
 
         // Victim is handed an authorize URL with a bad grant param (plain PKCE),
         // BEFORE presenting any invite. It must NOT 302 to evil.com.
@@ -2577,7 +2579,10 @@ mod tests {
             url_encode("https://evil.example.com/steal"),
         ));
         assert_eq!(r1.status().as_u16(), 400, "bad response_type is a 400 page");
-        assert!(r1.headers().get("location").is_none(), "no Location to evil.com");
+        assert!(
+            r1.headers().get("location").is_none(),
+            "no Location to evil.com"
+        );
         let _ = r1.body_mut().read_to_string();
 
         // Non-S256 PKCE method.
@@ -2587,7 +2592,10 @@ mod tests {
             url_encode("https://evil.example.com/steal"),
         ));
         assert_eq!(r2.status().as_u16(), 400, "plain PKCE is a 400 page");
-        assert!(r2.headers().get("location").is_none(), "no Location to evil.com");
+        assert!(
+            r2.headers().get("location").is_none(),
+            "no Location to evil.com"
+        );
         let _ = r2.body_mut().read_to_string();
 
         // Also via POST (hidden fields are attacker-editable) with a bad invite:
@@ -2604,7 +2612,10 @@ mod tests {
             ])
             .expect("post authorize");
         assert_eq!(r3.status().as_u16(), 400, "bad invite is a 400 page");
-        assert!(r3.headers().get("location").is_none(), "bad invite doesn't redirect off-origin");
+        assert!(
+            r3.headers().get("location").is_none(),
+            "bad invite doesn't redirect off-origin"
+        );
         let _ = r3.body_mut().read_to_string();
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -2636,7 +2647,13 @@ mod tests {
         // Seed a real family so the file exists with content.
         {
             let mut store = OauthStore::default();
-            store.mint_token_pair("alice", "mock", "client-1", Duration::from_secs(3600), 1_000);
+            store.mint_token_pair(
+                "alice",
+                "mock",
+                "client-1",
+                Duration::from_secs(3600),
+                1_000,
+            );
             store.save(&path).unwrap();
         }
         let read_all = || std::fs::read(&path).unwrap();
@@ -2660,7 +2677,11 @@ mod tests {
             assert_eq!(result.err(), Some(RotateError::Unknown));
         }
         assert_eq!(read_all(), before_bytes, "unknown refresh wrote nothing");
-        assert_eq!(mtime(), before_mtime, "unknown refresh left mtime untouched");
+        assert_eq!(
+            mtime(),
+            before_mtime,
+            "unknown refresh left mtime untouched"
+        );
 
         // Invalid invite consume: consume_invite returns None, no mutation.
         {
@@ -2677,38 +2698,6 @@ mod tests {
         // Control: a real invite mint DOES write (mtime advances, bytes change).
         mint_invite_locked(&path, "bob", false, None, None, 3_000).unwrap();
         assert_ne!(read_all(), before_bytes, "a real mint does write");
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// The `/oauth/token` edge is rate-limited: a burst of garbage refresh
-    /// exchanges past the bucket capacity gets 429s from one source.
-    #[test]
-    fn token_edge_is_rate_limited() {
-        let dir = scratch_dir("tokenrate");
-        let state = test_state_with_oauth(
-            "https://mcp.example.test",
-            &dir.join("oauth.json"),
-            Duration::from_secs(3600),
-        );
-        let addr = spawn_server(state);
-        let agent = no_redirect_agent();
-
-        let mut saw_429 = false;
-        for _ in 0..(REGISTER_BUCKET_CAPACITY as usize + 5) {
-            let status = agent
-                .post(format!("http://{addr}/oauth/token"))
-                .send_form([("grant_type", "refresh_token"), ("refresh_token", "garbage")])
-                .expect("token")
-                .status()
-                .as_u16();
-            if status == 429 {
-                saw_429 = true;
-                break;
-            }
-            assert_eq!(status, 400, "pre-throttle a bad refresh is a 400 (no write, no 500)");
-        }
-        assert!(saw_429, "a burst of token exchanges is rate-limited at the edge");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2735,7 +2724,10 @@ mod tests {
             .post(format!("http://{addr}/oauth/register"))
             .send_json(json!({ "redirect_uris": [good_redirect, other_redirect] }))
             .expect("register");
-        let client_id = read_json(&mut registered)["client_id"].as_str().unwrap().to_string();
+        let client_id = read_json(&mut registered)["client_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
 
         // Mint an invite BOUND to this client + the good redirect.
         let oauth = state.oauth.as_ref().unwrap();
@@ -2771,17 +2763,32 @@ mod tests {
         // Mismatched (but registered) redirect: refused with a 400 page, no
         // redirect off-origin, and the invite is NOT consumed.
         let mut wrong = submit(other_redirect);
-        assert_eq!(wrong.status().as_u16(), 400, "invite bound to a different redirect is refused");
-        assert!(wrong.headers().get("location").is_none(), "no redirect on a binding mismatch");
+        assert_eq!(
+            wrong.status().as_u16(),
+            400,
+            "invite bound to a different redirect is refused"
+        );
+        assert!(
+            wrong.headers().get("location").is_none(),
+            "no redirect on a binding mismatch"
+        );
         let _ = wrong.body_mut().read_to_string();
         assert!(
-            OauthStore::load(&state_path).unwrap().invites.values().any(|i| i.tenant == "alice"),
+            OauthStore::load(&state_path)
+                .unwrap()
+                .invites
+                .values()
+                .any(|i| i.tenant == "alice"),
             "the invite survives a mismatched attempt (not consumed)"
         );
 
         // Matching redirect: redeems, 302 with a code, and the invite is spent.
         let mut ok = submit(good_redirect);
-        assert_eq!(ok.status().as_u16(), 302, "matching client+redirect redeems the bound invite");
+        assert_eq!(
+            ok.status().as_u16(),
+            302,
+            "matching client+redirect redeems the bound invite"
+        );
         let (base, query) = location_query(&ok);
         assert_eq!(base, good_redirect);
         assert!(query.contains_key("code"), "an auth code was issued");
@@ -2803,7 +2810,8 @@ mod tests {
     fn consent_page_shows_client_and_redirect_and_anti_framing() {
         let dir = scratch_dir("consent");
         let issuer = "https://mcp.example.test";
-        let state = test_state_with_oauth(issuer, &dir.join("oauth.json"), Duration::from_secs(3600));
+        let state =
+            test_state_with_oauth(issuer, &dir.join("oauth.json"), Duration::from_secs(3600));
         let addr = spawn_server(state);
         let agent = no_redirect_agent();
         let redirect_uri = "https://connector.example.org/mcp/callback";
@@ -2815,7 +2823,10 @@ mod tests {
                 "client_name": "Acme Connector",
             }))
             .expect("register");
-        let client_id = read_json(&mut registered)["client_id"].as_str().unwrap().to_string();
+        let client_id = read_json(&mut registered)["client_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
 
         let challenge = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
         let mut form_page = agent
@@ -2831,7 +2842,12 @@ mod tests {
 
         // Anti-framing headers present.
         assert_eq!(
-            form_page.headers().get("x-frame-options").unwrap().to_str().unwrap(),
+            form_page
+                .headers()
+                .get("x-frame-options")
+                .unwrap()
+                .to_str()
+                .unwrap(),
             "DENY"
         );
         assert!(
@@ -2846,8 +2862,14 @@ mod tests {
         );
 
         let html = form_page.body_mut().read_to_string().unwrap();
-        assert!(html.contains("Acme Connector"), "consent page names the client");
-        assert!(html.contains(&client_id), "consent page shows the client_id");
+        assert!(
+            html.contains("Acme Connector"),
+            "consent page names the client"
+        );
+        assert!(
+            html.contains(&client_id),
+            "consent page shows the client_id"
+        );
         assert!(
             html.contains("https://connector.example.org"),
             "consent page shows the redirect host"

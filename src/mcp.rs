@@ -6,8 +6,10 @@
 //!
 //!   - `open_session` -> provision a sandbox via the backend, return a session
 //!     id (one tenant = one pile mount × driver).
-//!   - `exec`         -> run a command in that session's shell.
-//!   - `close_session`-> tear the sandbox down.
+//!   - `exec`         -> run a short command and wait for its result.
+//!   - `job_*`        -> start, poll, and cancel long-running commands.
+//!   - `close_session`-> release a handle to the persistent sandbox.
+//!   - `destroy_session` -> permanently tear the sandbox down.
 //!
 //! This module defines the [`SandboxProvider`] (session registry +
 //! multi-tenancy) and, on top of it, a minimal dependency-free MCP server
@@ -23,7 +25,7 @@
 //!
 //! ## Hand-rolled JSON-RPC (deliberate)
 //!
-//! The MCP surface this provider exposes is three tools and a handful of
+//! The MCP surface this provider exposes is seven small tools and a handful of
 //! lifecycle methods — small enough to hand-roll over `serde_json` (already a
 //! dependency) instead of pulling the official Rust SDK
 //! [`rmcp`](https://crates.io/crates/rmcp). Keeping the surface tiny and
@@ -34,188 +36,19 @@
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
-use std::sync::{Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
 
+use crate::jobs::{JobManager, JobSnapshot, JobState};
+#[cfg(test)]
+use crate::sandbox::ExecControl;
 use crate::sandbox::{
-    ExecRequest, ExecResult, LifecycleLocks, PileMount, SandboxBackend, SessionId, SessionSpec,
-    Tenant,
+    ExecRequest, ExecResult, ExecStream, LifecycleLocks, PileMount, SandboxBackend, SessionId,
+    SessionSpec, Tenant,
 };
-
-// ---------------------------------------------------------------------------
-// Admission control
-// ---------------------------------------------------------------------------
-
-/// Default cap on `exec`s in flight ACROSS ALL tenants. This is the daemon
-/// bound: a tenant `exec` pins one tokio blocking-pool worker (the provider is
-/// blocking; the HTTP transport bridges via `spawn_blocking`) plus one jail
-/// process for up to the timeout ceiling, so the global cap keeps a flood from
-/// occupying every blocking thread and wedging the whole service.
-pub const DEFAULT_GLOBAL_EXEC_LIMIT: usize = 32;
-
-/// Default cap on `exec`s in flight FOR ONE tenant. The per-tenant bound is the
-/// fairness guarantee: no single authenticated tenant can consume all the
-/// global slots and starve everyone else.
-pub const DEFAULT_PER_TENANT_EXEC_LIMIT: usize = 4;
-
-/// Default bound on how many `exec`s may WAIT for a slot (globally). Past this,
-/// admission is rejected immediately rather than queued — a bounded queue, so a
-/// burst cannot pile up unbounded waiters (each holding a blocking-pool thread).
-pub const DEFAULT_MAX_WAITERS: usize = 64;
-
-/// How long a waiting `exec` blocks for a slot before giving up. Bounds the time
-/// a queued request pins its blocking-pool thread.
-const ADMISSION_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Per-tenant + global concurrency limiter for `exec`. Holds a permit for the
-/// life of one `exec` and releases it (even on panic) via [`AdmissionGuard`].
-///
-/// Enforcement is a single mutex-guarded state + a condvar: an admitted `exec`
-/// increments the global and per-tenant counters; a blocked one waits on the
-/// condvar (bounded by [`AdmissionConfig::max_waiters`] and a wall-clock
-/// timeout) until a permit frees or it is rejected. This is deliberately
-/// std-only (no tokio): the provider is synchronous and this guards the blocking
-/// side, which is exactly the scarce resource.
-pub struct AdmissionControl {
-    config: AdmissionConfig,
-    state: Mutex<AdmissionState>,
-    freed: Condvar,
-}
-
-/// Tunables for [`AdmissionControl`].
-#[derive(Debug, Clone, Copy)]
-pub struct AdmissionConfig {
-    pub global_limit: usize,
-    pub per_tenant_limit: usize,
-    pub max_waiters: usize,
-}
-
-impl Default for AdmissionConfig {
-    fn default() -> Self {
-        AdmissionConfig {
-            global_limit: DEFAULT_GLOBAL_EXEC_LIMIT,
-            per_tenant_limit: DEFAULT_PER_TENANT_EXEC_LIMIT,
-            max_waiters: DEFAULT_MAX_WAITERS,
-        }
-    }
-}
-
-#[derive(Default)]
-struct AdmissionState {
-    /// Total `exec`s currently holding a permit.
-    global_in_flight: usize,
-    /// Per-tenant in-flight counts (entries drop to 0 stay until swept lazily;
-    /// a handful of tenants, so unbounded growth is not a concern).
-    per_tenant: HashMap<String, usize>,
-    /// Number of `exec`s currently blocked waiting for a permit.
-    waiters: usize,
-}
-
-impl AdmissionControl {
-    pub fn new(config: AdmissionConfig) -> Self {
-        AdmissionControl {
-            config,
-            state: Mutex::new(AdmissionState::default()),
-            freed: Condvar::new(),
-        }
-    }
-
-    /// Acquire a permit for one `exec` by `tenant`, or return an error if the
-    /// caps are full and either the wait queue is full or the wait times out.
-    /// The returned guard releases the permit (and wakes a waiter) on drop.
-    fn acquire(&self, tenant: &str) -> Result<AdmissionGuard<'_>> {
-        let mut state = self.state.lock().expect("admission poisoned");
-        loop {
-            let tenant_in_flight = state.per_tenant.get(tenant).copied().unwrap_or(0);
-            let has_slot = state.global_in_flight < self.config.global_limit
-                && tenant_in_flight < self.config.per_tenant_limit;
-            if has_slot {
-                state.global_in_flight += 1;
-                *state.per_tenant.entry(tenant.to_string()).or_insert(0) += 1;
-                return Ok(AdmissionGuard {
-                    control: self,
-                    tenant: tenant.to_string(),
-                });
-            }
-            // No slot. Refuse to queue past the waiter bound (a bounded queue).
-            if state.waiters >= self.config.max_waiters {
-                return Err(anyhow!(
-                    "sandbox busy: {} exec(s) already queued (global {}/{}, tenant '{}' {}/{}); \
-                     retry shortly",
-                    state.waiters,
-                    state.global_in_flight,
-                    self.config.global_limit,
-                    tenant,
-                    tenant_in_flight,
-                    self.config.per_tenant_limit
-                ));
-            }
-            state.waiters += 1;
-            let (next, wait) = self
-                .freed
-                .wait_timeout(state, ADMISSION_WAIT_TIMEOUT)
-                .expect("admission poisoned");
-            state = next;
-            state.waiters -= 1;
-            if wait.timed_out() {
-                // Retry once more (a permit may have freed as we timed out); if
-                // still full, give up so the caller's blocking-pool thread is not
-                // pinned indefinitely.
-                let tenant_in_flight = state.per_tenant.get(tenant).copied().unwrap_or(0);
-                if state.global_in_flight >= self.config.global_limit
-                    || tenant_in_flight >= self.config.per_tenant_limit
-                {
-                    return Err(anyhow!(
-                        "sandbox busy: timed out after {:?} waiting for an exec slot \
-                         (global {}/{}, tenant '{}' {}/{})",
-                        ADMISSION_WAIT_TIMEOUT,
-                        state.global_in_flight,
-                        self.config.global_limit,
-                        tenant,
-                        tenant_in_flight,
-                        self.config.per_tenant_limit
-                    ));
-                }
-            }
-            // Woken (or a slot may exist): loop and re-check.
-        }
-    }
-
-    fn release(&self, tenant: &str) {
-        let mut state = self.state.lock().expect("admission poisoned");
-        state.global_in_flight = state.global_in_flight.saturating_sub(1);
-        if let Some(n) = state.per_tenant.get_mut(tenant) {
-            *n = n.saturating_sub(1);
-            if *n == 0 {
-                state.per_tenant.remove(tenant);
-            }
-        }
-        drop(state);
-        // Wake ALL waiters, not one: a freed slot might be unusable to the first
-        // waiter it wakes (that waiter's tenant could still be at its per-tenant
-        // cap) while a DIFFERENT tenant's waiter could take it. `notify_all` lets
-        // every waiter re-check `has_slot` so the freed permit is never stranded
-        // behind a capped-tenant waiter. Waiter counts are small (bounded by
-        // `max_waiters`), so the re-check herd is cheap.
-        self.freed.notify_all();
-    }
-}
-
-/// RAII permit: releases its admission slot (and wakes waiters) on drop, so a
-/// permit is freed even if the guarded `exec` panics.
-struct AdmissionGuard<'a> {
-    control: &'a AdmissionControl,
-    tenant: String,
-}
-
-impl Drop for AdmissionGuard<'_> {
-    fn drop(&mut self) {
-        self.control.release(&self.tenant);
-    }
-}
 
 /// Parameters for the `open_session` MCP method.
 #[derive(Debug, Clone)]
@@ -261,7 +94,7 @@ struct SessionEntry {
 /// handle; `destroy_session` is the explicit hard teardown that ignores the
 /// count.
 pub struct SandboxProvider {
-    backend: Box<dyn SandboxBackend>,
+    backend: Arc<dyn SandboxBackend>,
     sessions: Mutex<HashMap<SessionId, SessionEntry>>,
     /// Per-canonical-tenant lifecycle lock. Serializes `open_session` /
     /// `close_session` / `destroy_session` for one tenant so the refcount
@@ -272,39 +105,33 @@ pub struct SandboxProvider {
     /// entirely after (and re-opens cleanly). Keyed by
     /// [`SandboxBackend::canonical_key`], the same key the jail backend locks on.
     lifecycle: LifecycleLocks,
-    /// Per-tenant + global admission gate for `exec` (repair #4). A tenant
-    /// command pins one blocking-pool worker + one jail process for up to the
-    /// timeout ceiling; this caps how many run at once so no single tenant can
-    /// occupy every worker (per-tenant limit) and no flood can wedge the daemon
-    /// (global limit), with a bounded wait queue in between.
-    admission: AdmissionControl,
+    /// The one execution state machine used by both synchronous `exec` and the
+    /// retained `job_*` surface. It owns the fixed concurrency and retention
+    /// bounds; there is no second waiter/admission scheduler.
+    jobs: Arc<JobManager>,
 }
 
 impl SandboxProvider {
     pub fn new(backend: Box<dyn SandboxBackend>) -> Self {
-        Self::with_admission(backend, AdmissionConfig::default())
-    }
-
-    /// [`SandboxProvider::new`] with an explicit admission-control config (the
-    /// server passes operator-tuned limits; tests pass tight ones to exercise
-    /// the caps).
-    pub fn with_admission(backend: Box<dyn SandboxBackend>, admission: AdmissionConfig) -> Self {
+        let backend: Arc<dyn SandboxBackend> = Arc::from(backend);
+        let jobs = JobManager::new(backend.clone());
         SandboxProvider {
             backend,
             sessions: Mutex::new(HashMap::new()),
             lifecycle: LifecycleLocks::new(),
-            admission: AdmissionControl::new(admission),
+            jobs,
         }
     }
 
     /// MCP `open_session`: provision a sandbox and register it (or attach to an
     /// already-open one from the same tenant, sharing the backend session).
     ///
-    /// The backend maps a tenant to a stable session id, so a second endpoint
-    /// from the same tenant lands on the same id: we bump that entry's refcount
-    /// instead of re-opening. A different tenant resolving to the same id is
-    /// rejected here (provider-layer defence complementing the jail backend's
-    /// ZFS-property provenance check).
+    /// The backend maps a tenant to a stable session id, so every call first
+    /// performs its idempotent open/re-attach check. A second endpoint from the
+    /// same tenant then lands on the same registry entry and bumps its refcount.
+    /// A different tenant resolving to the same id is rejected here
+    /// (provider-layer defence complementing the jail backend's ZFS-property
+    /// provenance check).
     pub fn open_session(&self, params: OpenSessionParams) -> Result<SessionId> {
         // Serialize against a concurrent same-tenant close: hold the per-tenant
         // lifecycle lock across the backend open AND the refcount bump, so this
@@ -336,34 +163,71 @@ impl SandboxProvider {
         })
     }
 
-    /// MCP `exec`: run a command in an open session.
-    ///
-    /// Streaming/long-running commands: the current [`SandboxBackend::exec`] is
-    /// blocking and returns a whole [`ExecResult`]. Streaming will be layered in
-    /// as an MCP notification channel (chunked stdout/stderr) once the transport
-    /// is chosen — the backend trait will grow an `exec_streaming` variant then,
-    /// not before.
-    pub fn exec(&self, params: ExecParams) -> Result<ExecResult> {
-        // Resolve the owning tenant (also enforces that this provider knows the
-        // session) so admission can key the per-tenant limit on it.
+    fn request_for(params: &ExecParams) -> ExecRequest {
+        ExecRequest {
+            command: params.command.clone(),
+            cwd: params.cwd.clone(),
+            stdin: params.stdin.clone(),
+            timeout: params.timeout,
+        }
+    }
+
+    /// Register one execution while holding the same per-tenant lifecycle lock
+    /// as open/close/destroy. The session is rechecked inside the lock, so a job
+    /// can never slip in after `destroy_session` has scanned and reaped jobs.
+    fn start_job(&self, params: &ExecParams) -> Result<String> {
         let tenant = {
             let guard = self.sessions.lock().expect("sessions poisoned");
-            match guard.get(&params.session) {
-                Some(entry) => entry.tenant.label.clone(),
-                None => return Err(anyhow!("unknown session {}", params.session.as_str())),
+            guard
+                .get(&params.session)
+                .map(|entry| entry.tenant.clone())
+                .ok_or_else(|| anyhow!("unknown session {}", params.session.as_str()))?
+        };
+        let key = self.backend.canonical_key(&tenant);
+        self.lifecycle.with_lock(&key, || {
+            let guard = self.sessions.lock().expect("sessions poisoned");
+            let current = guard
+                .get(&params.session)
+                .ok_or_else(|| anyhow!("unknown session {}", params.session.as_str()))?;
+            if current.tenant.label != tenant.label {
+                return Err(anyhow!("session ownership changed while starting job"));
             }
-        };
-        // ADMISSION: hold a per-tenant + global permit for the whole exec. When
-        // the caps are full this blocks (bounded) or is rejected; the guard
-        // releases the permit on drop, including if the backend exec panics.
-        let _permit = self.admission.acquire(&tenant)?;
-        let request = ExecRequest {
-            command: params.command,
-            cwd: params.cwd,
-            stdin: params.stdin,
-            timeout: params.timeout,
-        };
-        self.backend.exec(&params.session, &request)
+            self.jobs.start(
+                tenant.label.clone(),
+                params.session.clone(),
+                Self::request_for(params),
+            )
+        })
+    }
+
+    /// MCP `exec`: run through the same job kernel as `job_exec`, wait for its
+    /// terminal state, then discard the hidden handle.
+    pub fn exec(&self, params: ExecParams) -> Result<ExecResult> {
+        let id = self.start_job(&params)?;
+        self.jobs.wait_result_and_forget(&id)
+    }
+
+    pub fn job_exec(&self, params: ExecParams) -> Result<String> {
+        if !self.backend.supports_background_jobs() {
+            return Err(anyhow!(
+                "backend '{}' does not provide proven background-job cancellation; use synchronous exec",
+                self.backend.name()
+            ));
+        }
+        self.start_job(&params)
+    }
+
+    pub fn job_poll(&self, id: &str, cursor: u64) -> Result<JobSnapshot> {
+        self.jobs.poll(id, cursor)
+    }
+
+    pub fn job_cancel(&self, id: &str) -> Result<JobState> {
+        self.jobs.cancel(id)
+    }
+
+    #[cfg(feature = "mcp-http")]
+    pub fn job_tenant(&self, id: &str) -> Option<String> {
+        self.jobs.tenant(id)
     }
 
     /// MCP `close_session`: drop one endpoint's handle on a sandbox. Both
@@ -424,8 +288,8 @@ impl SandboxProvider {
     /// opposed to `close_session`'s last-handle detach. Any other endpoints still
     /// holding the box are cut off. Destroy now takes the per-tenant lifecycle
     /// lock, so it serializes against concurrent open/close of the same box
-    /// (repair #3); draining in-flight EXECs during a destroy (a fully
-    /// transactional exec lifecycle) is still future work.
+    /// (repair #3). In-flight commands are cancelled and reaped under that same
+    /// lock before the backend is destroyed.
     pub fn destroy_session(&self, session: &SessionId) -> Result<()> {
         // Resolve the tenant to lock on the same per-tenant key as open/close, so
         // a hard teardown serializes against concurrent lifecycle ops on this
@@ -439,6 +303,11 @@ impl SandboxProvider {
         };
         let key = self.backend.canonical_key(&tenant);
         self.lifecycle.with_lock(&key, || {
+            if self.backend.supports_background_jobs() {
+                self.jobs.cancel_session_and_wait(session);
+            } else {
+                self.jobs.wait_session(session);
+            }
             self.backend.destroy_session(session)?;
             self.sessions
                 .lock()
@@ -463,6 +332,13 @@ impl SandboxProvider {
     /// Returns the number of sessions that failed to close cleanly (0 on a full
     /// teardown).
     pub fn close_all_sessions(&self) -> usize {
+        // Jobs outlive individual HTTP transport sessions, but not the provider
+        // process. Reap them before detaching/stopping their sandboxes.
+        if self.backend.supports_background_jobs() {
+            self.jobs.cancel_all_and_wait();
+        } else {
+            self.jobs.wait_all();
+        }
         // Drain the registry under the lock, then close each entry without
         // holding it (backend close can block on limactl/ssh).
         let sessions: Vec<SessionId> = {
@@ -489,6 +365,15 @@ impl SandboxProvider {
     /// down. Best-effort: session-close failures are logged by
     /// `close_all_sessions` and do not block the spin-down.
     #[cfg(feature = "mcp-http")]
+    pub fn begin_shutdown(&self) {
+        if self.backend.supports_background_jobs() {
+            self.jobs.begin_shutdown();
+        } else {
+            self.jobs.stop_accepting();
+        }
+    }
+
+    #[cfg(feature = "mcp-http")]
     pub fn shutdown(&self) -> usize {
         self.close_all_sessions();
         match self.backend.shutdown() {
@@ -498,6 +383,13 @@ impl SandboxProvider {
                 0
             }
         }
+    }
+
+    /// Register the owning transport's process-level fail-stop action. A
+    /// backend marks only loss of command-tree control as fatal; ordinary
+    /// command and transport errors remain per-job results.
+    pub fn set_fatal_handler(&self, handler: Arc<dyn Fn(String) + Send + Sync>) {
+        self.jobs.set_fatal_handler(handler);
     }
 
     /// The tenant label a live session belongs to, or `None` if this provider
@@ -530,8 +422,8 @@ impl SandboxProvider {
 //   - `tools/list`                -> the sandbox tools
 //   - `tools/call`                -> dispatch to SandboxProvider
 //
-// The tools mirror the provider verbs: `open_session`, `exec`,
-// `close_session`, `destroy_session`.
+// The tools mirror the provider verbs: session lifecycle, synchronous `exec`,
+// and the cancellable `job_exec` / `job_poll` / `job_cancel` surface.
 
 /// The newest MCP protocol version this server speaks (and the one it
 /// advertises when the client requests something it doesn't know).
@@ -659,12 +551,12 @@ impl McpServer {
     /// provider, hence the `Arc<Self>`.
     pub fn serve_stdio(
         self,
-        transport: &mut StdioTransport<
-            std::io::BufReader<std::io::Stdin>,
-            std::io::Stdout,
-        >,
+        transport: &mut StdioTransport<std::io::BufReader<std::io::Stdin>, std::io::Stdout>,
     ) -> Result<()> {
         let server = std::sync::Arc::new(self);
+        server
+            .provider
+            .set_fatal_handler(Arc::new(|_reason| std::process::exit(1)));
         let on_signal = server.clone();
         // On SIGINT/SIGTERM: close every open session, then exit. Best-effort;
         // the handler runs on ctrlc's own thread, so touching the provider's
@@ -747,6 +639,9 @@ impl McpServer {
         let outcome = match name {
             "open_session" => self.tool_open_session(args),
             "exec" => self.tool_exec(args),
+            "job_exec" => self.tool_job_exec(args),
+            "job_poll" => self.tool_job_poll(args),
+            "job_cancel" => self.tool_job_cancel(args),
             "close_session" => self.tool_close_session(args),
             "destroy_session" => self.tool_destroy_session(args),
             other => Err(anyhow!("unknown tool: {other}")),
@@ -762,43 +657,47 @@ impl McpServer {
 
     fn tool_open_session(&self, args: Value) -> Result<String> {
         let tenant = parse_tenant(&args)?;
-        let cwd = args
-            .get("cwd")
-            .and_then(Value::as_str)
-            .map(PathBuf::from);
+        let cwd = args.get("cwd").and_then(Value::as_str).map(PathBuf::from);
         let env = parse_env(&args);
-        let id = self.provider.open_session(OpenSessionParams { tenant, cwd, env })?;
+        let id = self
+            .provider
+            .open_session(OpenSessionParams { tenant, cwd, env })?;
         Ok(id.as_str().to_string())
     }
 
     fn tool_exec(&self, args: Value) -> Result<String> {
-        let session = SessionId::new(
-            args.get("session")
-                .and_then(Value::as_str)
-                .ok_or_else(|| anyhow!("exec missing 'session'"))?,
-        );
-        let command = args
-            .get("command")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("exec missing 'command'"))?
-            .to_string();
-        let cwd = args.get("cwd").and_then(Value::as_str).map(PathBuf::from);
-        let stdin = args
-            .get("stdin")
-            .and_then(Value::as_str)
-            .map(|s| s.as_bytes().to_vec());
-        let timeout = args
-            .get("timeout_ms")
-            .and_then(Value::as_u64)
-            .map(Duration::from_millis);
-        let result = self.provider.exec(ExecParams {
-            session,
-            command,
-            cwd,
-            stdin,
-            timeout,
-        })?;
+        let result = self.provider.exec(parse_exec_params(&args, "exec")?)?;
         Ok(render_exec_result(&result))
+    }
+
+    fn tool_job_exec(&self, args: Value) -> Result<String> {
+        let id = self
+            .provider
+            .job_exec(parse_exec_params(&args, "job_exec")?)?;
+        Ok(json!({
+            "job_id": id,
+            "state": "running",
+            "cursor": 0,
+        })
+        .to_string())
+    }
+
+    fn tool_job_poll(&self, args: Value) -> Result<String> {
+        let id = args
+            .get("job_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("job_poll missing 'job_id'"))?;
+        let cursor = args.get("cursor").and_then(Value::as_u64).unwrap_or(0);
+        Ok(render_job_snapshot(&self.provider.job_poll(id, cursor)?).to_string())
+    }
+
+    fn tool_job_cancel(&self, args: Value) -> Result<String> {
+        let id = args
+            .get("job_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("job_cancel missing 'job_id'"))?;
+        let state = self.provider.job_cancel(id)?;
+        Ok(json!({ "job_id": id, "state": state.as_str() }).to_string())
     }
 
     fn tool_close_session(&self, args: Value) -> Result<String> {
@@ -820,6 +719,35 @@ impl McpServer {
         self.provider.destroy_session(&session)?;
         Ok(format!("destroyed {}", session.as_str()))
     }
+}
+
+fn parse_exec_params(args: &Value, tool: &str) -> Result<ExecParams> {
+    let session = SessionId::new(
+        args.get("session")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("{tool} missing 'session'"))?,
+    );
+    let command = args
+        .get("command")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("{tool} missing 'command'"))?
+        .to_string();
+    let cwd = args.get("cwd").and_then(Value::as_str).map(PathBuf::from);
+    let stdin = args
+        .get("stdin")
+        .and_then(Value::as_str)
+        .map(|s| s.as_bytes().to_vec());
+    let timeout = args
+        .get("timeout_ms")
+        .and_then(Value::as_u64)
+        .map(Duration::from_millis);
+    Ok(ExecParams {
+        session,
+        command,
+        cwd,
+        stdin,
+        timeout,
+    })
 }
 
 /// Internal dispatch result: a JSON-RPC result, error, or a notification that
@@ -850,7 +778,7 @@ fn tool_schemas() -> Value {
         },
         {
             "name": "exec",
-            "description": "Run a shell command inside an open sandbox session (stateful cwd/env persist across calls).",
+            "description": "Run a short shell command inside an open sandbox session and wait for its terminal result. Use job_exec for long-running work.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -861,6 +789,44 @@ fn tool_schemas() -> Value {
                     "timeout_ms": { "type": "integer", "description": "Wall-clock timeout in milliseconds." }
                 },
                 "required": ["session", "command"]
+            }
+        },
+        {
+            "name": "job_exec",
+            "description": "Start a cancellable shell command and return a job id immediately. Poll incremental output with job_poll.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session": { "type": "string", "description": "Session id from open_session." },
+                    "command": { "type": "string", "description": "Shell command line (run via sh -lc)." },
+                    "cwd": { "type": "string", "description": "Per-call working directory override (guest path)." },
+                    "stdin": { "type": "string", "description": "Optional stdin, as text." },
+                    "timeout_ms": { "type": "integer", "description": "Wall-clock timeout in milliseconds." }
+                },
+                "required": ["session", "command"]
+            }
+        },
+        {
+            "name": "job_poll",
+            "description": "Read one retry-safe page of incremental stdout/stderr and job state. Advance next_cursor and continue until state is terminal and has_more is false.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "job_id": { "type": "string", "description": "Opaque id returned by job_exec." },
+                    "cursor": { "type": "integer", "minimum": 0, "description": "Chunk cursor from the previous poll; defaults to 0." }
+                },
+                "required": ["job_id"]
+            }
+        },
+        {
+            "name": "job_cancel",
+            "description": "Idempotently request cancellation of one job. Poll until its state becomes terminal.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "job_id": { "type": "string", "description": "Opaque id returned by job_exec." }
+                },
+                "required": ["job_id"]
             }
         },
         {
@@ -964,6 +930,40 @@ fn render_exec_result(result: &ExecResult) -> String {
     out
 }
 
+fn render_job_snapshot(snapshot: &JobSnapshot) -> Value {
+    let chunks: Vec<Value> = snapshot
+        .chunks
+        .iter()
+        .map(|chunk| {
+            json!({
+                "sequence": chunk.sequence,
+                "stream": match chunk.stream {
+                    ExecStream::Stdout => "stdout",
+                    ExecStream::Stderr => "stderr",
+                },
+                "text": chunk.text,
+            })
+        })
+        .collect();
+    let terminal = snapshot.terminal.as_ref().map(|terminal| {
+        json!({
+            "kind": terminal.kind(),
+            "exit_code": terminal.exit_code(),
+            "error": terminal.error(),
+        })
+    });
+    json!({
+        "job_id": snapshot.id,
+        "state": snapshot.state.as_str(),
+        "chunks": chunks,
+        "next_cursor": snapshot.next_cursor,
+        "has_more": snapshot.has_more,
+        "gap": snapshot.gap,
+        "dropped_bytes": snapshot.dropped_bytes,
+        "terminal": terminal,
+    })
+}
+
 /// Test support shared with `crate::mcp_http`: a backend that needs no Lima.
 #[cfg(test)]
 pub(crate) mod testing {
@@ -984,16 +984,25 @@ pub(crate) mod testing {
         fn name(&self) -> &'static str {
             "mock"
         }
+        fn supports_background_jobs(&self) -> bool {
+            true
+        }
         fn open_session(&self, spec: &SessionSpec) -> Result<SessionId> {
             Ok(SessionId::new(format!("mock-{}", spec.tenant.label)))
         }
-        fn exec(&self, _session: &SessionId, request: &ExecRequest) -> Result<ExecResult> {
+        fn exec(
+            &self,
+            _session: &SessionId,
+            request: &ExecRequest,
+            control: &ExecControl,
+        ) -> Result<ExecResult> {
             self.execs.fetch_add(1, Ordering::SeqCst);
+            let stdout = format!("ran: {}", request.command).into_bytes();
+            control.emit(ExecStream::Stdout, &stdout);
             Ok(ExecResult {
-                stdout: format!("ran: {}", request.command).into_bytes(),
-                stderr: Vec::new(),
+                stdout,
                 exit_code: Some(0),
-                error: None,
+                ..Default::default()
             })
         }
         fn close_session(&self, _session: &SessionId) -> Result<()> {
@@ -1047,8 +1056,8 @@ mod tests {
 
         // initialize
         assert_eq!(lines[0]["result"]["protocolVersion"], MCP_PROTOCOL_VERSION);
-        // tools/list has the four sandbox tools
-        assert_eq!(lines[1]["result"]["tools"].as_array().unwrap().len(), 4);
+        // tools/list has lifecycle, sync exec, and the cancellable job triple.
+        assert_eq!(lines[1]["result"]["tools"].as_array().unwrap().len(), 7);
         // open_session returned the mock session id
         assert_eq!(lines[2]["result"]["content"][0]["text"], "mock-alice");
         assert_eq!(lines[2]["result"]["isError"], false);
@@ -1064,8 +1073,7 @@ mod tests {
     /// enforcement) and surfaces as an `isError` tool result, not a crash.
     #[test]
     fn exec_on_unknown_session_is_error() {
-        let requests =
-            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"exec","arguments":{"session":"nope","command":"echo hi"}}}"#;
+        let requests = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"exec","arguments":{"session":"nope","command":"echo hi"}}}"#;
         let input = std::io::Cursor::new(requests.as_bytes().to_vec());
         let mut output: Vec<u8> = Vec::new();
         let provider = SandboxProvider::new(Box::new(MockBackend::default()));
@@ -1074,13 +1082,14 @@ mod tests {
             let mut transport = StdioTransport::new(input, &mut output);
             server.serve_loop(&mut transport).expect("serve");
         }
-        let line: Value =
-            serde_json::from_str(String::from_utf8(output).unwrap().trim()).unwrap();
+        let line: Value = serde_json::from_str(String::from_utf8(output).unwrap().trim()).unwrap();
         assert_eq!(line["result"]["isError"], true);
-        assert!(line["result"]["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("unknown session"));
+        assert!(
+            line["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("unknown session")
+        );
     }
 
     /// The `destroy_session` tool routes to the backend's `destroy_session`
@@ -1123,16 +1132,20 @@ mod tests {
             .collect();
         // destroy_session succeeded...
         assert_eq!(lines[1]["result"]["isError"], false);
-        assert!(lines[1]["result"]["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("destroyed mock-alice"));
+        assert!(
+            lines[1]["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("destroyed mock-alice")
+        );
         // ...and deregistered the session: the later exec is now unknown.
         assert_eq!(lines[2]["result"]["isError"], true);
-        assert!(lines[2]["result"]["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("unknown session"));
+        assert!(
+            lines[2]["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("unknown session")
+        );
     }
 
     /// MEDIUM-1 leak fix: when the transport reaches EOF with sessions still
@@ -1203,11 +1216,12 @@ mod tests {
     }
 
     /// Two `open_session`s from the SAME tenant map to ONE backend sandbox
-    /// (shared jail): the second open bumps a refcount rather than re-opening,
-    /// the first `close_session` only decrements (box still known + execable),
-    /// and the SECOND `close_session` triggers exactly ONE backend close (the
-    /// last handle detaches). This is the explicit multi-endpoint sharing
-    /// requirement — one honest connection closing must not evict another.
+    /// (shared jail): after the backend's idempotent open/re-attach check, the
+    /// second provider handle bumps the shared registry refcount. The first
+    /// `close_session` only decrements (box still known + execable), and the
+    /// SECOND `close_session` triggers exactly ONE backend close (the last
+    /// handle detaches). This is the explicit multi-endpoint sharing requirement
+    /// — one honest connection closing must not evict another.
     #[test]
     fn provider_refcounts_shared_tenant_sessions() {
         let closes = Arc::new(AtomicUsize::new(0));
@@ -1224,12 +1238,22 @@ mod tests {
 
         // First close: refcount 2 -> 1. No backend close yet; still execable.
         provider.close_session(&id1).expect("close 1");
-        assert_eq!(closes.load(Ordering::SeqCst), 0, "first close must not detach");
-        provider.exec(exec_params(&id1)).expect("still execable after first close");
+        assert_eq!(
+            closes.load(Ordering::SeqCst),
+            0,
+            "first close must not detach"
+        );
+        provider
+            .exec(exec_params(&id1))
+            .expect("still execable after first close");
 
         // Second close: refcount 1 -> 0. Exactly one backend close, now unknown.
         provider.close_session(&id1).expect("close 2");
-        assert_eq!(closes.load(Ordering::SeqCst), 1, "last close detaches exactly once");
+        assert_eq!(
+            closes.load(Ordering::SeqCst),
+            1,
+            "last close detaches exactly once"
+        );
         assert!(
             provider.exec(exec_params(&id1)).is_err(),
             "session must be unknown after the last handle leaves"
@@ -1256,7 +1280,12 @@ mod tests {
             fn open_session(&self, _spec: &SessionSpec) -> Result<SessionId> {
                 Ok(SessionId::new("shared-id"))
             }
-            fn exec(&self, _s: &SessionId, _r: &ExecRequest) -> Result<ExecResult> {
+            fn exec(
+                &self,
+                _s: &SessionId,
+                _r: &ExecRequest,
+                _control: &ExecControl,
+            ) -> Result<ExecResult> {
                 Ok(ExecResult::default())
             }
             fn close_session(&self, _s: &SessionId) -> Result<()> {
@@ -1282,7 +1311,9 @@ mod tests {
         );
 
         // Alice's session is intact and still owned by her.
-        provider.exec(exec_params(&id)).expect("alice still execable");
+        provider
+            .exec(exec_params(&id))
+            .expect("alice still execable");
     }
 
     /// `destroy_session` is the hard teardown: it tears the box down and
@@ -1328,8 +1359,8 @@ mod tests {
     /// then re-opens cleanly — so the final session is always known and execable.
     #[test]
     fn lifecycle_lock_prevents_close_open_orphan() {
-        use std::sync::mpsc;
         use std::sync::Arc;
+        use std::sync::mpsc;
 
         /// Backend whose `close_session` blocks on a channel so the test can hold
         /// a close mid-flight and drive a concurrent open into the race window.
@@ -1344,8 +1375,16 @@ mod tests {
             fn open_session(&self, spec: &SessionSpec) -> Result<SessionId> {
                 Ok(SessionId::new(format!("box-{}", spec.tenant.label)))
             }
-            fn exec(&self, _s: &SessionId, _r: &ExecRequest) -> Result<ExecResult> {
-                Ok(ExecResult { exit_code: Some(0), ..Default::default() })
+            fn exec(
+                &self,
+                _s: &SessionId,
+                _r: &ExecRequest,
+                _control: &ExecControl,
+            ) -> Result<ExecResult> {
+                Ok(ExecResult {
+                    exit_code: Some(0),
+                    ..Default::default()
+                })
             }
             fn close_session(&self, _s: &SessionId) -> Result<()> {
                 // Signal we are mid-close, then block until released — this is the
@@ -1383,7 +1422,8 @@ mod tests {
         // lock, it BLOCKS until the close finishes; give it time to try, then
         // release the close.
         let pb = provider.clone();
-        let open_thread = std::thread::spawn(move || pb.open_session(params("alice")).expect("open 2"));
+        let open_thread =
+            std::thread::spawn(move || pb.open_session(params("alice")).expect("open 2"));
         std::thread::sleep(std::time::Duration::from_millis(200));
         release_tx.send(()).expect("release close");
 
@@ -1398,79 +1438,13 @@ mod tests {
             .expect("concurrently-opened session must remain known and execable");
     }
 
-    // -- Security repair #4: admission control (per-tenant + global caps) ------
+    // -- One bounded execution state machine ---------------------------------
 
-    /// The [`AdmissionControl`] unit: the per-tenant cap, the global cap, and
-    /// the bounded wait queue, exercised directly (fast, no backend).
+    /// A tenant has one foreground mutation lane. Long work returns a handle
+    /// immediately; a second command is refused rather than parking another
+    /// blocking worker in a hidden admission queue.
     #[test]
-    fn admission_caps_are_enforced() {
-        // Global 3, per-tenant 2, no waiters allowed (reject immediately on full).
-        let ctl = AdmissionControl::new(AdmissionConfig {
-            global_limit: 3,
-            per_tenant_limit: 2,
-            max_waiters: 0,
-        });
-
-        // alice takes her 2 (the per-tenant limit)...
-        let a1 = ctl.acquire("alice").expect("a1");
-        let a2 = ctl.acquire("alice").expect("a2");
-        // ...a 3rd for alice is refused (per-tenant cap), even though a GLOBAL
-        // slot is still free — the per-tenant limit is the fairness guarantee.
-        assert!(
-            ctl.acquire("alice").is_err(),
-            "a tenant must not exceed its per-tenant cap"
-        );
-
-        // bob can still take a slot (his own per-tenant budget), filling global.
-        let b1 = ctl.acquire("bob").expect("b1");
-        // Now global is full (3/3): even a fresh tenant is refused.
-        assert!(
-            ctl.acquire("carol").is_err(),
-            "the global cap must hold across tenants"
-        );
-
-        // Releasing one frees exactly one slot.
-        drop(a1);
-        let c1 = ctl.acquire("carol").expect("a freed global slot admits carol");
-
-        drop(a2);
-        drop(b1);
-        drop(c1);
-    }
-
-    /// A blocked acquire WAITS (up to the queue bound) and is then admitted when
-    /// a permit frees — proving the queue is a bounded wait, not just a reject.
-    #[test]
-    fn admission_waits_then_admits_on_release() {
-        use std::sync::Arc;
-        let ctl = Arc::new(AdmissionControl::new(AdmissionConfig {
-            global_limit: 1,
-            per_tenant_limit: 1,
-            max_waiters: 4,
-        }));
-
-        // Hold the only slot.
-        let held = ctl.acquire("alice").expect("first");
-
-        // A second acquire on a DIFFERENT tenant must block (global is full),
-        // then succeed once we release.
-        let ctl2 = ctl.clone();
-        let waiter = std::thread::spawn(move || {
-            // This blocks until the held permit is dropped.
-            let _g = ctl2.acquire("bob").expect("admitted after release");
-        });
-        // Give the waiter time to park on the condvar, then release.
-        std::thread::sleep(std::time::Duration::from_millis(150));
-        drop(held);
-        waiter.join().expect("waiter admitted");
-    }
-
-    /// Provider-level: a single tenant cannot run more than its per-tenant exec
-    /// limit concurrently. We hold execs open with a blocking backend and prove
-    /// the (limit+1)-th same-tenant exec is refused with `max_waiters = 0`.
-    #[test]
-    fn provider_admission_bounds_one_tenant() {
-        use std::sync::Arc;
+    fn provider_rejects_second_active_command_for_tenant() {
         use std::sync::mpsc;
 
         /// Backend whose `exec` blocks until released, so a test can hold N execs
@@ -1483,14 +1457,25 @@ mod tests {
             fn name(&self) -> &'static str {
                 "blocking-exec"
             }
+            fn supports_background_jobs(&self) -> bool {
+                true
+            }
             fn open_session(&self, spec: &SessionSpec) -> Result<SessionId> {
                 Ok(SessionId::new(format!("box-{}", spec.tenant.label)))
             }
-            fn exec(&self, _s: &SessionId, _r: &ExecRequest) -> Result<ExecResult> {
+            fn exec(
+                &self,
+                _s: &SessionId,
+                _r: &ExecRequest,
+                _control: &ExecControl,
+            ) -> Result<ExecResult> {
                 let _ = self.entered.send(());
                 // Block until the test releases one unit.
                 let _ = self.release.lock().expect("poisoned").recv();
-                Ok(ExecResult { exit_code: Some(0), ..Default::default() })
+                Ok(ExecResult {
+                    exit_code: Some(0),
+                    ..Default::default()
+                })
             }
             fn close_session(&self, _s: &SessionId) -> Result<()> {
                 Ok(())
@@ -1502,51 +1487,36 @@ mod tests {
 
         let (entered_tx, entered_rx) = mpsc::channel::<()>();
         let (release_tx, release_rx) = mpsc::channel::<()>();
-        let provider = Arc::new(SandboxProvider::with_admission(
-            Box::new(BlockingExecBackend {
-                entered: entered_tx,
-                release: Mutex::new(release_rx),
-            }),
-            AdmissionConfig {
-                global_limit: 10,   // plenty of global room...
-                per_tenant_limit: 2, // ...but only 2 per tenant.
-                max_waiters: 0,      // full => reject immediately (no queue).
-            },
-        ));
+        let provider = SandboxProvider::new(Box::new(BlockingExecBackend {
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+        }));
 
         let id = provider.open_session(params("alice")).expect("open");
-
-        // Launch 2 execs that will block inside the backend, holding both of
-        // alice's per-tenant permits.
-        let mut runners = Vec::new();
-        for _ in 0..2 {
-            let p = provider.clone();
-            let id = id.clone();
-            runners.push(std::thread::spawn(move || {
-                let _ = p.exec(exec_params(&id));
-            }));
-        }
-        // Wait until BOTH are actually inside the backend (permits held).
-        entered_rx.recv().expect("exec 1 entered");
-        entered_rx.recv().expect("exec 2 entered");
-
-        // A 3rd concurrent exec for alice must be refused: per-tenant cap is full
-        // and no waiter slot exists. (Global still has 8 free — this proves the
-        // per-tenant bound, not the global one.)
+        let first = provider.job_exec(exec_params(&id)).expect("job starts");
+        entered_rx.recv().expect("job entered backend");
         let err = provider
-            .exec(exec_params(&id))
-            .expect_err("3rd same-tenant exec must be refused");
+            .job_exec(exec_params(&id))
+            .expect_err("second same-tenant job must be refused");
         assert!(err.to_string().contains("sandbox busy"), "err: {err}");
 
-        // Release both in-flight execs and join.
+        // Once terminal, the tenant lane is immediately reusable.
         release_tx.send(()).unwrap();
-        release_tx.send(()).unwrap();
-        for r in runners {
-            r.join().unwrap();
+        for _ in 0..100 {
+            if provider.job_poll(&first, 0).unwrap().state == JobState::Terminal {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
-
-        // With the permits freed, a fresh exec is admitted again.
-        release_tx.send(()).unwrap(); // pre-load one release for the final exec
-        provider.exec(exec_params(&id)).expect("exec admitted after release");
+        let second = provider.job_exec(exec_params(&id)).expect("lane reused");
+        entered_rx.recv().expect("second entered backend");
+        release_tx.send(()).unwrap();
+        for _ in 0..100 {
+            if provider.job_poll(&second, 0).unwrap().state == JobState::Terminal {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("second job did not become terminal");
     }
 }
