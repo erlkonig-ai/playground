@@ -23,7 +23,7 @@
 #                            `playground user create --backend jail` (0600).
 #   playground_mcp_binary  : path to the playground binary.
 #   playground_mcp_logfile : server stdout/stderr.
-#   playground_mcp_flags   : extra args appended to `playground mcp-http`
+#   playground_mcp_args    : extra args appended to `playground mcp-http`
 #                            (e.g. --jail-dataset-parent, --idle-timeout-secs).
 
 . /etc/rc.subr
@@ -38,7 +38,7 @@ load_rc_config $name
 : ${playground_mcp_tokens:="/var/db/playground/tokens.json"}
 : ${playground_mcp_binary:="/usr/local/bin/playground"}
 : ${playground_mcp_logfile:="/var/log/playground_mcp.log"}
-: ${playground_mcp_flags:=""}
+: ${playground_mcp_args:=""}
 
 # Keep package binaries available to any child tooling. The root-only local
 # backend itself strips its operator-facing `sudo -n` prefix before spawning.
@@ -53,7 +53,7 @@ command_args="-f -H -P ${pidfile} -o ${playground_mcp_logfile} -- \
     --backend jail --jail-local \
     --bind ${playground_mcp_bind} \
     --tokens ${playground_mcp_tokens} \
-    ${playground_mcp_flags}"
+    ${playground_mcp_args}"
 
 playground_mcp_prestart()
 {

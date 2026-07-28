@@ -12,7 +12,7 @@ playground_mcp_enable="YES"
 playground_mcp_bind="127.0.0.1:8377"
 playground_mcp_tokens="/var/db/playground/tokens.json"
 playground_mcp_logfile="/var/log/playground_mcp.log"
-playground_mcp_flags="--jail-external-rctl --jail-template-snapshot airoot/jails/playground/jails/template@base --jail-dataset-parent airoot/jails/playground/jails --jail-pile-root /var/db/playground/piles --jail-bootstrap-pile /var/db/playground/bootstrap.pile --jail-clone-refquota 10G --jail-pile-quota 50G --public-url https://mcp.bultmann.eu --oauth-state /var/db/playground/oauth.json"
+playground_mcp_args="--jail-external-rctl --jail-template-snapshot airoot/jails/playground/jails/template@base --jail-dataset-parent airoot/jails/playground/jails --jail-pile-root /var/db/playground/piles --jail-bootstrap-pile /var/db/playground/bootstrap.pile --jail-clone-refquota 10G --jail-pile-quota 50G --public-url https://mcp.bultmann.eu --oauth-state /var/db/playground/oauth.json"
 
 caddy_enable="YES"
 caddy_config="/usr/local/etc/caddy/Caddyfile"

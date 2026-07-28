@@ -161,7 +161,7 @@ sudo playground invite --tenant <label> \
 # (the long flags value pins this parent jail's delegated dataset topology).
 sudo sysrc playground_mcp_bind='127.0.0.1:8377'
 sudo sysrc playground_mcp_tokens='/var/db/playground/tokens.json'
-sudo sysrc playground_mcp_flags='--jail-external-rctl --jail-template-snapshot airoot/jails/playground/jails/template@base --jail-dataset-parent airoot/jails/playground/jails --jail-pile-root /var/db/playground/piles --jail-bootstrap-pile /var/db/playground/bootstrap.pile --jail-clone-refquota 10G --jail-pile-quota 50G --public-url https://mcp.bultmann.eu --oauth-state /var/db/playground/oauth.json'
+sudo sysrc playground_mcp_args='--jail-external-rctl --jail-template-snapshot airoot/jails/playground/jails/template@base --jail-dataset-parent airoot/jails/playground/jails --jail-pile-root /var/db/playground/piles --jail-bootstrap-pile /var/db/playground/bootstrap.pile --jail-clone-refquota 10G --jail-pile-quota 50G --public-url https://mcp.bultmann.eu --oauth-state /var/db/playground/oauth.json'
 sudo sysrc caddy_config='/usr/local/etc/caddy/Caddyfile'
 # Validate both services before enabling either public listener.
 sudo service caddy configtest
