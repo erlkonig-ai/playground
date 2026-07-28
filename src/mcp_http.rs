@@ -452,6 +452,9 @@ pub fn serve(
     config: HttpServerConfig,
 ) -> Result<()> {
     let bind = config.bind;
+    server
+        .provider()
+        .set_fatal_handler(Arc::new(|_reason| std::process::exit(1)));
     // OAuth is opt-in: a runtime (persistent state + in-memory auth codes)
     // exists exactly when it was configured, and its routes mount exactly then.
     let oauth = config
@@ -483,20 +486,12 @@ pub fn serve(
                 oauth.public_url,
             );
         }
-        // `into_make_service_with_connect_info` surfaces the peer address to
-        // handlers via `ConnectInfo`, which the OAuth registration rate-limiter
-        // keys on (per-IP token buckets). Behind a reverse proxy the peer is the
-        // proxy, so the bucket is effectively shared — still a bound, just
-        // coarser; a future refinement could read a trusted forwarded header.
         // `state` is cloned into the router so the original Arc survives the
         // serve to drive the post-shutdown spin-down below.
-        let serve_result = axum::serve(
-            listener,
-            router(state.clone()).into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .context("serve mcp-http");
+        let serve_result = axum::serve(listener, router(state.clone()))
+            .with_graceful_shutdown(shutdown_signal(state.clone()))
+            .await
+            .context("serve mcp-http");
 
         // Graceful shutdown reached (SIGINT/SIGTERM), or serve errored out:
         // spin DOWN every owned sandbox that must not outlive this process
@@ -512,7 +507,7 @@ pub fn serve(
 /// SIGTERM — so axum drains in-flight requests before `serve` returns and we
 /// spin down owned sandboxes. A hard SIGKILL cannot be caught; `playground
 /// clean` recovers that case.
-async fn shutdown_signal() {
+async fn shutdown_signal(state: Arc<HttpState>) {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
     };
@@ -531,13 +526,19 @@ async fn shutdown_signal() {
         _ = ctrl_c => {}
         _ = terminate => {}
     }
-    eprintln!("playground mcp-http: shutdown signal received — draining, then spinning down");
+    // Start cancellation before Axum drains in-flight requests. Otherwise a
+    // synchronous exec can hold graceful shutdown open until its full command
+    // timeout and invite the service supervisor to SIGKILL us first.
+    state.server.provider().begin_shutdown();
+    eprintln!("playground mcp-http: shutdown signal received — cancelling jobs, then draining");
 }
 
 fn router(state: Arc<HttpState>) -> Router {
     let mut router = Router::new().route(
         "/mcp",
-        axum::routing::post(post_mcp).get(get_mcp).delete(delete_mcp),
+        axum::routing::post(post_mcp)
+            .get(get_mcp)
+            .delete(delete_mcp),
     );
     // Discovery/registration/authorize/token endpoints exist only when OAuth
     // was configured; without it the route table is exactly the v1 surface.
@@ -548,7 +549,9 @@ fn router(state: Arc<HttpState>) -> Router {
     // rather than inheriting axum's 2 MiB `DefaultBodyLimit`. An oversized body
     // is rejected with 413 before it is buffered.
     router
-        .layer(axum::extract::DefaultBodyLimit::max(state.config.max_body_bytes))
+        .layer(axum::extract::DefaultBodyLimit::max(
+            state.config.max_body_bytes,
+        ))
         .with_state(state)
 }
 
@@ -603,19 +606,18 @@ async fn post_mcp(
     // Dispatch on the blocking pool: the provider/backends shell out
     // (limactl/ssh), and handle_request itself is cheap but synchronous.
     let dispatch_state = state.clone();
-    let response = match tokio::task::spawn_blocking(move || {
-        dispatch_state.server.handle_request(&request)
-    })
-    .await
-    {
-        Ok(response) => response,
-        Err(e) => {
-            return http_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("dispatch panicked: {e}"),
-            );
-        }
-    };
+    let response =
+        match tokio::task::spawn_blocking(move || dispatch_state.server.handle_request(&request))
+            .await
+        {
+            Ok(response) => response,
+            Err(e) => {
+                return http_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("dispatch panicked: {e}"),
+                );
+            }
+        };
 
     match response {
         // Notification (no `id`): accepted, nothing to say. Per spec, 202.
@@ -630,7 +632,9 @@ async fn post_mcp(
             if let Some(session_id) = issued_session {
                 response.headers_mut().insert(
                     "mcp-session-id",
-                    session_id.parse().expect("base64url is a valid header value"),
+                    session_id
+                        .parse()
+                        .expect("base64url is a valid header value"),
                 );
             }
             response
@@ -839,10 +843,12 @@ fn validate_session(
 ///
 /// - `open_session`: an explicit `tenant` argument must match the token's; a
 ///   missing one is filled in from it (clients need not know their label).
-/// - `exec`/`close_session`/`destroy_session`: the sandbox session named in `arguments.session`
+/// - `exec`/`job_exec`/`close_session`/`destroy_session`: the sandbox session named in `arguments.session`
 ///   must belong to the token's tenant. Unknown sessions fall through — the
 ///   provider reports those as tool errors itself, and telling a prober
 ///   "forbidden" vs "unknown" for other tenants' ids would leak liveness.
+/// - `job_poll`/`job_cancel`: the retained job id must belong to the token's
+///   tenant. Unknown/expired ids likewise fall through to the provider.
 ///
 /// Malformed calls (missing name/arguments) also fall through to dispatch,
 /// which owns the error wording.
@@ -864,7 +870,11 @@ fn enforce_tenant_scope(
             let args = request
                 .get_mut("params")
                 .and_then(|p| p.get_mut("arguments"));
-            match args.as_ref().and_then(|a| a.get("tenant")).and_then(Value::as_str) {
+            match args
+                .as_ref()
+                .and_then(|a| a.get("tenant"))
+                .and_then(Value::as_str)
+            {
                 Some(tenant) if tenant != token.tenant => Err(http_error(
                     StatusCode::FORBIDDEN,
                     &format!("token is not authorized for tenant '{tenant}'"),
@@ -878,7 +888,7 @@ fn enforce_tenant_scope(
                 }
             }
         }
-        "exec" | "close_session" | "destroy_session" => {
+        "exec" | "job_exec" | "close_session" | "destroy_session" => {
             let session = request
                 .get("params")
                 .and_then(|p| p.get("arguments"))
@@ -895,6 +905,23 @@ fn enforce_tenant_scope(
                 Some(owner) if owner != token.tenant => Err(http_error(
                     StatusCode::FORBIDDEN,
                     "session belongs to a different tenant",
+                )),
+                _ => Ok(()),
+            }
+        }
+        "job_poll" | "job_cancel" => {
+            let job_id = request
+                .get("params")
+                .and_then(|p| p.get("arguments"))
+                .and_then(|a| a.get("job_id"))
+                .and_then(Value::as_str);
+            let Some(job_id) = job_id else {
+                return Ok(());
+            };
+            match state.server.provider().job_tenant(job_id) {
+                Some(owner) if owner != token.tenant => Err(http_error(
+                    StatusCode::FORBIDDEN,
+                    "job belongs to a different tenant",
                 )),
                 _ => Ok(()),
             }
@@ -1022,16 +1049,7 @@ pub(crate) mod tests {
         let addr = listener.local_addr().expect("local addr");
         std::thread::spawn(move || {
             runtime
-                .block_on(async move {
-                    // Wire ConnectInfo so the OAuth registration handler's
-                    // per-IP rate-limiter has a peer address (all test requests
-                    // share 127.0.0.1, i.e. one bucket).
-                    axum::serve(
-                        listener,
-                        router(state).into_make_service_with_connect_info::<SocketAddr>(),
-                    )
-                    .await
-                })
+                .block_on(async move { axum::serve(listener, router(state)).await })
                 .expect("test server");
         });
         addr
@@ -1127,10 +1145,17 @@ pub(crate) mod tests {
         assert_eq!(notified.status, 202);
         assert_eq!(notified.body, Value::Null);
 
-        // tools/list: the four sandbox tools.
-        let tools = post(&agent, addr, tok, Some(&session), None, &rpc(2, "tools/list", json!({})));
+        // tools/list: lifecycle, sync exec, and the cancellable job triple.
+        let tools = post(
+            &agent,
+            addr,
+            tok,
+            Some(&session),
+            None,
+            &rpc(2, "tools/list", json!({})),
+        );
         assert_eq!(tools.status, 200);
-        assert_eq!(tools.body["result"]["tools"].as_array().unwrap().len(), 4);
+        assert_eq!(tools.body["result"]["tools"].as_array().unwrap().len(), 7);
 
         // open_session without a tenant argument: filled in from the token.
         let opened = post(
@@ -1166,6 +1191,55 @@ pub(crate) mod tests {
         let text = ran.body["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("ran: echo hi"), "exec text: {text}");
 
+        // Long work uses the same execution kernel but returns a durable job
+        // handle that survives transport reconnects.
+        let started = post(
+            &agent,
+            addr,
+            tok,
+            Some(&session),
+            None,
+            &rpc(
+                5,
+                "tools/call",
+                json!({ "name": "job_exec", "arguments": { "session": "mock-alice", "command": "build" } }),
+            ),
+        );
+        assert_eq!(started.status, 200);
+        let started_text = started.body["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap();
+        let started_json: Value = serde_json::from_str(started_text).unwrap();
+        let job_id = started_json["job_id"].as_str().unwrap();
+        let mut cursor = 0;
+        let mut job_output = String::new();
+        let polled = loop {
+            let reply = post(
+                &agent,
+                addr,
+                tok,
+                Some(&session),
+                None,
+                &rpc(
+                    6,
+                    "tools/call",
+                    json!({ "name": "job_poll", "arguments": { "job_id": job_id, "cursor": cursor } }),
+                ),
+            );
+            let text = reply.body["result"]["content"][0]["text"].as_str().unwrap();
+            let poll: Value = serde_json::from_str(text).unwrap();
+            for chunk in poll["chunks"].as_array().unwrap() {
+                job_output.push_str(chunk["text"].as_str().unwrap());
+            }
+            cursor = poll["next_cursor"].as_u64().unwrap();
+            if poll["state"] == "terminal" && poll["has_more"] == false {
+                break poll;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(polled["terminal"]["kind"], "exited");
+        assert_eq!(job_output, "ran: build");
+
         // close_session.
         let closed = post(
             &agent,
@@ -1174,7 +1248,7 @@ pub(crate) mod tests {
             Some(&session),
             None,
             &rpc(
-                5,
+                7,
                 "tools/call",
                 json!({ "name": "close_session", "arguments": { "session": "mock-alice" } }),
             ),
@@ -1191,7 +1265,14 @@ pub(crate) mod tests {
             .expect("delete");
         assert_eq!(delete.status().as_u16(), 204);
         let _ = delete.body_mut().read_to_string();
-        let gone = post(&agent, addr, tok, Some(&session), None, &rpc(6, "tools/list", json!({})));
+        let gone = post(
+            &agent,
+            addr,
+            tok,
+            Some(&session),
+            None,
+            &rpc(8, "tools/list", json!({})),
+        );
         assert_eq!(gone.status, 404);
     }
 
@@ -1231,7 +1312,14 @@ pub(crate) mod tests {
         let agent = agent();
 
         // alice initializes and opens her sandbox.
-        let alice = post(&agent, addr, Some("tok-alice"), None, None, &rpc(1, "initialize", json!({})));
+        let alice = post(
+            &agent,
+            addr,
+            Some("tok-alice"),
+            None,
+            None,
+            &rpc(1, "initialize", json!({})),
+        );
         let alice_session = alice.session.unwrap();
         let opened = post(
             &agent,
@@ -1248,8 +1336,64 @@ pub(crate) mod tests {
         assert_eq!(opened.body["result"]["content"][0]["text"], "mock-alice");
 
         // bob initializes his own MCP session...
-        let bob = post(&agent, addr, Some("tok-bob"), None, None, &rpc(1, "initialize", json!({})));
+        let bob = post(
+            &agent,
+            addr,
+            Some("tok-bob"),
+            None,
+            None,
+            &rpc(1, "initialize", json!({})),
+        );
         let bob_session = bob.session.unwrap();
+
+        // Alice's completed jobs remain tenant-scoped even after their
+        // transport request is over: a job handle is an authority-bearing
+        // object just like a sandbox session id.
+        let started = post(
+            &agent,
+            addr,
+            Some("tok-alice"),
+            Some(&alice_session),
+            None,
+            &rpc(
+                3,
+                "tools/call",
+                json!({ "name": "job_exec", "arguments": { "session": "mock-alice", "command": "private" } }),
+            ),
+        );
+        let started_text = started.body["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap();
+        let started_json: Value = serde_json::from_str(started_text).unwrap();
+        let alice_job = started_json["job_id"].as_str().unwrap();
+
+        let poll_job = post(
+            &agent,
+            addr,
+            Some("tok-bob"),
+            Some(&bob_session),
+            None,
+            &rpc(
+                4,
+                "tools/call",
+                json!({ "name": "job_poll", "arguments": { "job_id": alice_job, "cursor": 0 } }),
+            ),
+        );
+        assert_eq!(poll_job.status, 403);
+
+        let cancel_job = post(
+            &agent,
+            addr,
+            Some("tok-bob"),
+            Some(&bob_session),
+            None,
+            &rpc(
+                5,
+                "tools/call",
+                json!({ "name": "job_cancel", "arguments": { "job_id": alice_job } }),
+            ),
+        );
+        assert_eq!(cancel_job.status, 403);
 
         // ...and may not exec in alice's sandbox,
         let exec = post(
@@ -1259,7 +1403,7 @@ pub(crate) mod tests {
             Some(&bob_session),
             None,
             &rpc(
-                3,
+                6,
                 "tools/call",
                 json!({ "name": "exec", "arguments": { "session": "mock-alice", "command": "cat /pile/self.pile" } }),
             ),
@@ -1274,7 +1418,7 @@ pub(crate) mod tests {
             Some(&bob_session),
             None,
             &rpc(
-                4,
+                7,
                 "tools/call",
                 json!({ "name": "close_session", "arguments": { "session": "mock-alice" } }),
             ),
@@ -1289,7 +1433,7 @@ pub(crate) mod tests {
             Some(&bob_session),
             None,
             &rpc(
-                5,
+                8,
                 "tools/call",
                 json!({ "name": "open_session", "arguments": { "tenant": "alice", "pile_host_path": "/tmp/alice/self.pile" } }),
             ),
@@ -1303,7 +1447,7 @@ pub(crate) mod tests {
             Some("tok-bob"),
             Some(&alice_session),
             None,
-            &rpc(6, "tools/list", json!({})),
+            &rpc(9, "tools/list", json!({})),
         );
         assert_eq!(hijack.status, 403);
     }
@@ -1315,11 +1459,25 @@ pub(crate) mod tests {
         let tok = Some("tok-alice");
 
         // No Mcp-Session-Id on a non-initialize request: 400.
-        let missing = post(&agent, addr, tok, None, None, &rpc(1, "tools/list", json!({})));
+        let missing = post(
+            &agent,
+            addr,
+            tok,
+            None,
+            None,
+            &rpc(1, "tools/list", json!({})),
+        );
         assert_eq!(missing.status, 400);
 
         // A session id the server never issued: 404.
-        let bogus = post(&agent, addr, tok, Some("never-issued"), None, &rpc(2, "tools/list", json!({})));
+        let bogus = post(
+            &agent,
+            addr,
+            tok,
+            Some("never-issued"),
+            None,
+            &rpc(2, "tools/list", json!({})),
+        );
         assert_eq!(bogus.status, 404);
     }
 
@@ -1328,9 +1486,23 @@ pub(crate) mod tests {
         // Zero idle timeout: the session is already stale on its second use.
         let addr = spawn_server(test_state(vec![], Duration::ZERO));
         let agent = agent();
-        let init = post(&agent, addr, Some("tok-alice"), None, None, &rpc(1, "initialize", json!({})));
+        let init = post(
+            &agent,
+            addr,
+            Some("tok-alice"),
+            None,
+            None,
+            &rpc(1, "initialize", json!({})),
+        );
         let session = init.session.unwrap();
-        let expired = post(&agent, addr, Some("tok-alice"), Some(&session), None, &rpc(2, "tools/list", json!({})));
+        let expired = post(
+            &agent,
+            addr,
+            Some("tok-alice"),
+            Some(&session),
+            None,
+            &rpc(2, "tools/list", json!({})),
+        );
         assert_eq!(expired.status, 404);
     }
 
@@ -1344,11 +1516,25 @@ pub(crate) mod tests {
         let init = rpc(1, "initialize", json!({}));
 
         // Unlisted browser origin: rejected before auth even runs.
-        let evil = post(&agent, addr, Some("tok-alice"), None, Some("https://evil.example"), &init);
+        let evil = post(
+            &agent,
+            addr,
+            Some("tok-alice"),
+            None,
+            Some("https://evil.example"),
+            &init,
+        );
         assert_eq!(evil.status, 403);
 
         // Allowlisted origin: fine.
-        let ok = post(&agent, addr, Some("tok-alice"), None, Some("http://localhost:5173"), &init);
+        let ok = post(
+            &agent,
+            addr,
+            Some("tok-alice"),
+            None,
+            Some("http://localhost:5173"),
+            &init,
+        );
         assert_eq!(ok.status, 200);
 
         // No Origin header (plain MCP client): fine.
@@ -1361,10 +1547,7 @@ pub(crate) mod tests {
         let addr = spawn_server(test_state(vec![], Duration::from_secs(3600)));
         let agent = agent();
 
-        let mut get = agent
-            .get(format!("http://{addr}/mcp"))
-            .call()
-            .expect("get");
+        let mut get = agent.get(format!("http://{addr}/mcp")).call().expect("get");
         assert_eq!(get.status().as_u16(), 405);
         let _ = get.body_mut().read_to_string();
 
@@ -1391,7 +1574,10 @@ pub(crate) mod tests {
         let mut tokens = HashMap::new();
         tokens.insert(
             "tok-alice".to_string(),
-            TokenEntry { tenant: "alice".to_string(), backend: "mock".to_string() },
+            TokenEntry {
+                tenant: "alice".to_string(),
+                backend: "mock".to_string(),
+            },
         );
         let state = Arc::new(HttpState {
             server,
@@ -1422,10 +1608,21 @@ pub(crate) mod tests {
             None,
             &rpc(1, "initialize", json!({ "pad": big })),
         );
-        assert_eq!(reply.status, 413, "oversized body must be 413: {}", reply.body);
+        assert_eq!(
+            reply.status, 413,
+            "oversized body must be 413: {}",
+            reply.body
+        );
 
         // A small body still works (sanity: the limit is not rejecting everything).
-        let ok = post(&agent, addr, Some("tok-alice"), None, None, &rpc(2, "initialize", json!({})));
+        let ok = post(
+            &agent,
+            addr,
+            Some("tok-alice"),
+            None,
+            None,
+            &rpc(2, "initialize", json!({})),
+        );
         assert_eq!(ok.status, 200);
     }
 
@@ -1545,7 +1742,10 @@ pub(crate) mod tests {
         atomic_write_0600(&path, b"second-and-longer").unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"second-and-longer");
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "overwrite restores 0600 (no truncate-in-place)");
+        assert_eq!(
+            mode, 0o600,
+            "overwrite restores 0600 (no truncate-in-place)"
+        );
 
         // No `.tmp` sibling survives a successful write.
         let leftovers: Vec<_> = std::fs::read_dir(&dir)
@@ -1553,7 +1753,10 @@ pub(crate) mod tests {
             .filter_map(|e| e.ok())
             .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
             .collect();
-        assert!(leftovers.is_empty(), "no temp files left after a clean write");
+        assert!(
+            leftovers.is_empty(),
+            "no temp files left after a clean write"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1582,7 +1785,10 @@ pub(crate) mod tests {
         let mut store = TokenStore::default();
         store.tokens.insert(
             "tok-old".to_string(),
-            TokenEntry { tenant: "alice".to_string(), backend: "mock".to_string() },
+            TokenEntry {
+                tenant: "alice".to_string(),
+                backend: "mock".to_string(),
+            },
         );
         store.save(&path).unwrap();
 
@@ -1609,7 +1815,14 @@ pub(crate) mod tests {
         let agent = agent();
 
         // The original token works.
-        let ok = post(&agent, addr, Some("tok-old"), None, None, &rpc(1, "initialize", json!({})));
+        let ok = post(
+            &agent,
+            addr,
+            Some("tok-old"),
+            None,
+            None,
+            &rpc(1, "initialize", json!({})),
+        );
         assert_eq!(ok.status, 200, "original token accepted before reset");
 
         // Out-of-band `token reset`: rewrite the store atomically with a fresh
@@ -1620,17 +1833,40 @@ pub(crate) mod tests {
         let mut reset = TokenStore::default();
         reset.tokens.insert(
             "tok-new".to_string(),
-            TokenEntry { tenant: "alice".to_string(), backend: "mock".to_string() },
+            TokenEntry {
+                tenant: "alice".to_string(),
+                backend: "mock".to_string(),
+            },
         );
         reset.save(&path).unwrap();
 
         // WITHOUT a restart: the old token is now rejected...
-        let revoked = post(&agent, addr, Some("tok-old"), None, None, &rpc(2, "initialize", json!({})));
-        assert_eq!(revoked.status, 401, "revoked token rejected immediately, no restart");
+        let revoked = post(
+            &agent,
+            addr,
+            Some("tok-old"),
+            None,
+            None,
+            &rpc(2, "initialize", json!({})),
+        );
+        assert_eq!(
+            revoked.status, 401,
+            "revoked token rejected immediately, no restart"
+        );
 
         // ...and the freshly-minted one is accepted immediately.
-        let fresh = post(&agent, addr, Some("tok-new"), None, None, &rpc(3, "initialize", json!({})));
-        assert_eq!(fresh.status, 200, "freshly-issued token accepted immediately, no restart");
+        let fresh = post(
+            &agent,
+            addr,
+            Some("tok-new"),
+            None,
+            None,
+            &rpc(3, "initialize", json!({})),
+        );
+        assert_eq!(
+            fresh.status, 200,
+            "freshly-issued token accepted immediately, no restart"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1647,11 +1883,21 @@ pub(crate) mod tests {
         let addr = spawn_server(state.clone());
         let agent = agent();
         for i in 0..5 {
-            let init = post(&agent, addr, Some("tok-alice"), None, None, &rpc(i, "initialize", json!({})));
+            let init = post(
+                &agent,
+                addr,
+                Some("tok-alice"),
+                None,
+                None,
+                &rpc(i, "initialize", json!({})),
+            );
             assert_eq!(init.status, 200);
         }
         let live = state.sessions.lock().unwrap().len();
-        assert_eq!(live, 1, "zero-idle sweep keeps the table at a single fresh entry");
+        assert_eq!(
+            live, 1,
+            "zero-idle sweep keeps the table at a single fresh entry"
+        );
     }
 
     /// The per-tenant cap evicts a tenant's own idlest session (never another
@@ -1667,7 +1913,10 @@ pub(crate) mod tests {
         for (t, tenant) in [("tok-alice", "alice"), ("tok-bob", "bob")] {
             tokens.insert(
                 t.to_string(),
-                TokenEntry { tenant: tenant.to_string(), backend: "mock".to_string() },
+                TokenEntry {
+                    tenant: tenant.to_string(),
+                    backend: "mock".to_string(),
+                },
             );
         }
         let state = Arc::new(HttpState {
@@ -1692,7 +1941,14 @@ pub(crate) mod tests {
         // alice mints 4 sessions; the per-tenant cap of 2 keeps only her 2 newest.
         let mut alice_sessions = Vec::new();
         for i in 0..4 {
-            let init = post(&agent, addr, Some("tok-alice"), None, None, &rpc(i, "initialize", json!({})));
+            let init = post(
+                &agent,
+                addr,
+                Some("tok-alice"),
+                None,
+                None,
+                &rpc(i, "initialize", json!({})),
+            );
             assert_eq!(init.status, 200);
             alice_sessions.push(init.session.unwrap());
         }
@@ -1708,17 +1964,42 @@ pub(crate) mod tests {
         }
 
         // bob mints one (table now: alice 2 + bob 1 = 3 = global cap).
-        let bob1 = post(&agent, addr, Some("tok-bob"), None, None, &rpc(10, "initialize", json!({})));
+        let bob1 = post(
+            &agent,
+            addr,
+            Some("tok-bob"),
+            None,
+            None,
+            &rpc(10, "initialize", json!({})),
+        );
         assert_eq!(bob1.status, 200);
-        assert_eq!(state.sessions.lock().unwrap().len(), 3, "table at the global cap");
+        assert_eq!(
+            state.sessions.lock().unwrap().len(),
+            3,
+            "table at the global cap"
+        );
 
         // bob's second initialize: bob is under his per-tenant cap (1 < 2), so no
         // self-eviction happens, and the global table is full → 503. alice's
         // sessions are untouched (a tenant can't crowd others out).
-        let bob2 = post(&agent, addr, Some("tok-bob"), None, None, &rpc(11, "initialize", json!({})));
-        assert_eq!(bob2.status, 503, "global cap refuses a new session when full");
+        let bob2 = post(
+            &agent,
+            addr,
+            Some("tok-bob"),
+            None,
+            None,
+            &rpc(11, "initialize", json!({})),
+        );
+        assert_eq!(
+            bob2.status, 503,
+            "global cap refuses a new session when full"
+        );
         let sessions = state.sessions.lock().unwrap();
-        assert_eq!(sessions.values().filter(|s| s.tenant == "alice").count(), 2, "alice untouched");
+        assert_eq!(
+            sessions.values().filter(|s| s.tenant == "alice").count(),
+            2,
+            "alice untouched"
+        );
 
         let _ = std::fs::remove_dir_all(std::env::temp_dir().join("nonexistent-cleanup"));
     }

@@ -17,6 +17,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 
+mod jobs;
 mod mcp;
 #[cfg(feature = "mcp-http")]
 mod mcp_http;
@@ -280,16 +281,6 @@ struct McpHttpArgs {
     /// non-dataset pile root is skipped with a note. (repair #4 storage bound)
     #[arg(long, default_value = "50G")]
     jail_pile_quota: String,
-    /// Max `exec`s in flight across ALL tenants (the daemon bound). (repair #4)
-    #[arg(long, default_value_t = mcp::DEFAULT_GLOBAL_EXEC_LIMIT)]
-    max_concurrent_execs: usize,
-    /// Max `exec`s in flight for ONE tenant (fairness). (repair #4)
-    #[arg(long, default_value_t = mcp::DEFAULT_PER_TENANT_EXEC_LIMIT)]
-    max_concurrent_execs_per_tenant: usize,
-    /// Max `exec`s that may WAIT for a slot before admission is rejected outright
-    /// (bounded queue). (repair #4)
-    #[arg(long, default_value_t = mcp::DEFAULT_MAX_WAITERS)]
-    max_queued_execs: usize,
     /// Explicit maximum request body in bytes (states the policy rather than
     /// inheriting axum's 2 MiB default). (repair #4 HIGH follow-up)
     #[arg(long, default_value_t = mcp_http::DEFAULT_MAX_BODY_BYTES)]
@@ -690,22 +681,17 @@ fn run_mcp_http(args: McpHttpArgs) -> Result<()> {
     };
 
     // Startup reattach sweep: after a host reboot the on-disk state survives but
-    // the running contexts are gone (jail: in-kernel jail records; lima: the VMs
-    // are stopped). Bring every provisioned sandbox back up before serving so a
-    // reconnecting tenant finds its box live. Both backends implement this.
-    match backend.reattach_all() {
-        Ok(n) => eprintln!("playground mcp-http: reattached {n} persistent sandbox(es)"),
-        Err(e) => eprintln!("playground mcp-http: reattach sweep failed: {e:#}"),
-    }
+    // the running contexts are gone (jail: in-kernel jail records and dynamic
+    // RCTL rules; lima: the VMs are stopped). Bring every provisioned sandbox
+    // back up before serving so a reconnecting tenant finds its box live. This
+    // is fail-closed: listening after a partial sweep could expose a jail whose
+    // mandatory RCTL rules were not restored.
+    let reattached = backend
+        .reattach_all()
+        .context("reattach persistent sandboxes before starting HTTP service")?;
+    eprintln!("playground mcp-http: reattached {reattached} persistent sandbox(es)");
 
-    let provider = mcp::SandboxProvider::with_admission(
-        backend,
-        mcp::AdmissionConfig {
-            global_limit: args.max_concurrent_execs,
-            per_tenant_limit: args.max_concurrent_execs_per_tenant,
-            max_waiters: args.max_queued_execs,
-        },
-    );
+    let provider = mcp::SandboxProvider::new(backend);
     let server = mcp::McpServer::new(provider);
     mcp_http::serve(
         server,
@@ -844,7 +830,11 @@ fn run_user_token_show(args: UserTokenShowArgs) -> Result<()> {
         }
     }
     if !found {
-        eprintln!("no token for '{}' in {}", args.name, args.backend.tokens.display());
+        eprintln!(
+            "no token for '{}' in {}",
+            args.name,
+            args.backend.tokens.display()
+        );
     }
     Ok(())
 }
@@ -918,7 +908,11 @@ fn run_token_invite(args: TokenInviteArgs) -> Result<()> {
     };
     eprintln!(
         "minted {} invite for tenant '{}'{binding} into {} — hand it to the human authorizing a connector:",
-        if args.reusable { "reusable" } else { "single-use" },
+        if args.reusable {
+            "reusable"
+        } else {
+            "single-use"
+        },
         args.tenant,
         args.oauth_state.display(),
     );

@@ -62,8 +62,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 
-use super::proc::{DEFAULT_MAX_OUTPUT_BYTES, drive_child, drive_child_capped};
-use super::{ExecRequest, ExecResult, SandboxBackend, SessionId, SessionSpec};
+use super::proc::{DEFAULT_MAX_OUTPUT_BYTES, drive_child, drive_child_capped_controlled};
+use super::{ExecControl, ExecRequest, ExecResult, SandboxBackend, SessionId, SessionSpec};
 
 /// Default per-command timeout when an [`ExecRequest`] does not specify one.
 const DEFAULT_EXEC_TIMEOUT: Duration = Duration::from_secs(300);
@@ -176,6 +176,41 @@ impl LimaBackend {
         self.runner.run(&argv, timeout)
     }
 
+    /// Killing the local `limactl shell` transport does not prove that its
+    /// guest process died. Force-stop the VM, then restart the same persistent
+    /// disk/config so cancellation has a sandbox-wide death boundary.
+    fn reset_after_cancel(&self, instance: &str) -> std::result::Result<(), String> {
+        let stopped = self
+            .limactl(&["stop", "--force", instance], ADMIN_TIMEOUT)
+            .map_err(|error| {
+                format!(
+                    "could not guarantee sandbox-wide termination: \
+                 limactl stop --force failed: {error:#}"
+                )
+            })?;
+        if !stopped.success() {
+            return Err(format!(
+                "could not guarantee sandbox-wide termination: \
+                 limactl stop --force exited {:?}: {}",
+                stopped.exit_code,
+                stopped.stderr_lossy()
+            ));
+        }
+        let started = self
+            .limactl(&["start", instance], ADMIN_TIMEOUT)
+            .map_err(|error| {
+                format!("VM was stopped, but restarting the persistent sandbox failed: {error:#}")
+            })?;
+        if !started.success() {
+            return Err(format!(
+                "VM was stopped, but restarting the persistent sandbox exited {:?}: {}",
+                started.exit_code,
+                started.stderr_lossy()
+            ));
+        }
+        Ok(())
+    }
+
     /// `(name, status)` for every Lima instance, parsed from
     /// `limactl list --format '{{.Name}} {{.Status}}'` (one instance per line,
     /// space-separated — Lima names and statuses never contain spaces).
@@ -273,7 +308,10 @@ impl LimaBackend {
         let replacements: [(&str, &Path); 3] = [
             ("__PILE_ROOT__", pile_root),
             ("__PILE_PATH__", guest_pile.as_path()),
-            ("__VM_ROOT__", spec.cwd.as_deref().unwrap_or(Path::new("/workspace"))),
+            (
+                "__VM_ROOT__",
+                spec.cwd.as_deref().unwrap_or(Path::new("/workspace")),
+            ),
         ];
         for (token, path) in replacements {
             text = text.replace(token, &path.to_string_lossy());
@@ -354,7 +392,11 @@ impl SandboxBackend for LimaBackend {
         match found {
             // 1. Already running: hand back the same id — no start, no re-render.
             Some((_, status)) if status == "Running" => {
-                eprintln!("[{}] reusing persistent sandbox '{}'", self.name(), instance);
+                eprintln!(
+                    "[{}] reusing persistent sandbox '{}'",
+                    self.name(),
+                    instance
+                );
                 Ok(SessionId::new(instance))
             }
             // 2. Exists but stopped (host reboot / playground restart): bring it
@@ -443,11 +485,7 @@ impl SandboxBackend for LimaBackend {
             }
             match self.bring_up(&name) {
                 Ok(()) => {
-                    eprintln!(
-                        "[{}] reattached persistent sandbox '{}'",
-                        self.name(),
-                        name
-                    );
+                    eprintln!("[{}] reattached persistent sandbox '{}'", self.name(), name);
                     reattached += 1;
                 }
                 Err(e) => {
@@ -491,7 +529,12 @@ impl SandboxBackend for LimaBackend {
         Ok(stopped)
     }
 
-    fn exec(&self, session: &SessionId, request: &ExecRequest) -> Result<ExecResult> {
+    fn exec(
+        &self,
+        session: &SessionId,
+        request: &ExecRequest,
+        control: &ExecControl,
+    ) -> Result<ExecResult> {
         let instance = session.as_str();
 
         // limactl shell <instance> -- sh -lc <command>. A per-call cwd is applied
@@ -511,7 +554,11 @@ impl SandboxBackend for LimaBackend {
                 cmd.arg("--workdir").arg("/");
             }
         }
-        cmd.arg(instance).arg("--").arg("sh").arg("-lc").arg(&request.command);
+        cmd.arg(instance)
+            .arg("--")
+            .arg("sh")
+            .arg("-lc")
+            .arg(&request.command);
 
         if request.stdin.is_some() {
             cmd.stdin(Stdio::piped());
@@ -533,20 +580,27 @@ impl SandboxBackend for LimaBackend {
             .timeout
             .unwrap_or(DEFAULT_EXEC_TIMEOUT)
             .min(MAX_EXEC_TIMEOUT);
-        let out = drive_child_capped(
+        let out = drive_child_capped_controlled(
             child,
             request.stdin.clone(),
             timeout,
             DEFAULT_MAX_OUTPUT_BYTES,
+            control,
         )?;
 
         let mut result = ExecResult {
             stdout: out.stdout,
             stderr: out.stderr,
             exit_code: out.exit_code,
+            cancelled: out.cancelled,
             error: None,
         };
-        if out.timed_out {
+        if out.cancelled {
+            result.error = Some(match self.reset_after_cancel(instance) {
+                Ok(()) => "command cancelled; Lima VM stopped and restarted to reap the guest process tree".to_string(),
+                Err(error) => format!("command cancelled; {error}"),
+            });
+        } else if out.timed_out {
             result.exit_code = Some(124);
             result.error = Some(format!("command timed out after {timeout:?}"));
         } else if out.output_truncated {
@@ -709,10 +763,7 @@ mod tests {
 
     /// A `limactl list` reply naming the given `(name, status)` instances.
     fn list_reply(rows: &[(&str, &str)]) -> super::super::proc::ChildOutput {
-        let body: String = rows
-            .iter()
-            .map(|(n, s)| format!("{n} {s}\n"))
-            .collect();
+        let body: String = rows.iter().map(|(n, s)| format!("{n} {s}\n")).collect();
         ok_with_stdout(&body)
     }
 
@@ -810,6 +861,42 @@ mod tests {
         assert!(!without.contains("__FACULTIES_PATH_EXPORT__"));
     }
 
+    #[test]
+    fn cancellation_reset_force_stops_then_restarts_the_vm() {
+        let (backend, mock) = MockRunner::default().into_backend("t");
+        backend.reset_after_cancel("t-alice").expect("reset");
+        assert_eq!(
+            mock.calls(),
+            vec![
+                vec![
+                    "stop".to_string(),
+                    "--force".to_string(),
+                    "t-alice".to_string()
+                ],
+                vec!["start".to_string(), "t-alice".to_string()],
+            ]
+        );
+    }
+
+    #[test]
+    fn cancellation_reset_reports_when_sandbox_death_is_not_guaranteed() {
+        let (backend, _mock) = MockRunner::default()
+            .reply(
+                &["stop", "--force"],
+                super::super::proc::ChildOutput {
+                    exit_code: Some(1),
+                    stderr: b"stop refused".to_vec(),
+                    ..Default::default()
+                },
+            )
+            .into_backend("t");
+        let error = backend
+            .reset_after_cancel("t-alice")
+            .expect_err("stop failure must be explicit");
+        assert!(error.contains("could not guarantee sandbox-wide termination"));
+        assert!(error.contains("stop refused"));
+    }
+
     /// End-to-end regression for the pipe deadlock through a *real* Lima VM:
     /// with the old poll-then-collect exec, any command producing more than a
     /// pipe buffer (~64 KiB) of output blocked forever and surfaced as a
@@ -826,10 +913,8 @@ mod tests {
 
         // Scratch pile in a scratch dir — the Lima template mounts the pile's
         // parent directory into the guest.
-        let scratch = std::env::temp_dir().join(format!(
-            "playground-lima-pipe-test-{}",
-            std::process::id()
-        ));
+        let scratch =
+            std::env::temp_dir().join(format!("playground-lima-pipe-test-{}", std::process::id()));
         std::fs::create_dir_all(&scratch).expect("create scratch dir");
         let pile_path = scratch.join("test.pile");
         std::fs::write(&pile_path, b"").expect("create scratch pile");
@@ -849,7 +934,9 @@ mod tests {
         };
 
         // Persistent lifecycle: provision (create) first, then open (reuse).
-        backend.provision_sandbox(&spec).expect("provision lima sandbox");
+        backend
+            .provision_sandbox(&spec)
+            .expect("provision lima sandbox");
         let id = backend.open_session(&spec).expect("open lima session");
         // 256 KiB of 'a' — several pipe buffers deep.
         let req = ExecRequest {
@@ -858,7 +945,7 @@ mod tests {
             stdin: None,
             timeout: Some(Duration::from_secs(120)),
         };
-        let result = backend.exec(&id, &req);
+        let result = backend.exec(&id, &req, &ExecControl::default());
         // Tear the VM down before asserting so a failure doesn't leak it.
         // (close only detaches now — destroy is the teardown.)
         let _ = backend.destroy_session(&id);
@@ -897,7 +984,9 @@ mod tests {
         assert_eq!(id.as_str(), "t-alice");
         let calls = mock.calls();
         assert!(
-            !calls.iter().any(|c| c.first().map(String::as_str) == Some("start")),
+            !calls
+                .iter()
+                .any(|c| c.first().map(String::as_str) == Some("start")),
             "reuse must not limactl start: {calls:?}"
         );
     }
@@ -946,7 +1035,10 @@ mod tests {
             "err: {msg}"
         );
         assert!(
-            !mock.calls().iter().any(|c| c.first().map(String::as_str) == Some("start")),
+            !mock
+                .calls()
+                .iter()
+                .any(|c| c.first().map(String::as_str) == Some("start")),
             "open must not limactl start when unprovisioned"
         );
     }
@@ -958,7 +1050,9 @@ mod tests {
         let (backend, mock) = MockRunner::default()
             .reply(&["list"], list_reply(&[])) // nothing exists yet
             .into_backend("t");
-        backend.provision_sandbox(&spec("alice")).expect("provision");
+        backend
+            .provision_sandbox(&spec("alice"))
+            .expect("provision");
         let calls = mock.calls();
         let create = calls
             .iter()
@@ -969,7 +1063,10 @@ mod tests {
         assert!(create.contains(&"t-alice".to_string()));
         // The last arg is the rendered config path.
         assert!(
-            create.last().map(|p| p.ends_with("lima.yaml")).unwrap_or(false),
+            create
+                .last()
+                .map(|p| p.ends_with("lima.yaml"))
+                .unwrap_or(false),
             "create start must reference the rendered config: {create:?}"
         );
     }
@@ -981,10 +1078,14 @@ mod tests {
         let (backend, mock) = MockRunner::default()
             .reply(&["list"], list_reply(&[("t-alice", "Running")]))
             .into_backend("t");
-        backend.provision_sandbox(&spec("alice")).expect("provision");
+        backend
+            .provision_sandbox(&spec("alice"))
+            .expect("provision");
         let calls = mock.calls();
         assert!(
-            !calls.iter().any(|c| c.first().map(String::as_str) == Some("start")),
+            !calls
+                .iter()
+                .any(|c| c.first().map(String::as_str) == Some("start")),
             "idempotent provision of a running box must not start: {calls:?}"
         );
     }
@@ -996,7 +1097,9 @@ mod tests {
         let (backend, mock) = MockRunner::default()
             .reply(&["list"], list_reply(&[("t-alice", "Stopped")]))
             .into_backend("t");
-        backend.provision_sandbox(&spec("alice")).expect("provision");
+        backend
+            .provision_sandbox(&spec("alice"))
+            .expect("provision");
         let calls = mock.calls();
         let starts: Vec<_> = calls
             .iter()
@@ -1027,7 +1130,10 @@ mod tests {
             .close_session(&SessionId::new("t-alice"))
             .expect("close");
         let calls = mock.calls();
-        assert!(calls.is_empty(), "detach must issue no limactl commands: {calls:?}");
+        assert!(
+            calls.is_empty(),
+            "detach must issue no limactl commands: {calls:?}"
+        );
     }
 
     /// destroy_session stops then deletes the instance.
@@ -1039,13 +1145,17 @@ mod tests {
             .expect("destroy");
         let calls = mock.calls();
         assert!(
-            calls.iter().any(|c| c.first().map(String::as_str) == Some("stop")
-                && c.contains(&"t-alice".to_string())),
+            calls
+                .iter()
+                .any(|c| c.first().map(String::as_str) == Some("stop")
+                    && c.contains(&"t-alice".to_string())),
             "destroy must limactl stop: {calls:?}"
         );
         assert!(
-            calls.iter().any(|c| c.first().map(String::as_str) == Some("delete")
-                && c.contains(&"t-alice".to_string())),
+            calls
+                .iter()
+                .any(|c| c.first().map(String::as_str) == Some("delete")
+                    && c.contains(&"t-alice".to_string())),
             "destroy must limactl delete: {calls:?}"
         );
     }
@@ -1058,8 +1168,14 @@ mod tests {
         let err = backend
             .destroy_session(&SessionId::new("otherbox"))
             .expect_err("must refuse");
-        assert!(err.to_string().contains("outside the 't-' namespace"), "err: {err}");
-        assert!(mock.calls().is_empty(), "refusal issues no limactl commands");
+        assert!(
+            err.to_string().contains("outside the 't-' namespace"),
+            "err: {err}"
+        );
+        assert!(
+            mock.calls().is_empty(),
+            "refusal issues no limactl commands"
+        );
     }
 
     /// destroy_session fails loud when `limactl delete` fails (a failed delete
@@ -1125,9 +1241,9 @@ mod tests {
             .reply(
                 &["list"],
                 list_reply(&[
-                    ("t-alice", "Running"), // ours, up   -> stop
-                    ("t-bob", "Stopped"),   // ours, down -> skip
-                    ("otherbox", "Running"),   // foreign    -> skip
+                    ("t-alice", "Running"),  // ours, up   -> stop
+                    ("t-bob", "Stopped"),    // ours, down -> skip
+                    ("otherbox", "Running"), // foreign    -> skip
                 ]),
             )
             .into_backend("t");

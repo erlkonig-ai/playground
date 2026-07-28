@@ -54,8 +54,20 @@ use super::proc::drive_child;
 /// (rather than "everything cargo builds") so the bundle is small and the build
 /// command is a clear allow-list.
 pub const SESSION_FACULTIES: &[&str] = &[
-    "wiki", "compass", "orient", "message", "files", "teams", "memory",
-    "relations", "status", "decide", "gauge", "patience", "reason", "web",
+    "wiki",
+    "compass",
+    "orient",
+    "message",
+    "files",
+    "teams",
+    "memory",
+    "relations",
+    "status",
+    "decide",
+    "gauge",
+    "patience",
+    "reason",
+    "web",
 ];
 
 /// Timeout for the (slow) in-guest cargo build.
@@ -83,12 +95,10 @@ fn source_fingerprint(faculties_src: &Path) -> Result<String> {
     use std::collections::BTreeMap;
     let mut entries: BTreeMap<String, (u64, i64)> = BTreeMap::new();
 
-    fn visit(
-        dir: &Path,
-        root: &Path,
-        out: &mut BTreeMap<String, (u64, i64)>,
-    ) -> Result<()> {
-        for entry in std::fs::read_dir(dir).with_context(|| format!("read_dir {}", dir.display()))? {
+    fn visit(dir: &Path, root: &Path, out: &mut BTreeMap<String, (u64, i64)>) -> Result<()> {
+        for entry in
+            std::fs::read_dir(dir).with_context(|| format!("read_dir {}", dir.display()))?
+        {
             let entry = entry?;
             let path = entry.path();
             let name = entry.file_name();
@@ -208,12 +218,20 @@ fn build_bundle_in_lima(
 ) -> Result<()> {
     // Mount the workspace root (parent of the faculties crate) so the crate's
     // `../sibling` path deps resolve; build the faculties subdir within it.
-    let workspace_root = faculties_src
-        .parent()
-        .ok_or_else(|| anyhow!("faculties source '{}' has no parent", faculties_src.display()))?;
+    let workspace_root = faculties_src.parent().ok_or_else(|| {
+        anyhow!(
+            "faculties source '{}' has no parent",
+            faculties_src.display()
+        )
+    })?;
     let facdir = faculties_src
         .file_name()
-        .ok_or_else(|| anyhow!("faculties source '{}' has no dir name", faculties_src.display()))?
+        .ok_or_else(|| {
+            anyhow!(
+                "faculties source '{}' has no dir name",
+                faculties_src.display()
+            )
+        })?
         .to_string_lossy()
         .into_owned();
 
@@ -341,7 +359,10 @@ ls -la /build/release | head -40
             }
             copied += 1;
         }
-        eprintln!("[faculties] staged {copied} binaries into {}", bundle_out.display());
+        eprintln!(
+            "[faculties] staged {copied} binaries into {}",
+            bundle_out.display()
+        );
         Ok(())
     });
 
@@ -419,7 +440,10 @@ mod tests {
         assert!(!SESSION_FACULTIES.is_empty());
         let mut seen = std::collections::HashSet::new();
         for f in SESSION_FACULTIES {
-            assert!(seen.insert(*f), "duplicate faculty in SESSION_FACULTIES: {f}");
+            assert!(
+                seen.insert(*f),
+                "duplicate faculty in SESSION_FACULTIES: {f}"
+            );
         }
     }
 }

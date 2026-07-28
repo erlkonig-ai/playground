@@ -26,18 +26,21 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
+
+use super::{ExecControl, ExecStream, sandbox_control_lost};
 
 /// Poll cadence while waiting for a driven child to finish.
 pub const EXEC_POLL: Duration = Duration::from_millis(50);
 
-/// Per-stream output ceiling used by the sandbox backends: each of stdout and
-/// stderr is capped independently at this many bytes, and the child is KILLED
-/// the moment either exceeds it (see [`drive_child`]). A tenant that runs
-/// `cat /dev/zero` therefore cannot make the daemon accumulate unbounded memory
-/// upstream of any reverse-proxy response cap — the process is terminated at the
-/// cap, not merely truncated while it keeps producing. 16 MiB comfortably fits
-/// any honest command's output while bounding a single exec's memory.
+/// Grace between TERM and KILL when cancelling a dedicated process group.
+/// FreeBSD `timeout(1)` gets five seconds to reap its descendant tree, so the
+/// local backstop must be strictly longer instead of racing the same deadline.
+const CANCEL_TERM_GRACE: Duration = Duration::from_secs(7);
+
+/// Per-stream capture ceiling for direct executions. Job-managed executions
+/// stream into their own bounded ring instead, so they keep draining after old
+/// output is evicted without duplicating it here.
 pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 
 /// Captured output of one driven child, however it was transported
@@ -51,41 +54,55 @@ pub struct ChildOutput {
     /// kills (e.g. FreeBSD `timeout(1)` on a jail host) surface as
     /// `exit_code == Some(124)` instead.
     pub timed_out: bool,
-    /// True iff the child was KILLED because it exceeded the per-stream output
-    /// ceiling. The captured `stdout`/`stderr` hold exactly the bytes read up to
-    /// (and a little past) the cap; the process was terminated, not left running.
+    /// True iff a captured (non-streamed) child was KILLED because it exceeded
+    /// the per-stream output ceiling. Streamed jobs use bounded sink retention
+    /// instead and do not trip this flag merely because old output was evicted.
     pub output_truncated: bool,
+    /// True iff an [`ExecControl`] cancellation request killed this child.
+    pub cancelled: bool,
+    /// Evidence that cancellation targeted a fresh process group rather than
+    /// only the transported child and that its descendant reaper exited
+    /// naturally. A capable backend treats cancellation without this proof as
+    /// process-fatal rather than attempting another sandbox state transition.
+    pub cancelled_process_group: bool,
 }
 
 impl ChildOutput {
     pub fn success(&self) -> bool {
-        !self.timed_out && !self.output_truncated && self.exit_code == Some(0)
+        !self.timed_out && !self.output_truncated && !self.cancelled && self.exit_code == Some(0)
     }
     pub fn stderr_lossy(&self) -> String {
         String::from_utf8_lossy(&self.stderr).trim().to_string()
     }
 }
 
-/// Read from `pipe` into `buf`, stopping once `buf` reaches `cap` bytes. When
-/// the cap is hit, flip `tripped` (so the poll loop can KILL the child) and
-/// return: nothing further is read, so the pipe fills, and once the killed
-/// child's write end is closed the drain terminates. Reads in bounded chunks so
-/// a single `read` can never blow far past `cap`.
-fn read_capped(mut pipe: impl Read, cap: usize, tripped: &AtomicBool) -> Vec<u8> {
-    // Cap of 0 means "unbounded" (used where no ceiling is wanted).
-    if cap == 0 {
-        let mut buf = Vec::new();
-        let _ = pipe.read_to_end(&mut buf);
-        return buf;
-    }
+/// Drain one output pipe. A plain execution captures into `buf` and trips its
+/// produced-output ceiling. A streamed execution sends every chunk to its
+/// bounded sink without retaining a duplicate here; filling the sink's ring is
+/// therefore never a reason to stop draining or kill the command.
+fn read_capped(
+    mut pipe: impl Read,
+    cap: usize,
+    tripped: &AtomicBool,
+    control: &ExecControl,
+    stream: ExecStream,
+) -> Vec<u8> {
     let mut buf = Vec::new();
+    let capture_output = control.captures_output();
     let mut chunk = [0u8; 64 * 1024];
     loop {
         match pipe.read(&mut chunk) {
             Ok(0) => break, // EOF
             Ok(n) => {
-                buf.extend_from_slice(&chunk[..n]);
-                if buf.len() >= cap {
+                control.emit(stream, &chunk[..n]);
+                if capture_output {
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+                // Cap of 0 means "unbounded". Streamed executions retain their
+                // own bounded ring and deliberately keep draining after
+                // eviction instead of turning model polling speed into command
+                // semantics.
+                if capture_output && cap != 0 && buf.len() >= cap {
                     // Trip the kill switch and stop draining. The poll loop sees
                     // `tripped` and kills the child; the closed write end then
                     // lets the (now-unread) pipe EOF so the caller's join returns.
@@ -118,23 +135,112 @@ fn read_capped(mut pipe: impl Read, cap: usize, tripped: &AtomicBool) -> Vec<u8>
 ///
 /// Convenience wrapper with no output ceiling (`max_output_bytes = 0`), for
 /// call sites that do not run untrusted commands. The sandbox backends use
-/// [`drive_child_capped`] with [`DEFAULT_MAX_OUTPUT_BYTES`].
+/// [`drive_child_capped_controlled`] with [`DEFAULT_MAX_OUTPUT_BYTES`].
 pub fn drive_child(child: Child, stdin: Option<Vec<u8>>, timeout: Duration) -> Result<ChildOutput> {
-    drive_child_capped(child, stdin, timeout, 0)
+    drive_child_controlled(child, stdin, timeout, &ExecControl::default())
 }
 
-/// Like [`drive_child`], but caps each of stdout/stderr at `max_output_bytes`
-/// and KILLS the child the instant either stream exceeds the cap (a `0` cap
-/// means unbounded). This is the resource bound for tenant-controlled output:
-/// the process is terminated at the ceiling, not merely truncated while it keeps
-/// producing, so `cat /dev/zero` cannot make the daemon accumulate unbounded
-/// memory. On a cap kill the result carries `output_truncated = true` and the
-/// bytes read up to the cap.
-pub fn drive_child_capped(
+/// Like [`drive_child`], with cooperative cancellation and streaming output.
+pub fn drive_child_controlled(
+    child: Child,
+    stdin: Option<Vec<u8>>,
+    timeout: Duration,
+    control: &ExecControl,
+) -> Result<ChildOutput> {
+    drive_child_capped_inner(
+        child,
+        stdin,
+        timeout,
+        0,
+        control,
+        CancelTarget::Child,
+        CANCEL_TERM_GRACE,
+    )
+}
+
+/// Like [`drive_child`], but with a per-stream capture cap, cooperative
+/// cancellation, and streamed stdout/stderr chunks. Cancellation kills and
+/// reaps the transported child.
+pub fn drive_child_capped_controlled(
+    child: Child,
+    stdin: Option<Vec<u8>>,
+    timeout: Duration,
+    max_output_bytes: usize,
+    control: &ExecControl,
+) -> Result<ChildOutput> {
+    drive_child_capped_inner(
+        child,
+        stdin,
+        timeout,
+        max_output_bytes,
+        control,
+        CancelTarget::Child,
+        CANCEL_TERM_GRACE,
+    )
+}
+
+/// Controlled child driver for a command configured as the leader of a fresh
+/// host process group. Cancellation sends TERM to that group, waits seven
+/// seconds for a descendant reaper such as FreeBSD `timeout(1)`, then sends
+/// KILL to the group if the leader has not exited. Once the reaper must be
+/// force-killed, descendant cleanup is no longer provable: return a typed fatal
+/// error immediately instead of waiting on a possibly stuck leader or pipe.
+pub fn drive_child_capped_controlled_process_group(
+    child: Child,
+    stdin: Option<Vec<u8>>,
+    timeout: Duration,
+    max_output_bytes: usize,
+    control: &ExecControl,
+) -> Result<ChildOutput> {
+    drive_child_capped_inner(
+        child,
+        stdin,
+        timeout,
+        max_output_bytes,
+        control,
+        CancelTarget::ProcessGroup,
+        CANCEL_TERM_GRACE,
+    )
+    .map_err(|error| sandbox_control_lost(format!("{error:#}")))
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CancelTarget {
+    Child,
+    ProcessGroup,
+}
+
+#[cfg(unix)]
+fn signal_process_group(process_group: u32, signal: i32) -> std::io::Result<()> {
+    let process_group =
+        i32::try_from(process_group).map_err(|_| std::io::Error::other("child pid exceeds i32"))?;
+    unsafe extern "C" {
+        fn kill(pid: i32, signal: i32) -> i32;
+    }
+    // A negative pid addresses the process group whose id is `-pid`.
+    if unsafe { kill(-process_group, signal) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(unix))]
+fn signal_process_group(_process_group: u32, _signal: i32) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "process-group cancellation requires Unix",
+    ))
+}
+
+fn drive_child_capped_inner(
     mut child: Child,
     stdin: Option<Vec<u8>>,
     timeout: Duration,
     max_output_bytes: usize,
+    control: &ExecControl,
+    cancel_target: CancelTarget,
+    cancel_term_grace: Duration,
 ) -> Result<ChildOutput> {
     let stdin_thread = match (stdin, child.stdin.take()) {
         (Some(bytes), Some(mut handle)) => Some(std::thread::spawn(move || {
@@ -151,29 +257,130 @@ pub fn drive_child_capped(
 
     let out_thread = child.stdout.take().map(|pipe| {
         let tripped = tripped.clone();
-        std::thread::spawn(move || read_capped(pipe, max_output_bytes, &tripped))
+        let control = control.clone();
+        std::thread::spawn(move || {
+            read_capped(
+                pipe,
+                max_output_bytes,
+                &tripped,
+                &control,
+                ExecStream::Stdout,
+            )
+        })
     });
     let err_thread = child.stderr.take().map(|pipe| {
         let tripped = tripped.clone();
-        std::thread::spawn(move || read_capped(pipe, max_output_bytes, &tripped))
+        let control = control.clone();
+        std::thread::spawn(move || {
+            read_capped(
+                pipe,
+                max_output_bytes,
+                &tripped,
+                &control,
+                ExecStream::Stderr,
+            )
+        })
     });
 
     let deadline = Instant::now() + timeout;
     let mut timed_out = false;
     let mut output_truncated = false;
-    let status = loop {
+    let mut cancelled = false;
+    let mut cancelled_process_group = false;
+    let status = 'wait: loop {
         match child.try_wait().context("wait on sandbox child")? {
             Some(status) => break status,
             None => {
+                if control.is_cancelled() {
+                    if matches!(cancel_target, CancelTarget::ProcessGroup) {
+                        if signal_process_group(child.id(), 15).is_ok() {
+                            cancelled = true;
+                            let kill_deadline = Instant::now() + cancel_term_grace;
+                            loop {
+                                if let Some(status) = child
+                                    .try_wait()
+                                    .context("wait on cancelled process-group leader")?
+                                {
+                                    // The FreeBSD timeout(1) leader exits only
+                                    // after its PROC_REAP subtree is empty. A
+                                    // natural leader exit is therefore proof;
+                                    // merely delivering TERM is not.
+                                    cancelled_process_group = true;
+                                    break 'wait status;
+                                }
+                                if Instant::now() >= kill_deadline {
+                                    // Killing the reaper destroys the proof that
+                                    // escaped descendants are gone. Best-effort
+                                    // KILL, then fail immediately; process exit
+                                    // will reap the leader and an operator owns
+                                    // recovery of the still-live jail.
+                                    let _ = signal_process_group(child.id(), 9);
+                                    let _ = child.kill();
+                                    return Err(anyhow!(
+                                        "descendant reaper did not finish cancellation within {cancel_term_grace:?}"
+                                    ));
+                                }
+                                std::thread::sleep(EXEC_POLL);
+                            }
+                        }
+
+                        // TERM may lose a race with natural completion. Give
+                        // that completion priority; otherwise kill the leader
+                        // best-effort and revoke the daemon's execution authority.
+                        if let Some(status) = child
+                            .try_wait()
+                            .context("recheck process-group leader after TERM failure")?
+                        {
+                            break 'wait status;
+                        }
+                        let _ = child.kill();
+                        return Err(anyhow!(
+                            "could not signal the command process group; descendant cleanup is unproven"
+                        ));
+                    }
+
+                    // A child-only transport has no descendant-tree proof. If
+                    // it already completed, natural completion wins; otherwise
+                    // a successful kill is the cancellation linearization.
+                    if let Some(status) = child
+                        .try_wait()
+                        .context("recheck sandbox child before cancellation")?
+                    {
+                        break status;
+                    }
+                    child.kill().context("kill cancelled sandbox child")?;
+                    cancelled = true;
+                    break child.wait().context("reap cancelled sandbox child")?;
+                }
                 // Output ceiling breached: kill the child NOW so it stops
                 // producing (rather than truncating the buffer while it runs on).
                 if tripped.load(Ordering::SeqCst) {
                     output_truncated = true;
+                    if matches!(cancel_target, CancelTarget::ProcessGroup) {
+                        // This is the LocalRunner/reaper path. A descendant may
+                        // have escaped the wrapper's process group while retaining
+                        // one of its pipes. Kill best-effort and fail immediately;
+                        // joining either the leader or drains could hang forever.
+                        let _ = signal_process_group(child.id(), 9);
+                        let _ = child.kill();
+                        return Err(anyhow!(
+                            "process-group output ceiling required killing the descendant reaper"
+                        ));
+                    }
                     let _ = child.kill();
                     break child.wait().context("reap output-capped sandbox child")?;
                 }
                 if Instant::now() >= deadline {
                     timed_out = true;
+                    if matches!(cancel_target, CancelTarget::ProcessGroup) {
+                        // A failed/hung descendant reaper cannot be the thing
+                        // whose exit or pipe EOF we synchronously await.
+                        let _ = signal_process_group(child.id(), 9);
+                        let _ = child.kill();
+                        return Err(anyhow!(
+                            "local execution watchdog expired before the descendant reaper exited"
+                        ));
+                    }
                     let _ = child.kill();
                     break child.wait().context("reap killed sandbox child")?;
                 }
@@ -187,8 +394,12 @@ pub fn drive_child_capped(
     if let Some(t) = stdin_thread {
         let _ = t.join();
     }
-    let stdout = out_thread.map(|t| t.join().unwrap_or_default()).unwrap_or_default();
-    let stderr = err_thread.map(|t| t.join().unwrap_or_default()).unwrap_or_default();
+    let stdout = out_thread
+        .map(|t| t.join().unwrap_or_default())
+        .unwrap_or_default();
+    let stderr = err_thread
+        .map(|t| t.join().unwrap_or_default())
+        .unwrap_or_default();
     // A cap trip may only be observed by a drain thread AFTER the poll loop
     // already saw the child exit on its own (a fast finisher). Fold that in so
     // the flag reflects "the cap was exceeded" regardless of which raced first.
@@ -199,6 +410,8 @@ pub fn drive_child_capped(
         exit_code: status.code(),
         timed_out,
         output_truncated,
+        cancelled,
+        cancelled_process_group,
     })
 }
 
@@ -206,10 +419,16 @@ pub fn drive_child_capped(
 mod tests {
     use super::*;
     use std::process::{Command, Stdio};
+    use std::sync::Mutex;
 
     /// Comfortably past any OS pipe buffer (64 KiB is the classic size;
     /// macOS can grow to 128 KiB under pressure).
     const BIG: usize = 1024 * 1024;
+
+    #[cfg(unix)]
+    const ESCAPED_HOLDER_PID_FILE: &str = "PLAYGROUND_ESCAPED_HOLDER_PID_FILE";
+    #[cfg(unix)]
+    const ESCAPED_HOLDER_MODE: &str = "PLAYGROUND_ESCAPED_HOLDER_MODE";
 
     fn sh(script: &str) -> Command {
         let mut cmd = Command::new("/bin/sh");
@@ -218,6 +437,157 @@ mod tests {
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
         cmd
+    }
+
+    /// Subprocess helper for
+    /// [`process_group_hard_kills_fail_without_joining_escaped_pipe_holders`].
+    ///
+    /// The parent test starts this test binary underneath a driven shell. This
+    /// helper then creates a new session, escaping the shell's process group,
+    /// while deliberately retaining the inherited stdout/stderr pipes. In a
+    /// normal test-harness run the marker variable is absent and this is a no-op.
+    #[cfg(unix)]
+    #[test]
+    fn escaped_pipe_holder_process() {
+        let Some(pid_file) = std::env::var_os(ESCAPED_HOLDER_PID_FILE) else {
+            return;
+        };
+
+        unsafe extern "C" {
+            fn setsid() -> i32;
+        }
+        let session = unsafe { setsid() };
+        assert_ne!(
+            session,
+            -1,
+            "escaped pipe-holder helper must create a fresh session: {}",
+            std::io::Error::last_os_error()
+        );
+        std::fs::write(&pid_file, std::process::id().to_string())
+            .expect("publish escaped pipe-holder pid");
+
+        if std::env::var(ESCAPED_HOLDER_MODE).as_deref() == Ok("spam") {
+            use std::io::Write;
+            let mut stdout = std::io::stdout().lock();
+            let chunk = [b'x'; 16 * 1024];
+            while stdout.write_all(&chunk).is_ok() {}
+        }
+
+        // Long enough that the old synchronous drain joins make the regression
+        // visibly fail, yet bounded so a failing test cannot leak indefinitely.
+        std::thread::sleep(Duration::from_secs(5));
+    }
+
+    #[cfg(unix)]
+    fn shell_quote_for_test(value: &str) -> String {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+
+    /// PID guard for an escaped grandchild. Once its driven shell is killed it
+    /// is adopted by the OS reaper, so cleanup sends KILL and waits until pid 0
+    /// probing reports that the reaper has collected it.
+    #[cfg(unix)]
+    struct EscapedHolder {
+        pid: i32,
+        pid_file: std::path::PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl EscapedHolder {
+        fn signal(&self, signal: i32) -> std::io::Result<()> {
+            unsafe extern "C" {
+                fn kill(pid: i32, signal: i32) -> i32;
+            }
+            if unsafe { kill(self.pid, signal) } == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        }
+
+        fn terminate_and_wait_for_reap(&mut self) {
+            let _ = self.signal(9);
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while Instant::now() < deadline {
+                if self.signal(0).is_err() {
+                    self.pid = 0;
+                    let _ = std::fs::remove_file(&self.pid_file);
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            panic!("escaped pipe-holder pid {} was not reaped", self.pid);
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for EscapedHolder {
+        fn drop(&mut self) {
+            if self.pid > 0 {
+                let _ = self.signal(9);
+            }
+            let _ = std::fs::remove_file(&self.pid_file);
+        }
+    }
+
+    #[cfg(unix)]
+    fn spawn_escaped_pipe_holder(mode: &str) -> (Child, EscapedHolder) {
+        use std::os::unix::process::CommandExt;
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let pid_file = std::env::temp_dir().join(format!(
+            "playground-escaped-holder-{}-{nonce}.pid",
+            std::process::id()
+        ));
+        let executable = std::env::current_exe().expect("current test executable");
+        let script = format!(
+            "{} escaped_pipe_holder_process --nocapture & helper=$!; wait \"$helper\"",
+            shell_quote_for_test(&executable.to_string_lossy())
+        );
+        let mut command = sh(&script);
+        command.env(ESCAPED_HOLDER_PID_FILE, &pid_file);
+        command.env(ESCAPED_HOLDER_MODE, mode);
+        command.process_group(0);
+        let mut child = command.spawn().expect("spawn escaped pipe-holder shell");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let pid = loop {
+            if let Ok(contents) = std::fs::read_to_string(&pid_file)
+                && let Ok(pid) = contents.trim().parse::<i32>()
+            {
+                break pid;
+            }
+            if let Some(status) = child.try_wait().expect("poll helper shell") {
+                panic!("escaped pipe-holder helper exited before publishing pid: {status}");
+            }
+            if Instant::now() >= deadline {
+                let _ = signal_process_group(child.id(), 9);
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("escaped pipe-holder helper did not publish its pid");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+
+        (child, EscapedHolder { pid, pid_file })
+    }
+
+    fn drive_capped(
+        child: Child,
+        stdin: Option<Vec<u8>>,
+        timeout: Duration,
+        max_output_bytes: usize,
+    ) -> Result<ChildOutput> {
+        drive_child_capped_controlled(
+            child,
+            stdin,
+            timeout,
+            max_output_bytes,
+            &ExecControl::default(),
+        )
     }
 
     #[test]
@@ -238,10 +608,8 @@ mod tests {
         // Second dd: `1>&2` first (dup the stderr *pipe* into fd 1), then
         // `2>/dev/null` for dd's own diagnostics — the reverse order would
         // send the payload to /dev/null.
-        let child = sh(
-            "dd if=/dev/zero bs=1024 count=1024 2>/dev/null; \
-             dd if=/dev/zero bs=1024 count=1024 1>&2 2>/dev/null",
-        )
+        let child = sh("dd if=/dev/zero bs=1024 count=1024 2>/dev/null; \
+             dd if=/dev/zero bs=1024 count=1024 1>&2 2>/dev/null")
         .spawn()
         .expect("spawn");
         let out = drive_child(child, None, Duration::from_secs(30)).expect("drive");
@@ -309,13 +677,16 @@ mod tests {
         let cap = 256 * 1024;
         let child = sh("yes AAAAAAAA").spawn().expect("spawn");
         let start = Instant::now();
-        let out = drive_child_capped(child, None, Duration::from_secs(30), cap).expect("drive");
+        let out = drive_capped(child, None, Duration::from_secs(30), cap).expect("drive");
         assert!(out.output_truncated, "cap breach must be signalled");
         assert!(!out.success(), "an output-capped run is not a success");
         assert!(!out.timed_out, "the cap kill, not the timeout, fired");
         // Captured up to the cap plus at most one 64 KiB chunk of slack.
         assert!(out.stdout.len() >= cap, "captured at least the cap");
-        assert!(out.stdout.len() < cap + 128 * 1024, "did not run far past the cap");
+        assert!(
+            out.stdout.len() < cap + 128 * 1024,
+            "did not run far past the cap"
+        );
         assert!(
             start.elapsed() < Duration::from_secs(10),
             "the process must be KILLED at the cap, not left to run to the timeout"
@@ -326,7 +697,7 @@ mod tests {
     fn output_cap_on_stderr_also_kills() {
         let cap = 256 * 1024;
         let child = sh("yes BBBBBBBB 1>&2").spawn().expect("spawn");
-        let out = drive_child_capped(child, None, Duration::from_secs(30), cap).expect("drive");
+        let out = drive_capped(child, None, Duration::from_secs(30), cap).expect("drive");
         assert!(out.output_truncated);
         assert!(out.stderr.len() >= cap);
     }
@@ -336,10 +707,187 @@ mod tests {
         // A command whose output is comfortably under the ceiling completes
         // normally, with no truncation flag.
         let child = sh("printf 'small output\\n'").spawn().expect("spawn");
-        let out = drive_child_capped(child, None, Duration::from_secs(10), 1024 * 1024)
-            .expect("drive");
+        let out = drive_capped(child, None, Duration::from_secs(10), 1024 * 1024).expect("drive");
         assert!(!out.output_truncated);
         assert!(out.success());
         assert_eq!(out.stdout, b"small output\n");
+    }
+
+    #[derive(Default)]
+    struct CollectSink {
+        stdout: Mutex<Vec<u8>>,
+        stderr: Mutex<Vec<u8>>,
+    }
+
+    impl super::super::ExecOutputSink for CollectSink {
+        fn on_output(&self, stream: ExecStream, chunk: &[u8]) {
+            let target = match stream {
+                ExecStream::Stdout => &self.stdout,
+                ExecStream::Stderr => &self.stderr,
+            };
+            target.lock().unwrap().extend_from_slice(chunk);
+        }
+    }
+
+    #[test]
+    fn emits_stdout_and_stderr_while_draining() {
+        let sink = Arc::new(CollectSink::default());
+        let control = ExecControl::with_output_sink(sink.clone());
+        let child = sh("printf hello; printf warning >&2")
+            .spawn()
+            .expect("spawn");
+        let out =
+            drive_child_controlled(child, None, Duration::from_secs(10), &control).expect("drive");
+        assert!(out.success());
+        assert_eq!(*sink.stdout.lock().unwrap(), b"hello");
+        assert_eq!(*sink.stderr.lock().unwrap(), b"warning");
+        assert!(out.stdout.is_empty(), "streamed output is not duplicated");
+        assert!(out.stderr.is_empty(), "streamed output is not duplicated");
+    }
+
+    #[test]
+    fn streamed_output_keeps_draining_past_the_capture_cap() {
+        let sink = Arc::new(CollectSink::default());
+        let control = ExecControl::with_output_sink(sink.clone());
+        let child = sh("dd if=/dev/zero bs=1024 count=256 2>/dev/null")
+            .spawn()
+            .expect("spawn");
+        let out = drive_child_capped_controlled(
+            child,
+            None,
+            Duration::from_secs(10),
+            64 * 1024,
+            &control,
+        )
+        .expect("drive");
+        assert!(out.success());
+        assert!(!out.output_truncated);
+        assert_eq!(sink.stdout.lock().unwrap().len(), 256 * 1024);
+        assert!(out.stdout.is_empty());
+    }
+
+    #[test]
+    fn cancellation_promptly_kills_and_reaps_the_child() {
+        let control = ExecControl::default();
+        let canceller = control.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            canceller.cancel();
+        });
+        let child = sh("printf ready; exec sleep 30").spawn().expect("spawn");
+        let start = Instant::now();
+        let out =
+            drive_child_controlled(child, None, Duration::from_secs(30), &control).expect("drive");
+        assert!(out.cancelled);
+        assert!(!out.cancelled_process_group);
+        assert!(!out.success());
+        assert_eq!(out.stdout, b"ready");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "cancel must not wait for the command timeout"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_group_cancellation_reports_job_scoped_evidence() {
+        use std::os::unix::process::CommandExt;
+
+        let control = ExecControl::default();
+        let canceller = control.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            canceller.cancel();
+        });
+        let mut command = sh("trap 'exit 0' TERM; while :; do sleep 1; done");
+        command.process_group(0);
+        let child = command.spawn().expect("spawn");
+        let out = drive_child_capped_controlled_process_group(
+            child,
+            None,
+            Duration::from_secs(30),
+            1024 * 1024,
+            &control,
+        )
+        .expect("drive");
+        assert!(out.cancelled);
+        assert!(out.cancelled_process_group);
+        assert!(!out.success());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn forced_group_kill_fails_without_waiting_on_the_reaper() {
+        use std::os::unix::process::CommandExt;
+
+        let control = ExecControl::default();
+        let canceller = control.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            canceller.cancel();
+        });
+        let mut command = sh("trap '' TERM; while :; do sleep 1; done");
+        command.process_group(0);
+        let child = command.spawn().expect("spawn");
+        let start = Instant::now();
+        let error = drive_child_capped_inner(
+            child,
+            None,
+            Duration::from_secs(30),
+            1024 * 1024,
+            &control,
+            CancelTarget::ProcessGroup,
+            Duration::from_millis(100),
+        )
+        .expect_err("forced reaper kill must revoke execution authority");
+        assert!(error.to_string().contains("descendant reaper"), "{error:#}");
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_group_hard_kills_fail_without_joining_escaped_pipe_holders() {
+        // Timeout path: the helper has called setsid(), so killing the driven
+        // shell's process group cannot close the stdout/stderr descriptors it
+        // inherited. The driver must return a fatal error rather than joining
+        // those drains first.
+        let (child, mut holder) = spawn_escaped_pipe_holder("sleep");
+        let start = Instant::now();
+        let error = drive_child_capped_controlled_process_group(
+            child,
+            None,
+            Duration::from_millis(100),
+            1024 * 1024,
+            &ExecControl::default(),
+        )
+        .expect_err("timed-out process group must lose execution authority");
+        assert!(crate::sandbox::is_sandbox_control_lost(&error));
+        assert!(error.to_string().contains("watchdog"), "{error:#}");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "timeout path joined a pipe held by an escaped descendant"
+        );
+        holder.terminate_and_wait_for_reap();
+
+        // Captured-output cap path: after filling stdout, the escaped helper
+        // keeps both descriptors open for five seconds. This must use the same
+        // fail-without-joining behavior as the timeout hard kill.
+        let (child, mut holder) = spawn_escaped_pipe_holder("spam");
+        let start = Instant::now();
+        let error = drive_child_capped_controlled_process_group(
+            child,
+            None,
+            Duration::from_secs(30),
+            32 * 1024,
+            &ExecControl::default(),
+        )
+        .expect_err("output-capped process group must lose execution authority");
+        assert!(crate::sandbox::is_sandbox_control_lost(&error));
+        assert!(error.to_string().contains("output ceiling"), "{error:#}");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "output-cap path joined a pipe held by an escaped descendant"
+        );
+        holder.terminate_and_wait_for_reap();
     }
 }
