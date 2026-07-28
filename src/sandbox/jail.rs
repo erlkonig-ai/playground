@@ -1035,6 +1035,54 @@ fi
     /// the pile target).
     const PILE_FSTYPE: &'static str = "nullfs";
 
+    /// Parse one FreeBSD `mount(8)` line into `(source, target, fstype)`.
+    /// All paths this backend creates are whitespace-safe, so the literal
+    /// delimiters emitted by mount(8) are unambiguous here.
+    fn mount_line_parts(line: &str) -> Option<(&str, &str, &str)> {
+        let (source, rest) = line.split_once(" on ")?;
+        let (target, tail) = rest.split_once(" (")?;
+        let fstype = tail.split([',', ')']).next()?.trim();
+        Some((source.trim(), target.trim(), fstype))
+    }
+
+    /// True iff a `mount(8)` listing shows the exact intended tuple.
+    fn mount_listing_has_exact_fstype(
+        listing: &str,
+        source: &str,
+        target: &str,
+        fstype: &str,
+    ) -> bool {
+        listing.lines().any(|line| {
+            Self::mount_line_parts(line)
+                .map(|(src, tgt, fs)| src == source && tgt == target && fs == fstype)
+                .unwrap_or(false)
+        })
+    }
+
+    /// Return whether `target` has exactly the intended mount, or is absent.
+    /// Any wrong or duplicate occupant is ambiguous authority and fails closed.
+    fn exact_mount_or_absent(
+        listing: &str,
+        source: &str,
+        target: &str,
+        fstype: &str,
+    ) -> Result<bool> {
+        let occupants: Vec<_> = listing
+            .lines()
+            .filter(|line| Self::line_target_is(line, target))
+            .collect();
+        match occupants.as_slice() {
+            [] => Ok(false),
+            [_] if Self::mount_listing_has_exact_fstype(listing, source, target, fstype) => {
+                Ok(true)
+            }
+            _ => bail!(
+                "mount target {target} has {} occupant(s), not exactly one ({source}, {target}, {fstype})",
+                occupants.len()
+            ),
+        }
+    }
+
     /// True iff a `mount(8)` listing already shows EXACTLY the intended mount:
     /// `<host_file> on <target> (nullfs, …)`. Parses each line in the FreeBSD
     /// shape `"<src> on <TARGET> (<fstype>, <opts>)"` and requires all three of
@@ -1044,30 +1092,7 @@ fi
     /// validation the reattach path needs before it trusts a reused jail's pile
     /// mount instead of blindly starting the jail.
     fn mount_listing_has_exact(listing: &str, host_file: &str, target: &str) -> bool {
-        listing.lines().any(|line| {
-            // Split on the literal " on " that FreeBSD `mount` prints between
-            // source and target. rsplit-once would misparse a source containing
-            // " on ", but our sources are pile paths, so split_once is safe and
-            // simplest; guard the source match to the exact prefix anyway.
-            let Some((src, rest)) = line.split_once(" on ") else {
-                return false;
-            };
-            if src.trim() != host_file {
-                return false;
-            }
-            // `rest` is "<TARGET> (<fstype>, <opts>)". The target is everything
-            // up to the " (" that opens the fstype group; take it as a whole so
-            // `/pile/self.pile` never matches a substring of another path.
-            let Some((tgt, tail)) = rest.split_once(" (") else {
-                return false;
-            };
-            tgt.trim() == target
-                && tail
-                    .split([',', ')'])
-                    .next()
-                    .map(|fs| fs.trim() == Self::PILE_FSTYPE)
-                    .unwrap_or(false)
-        })
+        Self::mount_listing_has_exact_fstype(listing, host_file, target, Self::PILE_FSTYPE)
     }
 
     /// Read the current `mount(8)` listing, failing CLOSED if the command itself
@@ -1079,6 +1104,88 @@ fi
             bail!("`mount` failed: {}", out.stderr_lossy());
         }
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    /// Resolve the target token mount(8) uses for this exact ZFS dataset. On a
+    /// physical host this equals `zfs get mountpoint`. Inside a nested jail with
+    /// `enforce_statfs=0`, ZFS returns the jail-local path while mount(8)
+    /// exposes the physical/global path. devfs entries use that global spelling,
+    /// so deriving it from the dataset's exact source tuple avoids suffix or
+    /// guessed-prefix matching.
+    fn reported_dataset_mountpoint(&self, listing: &str, dataset: &str) -> Result<String> {
+        let targets: Vec<&str> = listing
+            .lines()
+            .filter_map(Self::mount_line_parts)
+            .filter_map(|(source, target, fstype)| {
+                (source == dataset && fstype == "zfs").then_some(target)
+            })
+            .collect();
+        match targets.as_slice() {
+            [target] if target.starts_with('/') => Ok((*target).to_string()),
+            [] => bail!(
+                "mount table has no exact zfs entry for dataset {dataset} (cannot verify devfs target)"
+            ),
+            _ => bail!(
+                "mount table has {} zfs entries for dataset {dataset} (expected exactly one; refusing ambiguous devfs target)",
+                targets.len()
+            ),
+        }
+    }
+
+    /// Ensure the jail's devfs exists exactly once. Mount commands use the
+    /// jail-local `root`, while `mount(8)` may report the corresponding physical
+    /// target when this backend runs in a nested jail with `enforce_statfs=0`.
+    /// Derive that spelling from the dataset's exact ZFS row; never guess a
+    /// prefix or retry a mount whose state we cannot identify.
+    fn ensure_devfs_mount(&self, dataset: &str, root: &str) -> Result<()> {
+        let command_target = format!("{root}/dev");
+        let mkdir = self.run(
+            &["sudo", "-n", "mkdir", "-p", &command_target],
+            None,
+            ADMIN_TIMEOUT,
+        )?;
+        if !mkdir.success() {
+            bail!(
+                "mkdir devfs target {command_target} failed: {}",
+                mkdir.stderr_lossy()
+            );
+        }
+
+        let before = self.mount_listing()?;
+        let reported_root = self.reported_dataset_mountpoint(&before, dataset)?;
+        let listed_target = format!("{reported_root}/dev");
+        if Self::exact_mount_or_absent(&before, "devfs", &listed_target, "devfs")? {
+            return Ok(());
+        }
+
+        let mounted = self.run(
+            &[
+                "sudo",
+                "-n",
+                "mount",
+                "-t",
+                "devfs",
+                "-o",
+                "ruleset=4",
+                "devfs",
+                &command_target,
+            ],
+            None,
+            ADMIN_TIMEOUT,
+        )?;
+        let after = self.mount_listing()?;
+        let after_root = self.reported_dataset_mountpoint(&after, dataset)?;
+        let after_target = format!("{after_root}/dev");
+        if Self::exact_mount_or_absent(&after, "devfs", &after_target, "devfs")? {
+            return Ok(());
+        }
+        bail!(
+            "devfs mount at {command_target} did not establish exact postcondition \
+             (devfs, {after_target}, devfs): exit={:?}, timed_out={}, stderr={}",
+            mounted.exit_code,
+            mounted.timed_out,
+            mounted.stderr_lossy().trim()
+        )
     }
 
     /// THE ONE shared, FAIL-CLOSED single-file pile mount primitive, used by BOTH
@@ -1179,9 +1286,8 @@ fi
     /// `/pile/self.pile` never matches a longer path). Shared by the
     /// already-mounted probe and the exact-tuple check.
     fn line_target_is(line: &str, target: &str) -> bool {
-        line.split_once(" on ")
-            .and_then(|(_, rest)| rest.split_once(" ("))
-            .map(|(tgt, _)| tgt.trim() == target)
+        Self::mount_line_parts(line)
+            .map(|(_, tgt, _)| tgt == target)
             .unwrap_or(false)
     }
 
@@ -1945,40 +2051,13 @@ fi
                 format!("verify persistent pile marker before reattaching '{jail}'")
             })?;
         let root = self.mountpoint(dataset)?;
-        // devfs: re-mount and VERIFY it is live. A re-mount over a still-live
-        // devfs fails "already mounted", so we do not gate on the mount's own
-        // exit; instead we confirm `{root}/dev` is a devfs mount in the table
-        // afterward (covers both the fresh mount and the already-mounted no-op),
-        // and fail closed if it is absent — a jail with a broken /dev must not
-        // start.
-        let dev_target = format!("{root}/dev");
-        let _ = self.run(
-            &[
-                "sudo",
-                "-n",
-                "mount",
-                "-t",
-                "devfs",
-                "-o",
-                "ruleset=4",
-                "devfs",
-                &dev_target,
-            ],
-            None,
-            ADMIN_TIMEOUT,
-        );
+        // A nested jail may expose the devfs target in the physical namespace
+        // even though mount(8) accepts the jail-local path. Derive and verify
+        // both spellings from the dataset's exact ZFS mount-table row.
+        self.ensure_devfs_mount(dataset, &root).with_context(|| {
+            format!("reattach {jail}: restore and verify the exact devfs mount")
+        })?;
         let listing = self.mount_listing()?;
-        let devfs_live = listing.lines().any(|line| {
-            Self::line_target_is(line, &dev_target)
-                && line
-                    .split_once(" (")
-                    .and_then(|(_, tail)| tail.split([',', ')']).next())
-                    .map(|fs| fs.trim() == "devfs")
-                    .unwrap_or(false)
-        });
-        if !devfs_live {
-            bail!("reattach {jail}: devfs not mounted at {dev_target} (refusing to start jail)");
-        }
         // LEGACY-MOUNT MIGRATION (sol's reopened review of repair #2,
         // 2026-07-24): a jail provisioned under the OLD (pre-#2) code has the
         // writable-parent-DIRECTORY nullfs topology (`<pile_root>/<jail>` at
@@ -2866,6 +2945,9 @@ mod tests {
         script: Vec<(Vec<&'static str>, HostOutput)>,
         /// Stateful mount table: `(source, target, fstype)`, newest last.
         mounts: Mutex<Vec<(String, String, String)>>,
+        /// Model namespace-specific mount-table target spelling (notably a
+        /// nested jail's local devfs command target -> physical listed target).
+        mount_target_rewrites: std::collections::HashMap<String, String>,
         /// Stateful filesystem: path -> inode number. `cp DEST` and `tee DEST`
         /// mint a FRESH inode; `ln -h SRC DEST` gives DEST the SAME inode as SRC
         /// (a hardlink), which is what the fresh-inode validation checks; `stat
@@ -2925,6 +3007,11 @@ mod tests {
                 target.to_string(),
                 fstype.to_string(),
             ));
+            self
+        }
+        fn with_mount_target_rewrite(mut self, command_target: &str, listed_target: &str) -> Self {
+            self.mount_target_rewrites
+                .insert(command_target.to_string(), listed_target.to_string());
             self
         }
         /// Seed a small-file's contents (e.g. a pre-existing `.tenant` marker for
@@ -3023,6 +3110,11 @@ mod tests {
                 // (src,target) — a duplicate re-mount is the EBUSY no-op and must
                 // not stack).
                 ["sudo", "-n", "mount", "-t", fstype, .., src, target] => {
+                    let target = self
+                        .mount_target_rewrites
+                        .get(*target)
+                        .map(String::as_str)
+                        .unwrap_or(target);
                     let mut mounts = self.mounts.lock().unwrap();
                     let already = mounts.iter().any(|(s, t, _)| s == src && t == target);
                     if already {
@@ -3041,6 +3133,11 @@ mod tests {
                 }
                 // `umount -f <target>`: drop every mount at that target.
                 ["sudo", "-n", "umount", "-f", target] | ["umount", "-f", target] => {
+                    let target = self
+                        .mount_target_rewrites
+                        .get(*target)
+                        .map(String::as_str)
+                        .unwrap_or(target);
                     self.mounts.lock().unwrap().retain(|(_, t, _)| t != target);
                     return Ok(HostOutput {
                         exit_code: Some(0),
@@ -3314,6 +3411,7 @@ mod tests {
     /// reuse/reattach arms (which now VERIFY it) see alice's recorded label.
     fn mock_with_mountpoint() -> MockRunner {
         MockRunner::default()
+            .with_mount(&alice_dataset(), &alice_root(), "zfs")
             .reply(
                 &["zfs", "get", "-H", "-o", "value", "mountpoint"],
                 ok_with_stdout(&format!("{}\n", alice_root())),
@@ -4717,6 +4815,66 @@ mod tests {
         );
     }
 
+    /// FreeBSD globalizes a nested jail's devfs target in `mount(8)` when
+    /// `enforce_statfs=0`, even though mount/unmount still take the jail-local
+    /// path. Reattach must derive that physical spelling from the exact ZFS row,
+    /// accept the postcondition, and never stack a second devfs on a retry.
+    #[test]
+    fn reattach_accepts_globalized_devfs_target_without_stacking() {
+        let dataset = alice_dataset();
+        let local_root = alice_root();
+        let reported_root = format!("/physical-parent{local_root}");
+        let local_dev = format!("{local_root}/dev");
+        let reported_dev = format!("{reported_root}/dev");
+        let (backend, mock) = MockRunner::default()
+            .with_mount(&dataset, &reported_root, "zfs")
+            .with_mount_target_rewrite(&local_dev, &reported_dev)
+            .reply(
+                &["zfs", "get", "-H", "-o", "value", "mountpoint"],
+                ok_with_stdout(&format!("{local_root}\n")),
+            )
+            .reply(
+                &[
+                    "sudo",
+                    "-n",
+                    "zfs",
+                    "get",
+                    "-H",
+                    "-o",
+                    "value",
+                    "playground:tenant",
+                ],
+                ok_with_stdout("alice\n"),
+            )
+            .reply(&["sudo", "-n", "jls", "-j"], fail())
+            .into_backend();
+
+        backend.open_session(&spec("alice")).expect("reattach");
+        backend
+            .ensure_devfs_mount(&dataset, &local_root)
+            .expect("existing globalized devfs is a verified no-op");
+
+        let devfs_mounts = mock
+            .calls()
+            .into_iter()
+            .filter(|call| {
+                call.get(2).map(String::as_str) == Some("mount")
+                    && call.get(4).map(String::as_str) == Some("devfs")
+            })
+            .count();
+        assert_eq!(devfs_mounts, 1, "reattach retry must not stack devfs");
+        let listed_devfs = mock
+            .mounts
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(source, target, fstype)| {
+                source == "devfs" && target == &reported_dev && fstype == "devfs"
+            })
+            .count();
+        assert_eq!(listed_devfs, 1, "one exact physical devfs must be live");
+    }
+
     /// Reattach re-establishes BOTH single-file pile mounts (self + shared) —
     /// they do not survive a jail restart, exactly like the devfs re-mount —
     /// without re-seeding self.pile or the profile (the persisted host piles
@@ -5951,6 +6109,7 @@ echo "PASS: playground:tenant provenance property round-trips"
             // bob's dataset records "bob" as its tenant — jail_name("bob")
             // re-derives THIS leaf, so the provenance gate passes.
             .with_tenant_prop(&bob_dataset, "bob")
+            .with_mount(&bob_dataset, &bob_root, "zfs")
             .into_backend();
 
         let n = backend.reattach_all().expect("sweep");
