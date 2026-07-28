@@ -4,6 +4,10 @@
 # Required:
 #   PLAYGROUND_TOKEN=<static bearer token> ./smoke.sh
 #
+# Private preflight before enabling the public edge (loopback HTTP only):
+#   PLAYGROUND_TOKEN=... PLAYGROUND_BASE_URL=http://127.0.0.1:8377 \
+#     PLAYGROUND_PRIVATE_HTTP=YES ./smoke.sh
+#
 # The default pass proves certificate/hostname validation, unauthenticated
 # rejection, authenticated MCP initialization, the advertised seven-tool
 # surface, a tenant-scoped open_session, and synchronous exec.
@@ -36,10 +40,16 @@ need jq
 : "${PLAYGROUND_TOKEN:?set PLAYGROUND_TOKEN to a provisioned tenant bearer token}"
 
 BASE_URL=${PLAYGROUND_BASE_URL:-https://mcp.bultmann.eu}
-MCP_URL=${BASE_URL%/}/mcp
-case "$MCP_URL" in
-	https://*) ;;
-	*) die "PLAYGROUND_BASE_URL must use https (TLS is part of this smoke test)" ;;
+BASE_URL=${BASE_URL%/}
+MCP_URL=$BASE_URL/mcp
+case "$BASE_URL" in
+	https://*) CURL_PROTO='=https' ;;
+	http://127.0.0.1|http://127.0.0.1:*)
+		[ "${PLAYGROUND_PRIVATE_HTTP:-NO}" = YES ] || \
+			die "loopback HTTP requires PLAYGROUND_PRIVATE_HTTP=YES"
+		CURL_PROTO='=http'
+		;;
+	*) die "PLAYGROUND_BASE_URL must use https or opted-in loopback HTTP" ;;
 esac
 
 TMP_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/playground-smoke.XXXXXX") || exit 1
@@ -57,7 +67,7 @@ cleanup()
 	if [ -n "$JOB_ID" ] && [ -n "$SID" ]; then
 		cancel_payload=$(jq -cn --arg job_id "$JOB_ID" \
 			'{jsonrpc:"2.0",id:99,method:"tools/call",params:{name:"job_cancel",arguments:{job_id:$job_id}}}')
-		curl --silent --max-time 10 --proto '=https' \
+		curl --silent --max-time 10 --proto "$CURL_PROTO" \
 			-H "Authorization: Bearer $PLAYGROUND_TOKEN" \
 			-H "Mcp-Session-Id: $SID" -H 'Content-Type: application/json' \
 			--data-binary "$cancel_payload" "$MCP_URL" >/dev/null 2>&1 || true
@@ -73,7 +83,7 @@ cleanup()
 	if [ -n "$BOX" ] && [ -n "$SID" ]; then
 		close_payload=$(jq -cn --arg session "$BOX" \
 			'{jsonrpc:"2.0",id:98,method:"tools/call",params:{name:"close_session",arguments:{session:$session}}}')
-		curl --silent --max-time 10 --proto '=https' \
+		curl --silent --max-time 10 --proto "$CURL_PROTO" \
 			-H "Authorization: Bearer $PLAYGROUND_TOKEN" \
 			-H "Mcp-Session-Id: $SID" -H 'Content-Type: application/json' \
 			--data-binary "$close_payload" "$MCP_URL" >/dev/null 2>&1 || true
@@ -81,7 +91,7 @@ cleanup()
 	# DELETE releases only the short-lived MCP transport session. The tenant's
 	# persistent sandbox and its piles remain available for reconnection.
 	if [ -n "$SID" ]; then
-		curl --silent --max-time 10 --proto '=https' -X DELETE \
+		curl --silent --max-time 10 --proto "$CURL_PROTO" -X DELETE \
 			-H "Authorization: Bearer $PLAYGROUND_TOKEN" \
 			-H "Mcp-Session-Id: $SID" "$MCP_URL" >/dev/null 2>&1 || true
 	fi
@@ -97,7 +107,7 @@ INITIALIZE='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVer
 # curl verifies the public CA chain and hostname by default. --proto prevents a
 # typo or redirect from silently turning the TLS proof into an HTTP request.
 UNAUTH_STATUS=$(curl --silent --show-error \
-	--proto '=https' --connect-timeout 10 --max-time 30 \
+	--proto "$CURL_PROTO" --connect-timeout 10 --max-time 30 \
 	-D "$TMP_ROOT/unauth.headers" -o "$TMP_ROOT/unauth.body" \
 	-w '%{http_code}' -H 'Content-Type: application/json' \
 	--data-binary "$INITIALIZE" "$MCP_URL") || die "TLS/public endpoint request failed"
@@ -106,7 +116,7 @@ grep -Eiq '^www-authenticate:[[:space:]]*Bearer' "$TMP_ROOT/unauth.headers" || \
 	die "401 response did not carry a Bearer challenge"
 
 AUTH_STATUS=$(curl --silent --show-error \
-	--proto '=https' --connect-timeout 10 --max-time 60 \
+	--proto "$CURL_PROTO" --connect-timeout 10 --max-time 60 \
 	-D "$TMP_ROOT/init.headers" -o "$TMP_ROOT/init.body" \
 	-w '%{http_code}' -H "Authorization: Bearer $PLAYGROUND_TOKEN" \
 	-H 'Content-Type: application/json' --data-binary "$INITIALIZE" "$MCP_URL") || \
@@ -124,7 +134,7 @@ SID=$(awk 'tolower($1) == "mcp-session-id:" { gsub("\\r", "", $2); value=$2 } EN
 [ -n "$SID" ] || die "initialize response omitted Mcp-Session-Id"
 
 NOTIFY_STATUS=$(curl --silent --show-error \
-	--proto '=https' --connect-timeout 10 --max-time 30 \
+	--proto "$CURL_PROTO" --connect-timeout 10 --max-time 30 \
 	-o "$TMP_ROOT/notify.body" -w '%{http_code}' \
 	-H "Authorization: Bearer $PLAYGROUND_TOKEN" \
 	-H "Mcp-Session-Id: $SID" -H 'Content-Type: application/json' \
@@ -136,7 +146,7 @@ mcp_post()
 {
 	payload=$1
 	status=$(curl --silent --show-error \
-		--proto '=https' --connect-timeout 10 --max-time 90 \
+		--proto "$CURL_PROTO" --connect-timeout 10 --max-time 90 \
 		-o "$TMP_ROOT/response.body" -w '%{http_code}' \
 		-H "Authorization: Bearer $PLAYGROUND_TOKEN" \
 		-H "Mcp-Session-Id: $SID" -H 'Content-Type: application/json' \
