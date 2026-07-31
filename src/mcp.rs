@@ -94,13 +94,13 @@ struct SessionEntry {
 /// Reference counting: multiple endpoints from one tenant share a single
 /// backend session (see [`SessionEntry`]). `open_session` bumps the count and
 /// `close_session` decrements it, only DETACHING the backend at the last
-/// handle; `destroy_session` is the explicit hard teardown that ignores the
-/// count.
+/// handle. Permanent teardown is owned by the operator CLI, outside this
+/// model-facing provider surface.
 pub struct SandboxProvider {
     backend: Arc<dyn SandboxBackend>,
     sessions: Mutex<HashMap<SessionId, SessionEntry>>,
-    /// Per-canonical-tenant lifecycle lock. Serializes `open_session` /
-    /// `close_session` / `destroy_session` for one tenant so the refcount
+    /// Per-canonical-tenant lifecycle lock. Serializes `open_session` and
+    /// `close_session` for one tenant so the refcount
     /// close/open race (repair #1 follow-up) cannot orphan a concurrently-opened
     /// session: `close_session` holds this lock across the whole
     /// decrement + backend-close + registry-remove, so a same-tenant
@@ -177,8 +177,8 @@ impl SandboxProvider {
     }
 
     /// Register one execution while holding the same per-tenant lifecycle lock
-    /// as open/close/destroy. The session is rechecked inside the lock, so a job
-    /// can never slip in after `destroy_session` has scanned and reaped jobs.
+    /// as open/close. The session is rechecked inside the lock, so a job cannot
+    /// slip between a last-handle close and its backend detach.
     fn start_job(&self, params: &ExecParams) -> Result<String> {
         let tenant = {
             let guard = self.sessions.lock().expect("sessions poisoned");
@@ -278,44 +278,6 @@ impl SandboxProvider {
             // ssh/limactl). We remove the entry only after the close succeeds so
             // a failed close leaves the session known (and retryable).
             self.backend.close_session(session)?;
-            self.sessions
-                .lock()
-                .expect("sessions poisoned")
-                .remove(session);
-            Ok(())
-        })
-    }
-
-    /// Operator lifecycle API: permanently tear a sandbox down and deregister
-    /// it, REGARDLESS of refcount. This is deliberately not exposed as an MCP
-    /// tool: multiple agents can share one tenant, so one model-facing endpoint
-    /// must not be able to invalidate every other endpoint's workspace. The
-    /// operator CLI owns this explicit hard teardown (jail:
-    /// `jail -r` + `zfs destroy`; lima: `limactl stop` + `limactl delete`), as
-    /// opposed to `close_session`'s last-handle detach. Any other endpoints still
-    /// holding the box are cut off. Destroy now takes the per-tenant lifecycle
-    /// lock, so it serializes against concurrent open/close of the same box
-    /// (repair #3). In-flight commands are cancelled and reaped under that same
-    /// lock before the backend is destroyed.
-    pub fn destroy_session(&self, session: &SessionId) -> Result<()> {
-        // Resolve the tenant to lock on the same per-tenant key as open/close, so
-        // a hard teardown serializes against concurrent lifecycle ops on this
-        // box rather than racing them.
-        let tenant = {
-            let guard = self.sessions.lock().expect("sessions poisoned");
-            match guard.get(session) {
-                Some(entry) => entry.tenant.clone(),
-                None => return Err(anyhow!("unknown session {}", session.as_str())),
-            }
-        };
-        let key = self.backend.canonical_key(&tenant);
-        self.lifecycle.with_lock(&key, || {
-            if self.backend.supports_background_jobs() {
-                self.jobs.cancel_session_and_wait(session);
-            } else {
-                self.jobs.wait_session(session);
-            }
-            self.backend.destroy_session(session)?;
             self.sessions
                 .lock()
                 .expect("sessions poisoned")
@@ -2007,34 +1969,6 @@ mod tests {
         provider
             .exec(exec_params(&id))
             .expect("alice still execable");
-    }
-
-    /// `destroy_session` is the hard teardown: it tears the box down and
-    /// deregisters it REGARDLESS of a nonzero refcount (a second endpoint still
-    /// held it). Concurrent-exec safety during destroy is repair #3's job.
-    #[test]
-    fn provider_destroy_ignores_refcount() {
-        let destroys = Arc::new(AtomicUsize::new(0));
-        let closes = Arc::new(AtomicUsize::new(0));
-        let backend = MockBackend {
-            destroys: destroys.clone(),
-            closes: closes.clone(),
-            ..Default::default()
-        };
-        let provider = SandboxProvider::new(Box::new(backend));
-
-        // Two handles on one shared box (refcount 2).
-        let id = provider.open_session(params("alice")).expect("open 1");
-        provider.open_session(params("alice")).expect("open 2");
-
-        // Hard teardown removes the entry despite refs == 2, backend destroy once.
-        provider.destroy_session(&id).expect("destroy");
-        assert_eq!(destroys.load(Ordering::SeqCst), 1);
-        assert_eq!(closes.load(Ordering::SeqCst), 0, "destroy is not a close");
-        assert!(
-            provider.exec(exec_params(&id)).is_err(),
-            "destroyed session is gone regardless of prior refcount"
-        );
     }
 
     /// (c) The per-tenant lifecycle lock closes the close/open refcount race

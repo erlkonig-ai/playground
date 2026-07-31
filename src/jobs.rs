@@ -267,7 +267,6 @@ enum InnerState {
 struct Job {
     id: String,
     tenant: String,
-    session: SessionId,
     control: ExecControl,
     output: Arc<Mutex<OutputLog>>,
     state: Mutex<InnerState>,
@@ -549,7 +548,6 @@ impl JobManager {
             let job = Arc::new(Job {
                 id: id.clone(),
                 tenant: tenant.clone(),
-                session: session.clone(),
                 control,
                 output,
                 state: Mutex::new(InnerState::Running),
@@ -673,39 +671,6 @@ impl JobManager {
     #[cfg(feature = "mcp-http")]
     pub fn tenant(&self, id: &str) -> Option<String> {
         self.get(id).ok().map(|job| job.tenant.clone())
-    }
-
-    pub fn cancel_session_and_wait(&self, session: &SessionId) {
-        let jobs: Vec<Arc<Job>> = self
-            .state
-            .lock()
-            .expect("job manager poisoned")
-            .jobs
-            .values()
-            .filter(|job| &job.session == session && job.state() != JobState::Terminal)
-            .cloned()
-            .collect();
-        for job in &jobs {
-            job.request_cancel();
-        }
-        for job in jobs {
-            job.wait_terminal();
-        }
-    }
-
-    pub fn wait_session(&self, session: &SessionId) {
-        let jobs: Vec<Arc<Job>> = self
-            .state
-            .lock()
-            .expect("job manager poisoned")
-            .jobs
-            .values()
-            .filter(|job| &job.session == session && job.state() != JobState::Terminal)
-            .cloned()
-            .collect();
-        for job in jobs {
-            job.wait_terminal();
-        }
     }
 
     fn stop_accepting_and_collect(&self) -> Vec<Arc<Job>> {
