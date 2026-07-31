@@ -4,7 +4,7 @@
 //! static bearer token out of band — they discover authorization dynamically.
 //! The dance, per the MCP authorization spec:
 //!
-//! 1. the connector hits `/mcp` without a token, gets a `401` whose
+//! 1. the connector hits the origin root without a token, gets a `401` whose
 //!    `WWW-Authenticate: Bearer resource_metadata="..."` points at
 //! 2. `/.well-known/oauth-protected-resource` (RFC 9728), which names this
 //!    same server as the authorization server, described by
@@ -571,8 +571,8 @@ pub enum CodeTake {
 pub struct OauthRuntime {
     /// `OauthConfig::public_url`, normalized (no trailing slash).
     pub public_url: String,
-    /// Canonical protected resource served by this process. MCP lives at the
-    /// fixed `/mcp` endpoint beneath `public_url`.
+    /// Canonical protected resource served by this process. MCP lives at
+    /// `public_url` itself.
     pub resource: String,
     state_path: PathBuf,
     pub access_ttl: Duration,
@@ -610,7 +610,7 @@ impl OauthRuntime {
             )
         };
         let public_url = config.public_url.trim_end_matches('/').to_string();
-        let resource = format!("{public_url}/mcp");
+        let resource = public_url.clone();
         Ok(OauthRuntime {
             public_url,
             resource,
@@ -1922,7 +1922,7 @@ mod tests {
     use super::*;
     use crate::mcp_http::tests::{post, rpc, spawn_server, test_state_with_oauth};
 
-    const TEST_RESOURCE: &str = "https://mcp.example.test/mcp";
+    const TEST_RESOURCE: &str = "https://mcp.example.test";
 
     /// Fresh scratch dir for a test's state file.
     fn scratch_dir(label: &str) -> PathBuf {
@@ -2073,7 +2073,7 @@ mod tests {
                 .rotate_refresh(
                     &refresh2,
                     Some("client-1"),
-                    "https://other.example.test/mcp",
+                    "https://other.example.test",
                     None,
                     ttl,
                     2_500,
@@ -2147,7 +2147,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .lookup_access(&access, "https://other.example.test/mcp", 1_050)
+                .lookup_access(&access, "https://other.example.test", 1_050)
                 .err(),
             Some(("access token is for a different resource", false))
         );
@@ -2491,7 +2491,7 @@ mod tests {
         let dir = scratch_dir("flow");
         let state_path = dir.join("oauth.json");
         let issuer = "https://mcp.example.test";
-        let protected_resource = format!("{issuer}/mcp");
+        let protected_resource = issuer.to_string();
         let state = test_state_with_oauth(issuer, &state_path, Duration::from_secs(3600));
         let addr = spawn_server(state.clone());
         let agent = no_redirect_agent();
@@ -2508,8 +2508,8 @@ mod tests {
         );
         assert_eq!(bare.status, 401);
         let mut challenge = agent
-            .post(format!("http://{addr}/mcp"))
-            .send_json(&rpc(1, "initialize", json!({})))
+            .post(format!("http://{addr}"))
+            .send_json(rpc(1, "initialize", json!({})))
             .expect("bare request");
         let www = challenge
             .headers()
@@ -2639,7 +2639,7 @@ mod tests {
 
         for resource_query in [
             String::new(),
-            "&resource=https%3A%2F%2Fother.example%2Fmcp".into(),
+            "&resource=https%3A%2F%2Fother.example".into(),
         ] {
             let mut wrong_resource = agent
                 .get(format!(
@@ -2838,7 +2838,7 @@ mod tests {
         let (_, query) = location_query(&granted3);
         let code3 = query["code"].clone();
         let _ = granted3.body_mut().read_to_string();
-        let mut wrong_target = exchange_for(&code3, &verifier, "https://other.example.test/mcp");
+        let mut wrong_target = exchange_for(&code3, &verifier, "https://other.example.test");
         assert_eq!(wrong_target.status().as_u16(), 400);
         assert_eq!(read_json(&mut wrong_target)["error"], "invalid_target");
         let mut burned = exchange(&code3, &verifier);
@@ -2872,9 +2872,9 @@ mod tests {
         );
         assert_eq!(expired.status, 401);
         let mut expired_raw = agent
-            .post(format!("http://{addr}/mcp"))
+            .post(format!("http://{addr}"))
             .header("Authorization", format!("Bearer {stale}"))
-            .send_json(&rpc(4, "initialize", json!({})))
+            .send_json(rpc(4, "initialize", json!({})))
             .expect("expired request");
         assert!(
             expired_raw
@@ -2901,7 +2901,7 @@ mod tests {
                 .expect("refresh")
         };
         let rotate = |refresh: &str| rotate_for(refresh, protected_resource.as_str());
-        let mut wrong_target = rotate_for(&refresh, "https://other.example.test/mcp");
+        let mut wrong_target = rotate_for(&refresh, "https://other.example.test");
         assert_eq!(wrong_target.status().as_u16(), 400);
         assert_eq!(read_json(&mut wrong_target)["error"], "invalid_target");
         let mut rotated = rotate(&refresh);

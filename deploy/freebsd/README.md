@@ -16,7 +16,7 @@ their FSIDs) from the parent afterward, which prevents exact verification and
 safe unmount. This setting applies only to the operator-controlled parent;
 tenant child jails retain their restricted/default view.
 
-**Deployment status (2026-07-31): live at `https://mcp.bultmann.eu/mcp`.**
+**Deployment status (2026-07-31): live at `https://mcp.bultmann.eu`.**
 The dual-stack public edge (direct IPv6 plus IPv4 through the shared HAProxy),
 trusted TLS, loopback provider, persistent pilot, cold-boot reattach,
 synchronous and asynchronous execution, exact cancellation, and invite-gated

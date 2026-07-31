@@ -42,7 +42,7 @@ need jq
 
 BASE_URL=${PLAYGROUND_BASE_URL:-https://mcp.bultmann.eu}
 BASE_URL=${BASE_URL%/}
-MCP_URL=$BASE_URL/mcp
+MCP_URL=$BASE_URL
 case "$BASE_URL" in
 	https://*) CURL_PROTO='=https' ;;
 	http://127.0.0.1|http://127.0.0.1:*)
