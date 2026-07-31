@@ -1324,11 +1324,13 @@ fn resource_matches(requested: &str, canonical: &str) -> bool {
     let Ok(canonical_uri) = canonical.parse::<Uri>() else {
         return false;
     };
-    let (Some(scheme), Some(authority)) = (canonical_uri.scheme_str(), canonical_uri.authority())
-    else {
+    if canonical_uri.scheme().is_none() || canonical_uri.authority().is_none() {
         return false;
-    };
-    canonical == format!("{scheme}://{authority}") && requested == format!("{canonical}/")
+    }
+    canonical_uri.path() == "/"
+        && canonical_uri.query().is_none()
+        && !canonical.ends_with('/')
+        && requested.strip_suffix('/') == Some(canonical)
 }
 
 /// Parse the OAuth space-delimited scope set and return the one canonical
@@ -2426,6 +2428,10 @@ mod tests {
         let root = "https://mcp.example.test";
         assert!(resource_matches(root, root));
         assert!(resource_matches("https://mcp.example.test/", root));
+        assert!(resource_matches(
+            "HTTPS://mcp.example.test/",
+            "HTTPS://mcp.example.test"
+        ));
 
         for different in [
             "https://mcp.example.test//",
