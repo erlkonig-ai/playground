@@ -14,6 +14,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow};
 use rand::RngCore;
 
+#[cfg(test)]
+use crate::sandbox::ExecShellMode;
 use crate::sandbox::{
     ExecControl, ExecOutputSink, ExecRequest, ExecResult, ExecStream, SandboxBackend, SessionId,
     is_sandbox_control_lost, sandbox_control_lost,
@@ -35,7 +37,9 @@ pub const TERMINAL_JOB_TTL: Duration = Duration::from_secs(60 * 60);
 /// Retained incremental output per job (stdout and stderr combined).
 pub const MAX_RETAINED_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 /// Payload bytes alone are not a memory bound when a producer drip-feeds tiny
-/// writes: cap allocation/metadata count as well.
+/// writes: cap allocation/metadata count as well. Adjacent same-stream writes
+/// are normalized into poll-sized chunks first; stream changes, polls, and
+/// full chunks still create real metadata boundaries governed by this cap.
 pub const MAX_RETAINED_CHUNKS_PER_JOB: usize = 1024;
 /// One poll stays comfortably below HTTP and model-context ceilings.
 pub const MAX_POLL_OUTPUT_BYTES: usize = 256 * 1024;
@@ -129,22 +133,14 @@ struct OutputLog {
     next_sequence: u64,
     retained_bytes: usize,
     dropped_bytes: u64,
+    /// Once a poll has exposed the current tail's sequence, that chunk is
+    /// immutable: appending to it would hide new bytes from a client that
+    /// already advanced past the sequence.
+    tail_sealed: bool,
 }
 
 impl OutputLog {
-    fn push(&mut self, stream: ExecStream, bytes: &[u8]) {
-        if bytes.is_empty() {
-            return;
-        }
-        let chunk = StoredChunk {
-            sequence: self.next_sequence,
-            stream,
-            bytes: bytes.to_vec(),
-        };
-        self.next_sequence = self.next_sequence.saturating_add(1);
-        self.retained_bytes = self.retained_bytes.saturating_add(chunk.bytes.len());
-        self.chunks.push_back(chunk);
-
+    fn enforce_bounds(&mut self) {
         while self.retained_bytes > MAX_RETAINED_OUTPUT_BYTES
             || self.chunks.len() > MAX_RETAINED_CHUNKS_PER_JOB
         {
@@ -156,6 +152,38 @@ impl OutputLog {
         }
     }
 
+    fn push(&mut self, stream: ExecStream, mut bytes: &[u8]) {
+        while !bytes.is_empty() {
+            let append_to_tail = !self.tail_sealed
+                && self.chunks.back().is_some_and(|tail| {
+                    tail.stream == stream && tail.bytes.len() < MAX_POLL_OUTPUT_BYTES
+                });
+
+            if append_to_tail {
+                let tail = self.chunks.back_mut().expect("tail checked above");
+                let take = bytes
+                    .len()
+                    .min(MAX_POLL_OUTPUT_BYTES.saturating_sub(tail.bytes.len()));
+                tail.bytes.extend_from_slice(&bytes[..take]);
+                self.retained_bytes = self.retained_bytes.saturating_add(take);
+                bytes = &bytes[take..];
+            } else {
+                let take = bytes.len().min(MAX_POLL_OUTPUT_BYTES);
+                self.chunks.push_back(StoredChunk {
+                    sequence: self.next_sequence,
+                    stream,
+                    bytes: bytes[..take].to_vec(),
+                });
+                self.next_sequence = self.next_sequence.saturating_add(1);
+                self.retained_bytes = self.retained_bytes.saturating_add(take);
+                self.tail_sealed = false;
+                bytes = &bytes[take..];
+            }
+
+            self.enforce_bounds();
+        }
+    }
+
     fn first_sequence(&self) -> u64 {
         self.chunks
             .front()
@@ -163,7 +191,11 @@ impl OutputLog {
             .unwrap_or(self.next_sequence)
     }
 
-    fn poll(&self, cursor: u64) -> (Vec<PolledChunk>, u64, bool, bool) {
+    fn poll(&mut self, cursor: u64) -> (Vec<PolledChunk>, u64, bool, bool) {
+        // Cursor acknowledgement is sequence-based. Freeze the only chunk that
+        // could otherwise grow before exposing any sequence to this poll; the
+        // next producer push will allocate a fresh sequence.
+        self.tail_sealed = true;
         let first = self.first_sequence();
         let gap = cursor < first;
         // A malformed/future cursor must not suppress output that has not even
@@ -299,7 +331,7 @@ impl Job {
             InnerState::Cancelling => (JobState::Cancelling, None),
             InnerState::Terminal { result, .. } => (JobState::Terminal, Some(result.clone())),
         };
-        let output = self.output.lock().expect("job output poisoned");
+        let mut output = self.output.lock().expect("job output poisoned");
         let (chunks, next_cursor, gap, has_more) = output.poll(cursor);
         JobSnapshot {
             id: self.id.clone(),
@@ -935,6 +967,7 @@ mod tests {
     fn request() -> ExecRequest {
         ExecRequest {
             command: "work".to_string(),
+            shell_mode: ExecShellMode::Login,
             cwd: None,
             stdin: None,
             timeout: None,
@@ -1015,6 +1048,9 @@ mod tests {
         let mut output = OutputLog::default();
         output.push(ExecStream::Stdout, b"first");
 
+        // Even an empty/future poll seals the current tail. A later same-stream
+        // push must receive a new sequence rather than becoming invisible
+        // behind the cursor returned here.
         let (chunks, cursor, gap, has_more) = output.poll(u64::MAX);
         assert!(chunks.is_empty());
         assert!(!gap);
@@ -1040,21 +1076,56 @@ mod tests {
 
         let (first, cursor, gap, has_more) = output.poll(0);
         assert!(!gap);
-        assert_eq!(first.len(), 4);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].text.len(), MAX_POLL_OUTPUT_BYTES);
         assert!(has_more);
 
         let (second, next, gap, has_more) = output.poll(cursor);
         assert!(!gap);
         assert_eq!(second.len(), 1);
         assert!(!has_more);
-        assert_eq!(next, 5);
+        assert_eq!(next, 2);
     }
 
     #[test]
-    fn tiny_chunks_cannot_escape_the_memory_bound_through_metadata() {
+    fn fragmented_same_stream_output_coalesces_without_a_gap() {
         let mut output = OutputLog::default();
-        for _ in 0..=MAX_RETAINED_CHUNKS_PER_JOB {
+        let count = MAX_RETAINED_CHUNKS_PER_JOB + 257;
+        for _ in 0..count {
             output.push(ExecStream::Stdout, b"x");
+        }
+        let (stdout, stderr, gap) = output.render_all();
+        assert_eq!(stdout, vec![b'x'; count]);
+        assert!(stderr.is_empty());
+        assert!(!gap);
+        assert_eq!(output.dropped_bytes, 0);
+        assert_eq!(output.chunks.len(), 1);
+    }
+
+    #[test]
+    fn one_large_emit_is_split_at_the_poll_chunk_boundary() {
+        let mut output = OutputLog::default();
+        let bytes = vec![b'x'; MAX_POLL_OUTPUT_BYTES + 1];
+        output.push(ExecStream::Stdout, &bytes);
+        assert_eq!(output.chunks.len(), 2);
+        assert_eq!(output.chunks[0].bytes.len(), MAX_POLL_OUTPUT_BYTES);
+        assert_eq!(output.chunks[1].bytes.len(), 1);
+        let (stdout, stderr, gap) = output.render_all();
+        assert_eq!(stdout, bytes);
+        assert!(stderr.is_empty());
+        assert!(!gap);
+    }
+
+    #[test]
+    fn alternating_tiny_chunks_still_enforce_the_metadata_bound() {
+        let mut output = OutputLog::default();
+        for index in 0..=MAX_RETAINED_CHUNKS_PER_JOB {
+            let stream = if index % 2 == 0 {
+                ExecStream::Stdout
+            } else {
+                ExecStream::Stderr
+            };
+            output.push(stream, b"x");
         }
         assert_eq!(output.chunks.len(), MAX_RETAINED_CHUNKS_PER_JOB);
         assert_eq!(output.dropped_bytes, 1);
