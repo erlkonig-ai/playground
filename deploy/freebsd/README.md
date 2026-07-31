@@ -16,12 +16,13 @@ their FSIDs) from the parent afterward, which prevents exact verification and
 safe unmount. This setting applies only to the operator-controlled parent;
 tenant child jails retain their restricted/default view.
 
-**Deployment status (2026-07-28): live at `https://mcp.bultmann.eu/mcp`.**
-The IPv6-only public edge, trusted TLS, loopback provider, persistent pilot,
-cold-boot reattach, synchronous and asynchronous execution, exact cancellation,
-and invite-gated OAuth 2.1 flow are proven on the real host; see the deployment
-receipt below. Real Claude/ChatGPT connector UI flows remain a client-integration
-check, not an unproven server path. The administration path is
+**Deployment status (2026-07-31): live at `https://mcp.bultmann.eu/mcp`.**
+The dual-stack public edge (direct IPv6 plus IPv4 through the shared HAProxy),
+trusted TLS, loopback provider, persistent pilot, cold-boot reattach,
+synchronous and asynchronous execution, exact cancellation, and invite-gated
+OAuth 2.1 flow are proven on the real host; see the deployment receipts below.
+Real Claude/ChatGPT connector UI flows remain a client-integration check, not
+an unproven server path. The administration path is
 `ssh -6 jp@ai.bultmann.eu`: that hostname's IPv4 address is a different SSH
 host, so do not allow SSH or rsync to fall back to IPv4.
 
@@ -68,8 +69,10 @@ Two hosting modes exist and stay interchangeable:
   configured `--jail-dataset-parent`
   (`airoot/jails/playground/jails` in this profile). The
   `repo-*`/`trible*` jails and datasets on the same box are out of bounds.
-- The provider binds `127.0.0.1` and speaks plain HTTP. Caddy is the sole public
-  listener and sole TLS terminator; the provider port is never exposed.
+- The provider binds `127.0.0.1` and speaks plain HTTP. Caddy is the sole TLS
+  terminator: public IPv6 reaches its ordinary `:443` listener directly, while
+  public IPv4 enters the shared HAProxy and reaches Caddy's LAN-only `:444`
+  listener with a PROXY preamble. The provider port is never exposed.
 
 ## Build on the parent jail
 
@@ -197,8 +200,9 @@ an unexplained daemon exit. A loss of command-tree control deliberately exits
 nonzero and leaves the affected jail untouched for operator inspection; an
 operator must recover it before explicitly starting the provider again.
 `daemon -H` lets newsyslog reopen the file without restarting the provider or
-cancelling jobs. Caddy is the only public listener and terminates TLS for the
-single canonical origin `https://mcp.bultmann.eu`.
+cancelling jobs. Caddy terminates TLS for the single canonical origin
+`https://mcp.bultmann.eu`; the IPv4 HAProxy is a TCP/SNI ingress and does not
+terminate TLS.
 
 Note the trade-off this mode makes on a shared machine: the token store
 now lives on the server (root-readable only, but root includes anyone
@@ -375,12 +379,13 @@ The provider's rc prestart independently refuses to run unless
 its jail. The physical-host `rctl "jail:${GLOBAL_CHILD}"` check is a real
 provisioning gate, not optional paperwork.
 
-## Live deployment receipt (2026-07-28)
+## Initial live deployment receipt (2026-07-28)
 
 The deployed provider binary was built from commit `646ea65`. The following was
 measured on the real FreeBSD 15.1 host rather than inferred from configuration:
 
-- Public DNS is intentionally IPv6-only: independent resolvers return
+- At the time of this receipt public DNS was intentionally IPv6-only:
+  independent resolvers returned
   `mcp.bultmann.eu AAAA 2a00:c380:c0d5:1::17` and no A record. Caddy owns public
   TCP 80/443 and UDP 443; the provider owns only `127.0.0.1:8377`, which is
   unreachable at the public address. HTTP redirects to HTTPS and the trusted
@@ -407,6 +412,25 @@ measured on the real FreeBSD 15.1 host rather than inferred from configuration:
   exchange, `mcp offline_access`, wrong-resource rejection, refresh rotation,
   and MCP initialization with the rotated access token. Secret values stayed in
   mode-0700 temporary storage and were not logged.
+
+## Dual-stack ingress receipt (2026-07-31)
+
+- Public DNS now publishes `A 31.209.89.156` and
+  `AAAA 2a00:c380:c0d5:1::17`. IPv4 enters the production HAProxy pair; IPv6
+  still reaches Caddy directly.
+- The HAProxy TLS backend is `192.168.254.244:444 send-proxy`. Before the Caddy
+  change, a packet trace showed gw3 (`192.168.254.5`) repeatedly reaching that
+  port and receiving an immediate reset because nothing listened there.
+- Caddy now binds `192.168.254.244:444` for TCP only, decodes PROXY protocol
+  before TLS, and trusts asserted client addresses only from gw3/gw4
+  (`192.168.254.5/32` and `.6/32`). The backend listener is h1/h2-only so it
+  cannot advertise its internal port as a public HTTP/3 endpoint. Direct TCP
+  and UDP `:443` remain unchanged.
+- Both public address families return the same canonical HTTPS redirect, valid
+  certificate, MCP `405`/`Allow`, unauthenticated initialization `401` bearer
+  challenge, and OAuth protected-resource metadata. IPv4 responses omit
+  `Alt-Svc`; direct IPv6 retains h3 advertisement. Public TCP `:444` is closed
+  over both address families.
 
 The remaining check is product integration through the actual Claude and
 ChatGPT connector UIs. It requires their browser callbacks and is deliberately

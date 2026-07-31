@@ -1,12 +1,34 @@
-# The playground has one public origin. Caddy terminates TLS and forwards every
-# MCP and OAuth route to the provider's loopback-only listener. There is
-# intentionally no ai.bultmann.eu site until an actual UI exists.
-mcp.bultmann.eu {
+# The public IPv4 HAProxy sends PROXY protocol on its dedicated TLS backend
+# port. Decode it before the TLS handshake and trust client addresses only
+# when they came from the two production gateways. Direct public IPv6 remains
+# on the ordinary :443 listener and never passes through this wrapper.
+{
+	servers 192.168.254.244:444 {
+		listener_wrappers {
+			proxy_protocol {
+				timeout 2s
+				allow 192.168.254.5/32 192.168.254.6/32
+				fallback_policy skip
+			}
+			tls
+		}
+
+		# HAProxy accepts public TCP :443, so this internal listener must not
+		# advertise its backend-only :444 as an HTTP/3 endpoint.
+		protocols h1 h2
+	}
+}
+
+# The playground has one public origin. Both ingress listeners terminate TLS
+# in Caddy and forward every MCP and OAuth route to the provider's
+# loopback-only listener. There is intentionally no ai.bultmann.eu site until
+# an actual UI exists.
+(playground_routes) {
 	reverse_proxy 127.0.0.1:8377
 
 	# Caddy's file writer rotates this log itself. Authorization headers are not
 	# included in the default access-log fields.
-	log {
+	log playground {
 		output file /var/log/caddy/playground_access.log {
 			mode 0600
 			roll_size 10MiB
@@ -15,4 +37,15 @@ mcp.bultmann.eu {
 		}
 		format json
 	}
+}
+
+mcp.bultmann.eu {
+	import playground_routes
+}
+
+# LAN-only backend for the shared IPv4 HAProxy VIP. The PROXY listener wrapper
+# above consumes the preamble before Caddy begins the TLS handshake.
+https://mcp.bultmann.eu:444 {
+	bind 192.168.254.244
+	import playground_routes
 }
