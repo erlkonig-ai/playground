@@ -23,7 +23,8 @@
 //!   - `reattach_all` = the startup sweep: enumerate every provisioned dataset
 //!     under `dataset_parent` and `jail -c` each one whose jail context is gone
 //!     (host reboot wiped the in-kernel jail records but the datasets remain).
-//!   - `exec`          = `jexec <jail> /bin/sh -lc <command>`, wrapped in
+//!   - `exec`          = `jexec <jail> /bin/sh -lc <command>` for stateful user
+//!     commands, or `/bin/sh -c` for clean internal requests, wrapped in
 //!     FreeBSD `timeout(1)` server-side so a runaway command is killed *on the
 //!     server* (exit 124), with a local wall-clock backstop mirroring
 //!     [`super::lima::LimaBackend`]'s timeout/exit-124 semantics.
@@ -131,8 +132,8 @@ use super::proc::{
     drive_child_capped_controlled_process_group,
 };
 use super::{
-    ExecControl, ExecRequest, ExecResult, LifecycleLocks, SandboxBackend, SessionId, SessionSpec,
-    sandbox_control_lost,
+    ExecControl, ExecRequest, ExecResult, ExecShellMode, LifecycleLocks, SandboxBackend, SessionId,
+    SessionSpec, sandbox_control_lost,
 };
 
 /// Output of one host command, however it was transported. Local-backstop
@@ -2662,15 +2663,32 @@ impl SandboxBackend for JailBackend {
     ) -> Result<ExecResult> {
         let jail = session.as_str();
 
-        // Per-call cwd override; the session default cwd comes from the
-        // /etc/profile seed written at open_session.
-        let script = match &request.cwd {
-            Some(cwd) => format!(
-                "cd {} || exit 1\n{}",
-                shell_quote(&cwd.to_string_lossy()),
-                request.command
-            ),
-            None => request.command.clone(),
+        // Login requests preserve the profile-selected session cwd. Clean
+        // internal requests never source that tenant-controlled profile, so
+        // they always receive an explicit cwd (`/` when omitted).
+        let (shell_flag, script) = match request.shell_mode {
+            ExecShellMode::Login => {
+                let script = match &request.cwd {
+                    Some(cwd) => format!(
+                        "cd {} || exit 1\n{}",
+                        shell_quote(&cwd.to_string_lossy()),
+                        request.command
+                    ),
+                    None => request.command.clone(),
+                };
+                ("-lc", script)
+            }
+            ExecShellMode::Clean => {
+                let cwd = request.cwd.as_deref().unwrap_or(std::path::Path::new("/"));
+                (
+                    "-c",
+                    format!(
+                        "CDPATH=\ncd {} >/dev/null || exit 1\n{}",
+                        shell_quote(&cwd.to_string_lossy()),
+                        request.command
+                    ),
+                )
+            }
         };
 
         // TIMEOUT CEILING: a caller may request LESS than the default, never
@@ -2684,7 +2702,8 @@ impl SandboxBackend for JailBackend {
         // alone would leave the remote command running).
         let secs = timeout.as_secs().max(1).to_string();
         let argv = [
-            "sudo", "-n", "timeout", "-k", "5", &secs, "jexec", jail, "/bin/sh", "-lc", &script,
+            "sudo", "-n", "timeout", "-k", "5", &secs, "jexec", jail, "/bin/sh", shell_flag,
+            &script,
         ];
 
         // Tenant output is attacker-controlled. Direct capture retains a
@@ -3510,6 +3529,7 @@ mod tests {
             .into_backend();
         let req = ExecRequest {
             command: "exit 255".to_string(),
+            shell_mode: ExecShellMode::Login,
             cwd: None,
             stdin: None,
             timeout: None,
@@ -3925,6 +3945,7 @@ mod tests {
         // Ask for 10 hours — far past the 30-minute ceiling.
         let req = ExecRequest {
             command: "true".to_string(),
+            shell_mode: ExecShellMode::Login,
             cwd: None,
             stdin: None,
             timeout: Some(Duration::from_secs(10 * 3600)),
@@ -3957,6 +3978,7 @@ mod tests {
         let (backend, mock) = MockRunner::default().into_backend();
         let req = ExecRequest {
             command: "true".to_string(),
+            shell_mode: ExecShellMode::Login,
             cwd: None,
             stdin: None,
             timeout: Some(Duration::from_secs(5)),
@@ -3999,6 +4021,7 @@ mod tests {
             .into_backend();
         let req = ExecRequest {
             command: "yes".to_string(),
+            shell_mode: ExecShellMode::Login,
             cwd: None,
             stdin: None,
             timeout: None,
@@ -4041,6 +4064,7 @@ mod tests {
                 &SessionId::new(jail.clone()),
                 &ExecRequest {
                     command: "yes".to_string(),
+                    shell_mode: ExecShellMode::Login,
                     cwd: None,
                     stdin: None,
                     timeout: None,
@@ -4084,6 +4108,7 @@ mod tests {
             .into_backend();
         let req = ExecRequest {
             command: "sleep 30".to_string(),
+            shell_mode: ExecShellMode::Login,
             cwd: None,
             stdin: None,
             timeout: None,
@@ -4135,6 +4160,7 @@ mod tests {
             .into_backend();
         let req = ExecRequest {
             command: "sleep 30".to_string(),
+            shell_mode: ExecShellMode::Login,
             cwd: None,
             stdin: None,
             timeout: None,
@@ -5946,6 +5972,7 @@ echo "PASS: playground:tenant provenance property round-trips"
         let (backend, mock) = MockRunner::default().into_backend();
         let req = ExecRequest {
             command: "echo hello".to_string(),
+            shell_mode: ExecShellMode::Login,
             cwd: None,
             stdin: Some(b"in-bytes".to_vec()),
             timeout: Some(Duration::from_secs(7)),
@@ -5978,6 +6005,43 @@ echo "PASS: playground:tenant provenance property round-trips"
     }
 
     #[test]
+    fn clean_exec_bypasses_profile_and_anchors_omitted_cwd_at_root() {
+        let (backend, mock) = MockRunner::default().into_backend();
+        let req = ExecRequest {
+            command: "/bin/cat > '/tmp/file'".to_string(),
+            shell_mode: ExecShellMode::Clean,
+            cwd: None,
+            stdin: Some(b"exact-bytes".to_vec()),
+            timeout: Some(Duration::from_secs(7)),
+        };
+        backend
+            .exec(
+                &SessionId::new("playground-alice"),
+                &req,
+                &ExecControl::default(),
+            )
+            .expect("exec");
+        let (argv, stdin) = mock.calls.lock().unwrap()[0].clone();
+        assert_eq!(
+            argv,
+            vec![
+                "sudo",
+                "-n",
+                "timeout",
+                "-k",
+                "5",
+                "7",
+                "jexec",
+                "playground-alice",
+                "/bin/sh",
+                "-c",
+                "CDPATH=\ncd '/' >/dev/null || exit 1\n/bin/cat > '/tmp/file'",
+            ]
+        );
+        assert_eq!(stdin.as_deref(), Some(b"exact-bytes" as &[u8]));
+    }
+
+    #[test]
     fn exec_maps_exit_124_to_timeout_error() {
         let (backend, _mock) = MockRunner::default()
             .reply(
@@ -5990,6 +6054,7 @@ echo "PASS: playground:tenant provenance property round-trips"
             .into_backend();
         let req = ExecRequest {
             command: "sleep 999".to_string(),
+            shell_mode: ExecShellMode::Login,
             cwd: None,
             stdin: None,
             timeout: Some(Duration::from_secs(1)),
@@ -6010,6 +6075,7 @@ echo "PASS: playground:tenant provenance property round-trips"
         let (backend, mock) = MockRunner::default().into_backend();
         let req = ExecRequest {
             command: "pwd".to_string(),
+            shell_mode: ExecShellMode::Login,
             cwd: Some(PathBuf::from("/tmp/it's here")),
             stdin: None,
             timeout: None,

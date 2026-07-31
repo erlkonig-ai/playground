@@ -17,7 +17,9 @@ small session model, exposed as nine tools:
   files are returned as text, images as MCP image content, and other binary
   media as MIME-labelled embedded resources.
 - `write` — replace a sandbox file with one complete text or standard-base64
-  payload of up to 3 MiB.
+  payload of up to 3 MiB. The write directly truncates and overwrites its
+  target; it is not transactional, so a command failure may leave a partial
+  file.
 - `job_exec` — start a long-running command and return a job id immediately.
 - `job_poll` — read retry-safe pages of incremental stdout/stderr and terminal
   state.
@@ -29,6 +31,11 @@ The HTTP server's request-body ceiling remains 1 MiB by default, including the
 JSON-RPC envelope and base64 expansion. Consequently, public HTTP writes are
 smaller than the tool's 3 MiB byte ceiling unless the operator raises
 `--max-body-bytes`; stdio calls can use the full tool limit.
+
+`exec` and `job_exec` retain the sandbox's login profile and session defaults.
+File tools deliberately run through a non-login shell with absolute utility
+paths so profile output or stdin reads cannot corrupt their protocol payloads;
+an omitted file-tool `cwd` resolves relative paths from `/` on both backends.
 
 Synchronous and background commands use one bounded execution kernel. Jobs are
 kept in memory for reconnecting clients and expire after one hour; a daemon

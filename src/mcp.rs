@@ -49,8 +49,8 @@ use crate::jobs::{JobManager, JobSnapshot, JobState};
 #[cfg(test)]
 use crate::sandbox::ExecControl;
 use crate::sandbox::{
-    ExecRequest, ExecResult, ExecStream, LifecycleLocks, PileMount, SandboxBackend, SessionId,
-    SessionSpec, Tenant,
+    ExecRequest, ExecResult, ExecShellMode, ExecStream, LifecycleLocks, PileMount, SandboxBackend,
+    SessionId, SessionSpec, Tenant,
 };
 
 /// Parameters for the `open_session` MCP method.
@@ -66,6 +66,7 @@ pub struct OpenSessionParams {
 pub struct ExecParams {
     pub session: SessionId,
     pub command: String,
+    shell_mode: ExecShellMode,
     pub cwd: Option<std::path::PathBuf>,
     pub stdin: Option<Vec<u8>>,
     pub timeout: Option<Duration>,
@@ -169,6 +170,7 @@ impl SandboxProvider {
     fn request_for(params: &ExecParams) -> ExecRequest {
         ExecRequest {
             command: params.command.clone(),
+            shell_mode: params.shell_mode,
             cwd: params.cwd.clone(),
             stdin: params.stdin.clone(),
             timeout: params.timeout,
@@ -446,6 +448,12 @@ const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024
 /// payload enters that execution path.
 const MAX_FILE_BYTES: usize = 3 * 1024 * 1024;
 
+// Base-system locations shared by the Ubuntu Jammy Lima image and FreeBSD.
+// Absolute paths keep tenant PATH changes and shell functions out of the file
+// payload boundary.
+const SANDBOX_HEAD: &str = "/usr/bin/head";
+const SANDBOX_CAT: &str = "/bin/cat";
+
 /// A message transport for the MCP server: read one request, write one
 /// response, both as a single JSON value (framing is the transport's business).
 ///
@@ -689,12 +697,13 @@ impl McpServer {
         // `head` bounds the producer itself. A concurrently growing file can
         // therefore never evict the beginning of the shared 4 MiB job log.
         let command = format!(
-            "file={quoted_path}; head -c {} < \"$file\"",
+            "file={quoted_path}; {SANDBOX_HEAD} -c {} < \"$file\"",
             MAX_FILE_BYTES + 1
         );
         let result = self.provider.exec(ExecParams {
             session: target.session,
             command,
+            shell_mode: ExecShellMode::Clean,
             cwd: target.cwd,
             stdin: None,
             timeout: None,
@@ -718,7 +727,8 @@ impl McpServer {
         let quoted_path = shell_quote(&target.path)?;
         let result = self.provider.exec(ExecParams {
             session: target.session,
-            command: format!("file={quoted_path}; cat > \"$file\""),
+            command: format!("file={quoted_path}; {SANDBOX_CAT} > \"$file\""),
+            shell_mode: ExecShellMode::Clean,
             cwd: target.cwd,
             stdin: Some(bytes),
             timeout: None,
@@ -809,6 +819,7 @@ fn parse_exec_params(args: &Value, tool: &str) -> Result<ExecParams> {
     Ok(ExecParams {
         session,
         command,
+        shell_mode: ExecShellMode::Login,
         cwd,
         stdin,
         timeout,
@@ -1095,7 +1106,7 @@ fn tool_schemas() -> Value {
         },
         {
             "name": "write",
-            "description": "Write one complete text or base64 file payload inside an open sandbox session (maximum 3 MiB). Exactly one payload field is required.",
+            "description": "Write one complete text or base64 file payload inside an open sandbox session (maximum 3 MiB, additionally subject to transport request limits). Exactly one payload field is required.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1401,7 +1412,56 @@ mod tests {
         }
     }
 
-    fn file_server(backend: FileBackend) -> McpServer {
+    /// Models the exact hostile profile behavior file tools must bypass: a
+    /// login shell consumes write stdin and prefixes read stdout. Clean mode
+    /// instead behaves like the absolute cat/head commands in the backends.
+    #[derive(Default)]
+    struct ProfilePoisonBackend {
+        file: Arc<StdMutex<Vec<u8>>>,
+        requests: Arc<StdMutex<Vec<ExecRequest>>>,
+    }
+
+    impl SandboxBackend for ProfilePoisonBackend {
+        fn name(&self) -> &'static str {
+            "profile-poison-test"
+        }
+
+        fn open_session(&self, _spec: &SessionSpec) -> Result<SessionId> {
+            Ok(SessionId::new("file-alice"))
+        }
+
+        fn exec(
+            &self,
+            _session: &SessionId,
+            request: &ExecRequest,
+            control: &ExecControl,
+        ) -> Result<ExecResult> {
+            self.requests.lock().unwrap().push(request.clone());
+            match request.shell_mode {
+                ExecShellMode::Login => {
+                    // Simulate profile stdout plus `read` consuming all stdin.
+                    control.emit(ExecStream::Stdout, b"PROFILE_NOISE\n");
+                }
+                ExecShellMode::Clean => match &request.stdin {
+                    Some(bytes) => *self.file.lock().unwrap() = bytes.clone(),
+                    None => {
+                        let bytes = self.file.lock().unwrap().clone();
+                        control.emit(ExecStream::Stdout, &bytes);
+                    }
+                },
+            }
+            Ok(ExecResult {
+                exit_code: Some(0),
+                ..Default::default()
+            })
+        }
+
+        fn close_session(&self, _session: &SessionId) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn file_server(backend: impl SandboxBackend + 'static) -> McpServer {
         let provider = SandboxProvider::new(Box::new(backend));
         provider
             .open_session(OpenSessionParams {
@@ -1456,12 +1516,13 @@ mod tests {
 
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].shell_mode, ExecShellMode::Clean);
         assert_eq!(requests[0].cwd, Some(PathBuf::from("/work dir")));
         assert_eq!(requests[0].stdin, None);
         assert_eq!(
             requests[0].command,
             format!(
-                "file={}; head -c {} < \"$file\"",
+                "file={}; /usr/bin/head -c {} < \"$file\"",
                 shell_quote(path).unwrap(),
                 MAX_FILE_BYTES + 1
             )
@@ -1489,11 +1550,63 @@ mod tests {
         assert_eq!(result["_meta"]["size"], bytes.len());
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].shell_mode, ExecShellMode::Clean);
         assert_eq!(requests[0].stdin.as_deref(), Some(bytes.as_slice()));
         assert_eq!(
             requests[0].command,
-            format!("file={}; cat > \"$file\"", shell_quote(path).unwrap())
+            format!("file={}; /bin/cat > \"$file\"", shell_quote(path).unwrap())
         );
+    }
+
+    #[test]
+    fn file_tools_bypass_profile_stdout_and_stdin_interception() {
+        let backend = ProfilePoisonBackend::default();
+        let file = backend.file.clone();
+        let requests = backend.requests.clone();
+        let server = file_server(backend);
+        let payload = "exact payload despite hostile profile";
+
+        let written = call_tool(
+            &server,
+            "write",
+            json!({
+                "session": "file-alice",
+                "path": "relative.txt",
+                "text": payload,
+            }),
+        );
+        assert_eq!(written["isError"], false);
+        assert_eq!(&*file.lock().unwrap(), payload.as_bytes());
+
+        let read = call_tool(
+            &server,
+            "read",
+            json!({ "session": "file-alice", "path": "relative.txt" }),
+        );
+        assert_eq!(read["isError"], false);
+        assert_eq!(read["content"][0]["type"], "text");
+        assert_eq!(read["content"][0]["text"], payload);
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.shell_mode == ExecShellMode::Clean)
+        );
+        assert!(requests.iter().all(|request| request.cwd.is_none()));
+        assert!(requests[0].command.contains("/bin/cat"));
+        assert!(requests[1].command.contains("/usr/bin/head"));
+    }
+
+    #[test]
+    fn ordinary_exec_requests_remain_login_shells() {
+        let params = parse_exec_params(
+            &json!({ "session": "file-alice", "command": "compass list" }),
+            "exec",
+        )
+        .unwrap();
+        assert_eq!(params.shell_mode, ExecShellMode::Login);
     }
 
     #[test]
@@ -1808,6 +1921,7 @@ mod tests {
         ExecParams {
             session: session.clone(),
             command: "true".to_string(),
+            shell_mode: ExecShellMode::Login,
             cwd: None,
             stdin: None,
             timeout: None,

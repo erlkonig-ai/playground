@@ -23,9 +23,10 @@
 //!   - `reattach_all`  = the startup sweep: enumerate every provisioned instance
 //!     under the `<prefix>-` namespace and `limactl start` each one that is
 //!     stopped.
-//!   - `exec`          = `limactl shell <instance> -- sh -lc <command>` with a
-//!     wall-clock timeout (a *session* shell, not the pile-polling systemd
-//!     service the `run` command provisions).
+//!   - `exec`          = `limactl shell <instance> -- sh -lc <command>` for
+//!     stateful user commands, or `/bin/sh -c` for clean internal requests,
+//!     with a wall-clock timeout (a *session* shell, not the pile-polling
+//!     systemd service the `run` command provisions).
 //!   - `close_session` = DETACH only: the VM persists across disconnects so the
 //!     same tenant returns to the same box. No stop, no delete.
 //!   - `destroy_session` = the explicit teardown: `limactl stop <instance>` +
@@ -63,7 +64,9 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 
 use super::proc::{DEFAULT_MAX_OUTPUT_BYTES, drive_child, drive_child_capped_controlled};
-use super::{ExecControl, ExecRequest, ExecResult, SandboxBackend, SessionId, SessionSpec};
+use super::{
+    ExecControl, ExecRequest, ExecResult, ExecShellMode, SandboxBackend, SessionId, SessionSpec,
+};
 
 /// Default per-command timeout when an [`ExecRequest`] does not specify one.
 const DEFAULT_EXEC_TIMEOUT: Duration = Duration::from_secs(300);
@@ -174,6 +177,29 @@ impl LimaBackend {
     fn limactl(&self, argv: &[&str], timeout: Duration) -> Result<super::proc::ChildOutput> {
         let argv: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
         self.runner.run(&argv, timeout)
+    }
+
+    /// Construct the exact guest execution argv. Keeping this pure makes the
+    /// profile boundary reviewable: user commands retain `sh -lc`, while
+    /// protocol-internal byte transfers use `/bin/sh -c` and an explicit root
+    /// workdir when the caller supplied no cwd.
+    fn exec_command(instance: &str, request: &ExecRequest) -> Command {
+        let mut cmd = Command::new("limactl");
+        cmd.arg("shell")
+            .arg("--workdir")
+            .arg(request.cwd.as_deref().unwrap_or(Path::new("/")))
+            .arg(instance)
+            .arg("--");
+        match request.shell_mode {
+            ExecShellMode::Login => {
+                cmd.arg("sh").arg("-lc");
+            }
+            ExecShellMode::Clean => {
+                cmd.arg("/bin/sh").arg("-c");
+            }
+        }
+        cmd.arg(&request.command);
+        cmd
     }
 
     /// Killing the local `limactl shell` transport does not prove that its
@@ -537,28 +563,12 @@ impl SandboxBackend for LimaBackend {
     ) -> Result<ExecResult> {
         let instance = session.as_str();
 
-        // limactl shell <instance> -- sh -lc <command>. A per-call cwd is applied
-        // via `--workdir`; otherwise we anchor at `/`. Without an explicit
-        // workdir `limactl shell` tries to cd into the *host* cwd mirrored in the
-        // guest — a path a session VM does not mount (it mounts only /pile and
-        // /opt/faculties) — and the login shell aborts before the command runs.
-        // `/` always exists, so the session's own `cd`/PILE-relative work is
-        // unaffected.
-        let mut cmd = Command::new("limactl");
-        cmd.arg("shell");
-        match &request.cwd {
-            Some(cwd) => {
-                cmd.arg("--workdir").arg(cwd);
-            }
-            None => {
-                cmd.arg("--workdir").arg("/");
-            }
-        }
-        cmd.arg(instance)
-            .arg("--")
-            .arg("sh")
-            .arg("-lc")
-            .arg(&request.command);
+        // A per-call cwd is applied via `--workdir`; otherwise the transport is
+        // anchored at `/`. Without it, `limactl shell` tries to mirror the host
+        // cwd, which this minimal VM does not mount. Login mode may then apply
+        // the session profile's own cwd; clean mode cannot source that profile
+        // and therefore deterministically remains at `/`.
+        let mut cmd = Self::exec_command(instance, request);
 
         if request.stdin.is_some() {
             cmd.stdin(Stdio::piped());
@@ -761,6 +771,59 @@ mod tests {
         }
     }
 
+    fn command_argv(command: &Command) -> Vec<String> {
+        std::iter::once(command.get_program())
+            .chain(command.get_args())
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn exec_shell_mode_selects_login_or_clean_argv() {
+        let mut request = ExecRequest {
+            command: "profile-sensitive".to_string(),
+            shell_mode: ExecShellMode::Login,
+            cwd: None,
+            stdin: Some(b"payload".to_vec()),
+            timeout: None,
+        };
+        assert_eq!(
+            command_argv(&LimaBackend::exec_command("playground-alice", &request)),
+            [
+                "limactl",
+                "shell",
+                "--workdir",
+                "/",
+                "playground-alice",
+                "--",
+                "sh",
+                "-lc",
+                "profile-sensitive",
+            ]
+        );
+
+        request.shell_mode = ExecShellMode::Clean;
+        request.command = "/bin/cat > /tmp/file".to_string();
+        assert_eq!(
+            command_argv(&LimaBackend::exec_command("playground-alice", &request)),
+            [
+                "limactl",
+                "shell",
+                "--workdir",
+                "/",
+                "playground-alice",
+                "--",
+                "/bin/sh",
+                "-c",
+                "/bin/cat > /tmp/file",
+            ]
+        );
+
+        request.cwd = Some(PathBuf::from("/work tree"));
+        let argv = command_argv(&LimaBackend::exec_command("playground-alice", &request));
+        assert_eq!(argv[3], "/work tree");
+    }
+
     /// A `limactl list` reply naming the given `(name, status)` instances.
     fn list_reply(rows: &[(&str, &str)]) -> super::super::proc::ChildOutput {
         let body: String = rows.iter().map(|(n, s)| format!("{n} {s}\n")).collect();
@@ -941,6 +1004,7 @@ mod tests {
         // 256 KiB of 'a' — several pipe buffers deep.
         let req = ExecRequest {
             command: "dd if=/dev/zero bs=1024 count=256 2>/dev/null | tr '\\0' 'a'".to_string(),
+            shell_mode: ExecShellMode::Login,
             cwd: None,
             stdin: None,
             timeout: Some(Duration::from_secs(120)),

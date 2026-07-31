@@ -154,11 +154,25 @@ pub struct SessionSpec {
     pub env: Vec<(String, String)>,
 }
 
+/// How an [`ExecRequest`] enters the sandbox shell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExecShellMode {
+    /// Stateful user command: source the sandbox's session profile (`sh -lc`).
+    #[default]
+    Login,
+    /// Internal protocol command: bypass tenant profile code (`sh -c`).
+    Clean,
+}
+
 /// A single command invocation within an already-open session.
 #[derive(Debug, Clone)]
 pub struct ExecRequest {
-    /// Shell command line (run via `sh -lc`, matching the current exec worker).
+    /// Shell command line interpreted according to [`ExecShellMode`].
     pub command: String,
+    /// Login shells preserve the stateful user-command contract; clean shells
+    /// are reserved for internal operations whose stdout/stdin are protocol
+    /// payloads and therefore must not pass through tenant profile code.
+    pub shell_mode: ExecShellMode,
     /// Optional per-call cwd override (guest path).
     pub cwd: Option<PathBuf>,
     /// Optional stdin bytes.
