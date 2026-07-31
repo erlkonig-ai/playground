@@ -461,6 +461,25 @@ ChatGPT connector UIs. It requires their browser callbacks and is deliberately
 not simulated as a server deployment gate. `ai.bultmann.eu` still has no UI or
 other product to serve, so no second OAuth/CORS origin is exposed there.
 
+## MIME-aware file-tool receipt (2026-07-31)
+
+- Provider commit `bc05ebfb7e7e` added the bounded `read` and `write` tools and
+  was built in the parent jail with the locked, HTTP-only FreeBSD profile. The
+  installed binary and build artifact have identical SHA-256
+  `e8ca154ee01d686a49a2e7da0a19574897d2c9b357982900e084b6ab93fdd38c`;
+  the prior binary and smoke harness are retained as
+  `/usr/local/bin/playground.pre-files-bc05ebfb7e7e` and
+  `/usr/local/libexec/playground_mcp-smoke.pre-files-bc05ebfb7e7e`.
+- After an orderly provider restart, the private loopback smoke and the public
+  `https://mcp.bultmann.eu` smoke both passed. Each authenticated MCP session
+  advertised all nine tools and proved `write`, complete close/reopen of the
+  sandbox handle, MIME-aware `read`, exact text recovery, and cleanup through
+  the ordinary execution lane. The persistent `jp` sandbox was reused.
+- The in-jail public smoke could not resolve the public hostname, so the public
+  TLS run was made from the operator host. This is a DNS limitation inside the
+  trusted parent jail, not a provider or public-edge failure; its loopback run
+  passed first and the external public run then passed end to end.
+
 The first pilot does not need VNET, a second privileged helper, a pile-backed
 job ledger, or multiple execution strategies. Those are later responses to
 observed needs, not prerequisites for safe usefulness.
