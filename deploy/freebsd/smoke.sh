@@ -9,7 +9,7 @@
 #     PLAYGROUND_PRIVATE_HTTP=YES ./smoke.sh
 #
 # The default pass proves certificate/hostname validation, unauthenticated
-# rejection, authenticated MCP initialization, the advertised nine-tool
+# rejection, authenticated MCP initialization, the advertised eight-tool
 # surface, a tenant-scoped open_session, synchronous exec, and a file-tool
 # write/read roundtrip.
 #
@@ -180,6 +180,9 @@ for tool in open_session exec read write job_exec job_poll job_cancel close_sess
 	printf '%s' "$TOOLS" | jq -e --arg tool "$tool" \
 		'.result.tools | any(.name == $tool)' >/dev/null || die "tools/list omitted $tool"
 done
+printf '%s' "$TOOLS" | jq -e \
+	'.result.tools | length == 8 and all(.name != "destroy_session")' >/dev/null || \
+	die "tools/list exposed an unexpected or destructive tool"
 
 BOX=$(tool_call open_session '{}')
 [ -n "$BOX" ] || die "open_session returned an empty sandbox id"
