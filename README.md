@@ -8,7 +8,7 @@ an isolated sandbox. This crate is only the provider.
 ## The MCP surface
 
 Because a shell is **stateful** (cwd, env, running processes), the surface is a
-small session model, exposed as nine tools:
+small session model, exposed as eight tools:
 
 - `open_session` — provision a sandbox bound to a pile (append-only) and a
   tenant, and return a session id.
@@ -25,7 +25,10 @@ small session model, exposed as nine tools:
   state.
 - `job_cancel` — idempotently request cancellation of one job.
 - `close_session` — release this handle; the persistent sandbox remains.
-- `destroy_session` — permanently tear the sandbox down and free its storage.
+
+Permanent sandbox destruction is deliberately operator-only (`user destroy`),
+not an MCP tool: several agents may share one tenant, and one connection must
+not be able to invalidate every other connection's workspace.
 
 The HTTP server's request-body ceiling remains 1 MiB by default, including the
 JSON-RPC envelope and base64 expansion. Consequently, public HTTP writes are

@@ -11,7 +11,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 
 #[test]
-fn mcp_stdio_handshake_lists_nine_tools() {
+fn mcp_stdio_handshake_lists_eight_tools() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_playground"))
         .arg("mcp")
         .stdin(Stdio::piped())
@@ -59,7 +59,7 @@ fn mcp_stdio_handshake_lists_nine_tools() {
         .iter()
         .map(|t| t["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names.len(), 9);
+    assert_eq!(names.len(), 8);
     for want in [
         "open_session",
         "exec",
@@ -69,10 +69,10 @@ fn mcp_stdio_handshake_lists_nine_tools() {
         "job_poll",
         "job_cancel",
         "close_session",
-        "destroy_session",
     ] {
         assert!(names.contains(&want), "missing tool {want} in {names:?}");
     }
+    assert!(!names.contains(&"destroy_session"));
 
     // Closing stdin is EOF for the server; it exits the serve loop cleanly.
     drop(stdin);

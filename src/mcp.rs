@@ -11,7 +11,6 @@
 //!     session through that same synchronous execution path.
 //!   - `job_*`        -> start, poll, and cancel long-running commands.
 //!   - `close_session`-> release a handle to the persistent sandbox.
-//!   - `destroy_session` -> permanently tear the sandbox down.
 //!
 //! This module defines the [`SandboxProvider`] (session registry +
 //! multi-tenancy) and, on top of it, a minimal dependency-free MCP server
@@ -27,7 +26,7 @@
 //!
 //! ## Hand-rolled JSON-RPC (deliberate)
 //!
-//! The MCP surface this provider exposes is nine small tools and a handful of
+//! The MCP surface this provider exposes is eight small tools and a handful of
 //! lifecycle methods — small enough to hand-roll over `serde_json` (already a
 //! dependency) instead of pulling the official Rust SDK
 //! [`rmcp`](https://crates.io/crates/rmcp). Keeping the surface tiny and
@@ -240,8 +239,8 @@ impl SandboxProvider {
     /// with refcounting it detaches only when the LAST endpoint sharing the box
     /// leaves. A `close_session` from one of several handles just decrements the
     /// count and leaves the box (and every other handle's `exec`) untouched; the
-    /// box lives on and the same tenant can reconnect. Use `destroy_session` to
-    /// remove it for good.
+    /// box lives on and the same tenant can reconnect. Permanent removal stays
+    /// behind the operator lifecycle API.
     pub fn close_session(&self, session: &SessionId) -> Result<()> {
         // Resolve the tenant so we can lock on the SAME per-tenant key
         // `open_session` uses. If the session is unknown, there is nothing to
@@ -287,8 +286,11 @@ impl SandboxProvider {
         })
     }
 
-    /// MCP `destroy_session`: permanently tear a sandbox down and deregister it,
-    /// REGARDLESS of refcount — this is the explicit hard teardown (jail:
+    /// Operator lifecycle API: permanently tear a sandbox down and deregister
+    /// it, REGARDLESS of refcount. This is deliberately not exposed as an MCP
+    /// tool: multiple agents can share one tenant, so one model-facing endpoint
+    /// must not be able to invalidate every other endpoint's workspace. The
+    /// operator CLI owns this explicit hard teardown (jail:
     /// `jail -r` + `zfs destroy`; lima: `limactl stop` + `limactl delete`), as
     /// opposed to `close_session`'s last-handle detach. Any other endpoints still
     /// holding the box are cut off. Destroy now takes the per-tenant lifecycle
@@ -664,7 +666,6 @@ impl McpServer {
             "job_poll" => self.tool_job_poll(args).map(|text| tool_ok(&text)),
             "job_cancel" => self.tool_job_cancel(args).map(|text| tool_ok(&text)),
             "close_session" => self.tool_close_session(args).map(|text| tool_ok(&text)),
-            "destroy_session" => self.tool_destroy_session(args).map(|text| tool_ok(&text)),
             other => Err(anyhow!("unknown tool: {other}")),
         };
 
@@ -783,16 +784,6 @@ impl McpServer {
         );
         self.provider.close_session(&session)?;
         Ok(format!("closed {}", session.as_str()))
-    }
-
-    fn tool_destroy_session(&self, args: Value) -> Result<String> {
-        let session = SessionId::new(
-            args.get("session")
-                .and_then(Value::as_str)
-                .ok_or_else(|| anyhow!("destroy_session missing 'session'"))?,
-        );
-        self.provider.destroy_session(&session)?;
-        Ok(format!("destroyed {}", session.as_str()))
     }
 }
 
@@ -1164,18 +1155,7 @@ fn tool_schemas() -> Value {
         },
         {
             "name": "close_session",
-            "description": "Release a sandbox session. Sandboxes are persistent (both the jail and lima backends): close_session only detaches, so the box stays alive and the same tenant can reconnect. Use destroy_session to remove it for good.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "session": { "type": "string", "description": "Session id from open_session." }
-                },
-                "required": ["session"]
-            }
-        },
-        {
-            "name": "destroy_session",
-            "description": "Permanently tear down a sandbox session and free its storage. Both backends' sandboxes are persistent (close_session only detaches); this removes the box for good.",
+            "description": "Release a sandbox session. Sandboxes are persistent (both the jail and lima backends): close_session only detaches, so the box stays alive and the same tenant can reconnect. Permanent removal is an operator action and is not exposed over MCP.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1769,7 +1749,7 @@ mod tests {
         assert_eq!(lines[0]["result"]["protocolVersion"], MCP_PROTOCOL_VERSION);
         // tools/list has lifecycle, file I/O, sync exec, and the cancellable
         // job triple.
-        assert_eq!(lines[1]["result"]["tools"].as_array().unwrap().len(), 9);
+        assert_eq!(lines[1]["result"]["tools"].as_array().unwrap().len(), 8);
         // open_session returned the mock session id
         assert_eq!(lines[2]["result"]["content"][0]["text"], "mock-alice");
         assert_eq!(lines[2]["result"]["isError"], false);
@@ -1804,11 +1784,11 @@ mod tests {
         );
     }
 
-    /// The `destroy_session` tool routes to the backend's `destroy_session`
-    /// (permanent teardown), distinct from `close_session`'s detach, and
-    /// deregisters the session so a follow-up is refused.
+    /// Permanent teardown is operator-only: it is neither advertised nor
+    /// callable as a hidden MCP tool. A rejected attempt must leave the shared
+    /// tenant sandbox alive for its other endpoints.
     #[test]
-    fn destroy_session_tool_calls_backend_destroy() {
+    fn destroy_session_is_not_an_mcp_tool() {
         let requests = [
             r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"open_session","arguments":{"tenant":"alice","pile_host_path":"/tmp/alice/self.pile"}}}"#,
             r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"destroy_session","arguments":{"session":"mock-alice"}}}"#,
@@ -1833,30 +1813,30 @@ mod tests {
             server.serve_loop(&mut transport).expect("serve");
         }
 
-        // destroy_session went to the backend's destroy path, not close.
-        assert_eq!(destroys.load(std::sync::atomic::Ordering::SeqCst), 1);
-        assert_eq!(closes.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(destroys.load(std::sync::atomic::Ordering::SeqCst), 0);
+        // EOF still performs the ordinary detach cleanup for the open handle.
+        assert_eq!(closes.load(std::sync::atomic::Ordering::SeqCst), 1);
 
         let lines: Vec<Value> = String::from_utf8(output)
             .unwrap()
             .lines()
             .map(|l| serde_json::from_str(l).unwrap())
             .collect();
-        // destroy_session succeeded...
-        assert_eq!(lines[1]["result"]["isError"], false);
+        // The removed tool is rejected even when called by its old name.
+        assert_eq!(lines[1]["result"]["isError"], true);
         assert!(
             lines[1]["result"]["content"][0]["text"]
                 .as_str()
                 .unwrap()
-                .contains("destroyed mock-alice")
+                .contains("unknown tool: destroy_session")
         );
-        // ...and deregistered the session: the later exec is now unknown.
-        assert_eq!(lines[2]["result"]["isError"], true);
+        // The attempted teardown did not affect the still-open session.
+        assert_eq!(lines[2]["result"]["isError"], false);
         assert!(
             lines[2]["result"]["content"][0]["text"]
                 .as_str()
                 .unwrap()
-                .contains("unknown session")
+                .contains("ran: echo hi")
         );
     }
 

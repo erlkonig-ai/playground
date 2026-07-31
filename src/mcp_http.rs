@@ -32,7 +32,7 @@
 //! - `open_session` for a tenant other than the token's → `403` (a missing
 //!   `tenant` argument is filled in from the token, so clients need not know
 //!   their own label);
-//! - `exec`/`read`/`write`/`close_session`/`destroy_session` against a sandbox
+//! - `exec`/`read`/`write`/`close_session` against a sandbox
 //!   session owned by another tenant → `403` (via
 //!   [`SandboxProvider::session_tenant`]);
 //! - an `Mcp-Session-Id` issued to another tenant's token → `403`.
@@ -880,7 +880,7 @@ fn validate_session(
 ///   missing one is filled in from it (clients need not know their label). For
 ///   the host-owned jail backend the ignored pile path is also synthesized, so
 ///   its public tool accepts `{}` and exposes no host-storage plumbing.
-/// - `exec`/`read`/`write`/`job_exec`/`close_session`/`destroy_session`: the
+/// - `exec`/`read`/`write`/`job_exec`/`close_session`: the
 ///   sandbox session named in `arguments.session` must belong to the token's
 ///   tenant. Unknown sessions fall through — the provider reports those as tool
 ///   errors itself, and telling a prober "forbidden" vs "unknown" for other
@@ -945,7 +945,7 @@ fn enforce_tenant_scope(
                 }
             }
         }
-        "exec" | "read" | "write" | "job_exec" | "close_session" | "destroy_session" => {
+        "exec" | "read" | "write" | "job_exec" | "close_session" => {
             let session = request
                 .get("params")
                 .and_then(|p| p.get("arguments"))
@@ -1220,7 +1220,7 @@ pub(crate) mod tests {
             &rpc(2, "tools/list", json!({})),
         );
         assert_eq!(tools.status, 200);
-        assert_eq!(tools.body["result"]["tools"].as_array().unwrap().len(), 9);
+        assert_eq!(tools.body["result"]["tools"].as_array().unwrap().len(), 8);
 
         // open_session without a tenant argument: filled in from the token.
         let opened = post(
