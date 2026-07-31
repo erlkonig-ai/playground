@@ -432,6 +432,30 @@ measured on the real FreeBSD 15.1 host rather than inferred from configuration:
   `Alt-Svc`; direct IPv6 retains h3 advertisement. Public TCP `:444` is closed
   over both address families.
 
+## Canonical-root MCP receipt (2026-07-31)
+
+- Provider commit `babfe4c` moved the sole Streamable HTTP endpoint and RFC
+  8707 protected-resource identity from `/mcp` to the dedicated origin itself:
+  `https://mcp.bultmann.eu`. No Caddy or HAProxy change was needed because both
+  already forward paths transparently. Rollback copies are
+  `/usr/local/bin/playground.pre-root-babfe4cfa629` and
+  `/usr/local/libexec/playground_mcp-smoke.pre-root-babfe4cfa629` inside the
+  parent jail.
+- On the private loopback listener, root `POST` returned the expected OAuth
+  `401`, root `GET` returned the MCP SSE-seam `405`, both methods at the retired
+  `/mcp` path returned `404`, and protected-resource metadata named the bare
+  origin. The full static-token smoke then proved initialization, all seven
+  tools, synchronous execution, and persistent close/reopen.
+- Over both forced IPv4 and forced IPv6, unauthenticated root initialization
+  returned `401`, authenticated initialization returned `200` with protocol
+  `2025-06-18` and a fresh session id, root `GET` returned `405`, `/mcp`
+  returned `404`, and metadata named `https://mcp.bultmann.eu`.
+- Existing OAuth access/refresh families remain bound to the old resource and
+  were not rewritten. A live old refresh was rejected as `invalid_target`;
+  connector reauthorization is therefore deliberate. The two dynamic client
+  registrations and two unused JP invites survived the cutover and remain
+  available for that reauthorization.
+
 The remaining check is product integration through the actual Claude and
 ChatGPT connector UIs. It requires their browser callbacks and is deliberately
 not simulated as a server deployment gate. `ai.bultmann.eu` still has no UI or
