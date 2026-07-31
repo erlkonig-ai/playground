@@ -8,17 +8,27 @@ an isolated sandbox. This crate is only the provider.
 ## The MCP surface
 
 Because a shell is **stateful** (cwd, env, running processes), the surface is a
-small session model, exposed as seven tools:
+small session model, exposed as nine tools:
 
 - `open_session` — provision a sandbox bound to a pile (append-only) and a
   tenant, and return a session id.
 - `exec` — run a short shell command and wait for its result.
+- `read` — read up to 3 MiB from a sandbox file without byte loss; textual
+  files are returned as text, images as MCP image content, and other binary
+  media as MIME-labelled embedded resources.
+- `write` — replace a sandbox file with one complete text or standard-base64
+  payload of up to 3 MiB.
 - `job_exec` — start a long-running command and return a job id immediately.
 - `job_poll` — read retry-safe pages of incremental stdout/stderr and terminal
   state.
 - `job_cancel` — idempotently request cancellation of one job.
 - `close_session` — release this handle; the persistent sandbox remains.
 - `destroy_session` — permanently tear the sandbox down and free its storage.
+
+The HTTP server's request-body ceiling remains 1 MiB by default, including the
+JSON-RPC envelope and base64 expansion. Consequently, public HTTP writes are
+smaller than the tool's 3 MiB byte ceiling unless the operator raises
+`--max-body-bytes`; stdio calls can use the full tool limit.
 
 Synchronous and background commands use one bounded execution kernel. Jobs are
 kept in memory for reconnecting clients and expire after one hour; a daemon
