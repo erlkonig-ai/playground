@@ -1302,12 +1302,33 @@ fn validate_grant_shape(
             "only code_challenge_method=S256 is supported",
         ));
     }
-    if params.resource != expected_resource {
+    if !resource_matches(&params.resource, expected_resource) {
         return Err(authorize_error_page(
-            "resource must exactly match this MCP protected resource",
+            "resource must match this MCP protected resource",
         ));
     }
     canonicalize_scope(&params.scope).map_err(authorize_error_page)
+}
+
+/// Compare an RFC 8707 resource indicator with this server's canonical
+/// resource identity. The only non-byte-exact spelling admitted is the URI
+/// equivalence between a bare origin and that origin's root path (`https://h`
+/// versus `https://h/`). Codex serializes a root Streamable-HTTP endpoint with
+/// the slash during token exchange even when discovery advertised the bare
+/// origin. Non-root paths, queries, authorities, ports, and schemes remain
+/// byte-exact so this cannot widen a grant to another protected resource.
+fn resource_matches(requested: &str, canonical: &str) -> bool {
+    if requested == canonical {
+        return true;
+    }
+    let Ok(canonical_uri) = canonical.parse::<Uri>() else {
+        return false;
+    };
+    let (Some(scheme), Some(authority)) = (canonical_uri.scheme_str(), canonical_uri.authority())
+    else {
+        return false;
+    };
+    canonical == format!("{scheme}://{authority}") && requested == format!("{canonical}/")
 }
 
 /// Parse the OAuth space-delimited scope set and return the one canonical
@@ -1346,10 +1367,14 @@ async fn authorize_form(State(state): State<Arc<HttpState>>, uri: Uri) -> Respon
         Ok(name) => name,
         Err(response) => return response,
     };
-    params.scope = match validate_grant_shape(&params, &oauth(&state).resource) {
+    let oauth = oauth(&state);
+    params.scope = match validate_grant_shape(&params, &oauth.resource) {
         Ok(scope) => scope,
         Err(response) => return response,
     };
+    // Grants and hidden form fields always carry our one canonical spelling,
+    // irrespective of which equivalent root spelling the client requested.
+    params.resource.clone_from(&oauth.resource);
     // Anti-framing (repair #5 HIGH): the consent page must not be embeddable, so
     // a clickjacking overlay can't trick the human into submitting the invite.
     (
@@ -1382,6 +1407,7 @@ async fn authorize_submit(State(state): State<Arc<HttpState>>, body: Bytes) -> R
         Ok(scope) => scope,
         Err(response) => return response,
     };
+    params.resource.clone_from(&oauth.resource);
 
     // The human gate: a valid invite code names the tenant. Consumption, the
     // client's `authorized_at` stamp (so GC keeps it — it has now completed an
@@ -1507,7 +1533,8 @@ async fn token(State(state): State<Arc<HttpState>>, body: Bytes) -> Response {
             if get("redirect_uri") != code.redirect_uri {
                 return token_error("invalid_grant", "redirect_uri does not match code");
             }
-            if get("resource") != code.resource || code.resource != oauth.resource {
+            if !resource_matches(get("resource"), &code.resource) || code.resource != oauth.resource
+            {
                 return token_error(
                     "invalid_target",
                     "resource does not match the authorization grant",
@@ -1572,13 +1599,14 @@ async fn token(State(state): State<Arc<HttpState>>, body: Bytes) -> Response {
         "refresh_token" => {
             let client_id = form.get("client_id").cloned();
             let refresh_token = get("refresh_token").to_string();
-            let resource = get("resource").to_string();
-            if resource != oauth.resource {
+            if !resource_matches(get("resource"), &oauth.resource) {
                 return token_error(
                     "invalid_target",
-                    "resource must exactly match this MCP protected resource",
+                    "resource must match this MCP protected resource",
                 );
             }
+            // Persist and compare only the server's canonical spelling.
+            let resource = oauth.resource.clone();
             let requested_scope = match form.get("scope") {
                 Some(scope) => match canonicalize_scope(scope) {
                     Ok(scope) => Some(scope),
@@ -2393,6 +2421,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn resource_match_only_normalizes_an_origin_root_slash() {
+        let root = "https://mcp.example.test";
+        assert!(resource_matches(root, root));
+        assert!(resource_matches("https://mcp.example.test/", root));
+
+        for different in [
+            "https://mcp.example.test//",
+            "https://mcp.example.test/mcp",
+            "https://mcp.example.test?resource=other",
+            "http://mcp.example.test/",
+            "https://mcp.example.test:444/",
+            "https://other.example.test/",
+        ] {
+            assert!(
+                !resource_matches(different, root),
+                "must not widen the resource to {different}"
+            );
+        }
+
+        let non_root = "https://mcp.example.test/mcp";
+        assert!(resource_matches(non_root, non_root));
+        assert!(!resource_matches("https://mcp.example.test/mcp/", non_root));
+    }
+
     // -- Integration: the whole browser-connector flow ----------------------
 
     /// ureq agent that does NOT follow redirects (we assert on Location).
@@ -2492,6 +2545,7 @@ mod tests {
         let state_path = dir.join("oauth.json");
         let issuer = "https://mcp.example.test";
         let protected_resource = issuer.to_string();
+        let root_slash_resource = format!("{protected_resource}/");
         let state = test_state_with_oauth(issuer, &state_path, Duration::from_secs(3600));
         let addr = spawn_server(state.clone());
         let agent = no_redirect_agent();
@@ -2608,7 +2662,7 @@ mod tests {
                 url_encode(&client_id),
                 url_encode(redirect_uri),
                 url_encode(challenge),
-                url_encode(&protected_resource),
+                url_encode(&root_slash_resource),
                 url_encode(requested_scope),
             )
         };
@@ -2710,7 +2764,7 @@ mod tests {
                     ("code_challenge", challenge),
                     ("code_challenge_method", "S256"),
                     ("state", "xyz-123"),
-                    ("resource", protected_resource.as_str()),
+                    ("resource", root_slash_resource.as_str()),
                     ("scope", requested_scope),
                     ("invite_code", invite),
                 ])
@@ -2758,8 +2812,12 @@ mod tests {
                 ])
                 .expect("token exchange")
         };
+        // Codex serializes a root endpoint with `/` at token exchange. The
+        // authorization code remains audience-bound to the discovery
+        // document's canonical bare origin while this equivalent spelling
+        // succeeds.
         let exchange =
-            |code: &str, verifier: &str| exchange_for(code, verifier, protected_resource.as_str());
+            |code: &str, verifier: &str| exchange_for(code, verifier, root_slash_resource.as_str());
         let mut tokens = exchange(&code, &verifier);
         assert_eq!(tokens.status().as_u16(), 200);
         let tokens = read_json(&mut tokens);
@@ -2900,7 +2958,7 @@ mod tests {
                 ])
                 .expect("refresh")
         };
-        let rotate = |refresh: &str| rotate_for(refresh, protected_resource.as_str());
+        let rotate = |refresh: &str| rotate_for(refresh, root_slash_resource.as_str());
         let mut wrong_target = rotate_for(&refresh, "https://other.example.test");
         assert_eq!(wrong_target.status().as_u16(), 400);
         assert_eq!(read_json(&mut wrong_target)["error"], "invalid_target");
