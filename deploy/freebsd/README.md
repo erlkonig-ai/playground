@@ -511,3 +511,23 @@ producer chunking.
 The first pilot does not need VNET, a second privileged helper, a pile-backed
 job ledger, or multiple execution strategies. Those are later responses to
 observed needs, not prerequisites for safe usefulness.
+
+## Operator-only sandbox destruction receipt (2026-07-31)
+
+- Commit `016d31bf5c02` removed `destroy_session` from MCP discovery and
+  dispatch. A direct call to the retired name is a tool error and leaves the
+  open sandbox usable; permanent teardown remains available only through the
+  operator's `playground user destroy` command.
+- Follow-up commit `92f451c52b52` deleted the now-orphaned provider teardown,
+  per-session job-reaping methods, stored job-session field, and their obsolete
+  test: 107 lines of lifecycle machinery disappeared rather than becoming a
+  hidden compatibility path.
+- The locked HTTP-only FreeBSD build and installed binary have identical
+  SHA-256 `7007e142e8b6dcaf1b285f18dea1d035a31d6b0df6aa05678d49d0d52814780c`.
+  The prior binary and smoke harness remain as
+  `/usr/local/bin/playground.pre-no-destroy-92f451c52b52` and
+  `/usr/local/libexec/playground_mcp-smoke.pre-no-destroy-92f451c52b52`.
+- After one orderly provider restart, both private-loopback and public-TLS
+  smoke passed against the persistent `jp` tenant. The harness now requires
+  exactly eight advertised tools and explicitly rejects any reappearance of
+  `destroy_session`.
