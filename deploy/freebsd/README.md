@@ -480,6 +480,34 @@ other product to serve, so no second OAuth/CORS origin is exposed there.
   trusted parent jail, not a provider or public-edge failure; its loopback run
   passed first and the external public run then passed end to end.
 
+### Exact-payload follow-up
+
+An asynchronous review of the first deployment found two correctness gaps in
+its exact-byte contract: file commands still entered a tenant-controlled login
+profile, and the job log's independent 1,024-chunk metadata cap could reject an
+in-limit read fragmented into unusually small pipe reads. Neither crossed a
+tenant boundary, but both made exact transfer depend on mutable shell state or
+producer chunking.
+
+- Commit `aaaf37fcd7af` keeps the single admission/cancellation lane while giving
+  internal file requests an explicit clean-shell mode. Ordinary `exec` and
+  `job_exec` retain login-shell behavior. File commands use `/bin/sh -c`, an
+  explicit cwd, and absolute base-system utility paths; the live tenant child
+  was checked for `/usr/bin/head` and `/bin/cat` before installation.
+- Adjacent same-stream producer fragments are now normalized into bounded
+  poll-sized chunks. A poll seals the visible tail before returning its cursor,
+  so later bytes always receive a new sequence; alternating-stream output still
+  exercises the unchanged metadata bound and gap reporting.
+- The locked FreeBSD build and installed binary have identical SHA-256
+  `fd2a6c6793b95a1de5c95678b71eb2db39c79ef73e555e21cafff50278183e62`.
+  The pre-repair binary and smoke harness are retained as
+  `/usr/local/bin/playground.pre-clean-aaaf37fcd7af` and
+  `/usr/local/libexec/playground_mcp-smoke.pre-clean-aaaf37fcd7af`.
+- After restart, both private-loopback and public-TLS smoke passed again. A
+  separate public boundary probe generated a 3 MiB file in the persistent jail,
+  read it through the MCP tool, and verified all 3,145,728 returned bytes with
+  no prefix, suffix, truncation, or non-`x` byte.
+
 The first pilot does not need VNET, a second privileged helper, a pile-backed
 job ledger, or multiple execution strategies. Those are later responses to
 observed needs, not prerequisites for safe usefulness.
