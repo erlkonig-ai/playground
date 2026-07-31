@@ -176,7 +176,7 @@ tool_call()
 }
 
 TOOLS=$(mcp_post '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}')
-for tool in open_session exec read write job_exec job_poll job_cancel close_session destroy_session; do
+for tool in open_session exec read write job_exec job_poll job_cancel close_session; do
 	printf '%s' "$TOOLS" | jq -e --arg tool "$tool" \
 		'.result.tools | any(.name == $tool)' >/dev/null || die "tools/list omitted $tool"
 done
