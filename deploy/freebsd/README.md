@@ -531,3 +531,26 @@ observed needs, not prerequisites for safe usefulness.
   smoke passed against the persistent `jp` tenant. The harness now requires
   exactly eight advertised tools and explicitly rejects any reappearance of
   `destroy_session`.
+
+## Codex root-resource interoperability receipt (2026-07-31)
+
+- Codex canonicalizes a root Streamable-HTTP endpoint as
+  `https://mcp.bultmann.eu/` during token exchange, while the protected-resource
+  discovery document intentionally names the canonical bare origin
+  `https://mcp.bultmann.eu`. The original byte-exact comparison therefore let
+  browser authorization finish but rejected the subsequent token exchange as
+  `invalid_target`.
+- Commits `04366000ae1b` and `2b6ef3e05fb7` admit exactly that bare-origin ↔
+  origin-root-slash URI equivalence. Accepted input is immediately reduced to
+  the server's canonical bare spelling before authorization codes or token
+  families are created. Non-root paths, queries, schemes, authorities, and
+  ports remain byte-exact; persisted token and access checks are unchanged.
+- The locked HTTP-only FreeBSD build and installed binary have identical
+  SHA-256 `2d32dee58bca6eee09554f03b1cf9a77d7512715a1196bd2dffaf9abad620b93`.
+  The prior binary remains available as
+  `/usr/local/bin/playground.pre-oauth-root-2b6ef3e05fb7`.
+- The 188-test all-feature suite, focused authorize/exchange/refresh coverage,
+  private-loopback smoke, and public-TLS smoke all passed. A client- and
+  callback-bound single-use invite then completed a real Codex OAuth login for
+  the existing `jp` tenant; `codex mcp list` reports the live server as enabled
+  with OAuth.
