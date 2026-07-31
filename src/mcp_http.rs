@@ -2,19 +2,19 @@
 //!
 //! This is the internet-facing half of the sandbox provider (the seam left on
 //! [`crate::mcp::McpTransport`]): MCP's Streamable HTTP transport (spec rev
-//! 2025-06-18) on a single `/mcp` endpoint, in front of the blocking
+//! 2025-06-18) on the origin-root endpoint, in front of the blocking
 //! [`McpServer`](crate::mcp::McpServer) core.
 //!
 //! ## Protocol surface (v1)
 //!
-//! - `POST /mcp` — one JSON-RPC message per request body. Requests (with an
+//! - `POST /` — one JSON-RPC message per request body. Requests (with an
 //!   `id`) get a single `application/json` JSON-RPC response; notifications
 //!   get `202 Accepted`. The spec explicitly permits plain-JSON responses for
 //!   servers that don't stream — SSE streaming (`Accept: text/event-stream`
 //!   upgrades, server-push notifications, resumability) is a deliberate v2
 //!   seam, see [`get_mcp`].
-//! - `GET /mcp` — `405 Method Not Allowed` (that's the SSE seam).
-//! - `DELETE /mcp` — explicit MCP-session termination.
+//! - `GET /` — `405 Method Not Allowed` (that's the SSE seam).
+//! - `DELETE /` — explicit MCP-session termination.
 //! - `Mcp-Session-Id` — issued on `initialize`, required on every subsequent
 //!   request, expired after [`HttpServerConfig::idle_timeout`] of inactivity
 //!   (checked lazily on access — no reaper thread) or on `DELETE`.
@@ -475,7 +475,7 @@ pub fn serve(
             .await
             .with_context(|| format!("bind {bind}"))?;
         eprintln!(
-            "playground mcp-http: MCP at http://{}/mcp (backend {}, {} token(s); plain HTTP — front with a TLS proxy for the internet)",
+            "playground mcp-http: MCP at http://{}/ (backend {}, {} token(s); plain HTTP — front with a TLS proxy for the internet)",
             listener.local_addr()?,
             state.config.backend_name,
             state.tokens.len(),
@@ -535,7 +535,7 @@ async fn shutdown_signal(state: Arc<HttpState>) {
 
 fn router(state: Arc<HttpState>) -> Router {
     let mut router = Router::new().route(
-        "/mcp",
+        "/",
         axum::routing::post(post_mcp)
             .get(get_mcp)
             .delete(delete_mcp),
@@ -555,7 +555,7 @@ fn router(state: Arc<HttpState>) -> Router {
         .with_state(state)
 }
 
-/// `POST /mcp`: one JSON-RPC message in, one JSON-RPC response (or 202) out.
+/// `POST /`: one JSON-RPC message in, one JSON-RPC response (or 202) out.
 async fn post_mcp(
     State(state): State<Arc<HttpState>>,
     headers: HeaderMap,
@@ -676,7 +676,7 @@ fn specialize_host_owned_jail_tools(response: &mut Value) {
     });
 }
 
-/// `GET /mcp`: the SSE seam, deliberately unimplemented in v1.
+/// `GET /`: the SSE seam, deliberately unimplemented in v1.
 ///
 /// A streaming server would answer a GET carrying `Accept: text/event-stream`
 /// with a server-push SSE stream (unsolicited notifications, exec progress);
@@ -691,7 +691,7 @@ async fn get_mcp() -> Response {
         .into_response()
 }
 
-/// `DELETE /mcp`: explicit MCP-session termination.
+/// `DELETE /`: explicit MCP-session termination.
 ///
 /// Removes the transport session only — sandbox sessions stay open (they
 /// belong to the tenant; close them with the `close_session` tool).
@@ -1142,7 +1142,7 @@ pub(crate) mod tests {
         origin: Option<&str>,
         message: &Value,
     ) -> Reply {
-        let mut request = agent.post(format!("http://{addr}/mcp"));
+        let mut request = agent.post(format!("http://{addr}"));
         if let Some(token) = token {
             request = request.header("Authorization", format!("Bearer {token}"));
         }
@@ -1321,7 +1321,7 @@ pub(crate) mod tests {
 
         // DELETE terminates the MCP session; it is unknown afterwards.
         let mut delete = agent
-            .delete(format!("http://{addr}/mcp"))
+            .delete(format!("http://{addr}"))
             .header("Authorization", "Bearer tok-alice")
             .header("Mcp-Session-Id", &session)
             .call()
@@ -1685,13 +1685,20 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn get_is_405_and_batches_are_400() {
+    fn root_get_is_405_old_mcp_is_404_and_batches_are_400() {
         let addr = spawn_server(test_state(vec![], Duration::from_secs(3600)));
         let agent = agent();
 
-        let mut get = agent.get(format!("http://{addr}/mcp")).call().expect("get");
+        let mut get = agent.get(format!("http://{addr}")).call().expect("get");
         assert_eq!(get.status().as_u16(), 405);
         let _ = get.body_mut().read_to_string();
+
+        let mut old_endpoint = agent
+            .get(format!("http://{addr}/mcp"))
+            .call()
+            .expect("old endpoint");
+        assert_eq!(old_endpoint.status().as_u16(), 404);
+        let _ = old_endpoint.body_mut().read_to_string();
 
         let batch = post(
             &agent,
