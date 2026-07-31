@@ -32,8 +32,9 @@
 //! - `open_session` for a tenant other than the token's → `403` (a missing
 //!   `tenant` argument is filled in from the token, so clients need not know
 //!   their own label);
-//! - `exec`/`close_session`/`destroy_session` against a sandbox session owned by
-//!   another tenant → `403` (via [`SandboxProvider::session_tenant`]);
+//! - `exec`/`read`/`write`/`close_session`/`destroy_session` against a sandbox
+//!   session owned by another tenant → `403` (via
+//!   [`SandboxProvider::session_tenant`]);
 //! - an `Mcp-Session-Id` issued to another tenant's token → `403`.
 //!
 //! The stdio transport (`playground mcp`) stays unauthenticated by design: it
@@ -879,10 +880,11 @@ fn validate_session(
 ///   missing one is filled in from it (clients need not know their label). For
 ///   the host-owned jail backend the ignored pile path is also synthesized, so
 ///   its public tool accepts `{}` and exposes no host-storage plumbing.
-/// - `exec`/`job_exec`/`close_session`/`destroy_session`: the sandbox session named in `arguments.session`
-///   must belong to the token's tenant. Unknown sessions fall through — the
-///   provider reports those as tool errors itself, and telling a prober
-///   "forbidden" vs "unknown" for other tenants' ids would leak liveness.
+/// - `exec`/`read`/`write`/`job_exec`/`close_session`/`destroy_session`: the
+///   sandbox session named in `arguments.session` must belong to the token's
+///   tenant. Unknown sessions fall through — the provider reports those as tool
+///   errors itself, and telling a prober "forbidden" vs "unknown" for other
+///   tenants' ids would leak liveness.
 /// - `job_poll`/`job_cancel`: the retained job id must belong to the token's
 ///   tenant. Unknown/expired ids likewise fall through to the provider.
 ///
@@ -943,7 +945,7 @@ fn enforce_tenant_scope(
                 }
             }
         }
-        "exec" | "job_exec" | "close_session" | "destroy_session" => {
+        "exec" | "read" | "write" | "job_exec" | "close_session" | "destroy_session" => {
             let session = request
                 .get("params")
                 .and_then(|p| p.get("arguments"))
@@ -1218,7 +1220,7 @@ pub(crate) mod tests {
             &rpc(2, "tools/list", json!({})),
         );
         assert_eq!(tools.status, 200);
-        assert_eq!(tools.body["result"]["tools"].as_array().unwrap().len(), 7);
+        assert_eq!(tools.body["result"]["tools"].as_array().unwrap().len(), 9);
 
         // open_session without a tenant argument: filled in from the token.
         let opened = post(
@@ -1552,6 +1554,36 @@ pub(crate) mod tests {
         );
         assert_eq!(exec.status, 403);
 
+        // File operations use the same sandbox-session authority boundary as
+        // exec; their narrower surface must not become a cross-tenant bypass.
+        let read = post(
+            &agent,
+            addr,
+            Some("tok-bob"),
+            Some(&bob_session),
+            None,
+            &rpc(
+                7,
+                "tools/call",
+                json!({ "name": "read", "arguments": { "session": "mock-alice", "path": "/private.txt" } }),
+            ),
+        );
+        assert_eq!(read.status, 403);
+
+        let write = post(
+            &agent,
+            addr,
+            Some("tok-bob"),
+            Some(&bob_session),
+            None,
+            &rpc(
+                8,
+                "tools/call",
+                json!({ "name": "write", "arguments": { "session": "mock-alice", "path": "/private.txt", "text": "stolen" } }),
+            ),
+        );
+        assert_eq!(write.status, 403);
+
         // ...may not close it,
         let close = post(
             &agent,
@@ -1560,7 +1592,7 @@ pub(crate) mod tests {
             Some(&bob_session),
             None,
             &rpc(
-                7,
+                9,
                 "tools/call",
                 json!({ "name": "close_session", "arguments": { "session": "mock-alice" } }),
             ),
@@ -1575,7 +1607,7 @@ pub(crate) mod tests {
             Some(&bob_session),
             None,
             &rpc(
-                8,
+                10,
                 "tools/call",
                 json!({ "name": "open_session", "arguments": { "tenant": "alice", "pile_host_path": "/tmp/alice/self.pile" } }),
             ),
@@ -1589,7 +1621,7 @@ pub(crate) mod tests {
             Some("tok-bob"),
             Some(&alice_session),
             None,
-            &rpc(9, "tools/list", json!({})),
+            &rpc(11, "tools/list", json!({})),
         );
         assert_eq!(hijack.status, 403);
     }

@@ -7,6 +7,8 @@
 //!   - `open_session` -> provision a sandbox via the backend, return a session
 //!     id (one tenant = one pile mount × driver).
 //!   - `exec`         -> run a short command and wait for its result.
+//!   - `read`/`write` -> exchange bounded, lossless file payloads with an open
+//!     session through that same synchronous execution path.
 //!   - `job_*`        -> start, poll, and cancel long-running commands.
 //!   - `close_session`-> release a handle to the persistent sandbox.
 //!   - `destroy_session` -> permanently tear the sandbox down.
@@ -25,7 +27,7 @@
 //!
 //! ## Hand-rolled JSON-RPC (deliberate)
 //!
-//! The MCP surface this provider exposes is seven small tools and a handful of
+//! The MCP surface this provider exposes is nine small tools and a handful of
 //! lifecycle methods — small enough to hand-roll over `serde_json` (already a
 //! dependency) instead of pulling the official Rust SDK
 //! [`rmcp`](https://crates.io/crates/rmcp). Keeping the surface tiny and
@@ -40,6 +42,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
+use base64::Engine as _;
 use serde_json::{Value, json};
 
 use crate::jobs::{JobManager, JobSnapshot, JobState};
@@ -435,6 +438,14 @@ const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 /// identical across all three, so no per-version branching exists elsewhere.
 const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 
+/// Maximum byte payload accepted by `write` or returned by `read`.
+///
+/// Reads ask the sandbox for at most one byte beyond this ceiling, which lets
+/// us report an explicit oversize error without ever overflowing the shared
+/// synchronous job log's 4 MiB retention bound. Writes are checked before the
+/// payload enters that execution path.
+const MAX_FILE_BYTES: usize = 3 * 1024 * 1024;
+
 /// A message transport for the MCP server: read one request, write one
 /// response, both as a single JSON value (framing is the transport's business).
 ///
@@ -636,19 +647,21 @@ impl McpServer {
         };
         let args = params.get("arguments").cloned().unwrap_or(Value::Null);
 
-        let outcome = match name {
-            "open_session" => self.tool_open_session(args),
-            "exec" => self.tool_exec(args),
-            "job_exec" => self.tool_job_exec(args),
-            "job_poll" => self.tool_job_poll(args),
-            "job_cancel" => self.tool_job_cancel(args),
-            "close_session" => self.tool_close_session(args),
-            "destroy_session" => self.tool_destroy_session(args),
+        let outcome: Result<Value> = match name {
+            "open_session" => self.tool_open_session(args).map(|text| tool_ok(&text)),
+            "exec" => self.tool_exec(args).map(|text| tool_ok(&text)),
+            "read" => self.tool_read(args),
+            "write" => self.tool_write(args),
+            "job_exec" => self.tool_job_exec(args).map(|text| tool_ok(&text)),
+            "job_poll" => self.tool_job_poll(args).map(|text| tool_ok(&text)),
+            "job_cancel" => self.tool_job_cancel(args).map(|text| tool_ok(&text)),
+            "close_session" => self.tool_close_session(args).map(|text| tool_ok(&text)),
+            "destroy_session" => self.tool_destroy_session(args).map(|text| tool_ok(&text)),
             other => Err(anyhow!("unknown tool: {other}")),
         };
 
         match outcome {
-            Ok(text) => DispatchOutcome::Result(tool_ok(&text)),
+            Ok(result) => DispatchOutcome::Result(result),
             // Tool-level failures are reported as an `isError` result (per MCP),
             // not a JSON-RPC protocol error — the model needs to see the text.
             Err(e) => DispatchOutcome::Result(tool_err(&format!("{e:#}"))),
@@ -668,6 +681,58 @@ impl McpServer {
     fn tool_exec(&self, args: Value) -> Result<String> {
         let result = self.provider.exec(parse_exec_params(&args, "exec")?)?;
         Ok(render_exec_result(&result))
+    }
+
+    fn tool_read(&self, args: Value) -> Result<Value> {
+        let target = parse_file_target(&args, "read")?;
+        let quoted_path = shell_quote(&target.path)?;
+        // `head` bounds the producer itself. A concurrently growing file can
+        // therefore never evict the beginning of the shared 4 MiB job log.
+        let command = format!(
+            "file={quoted_path}; head -c {} < \"$file\"",
+            MAX_FILE_BYTES + 1
+        );
+        let result = self.provider.exec(ExecParams {
+            session: target.session,
+            command,
+            cwd: target.cwd,
+            stdin: None,
+            timeout: None,
+        })?;
+        ensure_file_command_succeeded("read", &result)?;
+        if result.stdout.len() > MAX_FILE_BYTES {
+            return Err(anyhow!(
+                "read refused: '{}' exceeds the {} byte file limit",
+                target.path,
+                MAX_FILE_BYTES
+            ));
+        }
+        Ok(read_tool_result(&target.path, &result.stdout))
+    }
+
+    fn tool_write(&self, args: Value) -> Result<Value> {
+        let target = parse_file_target(&args, "write")?;
+        let bytes = parse_write_payload(&args)?;
+        let size = bytes.len();
+        let mime_type = infer_mime(&target.path, &bytes);
+        let quoted_path = shell_quote(&target.path)?;
+        let result = self.provider.exec(ExecParams {
+            session: target.session,
+            command: format!("file={quoted_path}; cat > \"$file\""),
+            cwd: target.cwd,
+            stdin: Some(bytes),
+            timeout: None,
+        })?;
+        ensure_file_command_succeeded("write", &result)?;
+
+        Ok(json!({
+            "content": [{
+                "type": "text",
+                "text": format!("wrote {size} bytes to {} ({mime_type})", target.path),
+            }],
+            "isError": false,
+            "_meta": file_meta(&target.path, &mime_type, size),
+        }))
     }
 
     fn tool_job_exec(&self, args: Value) -> Result<String> {
@@ -750,6 +815,229 @@ fn parse_exec_params(args: &Value, tool: &str) -> Result<ExecParams> {
     })
 }
 
+struct FileTarget {
+    session: SessionId,
+    path: String,
+    cwd: Option<PathBuf>,
+}
+
+fn parse_file_target(args: &Value, tool: &str) -> Result<FileTarget> {
+    let session = SessionId::new(
+        args.get("session")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("{tool} missing 'session'"))?,
+    );
+    let path = args
+        .get("path")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("{tool} missing 'path'"))?
+        .to_string();
+    if path.contains('\0') {
+        return Err(anyhow!("{tool} path contains a NUL byte"));
+    }
+    let cwd = match args.get("cwd") {
+        None | Some(Value::Null) => None,
+        Some(value) => {
+            let cwd = value
+                .as_str()
+                .ok_or_else(|| anyhow!("{tool} 'cwd' must be a string"))?;
+            if cwd.contains('\0') {
+                return Err(anyhow!("{tool} cwd contains a NUL byte"));
+            }
+            Some(PathBuf::from(cwd))
+        }
+    };
+    Ok(FileTarget { session, path, cwd })
+}
+
+fn parse_write_payload(args: &Value) -> Result<Vec<u8>> {
+    let bytes = match (args.get("text"), args.get("base64")) {
+        (Some(_), Some(_)) | (None, None) => {
+            return Err(anyhow!(
+                "write requires exactly one payload: either 'text' or 'base64'"
+            ));
+        }
+        (Some(value), None) => value
+            .as_str()
+            .ok_or_else(|| anyhow!("write 'text' payload must be a string"))?
+            .as_bytes()
+            .to_vec(),
+        (None, Some(value)) => {
+            let encoded = value
+                .as_str()
+                .ok_or_else(|| anyhow!("write 'base64' payload must be a string"))?;
+            // Reject a payload that cannot possibly fit before asking the
+            // decoder to allocate for it. The exact decoded-size check below
+            // remains authoritative for padding and short final quanta.
+            let max_encoded = MAX_FILE_BYTES.div_ceil(3) * 4;
+            if encoded.len() > max_encoded {
+                return Err(anyhow!(
+                    "write payload exceeds the {} byte file limit",
+                    MAX_FILE_BYTES
+                ));
+            }
+            base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .map_err(|error| anyhow!("write 'base64' payload is invalid: {error}"))?
+        }
+    };
+    if bytes.len() > MAX_FILE_BYTES {
+        return Err(anyhow!(
+            "write payload is {} bytes; limit is {} bytes",
+            bytes.len(),
+            MAX_FILE_BYTES
+        ));
+    }
+    Ok(bytes)
+}
+
+/// Quote one arbitrary (non-NUL) path as a single POSIX-shell word.
+fn shell_quote(path: &str) -> Result<String> {
+    if path.contains('\0') {
+        return Err(anyhow!("file path contains a NUL byte"));
+    }
+    Ok(format!("'{}'", path.replace('\'', "'\"'\"'")))
+}
+
+fn ensure_file_command_succeeded(tool: &str, result: &ExecResult) -> Result<()> {
+    if result.exit_code == Some(0) && result.error.is_none() && !result.cancelled {
+        return Ok(());
+    }
+
+    let mut details = Vec::new();
+    details.push(format!("exit {}", result.exit_code.unwrap_or(-1)));
+    if result.cancelled {
+        details.push("cancelled".to_string());
+    }
+    if let Some(error) = &result.error {
+        details.push(error.clone());
+    }
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    let stderr = stderr.trim();
+    if !stderr.is_empty() {
+        details.push(format!("stderr: {stderr}"));
+    }
+    Err(anyhow!(
+        "{tool} sandbox command failed ({})",
+        details.join("; ")
+    ))
+}
+
+fn infer_mime(path: &str, bytes: &[u8]) -> String {
+    infer::get(bytes)
+        .map(|kind| kind.mime_type().to_string())
+        .or_else(|| mime_guess::from_path(path).first_raw().map(str::to_string))
+        .unwrap_or_else(|| {
+            if std::str::from_utf8(bytes).is_ok() {
+                "text/plain; charset=utf-8".to_string()
+            } else {
+                "application/octet-stream".to_string()
+            }
+        })
+}
+
+fn is_textual_mime(mime_type: &str) -> bool {
+    let essence = mime_type.split(';').next().unwrap_or(mime_type);
+    essence.starts_with("text/")
+        || essence.ends_with("+json")
+        || essence.ends_with("+xml")
+        || matches!(
+            essence,
+            "application/json"
+                | "application/javascript"
+                | "application/x-javascript"
+                | "application/xml"
+                | "application/yaml"
+                | "application/x-yaml"
+                | "application/toml"
+                | "application/sql"
+        )
+}
+
+fn sandbox_uri(path: &str) -> String {
+    let (kind, path) = if let Some(path) = path.strip_prefix('/') {
+        ("absolute", path.trim_start_matches('/'))
+    } else {
+        ("relative", path)
+    };
+    let mut uri = format!("sandbox:///{kind}/");
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    for byte in path.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'~' | b'/' => {
+                uri.push(*byte as char)
+            }
+            _ => {
+                uri.push('%');
+                uri.push(HEX[(byte >> 4) as usize] as char);
+                uri.push(HEX[(byte & 0x0f) as usize] as char);
+            }
+        }
+    }
+    uri
+}
+
+fn file_meta(path: &str, mime_type: &str, size: usize) -> Value {
+    json!({
+        "path": path,
+        "mimeType": mime_type,
+        "size": size,
+        "uri": sandbox_uri(path),
+    })
+}
+
+fn read_tool_result(path: &str, bytes: &[u8]) -> Value {
+    let detected_by_magic = infer::get(bytes).is_some();
+    let mime_type = infer_mime(path, bytes);
+    let encoded = || base64::engine::general_purpose::STANDARD.encode(bytes);
+    let content = if mime_type.starts_with("image/") {
+        json!({ "type": "image", "data": encoded(), "mimeType": mime_type })
+    } else if mime_type.starts_with("audio/") {
+        // Native audio content was added after some protocol revisions this
+        // server still negotiates. An embedded blob keeps the MIME and exact
+        // bytes while remaining valid for every advertised revision.
+        json!({
+            "type": "resource",
+            "resource": {
+                "uri": sandbox_uri(path),
+                "mimeType": mime_type,
+                "blob": encoded(),
+            }
+        })
+    } else if is_textual_mime(&mime_type)
+        || (!detected_by_magic && std::str::from_utf8(bytes).is_ok())
+    {
+        match std::str::from_utf8(bytes) {
+            Ok(text) => json!({ "type": "text", "text": text }),
+            // A textual filename does not make malformed bytes safe to decode.
+            // Fall back to a blob so the read remains lossless.
+            Err(_) => json!({
+                "type": "resource",
+                "resource": {
+                    "uri": sandbox_uri(path),
+                    "mimeType": mime_type,
+                    "blob": encoded(),
+                }
+            }),
+        }
+    } else {
+        json!({
+            "type": "resource",
+            "resource": {
+                "uri": sandbox_uri(path),
+                "mimeType": mime_type,
+                "blob": encoded(),
+            }
+        })
+    };
+
+    json!({
+        "content": [content],
+        "isError": false,
+        "_meta": file_meta(path, &mime_type, bytes.len()),
+    })
+}
+
 /// Internal dispatch result: a JSON-RPC result, error, or a notification that
 /// gets no reply.
 enum DispatchOutcome {
@@ -789,6 +1077,40 @@ fn tool_schemas() -> Value {
                     "timeout_ms": { "type": "integer", "description": "Wall-clock timeout in milliseconds." }
                 },
                 "required": ["session", "command"]
+            }
+        },
+        {
+            "name": "read",
+            "description": "Read one file from an open sandbox session without byte loss (maximum 3 MiB). Returns text or image content directly and other MIME-labelled binary (including audio) as an embedded resource.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session": { "type": "string", "description": "Session id from open_session." },
+                    "path": { "type": "string", "description": "File path inside the sandbox." },
+                    "cwd": { "type": "string", "description": "Working directory for a relative path." }
+                },
+                "required": ["session", "path"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "write",
+            "description": "Write one complete text or base64 file payload inside an open sandbox session (maximum 3 MiB). Exactly one payload field is required.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session": { "type": "string", "description": "Session id from open_session." },
+                    "path": { "type": "string", "description": "File path inside the sandbox." },
+                    "cwd": { "type": "string", "description": "Working directory for a relative path." },
+                    "text": { "type": "string", "description": "UTF-8 text payload." },
+                    "base64": { "type": "string", "description": "Standard base64 payload for arbitrary bytes." }
+                },
+                "required": ["session", "path"],
+                "oneOf": [
+                    { "required": ["text"], "not": { "required": ["base64"] } },
+                    { "required": ["base64"], "not": { "required": ["text"] } }
+                ],
+                "additionalProperties": false
             }
         },
         {
@@ -1021,6 +1343,282 @@ mod tests {
     use super::testing::MockBackend;
     use super::*;
 
+    use std::sync::Mutex as StdMutex;
+
+    struct FileBackend {
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+        exit_code: Option<i32>,
+        error: Option<String>,
+        requests: Arc<StdMutex<Vec<ExecRequest>>>,
+    }
+
+    impl FileBackend {
+        fn reading(bytes: Vec<u8>) -> (Self, Arc<StdMutex<Vec<ExecRequest>>>) {
+            let requests = Arc::new(StdMutex::new(Vec::new()));
+            (
+                Self {
+                    stdout: bytes,
+                    stderr: Vec::new(),
+                    exit_code: Some(0),
+                    error: None,
+                    requests: requests.clone(),
+                },
+                requests,
+            )
+        }
+    }
+
+    impl SandboxBackend for FileBackend {
+        fn name(&self) -> &'static str {
+            "file-test"
+        }
+
+        fn open_session(&self, _spec: &SessionSpec) -> Result<SessionId> {
+            Ok(SessionId::new("file-alice"))
+        }
+
+        fn exec(
+            &self,
+            _session: &SessionId,
+            request: &ExecRequest,
+            control: &ExecControl,
+        ) -> Result<ExecResult> {
+            self.requests.lock().unwrap().push(request.clone());
+            control.emit(ExecStream::Stdout, &self.stdout);
+            control.emit(ExecStream::Stderr, &self.stderr);
+            Ok(ExecResult {
+                stdout: self.stdout.clone(),
+                stderr: self.stderr.clone(),
+                exit_code: self.exit_code,
+                cancelled: false,
+                error: self.error.clone(),
+            })
+        }
+
+        fn close_session(&self, _session: &SessionId) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn file_server(backend: FileBackend) -> McpServer {
+        let provider = SandboxProvider::new(Box::new(backend));
+        provider
+            .open_session(OpenSessionParams {
+                tenant: Tenant {
+                    label: "alice".to_string(),
+                    pile: PileMount {
+                        host_path: PathBuf::from("/tmp/alice/self.pile"),
+                        guest_path: PathBuf::from("/pile/self.pile"),
+                        append_only: true,
+                    },
+                },
+                cwd: None,
+                env: Vec::new(),
+            })
+            .unwrap();
+        McpServer::new(provider)
+    }
+
+    fn call_tool(server: &McpServer, name: &str, arguments: Value) -> Value {
+        server
+            .handle_request(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": { "name": name, "arguments": arguments },
+            }))
+            .unwrap()["result"]
+            .clone()
+    }
+
+    #[test]
+    fn read_preserves_exact_binary_and_quotes_unusual_path() {
+        let bytes = vec![0xff, 0x00, b'\n', 0x80, b'Z'];
+        let (backend, requests) = FileBackend::reading(bytes.clone());
+        let server = file_server(backend);
+        let path = "odd ' name\n$(not-executed);.unknown";
+        let result = call_tool(
+            &server,
+            "read",
+            json!({ "session": "file-alice", "path": path, "cwd": "/work dir" }),
+        );
+
+        assert_eq!(result["isError"], false);
+        assert_eq!(result["content"][0]["type"], "resource");
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(result["content"][0]["resource"]["blob"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(decoded, bytes);
+        assert_eq!(result["_meta"]["path"], path);
+        assert_eq!(result["_meta"]["size"], 5);
+        assert_eq!(result["content"][0]["resource"]["uri"], sandbox_uri(path));
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].cwd, Some(PathBuf::from("/work dir")));
+        assert_eq!(requests[0].stdin, None);
+        assert_eq!(
+            requests[0].command,
+            format!(
+                "file={}; head -c {} < \"$file\"",
+                shell_quote(path).unwrap(),
+                MAX_FILE_BYTES + 1
+            )
+        );
+    }
+
+    #[test]
+    fn write_passes_exact_base64_bytes_as_stdin() {
+        let (backend, requests) = FileBackend::reading(Vec::new());
+        let server = file_server(backend);
+        let bytes = vec![0, 1, 2, 0xfe, 0xff];
+        let path = "-leading ' quote.bin";
+        let result = call_tool(
+            &server,
+            "write",
+            json!({
+                "session": "file-alice",
+                "path": path,
+                "base64": base64::engine::general_purpose::STANDARD.encode(&bytes),
+            }),
+        );
+
+        assert_eq!(result["isError"], false);
+        assert_eq!(result["_meta"]["path"], path);
+        assert_eq!(result["_meta"]["size"], bytes.len());
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].stdin.as_deref(), Some(bytes.as_slice()));
+        assert_eq!(
+            requests[0].command,
+            format!("file={}; cat > \"$file\"", shell_quote(path).unwrap())
+        );
+    }
+
+    #[test]
+    fn read_dispatches_text_image_audio_and_opaque_binary_losslessly() {
+        let text = read_tool_result("notes.md", "hello, Liora\n".as_bytes());
+        assert_eq!(text["content"][0]["type"], "text");
+        assert_eq!(text["content"][0]["text"], "hello, Liora\n");
+        assert_eq!(text["_meta"]["mimeType"], "text/markdown");
+
+        let utf8_with_binary_name = read_tool_result("actually-text.bin", b"plain utf-8");
+        assert_eq!(utf8_with_binary_name["content"][0]["type"], "text");
+        assert_eq!(utf8_with_binary_name["content"][0]["text"], "plain utf-8");
+        assert_eq!(
+            utf8_with_binary_name["_meta"]["mimeType"],
+            "application/octet-stream"
+        );
+
+        let png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR";
+        let image = read_tool_result("misleading.bin", png);
+        assert_eq!(image["content"][0]["type"], "image");
+        assert_eq!(image["content"][0]["mimeType"], "image/png");
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(image["content"][0]["data"].as_str().unwrap())
+                .unwrap(),
+            png
+        );
+
+        let wav = b"RIFF\x04\x00\x00\x00WAVEfmt ";
+        let audio = read_tool_result("sound.wav", wav);
+        assert_eq!(audio["content"][0]["type"], "resource");
+        assert_eq!(audio["content"][0]["resource"]["mimeType"], "audio/x-wav");
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(audio["content"][0]["resource"]["blob"].as_str().unwrap())
+                .unwrap(),
+            wav
+        );
+
+        let opaque_bytes = [0xff, 0x00, 0x81];
+        let opaque = read_tool_result("payload", &opaque_bytes);
+        assert_eq!(opaque["content"][0]["type"], "resource");
+        assert_eq!(opaque["_meta"]["mimeType"], "application/octet-stream");
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(opaque["content"][0]["resource"]["blob"].as_str().unwrap())
+                .unwrap(),
+            opaque_bytes
+        );
+    }
+
+    #[test]
+    fn write_requires_one_valid_bounded_payload() {
+        for arguments in [
+            json!({}),
+            json!({ "text": "a", "base64": "Yg==" }),
+            json!({ "text": 7 }),
+            json!({ "base64": "%%%" }),
+        ] {
+            assert!(parse_write_payload(&arguments).is_err(), "{arguments}");
+        }
+        assert_eq!(
+            parse_write_payload(&json!({ "text": "hé" })).unwrap(),
+            "hé".as_bytes()
+        );
+        assert_eq!(
+            parse_write_payload(&json!({ "base64": "AAEC" })).unwrap(),
+            [0, 1, 2]
+        );
+
+        let too_large = "x".repeat(MAX_FILE_BYTES + 1);
+        let error = parse_write_payload(&json!({ "text": too_large })).unwrap_err();
+        assert!(error.to_string().contains("limit"));
+    }
+
+    #[test]
+    fn read_limit_plus_one_is_an_error_not_truncated_success() {
+        let (backend, _) = FileBackend::reading(vec![b'x'; MAX_FILE_BYTES + 1]);
+        let server = file_server(backend);
+        let result = call_tool(
+            &server,
+            "read",
+            json!({ "session": "file-alice", "path": "large.bin" }),
+        );
+        assert_eq!(result["isError"], true);
+        assert_eq!(result["content"].as_array().unwrap().len(), 1);
+        let error = result["content"][0]["text"].as_str().unwrap();
+        assert!(error.contains("exceeds"), "{error}");
+        assert!(error.contains(&MAX_FILE_BYTES.to_string()), "{error}");
+    }
+
+    #[test]
+    fn nonzero_file_command_is_a_tool_error() {
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let server = file_server(FileBackend {
+            stdout: Vec::new(),
+            stderr: b"permission denied".to_vec(),
+            exit_code: Some(13),
+            error: None,
+            requests,
+        });
+        let result = call_tool(
+            &server,
+            "read",
+            json!({ "session": "file-alice", "path": "/secret" }),
+        );
+        assert_eq!(result["isError"], true);
+        let error = result["content"][0]["text"].as_str().unwrap();
+        assert!(error.contains("exit 13"), "{error}");
+        assert!(error.contains("permission denied"), "{error}");
+    }
+
+    #[test]
+    fn shell_quote_round_trips_metacharacters() {
+        let path = "-odd ' path\n$(touch nope); * [x] café";
+        let command = format!("file={}; printf '%s' \"$file\"", shell_quote(path).unwrap());
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, path.as_bytes());
+    }
+
     /// Drive the whole handshake over an in-memory stdio transport and assert
     /// the JSON-RPC responses. Proves the server surface without Lima.
     #[test]
@@ -1056,8 +1654,9 @@ mod tests {
 
         // initialize
         assert_eq!(lines[0]["result"]["protocolVersion"], MCP_PROTOCOL_VERSION);
-        // tools/list has lifecycle, sync exec, and the cancellable job triple.
-        assert_eq!(lines[1]["result"]["tools"].as_array().unwrap().len(), 7);
+        // tools/list has lifecycle, file I/O, sync exec, and the cancellable
+        // job triple.
+        assert_eq!(lines[1]["result"]["tools"].as_array().unwrap().len(), 9);
         // open_session returned the mock session id
         assert_eq!(lines[2]["result"]["content"][0]["text"], "mock-alice");
         assert_eq!(lines[2]["result"]["isError"], false);

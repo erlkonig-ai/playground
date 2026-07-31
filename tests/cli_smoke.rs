@@ -11,7 +11,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 
 #[test]
-fn mcp_stdio_handshake_lists_seven_tools() {
+fn mcp_stdio_handshake_lists_nine_tools() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_playground"))
         .arg("mcp")
         .stdin(Stdio::piped())
@@ -49,7 +49,8 @@ fn mcp_stdio_handshake_lists_seven_tools() {
     assert_eq!(init["result"]["protocolVersion"], "2025-06-18");
     assert_eq!(init["result"]["serverInfo"]["name"], "playground-sandbox");
 
-    // tools/list -> lifecycle, sync exec, and the cancellable job triple.
+    // tools/list -> lifecycle, sync exec, bounded file I/O, and the
+    // cancellable job triple.
     let tools = read_response(&mut stdout);
     assert_eq!(tools["id"], 2);
     let names: Vec<&str> = tools["result"]["tools"]
@@ -58,10 +59,12 @@ fn mcp_stdio_handshake_lists_seven_tools() {
         .iter()
         .map(|t| t["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names.len(), 7);
+    assert_eq!(names.len(), 9);
     for want in [
         "open_session",
         "exec",
+        "read",
+        "write",
         "job_exec",
         "job_poll",
         "job_cancel",

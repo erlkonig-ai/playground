@@ -9,8 +9,9 @@
 #     PLAYGROUND_PRIVATE_HTTP=YES ./smoke.sh
 #
 # The default pass proves certificate/hostname validation, unauthenticated
-# rejection, authenticated MCP initialization, the advertised seven-tool
-# surface, a tenant-scoped open_session, and synchronous exec.
+# rejection, authenticated MCP initialization, the advertised nine-tool
+# surface, a tenant-scoped open_session, synchronous exec, and a file-tool
+# write/read roundtrip.
 #
 # Optional FreeBSD cancellation proof (run as root in the dedicated parent
 # jail, after the normal pass is known-good):
@@ -175,7 +176,7 @@ tool_call()
 }
 
 TOOLS=$(mcp_post '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}')
-for tool in open_session exec job_exec job_poll job_cancel close_session destroy_session; do
+for tool in open_session exec read write job_exec job_poll job_cancel close_session destroy_session; do
 	printf '%s' "$TOOLS" | jq -e --arg tool "$tool" \
 		'.result.tools | any(.name == $tool)' >/dev/null || die "tools/list omitted $tool"
 done
@@ -191,14 +192,14 @@ printf '%s' "$EXEC_TEXT" | grep -q 'PLAYGROUND_SMOKE_OK' || die "exec output omi
 printf '%s' "$EXEC_TEXT" | grep -q '\[exit 0\]' || die "exec did not report exit 0"
 
 # The tenant jail is persistent even though its provider-side handle is not.
-# Write through MCP, release the handle completely, reopen it, and prove the
-# same filesystem came back rather than a fresh clone.
+# Write through the bounded file tool, release the handle completely, reopen
+# it, and prove both the read tool and persistent filesystem came back intact.
 OLD_BOX=$BOX
 PERSIST_PATH="/tmp/playground-smoke-persist-$$-$(date +%s)"
-PERSIST_ARGS=$(jq -cn --arg session "$BOX" --arg path "$PERSIST_PATH" \
-	'{session:$session,command:("echo PLAYGROUND_PERSIST_OK > " + ($path | @sh)),timeout_ms:30000}')
-PERSIST_TEXT=$(tool_call exec "$PERSIST_ARGS")
-printf '%s' "$PERSIST_TEXT" | grep -q '\[exit 0\]' || die "persistence marker write failed"
+WRITE_ARGS=$(jq -cn --arg session "$BOX" --arg path "$PERSIST_PATH" \
+	--arg text 'PLAYGROUND_PERSIST_OK' \
+	'{session:$session,path:$path,text:$text}')
+tool_call write "$WRITE_ARGS" >/dev/null
 
 CLOSE_ARGS=$(jq -cn --arg session "$BOX" \
 	'{session:$session}')
@@ -207,14 +208,18 @@ BOX=
 BOX=$(tool_call open_session '{}')
 [ "$BOX" = "$OLD_BOX" ] || die "reopened tenant returned a different sandbox id"
 
-PERSIST_ARGS=$(jq -cn --arg session "$BOX" --arg path "$PERSIST_PATH" \
-	'{session:$session,command:("cat " + ($path | @sh) + "; rm -f " + ($path | @sh)),timeout_ms:30000}')
-PERSIST_TEXT=$(tool_call exec "$PERSIST_ARGS")
+READ_ARGS=$(jq -cn --arg session "$BOX" --arg path "$PERSIST_PATH" \
+	'{session:$session,path:$path}')
+PERSIST_TEXT=$(tool_call read "$READ_ARGS")
 printf '%s' "$PERSIST_TEXT" | grep -q 'PLAYGROUND_PERSIST_OK' || \
-	die "tenant filesystem did not persist across close/reopen"
-printf '%s' "$PERSIST_TEXT" | grep -q '\[exit 0\]' || die "persistence marker cleanup failed"
+	die "file-tool payload did not persist across close/reopen"
 
-printf 'playground smoke: transport, Bearer auth, MCP handshake, tools, exec, and persistence: ok\n'
+CLEAN_ARGS=$(jq -cn --arg session "$BOX" --arg path "$PERSIST_PATH" \
+	'{session:$session,command:("rm -f " + ($path | @sh)),timeout_ms:30000}')
+CLEAN_TEXT=$(tool_call exec "$CLEAN_ARGS")
+printf '%s' "$CLEAN_TEXT" | grep -q '\[exit 0\]' || die "persistence marker cleanup failed"
+
+printf 'playground smoke: transport, Bearer auth, MCP handshake, tools, exec, file roundtrip, and persistence: ok\n'
 
 [ "${PLAYGROUND_FREEBSD_JOB_SMOKE:-NO}" = YES ] || exit 0
 
