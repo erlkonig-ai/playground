@@ -213,6 +213,67 @@ pile or any other pile on the host. Append-only (`chflags sappnd`,
 malicious-proof once `securelevel>=1`) bounds the damage to appends, not
 truncation.
 
+## One-time assistant-persona backfill for existing tenants
+
+Jails created by a version predating tenant assistant provisioning keep their
+persisted `/etc/profile` unchanged on restart/reattach. This is intentional:
+deploying a new daemon must not silently rewrite an existing workspace. New
+tenants need no rollout step. For each pre-feature tenant, enter the trusted
+`playground` parent jail as root and run this explicit, idempotent backfill once:
+
+```sh
+# From the physical host, enter the trusted parent first:
+sudo jexec playground /bin/sh
+
+# The remaining commands run INSIDE that parent jail.
+TENANT='<existing-label>'
+case "$TENANT" in
+  ''|[[:space:]]*|*[[:space:]])
+    echo "tenant label is empty or has surrounding whitespace" >&2
+    exit 64
+    ;;
+esac
+JAIL=$(/usr/local/bin/playground user jail-name "$TENANT")
+LABEL="${TENANT} assistant"
+LABEL_BYTES=$(LC_ALL=C printf '%s' "$LABEL" | wc -c | tr -d ' ')
+[ "$LABEL_BYTES" -le 32 ] || {
+  echo "assistant label exceeds the relations 32-byte limit" >&2
+  exit 64
+}
+
+# This is the v1 identity protocol implemented by TenantAssistantPersona:
+# lower 128 bits of SHA-256(domain || exact unsanitised tenant bytes).
+PERSONA_ID=$(
+  { printf 'playground/tenant-assistant/v1\000'; printf '%s' "$TENANT"; } |
+    sha256 -q | cut -c 33-64
+)
+
+# Insert first. Do not use --force: an existing label on another id is a
+# conflict to inspect, not something rollout should paper over.
+/usr/sbin/jexec "$JAIL" /opt/faculties/relations \
+  --pile /shared/shared.pile \
+  add "$LABEL" --id "$PERSONA_ID" --display-name "$LABEL" \
+  --affinity assistant --source playground
+
+# Then persist that exact same label for future login shells. Pass the line as
+# argv (not interpolated into shell code); grep makes the append idempotent.
+ESCAPED_LABEL=$(printf '%s' "$LABEL" | sed "s/'/'\\\\''/g")
+PROFILE_LINE="export PERSONA='$ESCAPED_LABEL'"
+/usr/sbin/jexec "$JAIL" /bin/sh -c \
+  'grep -Fqx "$1" /etc/profile || printf "%s\n" "$1" >> /etc/profile' \
+  sh "$PROFILE_LINE"
+
+# Agreement check: the next login shell resolves PERSONA to the shared person.
+/usr/sbin/jexec "$JAIL" /bin/sh -lc \
+  'test "$PERSONA" = "$1" && relations --pile /shared/shared.pile show "$PERSONA"' \
+  sh "$LABEL"
+```
+
+The person id is deterministic and `relations` has set semantics, so rerunning
+after an interrupted backfill converges on the same entity. The profile line is
+added only after the relation succeeds; a relation conflict therefore cannot
+leave `PERSONA` pointing at an unknown identity.
+
 ## Verify privately before enabling Caddy
 
 ```sh

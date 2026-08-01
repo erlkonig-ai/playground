@@ -9,8 +9,10 @@
 //!     (`aitemp/playground/<session>`), given a manual `devfs` mount, its two
 //!     host-owned piles (per-coworker `self.pile` + the shared `shared.pile`)
 //!     nullfs-mounted rw at guest `/pile` and `/shared`, seeded `/etc/profile`
-//!     (PATH=/opt/faculties + PILE=/pile/self.pile), then `jail -c
-//!     name=playground-<session> path=<mountpoint> persist ...`. Idempotent: a
+//!     (PATH=/opt/faculties + PILE=/pile/self.pile + the tenant-derived
+//!     `PERSONA`), then `jail -c name=playground-<session> path=<mountpoint>
+//!     persist ...`, and registers that same persona in the shared pile.
+//!     Idempotent: a
 //!     tenant whose dataset already exists is treated as already-provisioned
 //!     (skip the clone, just ensure the jail is up). This is what `playground
 //!     user create <name>` calls.
@@ -169,6 +171,16 @@ const DEFAULT_CLONE_REFQUOTA: &str = "10G";
 /// Default ZFS `quota` for the pile-root dataset (a ZFS size string). Global cap
 /// across all tenants' piles (self + shared) so pile writes cannot fill the pool.
 const DEFAULT_PILE_ROOT_QUOTA: &str = "50G";
+/// Domain separator for the deterministic tenant-assistant identity. The
+/// lower 128 bits of SHA-256 become an opaque, deterministic GenId. This is
+/// deliberately not called an intrinsic entity id: intrinsic identity hashes
+/// canonical facts with Blake3, while this operational identity hashes one
+/// agreed namespace + tenant key and reuses the provider's existing SHA-256
+/// dependency.
+const TENANT_ASSISTANT_ID_DOMAIN: &[u8] = b"playground/tenant-assistant/v1\0";
+/// `relations::label_norm` is a ShortString, so the human-facing persona label
+/// supplied to `relations add` must fit its 32-byte inline representation.
+const RELATIONS_LABEL_MAX_BYTES: usize = 32;
 /// Default per-jail `rctl(8)` rules (the `<resource>:<action>=<amount>` tails).
 /// Applied whenever a jail is created or reused while host RACCT is enabled;
 /// dynamic RCTL rules do not survive a reboot, and repeated `rctl -a` calls for
@@ -185,6 +197,46 @@ const DEFAULT_RCTL_RULES: &[&str] = &[
     "pcpu:deny=90",
     "nthr:deny=2048",
 ];
+
+/// The single source of truth for a tenant's assistant identity.
+///
+/// Both the `PERSONA` profile export and the person inserted into
+/// `/shared/shared.pile` are rendered from this one value. Identity is scoped
+/// by the original (unsanitised) tenant label, so labels that happen to map to
+/// similar jail names cannot share an assistant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TenantAssistantPersona {
+    id_hex: String,
+    label: String,
+}
+
+impl TenantAssistantPersona {
+    fn for_tenant(tenant: &str) -> Result<Self> {
+        if tenant.trim() != tenant {
+            bail!(
+                "invalid tenant label: leading/trailing whitespace would make its assistant \
+                 persona resolve differently in the relations faculty"
+            );
+        }
+
+        let label = format!("{tenant} assistant");
+        if label.len() > RELATIONS_LABEL_MAX_BYTES {
+            bail!(
+                "tenant assistant label '{label}' is {} bytes but relations labels hold at most \
+                 {RELATIONS_LABEL_MAX_BYTES}; shorten the tenant label",
+                label.len()
+            );
+        }
+
+        let mut hasher = Sha256::new();
+        hasher.update(TENANT_ASSISTANT_ID_DOMAIN);
+        hasher.update(tenant.as_bytes());
+        let digest_hex = format!("{:x}", hasher.finalize());
+        let id_hex = digest_hex[digest_hex.len() - 32..].to_string();
+
+        Ok(Self { id_hex, label })
+    }
+}
 
 /// Tri-state, ERROR-PRESERVING result of a "does this ZFS dataset exist?" probe.
 ///
@@ -1302,6 +1354,53 @@ fi
         Ok(())
     }
 
+    /// Register the tenant's stable assistant in the org-wide relations graph.
+    ///
+    /// `relations add --id` is deliberately the writer here: it owns the
+    /// canonical person schema, label normalization, kind entity, and branch
+    /// mechanics. The provider only supplies the identity it derived for this
+    /// tenant. Replaying this command after a failed create is set-idempotent:
+    /// the same tenant produces the same person id and facts, never a second
+    /// person entity.
+    fn register_tenant_assistant(
+        &self,
+        jail: &str,
+        assistant: &TenantAssistantPersona,
+    ) -> Result<()> {
+        let added = self.run(
+            &[
+                "sudo",
+                "-n",
+                "jexec",
+                jail,
+                "/opt/faculties/relations",
+                "--pile",
+                Self::GUEST_SHARED_PILE,
+                "add",
+                &assistant.label,
+                "--id",
+                &assistant.id_hex,
+                "--display-name",
+                &assistant.label,
+                "--affinity",
+                "assistant",
+                "--source",
+                "playground",
+            ],
+            None,
+            ADMIN_TIMEOUT,
+        )?;
+        if !added.success() {
+            bail!(
+                "register tenant assistant '{}' ({}) in shared.pile failed: {}",
+                assistant.label,
+                assistant.id_hex,
+                added.stderr_lossy()
+            );
+        }
+        Ok(())
+    }
+
     /// Public liveness probe for the `user list` CLI: true iff the tenant's jail
     /// context is currently running. Sanitises the label the same way
     /// [`JailBackend::jail_name`] does, so the CLI and backend agree.
@@ -2215,6 +2314,14 @@ impl SandboxBackend for JailBackend {
 
     fn provision_sandbox(&self, spec: &SessionSpec) -> Result<()> {
         Self::validate_label(&spec.tenant.label)?;
+        let assistant = TenantAssistantPersona::for_tenant(&spec.tenant.label)?;
+        if spec.env.iter().any(|(key, _)| key == "PERSONA") {
+            bail!(
+                "PERSONA is reserved by Playground and derives from tenant '{}'; \
+                 do not supply it in SessionSpec::env",
+                spec.tenant.label
+            );
+        }
         let jail = self.jail_name(&spec.tenant.label);
         let dataset = self.dataset(&jail);
 
@@ -2516,6 +2623,10 @@ impl SandboxBackend for JailBackend {
                     "export PILE={}\n",
                     shell_quote(Self::GUEST_SELF_PILE)
                 ));
+                profile.push_str(&format!(
+                    "export PERSONA={}\n",
+                    shell_quote(&assistant.label)
+                ));
                 for (k, v) in &spec.env {
                     profile.push_str(&format!("export {}={}\n", k, shell_quote(v)));
                 }
@@ -2556,6 +2667,10 @@ impl SandboxBackend for JailBackend {
                 // runs on reattach/reuse because dynamic rules vanish on reboot.
                 self.apply_rctl_rules(&jail)
                     .with_context(|| format!("apply resource limits to new jail '{jail}'"))?;
+                self.register_tenant_assistant(&jail, &assistant)
+                    .with_context(|| {
+                        format!("register assistant for tenant '{}'", spec.tenant.label)
+                    })?;
                 Ok(())
             })(&mut created_clone);
 
@@ -3486,6 +3601,20 @@ mod tests {
         assert_eq!(shell_quote(""), "''");
     }
 
+    #[test]
+    fn tenant_assistant_identity_is_stable_and_tenant_scoped() {
+        let alice = TenantAssistantPersona::for_tenant("alice").expect("alice persona");
+        let alice_again = TenantAssistantPersona::for_tenant("alice").expect("same alice persona");
+        let bob = TenantAssistantPersona::for_tenant("bob").expect("bob persona");
+
+        assert_eq!(alice, alice_again);
+        assert_eq!(alice.label, "alice assistant");
+        assert_eq!(alice.id_hex, "25c147ed19fde75186fef26c7217f5db");
+        assert_ne!(alice.id_hex, bob.id_hex);
+        assert!(TenantAssistantPersona::for_tenant(" alice").is_err());
+        assert!(TenantAssistantPersona::for_tenant("abcdefghijklmnopqrstuvw").is_err());
+    }
+
     /// LocalRunner really spawns the argv on this machine: argv reaches the
     /// process verbatim (no shell re-parse), stdin is fed, both output
     /// streams and the exit code come back. (Pipe-buffer-sized payloads and
@@ -3597,6 +3726,145 @@ mod tests {
         assert!(jail_call.contains(&"ip4=disable".to_string()));
         assert!(jail_call.contains(&"ip6=disable".to_string()));
         assert!(jail_call.contains(&"persist".to_string()));
+    }
+
+    /// Fresh provision renders one tenant-derived persona value into BOTH
+    /// identity surfaces: the login-shell `PERSONA` export and the stable
+    /// relations person inserted into shared.pile. The relation id is explicit,
+    /// so a retry after a partial create cannot mint a second person.
+    #[test]
+    fn fresh_provision_registers_one_shared_persona_matching_environment() {
+        let (backend, mock) = mock_provision_ready()
+            .reply(&["sudo", "-n", "zfs", "list"], dataset_absent())
+            .into_backend();
+        backend
+            .provision_sandbox(&spec("alice"))
+            .expect("provision");
+
+        let expected = TenantAssistantPersona::for_tenant("alice").unwrap();
+        let calls = mock.calls();
+        let persona_calls: Vec<_> = calls
+            .iter()
+            .filter(|call| {
+                call.get(2).map(String::as_str) == Some("jexec")
+                    && call.get(4).map(String::as_str) == Some("/opt/faculties/relations")
+                    && call.get(7).map(String::as_str) == Some("add")
+            })
+            .collect();
+        assert_eq!(
+            persona_calls.len(),
+            1,
+            "fresh provision must register exactly one assistant: {calls:?}"
+        );
+        let add = persona_calls[0];
+        assert_eq!(add.get(6).map(String::as_str), Some("/shared/shared.pile"));
+        assert_eq!(add.get(8), Some(&expected.label));
+        assert_eq!(add.get(9).map(String::as_str), Some("--id"));
+        assert_eq!(add.get(10), Some(&expected.id_hex));
+
+        let (_, seed_stdin) = mock
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(argv, _)| {
+                argv.iter().any(|arg| arg == "tee")
+                    && argv.iter().any(|arg| arg == "-a")
+                    && argv.iter().any(|arg| arg.ends_with("/etc/profile"))
+            })
+            .cloned()
+            .expect("profile seed");
+        let profile = String::from_utf8(seed_stdin.expect("profile body")).unwrap();
+        let persona_export = format!("export PERSONA={}\n", shell_quote(&expected.label));
+        assert_eq!(profile.matches("export PERSONA=").count(), 1);
+        assert!(
+            profile.contains(&persona_export),
+            "profile and relations identity must share the same label: {profile}"
+        );
+    }
+
+    /// Once the persistent dataset exists, both administrative re-provision and
+    /// client reconnect reuse the profile + shared relation established by the
+    /// first create. Neither path re-seeds the profile or re-runs `relations
+    /// add`, so lifecycle churn cannot mint another assistant.
+    #[test]
+    fn repeated_provision_and_reconnect_reuse_existing_persona() {
+        let jail = alice_jail();
+        let (backend, mock) = mock_reattached_alice()
+            .with_running_jail(&jail)
+            .into_backend();
+
+        backend
+            .provision_sandbox(&spec("alice"))
+            .expect("first repeated provision");
+        backend
+            .provision_sandbox(&spec("alice"))
+            .expect("second repeated provision");
+        backend.open_session(&spec("alice")).expect("reconnect one");
+        backend.open_session(&spec("alice")).expect("reconnect two");
+
+        let raw_calls = mock.calls.lock().unwrap();
+        assert!(
+            !raw_calls.iter().any(|(argv, _)| {
+                argv.get(2).map(String::as_str) == Some("jexec")
+                    && argv.get(4).map(String::as_str) == Some("/opt/faculties/relations")
+            }),
+            "reuse must not register another assistant: {raw_calls:?}"
+        );
+        assert!(
+            !raw_calls.iter().any(|(argv, stdin)| {
+                argv.iter().any(|arg| arg.ends_with("/etc/profile"))
+                    && stdin.as_deref().is_some_and(|body| {
+                        String::from_utf8_lossy(body).contains("export PERSONA=")
+                    })
+            }),
+            "reuse must retain, not rewrite, the persisted PERSONA profile: {raw_calls:?}"
+        );
+    }
+
+    #[test]
+    fn provision_rejects_a_second_persona_source_before_host_mutation() {
+        let mut conflicting = spec("alice");
+        conflicting
+            .env
+            .push(("PERSONA".to_string(), "someone else".to_string()));
+        let (backend, mock) = MockRunner::default().into_backend();
+
+        let error = backend
+            .provision_sandbox(&conflicting)
+            .expect_err("PERSONA must have one source");
+        assert!(error.to_string().contains("PERSONA is reserved"));
+        assert!(
+            mock.calls().is_empty(),
+            "conflict must fail before any host mutation"
+        );
+    }
+
+    #[test]
+    fn persona_registration_failure_rolls_back_the_fresh_clone() {
+        let (backend, mock) = mock_provision_ready()
+            .reply(&["sudo", "-n", "zfs", "list"], dataset_absent())
+            .reply(
+                &["sudo", "-n", "jexec"],
+                HostOutput {
+                    exit_code: Some(1),
+                    stderr: b"relations unavailable".to_vec(),
+                    ..Default::default()
+                },
+            )
+            .into_backend();
+
+        let error = backend
+            .provision_sandbox(&spec("alice"))
+            .expect_err("identity setup is part of successful provision");
+        assert!(format!("{error:#}").contains("relations unavailable"));
+        assert!(
+            mock.calls().iter().any(|call| {
+                call.get(2).map(String::as_str) == Some("zfs")
+                    && call.get(3).map(String::as_str) == Some("destroy")
+            }),
+            "failed identity setup must clean up its operation-owned clone"
+        );
     }
 
     // ---- repair #4: resource bounds ----------------------------------------

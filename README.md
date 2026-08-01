@@ -100,6 +100,16 @@ cargo run --manifest-path playground/Cargo.toml -- \
   user create alice --backend jail --tokens ./tokens.json
 ```
 
+The first jail provision also creates one stable person in the shared pile's
+relations graph, labelled `<tenant> assistant`, and exports that same label as
+`PERSONA` in every login shell. Its explicit person id is derived from the
+unsanitised tenant label, so retries after a partial provision and later
+destroy/recreate cycles converge on the same identity rather than minting a
+new one. Reconnects and daemon restarts reuse the persisted profile and pile;
+they do not perform identity setup again. Because relations labels use a
+32-byte ShortString, jail tenant labels in this scheme must be at most 22 bytes
+and have no leading or trailing whitespace.
+
 Other `user` verbs: `user list` (tenants in the store, annotated live/down),
 `user destroy <name>` (tear the sandbox down + drop its tokens), `user token
 show <name>`, `user token reset <name>` (revoke + re-mint). Pass
