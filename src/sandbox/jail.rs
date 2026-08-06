@@ -64,9 +64,32 @@
 //!
 //! ## Networking
 //!
-//! v1 jails are created with `ip4=disable ip6=disable`: no network at all.
-//! This is deliberate default-deny; host-only or NAT networking is a later,
-//! explicit decision.
+//! Sandboxes are created with `ip4=inherit ip6=inherit`. For a CHILD jail that
+//! means the parent's addresses and nothing more — a jail cannot grant a child
+//! an address it does not hold itself — so a sandbox is confined to whatever
+//! the surrounding backend jail already has.
+//!
+//! v1 used `ip4=disable ip6=disable` (no network at all) and deferred the
+//! alternative as "a later, explicit decision"; this is that decision. The
+//! motivation is that a sandbox with no addresses cannot reach any external
+//! API, which makes network-using faculties impossible to run inside one.
+//!
+//! **The egress policy is NOT expressed here.** Inheriting an address places a
+//! sandbox under whatever packet filter already governs that address on the
+//! host; this module contributes no filtering of its own. An operator who
+//! wants sandboxes to reach the public internet but not the surrounding
+//! private network is expected to express exactly that as a host firewall rule
+//! on the parent jail's address — which is also the only place it *can* be
+//! expressed, since with `vnet=inherit` a child shares the parent's stack and
+//! is not separately addressable.
+//!
+//! Two consequences worth stating plainly:
+//!
+//!   - Deploy this only where such a rule exists. With no filtering on the
+//!     parent address, sandboxes reach the host's whole network.
+//!   - Inheriting shares the parent's loopback, so anything the parent serves
+//!     on `127.0.0.1` — including this MCP server — becomes reachable from
+//!     inside a sandbox.
 //!
 //! ## Pile provisioning (Model B: host-owned, server-born piles)
 //!
@@ -1354,6 +1377,43 @@ fi
         Ok(())
     }
 
+    /// Copy the runner's resolver configuration into the sandbox root.
+    ///
+    /// `ip4=inherit` gives a sandbox the parent jail's ADDRESSES, but a ZFS
+    /// template clone carries no `/etc/resolv.conf`, so every lookup fails with
+    /// "failed to lookup address information" while egress itself works fine.
+    /// That failure surfaces late and misleadingly — as a DNS error inside some
+    /// agent's tool call, far from its cause — so it is fixed at provision time.
+    ///
+    /// Called before BOTH `jail -c` sites, not just first-create: it is
+    /// idempotent, it repairs datasets provisioned before sandboxes had any
+    /// network, and it lets a change of resolver on the host propagate on the
+    /// next reattach.
+    ///
+    /// A runner with no `/etc/resolv.conf` is not an error (there is nothing to
+    /// propagate, and the operator may be running split-DNS deliberately); a
+    /// failed WRITE is, because silently shipping a sandbox that cannot resolve
+    /// is the exact failure this exists to prevent.
+    fn seed_resolv_conf(&self, root: &str) -> Result<()> {
+        let resolv = self.run(
+            &["sudo", "-n", "cat", "/etc/resolv.conf"],
+            None,
+            ADMIN_TIMEOUT,
+        )?;
+        if !resolv.success() || resolv.stdout.is_empty() {
+            return Ok(());
+        }
+        let wrote = self.run(
+            &["sudo", "-n", "tee", &format!("{root}/etc/resolv.conf")],
+            Some(&resolv.stdout),
+            ADMIN_TIMEOUT,
+        )?;
+        if !wrote.success() {
+            bail!("seed /etc/resolv.conf failed: {}", wrote.stderr_lossy());
+        }
+        Ok(())
+    }
+
     /// Register the tenant's stable assistant in the org-wide relations graph.
     ///
     /// `relations add --id` is deliberately the writer here: it owns the
@@ -2171,6 +2231,10 @@ fi
         // Pile mounts do not survive a jail restart either — re-establish both,
         // FAIL-CLOSED (exact-tuple validated). A failure aborts before `jail -c`.
         self.mount_piles(jail, &root)?;
+        // Resolver config does not survive as part of the dataset for boxes
+        // provisioned before sandboxes had addresses — re-seed on every
+        // reattach so those self-heal.
+        self.seed_resolv_conf(&root)?;
         let created = self.run(
             &[
                 "sudo",
@@ -2181,8 +2245,8 @@ fi
                 &format!("path={root}"),
                 &format!("host.hostname={jail}"),
                 "persist",
-                "ip4=disable",
-                "ip6=disable",
+                "ip4=inherit",
+                "ip6=inherit",
             ],
             None,
             ADMIN_TIMEOUT,
@@ -2639,8 +2703,13 @@ impl SandboxBackend for JailBackend {
                     bail!("seed /etc/profile failed: {}", seed.stderr_lossy());
                 }
 
-                // Create the jail context: persistent (no processes yet), no
-                // network at all (default-deny v1), minimal params.
+                // A template clone has no /etc/resolv.conf; without one the
+                // sandbox has addresses and egress but cannot resolve a name.
+                self.seed_resolv_conf(&root)?;
+
+                // Create the jail context: persistent (no processes yet),
+                // inheriting the parent jail's addresses so the host's existing
+                // pf policy applies (see the Networking note above).
                 let created = self.run(
                     &[
                         "sudo",
@@ -2651,8 +2720,8 @@ impl SandboxBackend for JailBackend {
                         &format!("path={root}"),
                         &format!("host.hostname={jail}"),
                         "persist",
-                        "ip4=disable",
-                        "ip6=disable",
+                        "ip4=inherit",
+                        "ip6=inherit",
                     ],
                     None,
                     ADMIN_TIMEOUT,
@@ -3723,8 +3792,8 @@ mod tests {
             .expect("jail -c issued");
         assert!(jail_call.contains(&format!("name={jail}")));
         assert!(jail_call.contains(&format!("path={}", alice_root())));
-        assert!(jail_call.contains(&"ip4=disable".to_string()));
-        assert!(jail_call.contains(&"ip6=disable".to_string()));
+        assert!(jail_call.contains(&"ip4=inherit".to_string()));
+        assert!(jail_call.contains(&"ip6=inherit".to_string()));
         assert!(jail_call.contains(&"persist".to_string()));
     }
 
