@@ -2,12 +2,23 @@
 # port. Decode it before the TLS handshake and trust client addresses only
 # when they came from the two production gateways. Direct public IPv6 remains
 # on the ordinary :443 listener and never passes through this wrapper.
+#
+# Site-specific addresses are environment placeholders, so this file is
+# publishable as-is and the deployment supplies its own topology:
+#
+#   PLAYGROUND_LAN_IP     address this jail's Caddy binds for the IPv4 path
+#   PLAYGROUND_PROXY_GW1  first gateway allowed to assert a client address
+#   PLAYGROUND_PROXY_GW2  second gateway allowed to assert a client address
+#
+# Each defaults to 127.0.0.1. The default is deliberately narrower than any
+# real deployment: forgetting to set these yields a listener that answers
+# nobody, never one that trusts more peers than intended.
 {
-	servers <lan-ingress-ip>:444 {
+	servers {$PLAYGROUND_LAN_IP:127.0.0.1}:444 {
 		listener_wrappers {
 			proxy_protocol {
 				timeout 2s
-				allow <lan-gateway-1>/32 <lan-gateway-2>/32
+				allow {$PLAYGROUND_PROXY_GW1:127.0.0.1}/32 {$PLAYGROUND_PROXY_GW2:127.0.0.1}/32
 				fallback_policy skip
 			}
 			tls
@@ -46,6 +57,6 @@ mcp.bultmann.eu {
 # LAN-only backend for the shared IPv4 HAProxy VIP. The PROXY listener wrapper
 # above consumes the preamble before Caddy begins the TLS handshake.
 https://mcp.bultmann.eu:444 {
-	bind <lan-ingress-ip>
+	bind {$PLAYGROUND_LAN_IP:127.0.0.1}
 	import playground_routes
 }

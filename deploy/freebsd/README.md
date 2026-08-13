@@ -16,6 +16,26 @@ their FSIDs) from the parent afterward, which prevents exact verification and
 safe unmount. This setting applies only to the operator-controlled parent;
 tenant child jails retain their restricted/default view.
 
+## Placeholders
+
+Site-specific addressing is not published in this repository. Wherever a
+deployment receipt or config below shows one of these, substitute your own
+value:
+
+| placeholder | meaning |
+|---|---|
+| `<jail-host>` | the FreeBSD host the parent jail runs on |
+| `<lan-ingress-ip>` | address Caddy binds for the IPv4 (PROXY protocol) path |
+| `<lan-gateway-1>`, `<lan-gateway-2>` | the two gateways allowed to assert a client address |
+| `<lan-prefix>` | the private IPv4 range those addresses sit in |
+| `<public-ipv6-address>`, `<ipv6-prefix>` | the public IPv6 address and its routed prefix |
+
+`Caddyfile` reads the first three from the environment
+(`PLAYGROUND_LAN_IP`, `PLAYGROUND_PROXY_GW1`, `PLAYGROUND_PROXY_GW2`), each
+defaulting to `127.0.0.1`, so an unset variable fails closed rather than
+widening the listener. The public origin and its DNS records are genuinely
+public and appear verbatim.
+
 **Deployment status (2026-07-31): live at `https://mcp.bultmann.eu`.**
 The dual-stack public edge (direct IPv6 plus IPv4 through the shared HAProxy),
 trusted TLS, loopback provider, persistent pilot, cold-boot reattach,
