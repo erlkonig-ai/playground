@@ -26,6 +26,7 @@ pub mod faculties;
 pub mod jail;
 pub mod lima;
 pub mod proc;
+pub mod runner;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
