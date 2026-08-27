@@ -291,7 +291,11 @@ mod tests {
             ResourceState::Unknown
         );
         assert_eq!(
-            classify_probe(&out(None, "dataset does not exist", true), Some(255), absent),
+            classify_probe(
+                &out(None, "dataset does not exist", true),
+                Some(255),
+                absent
+            ),
             ResourceState::Unknown
         );
         assert_eq!(
