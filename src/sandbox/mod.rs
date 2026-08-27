@@ -25,6 +25,7 @@
 pub mod faculties;
 pub mod jail;
 pub mod lima;
+pub mod policy;
 pub mod proc;
 pub mod runner;
 

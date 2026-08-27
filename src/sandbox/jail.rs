@@ -151,6 +151,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 
+use super::policy::{self, MountRow, ResourceState, TenantAssistantPersona};
 use super::proc::DEFAULT_MAX_OUTPUT_BYTES;
 // The host-command transports live in `super::runner`: they are transport, not
 // FreeBSD policy, and the Linux backend drives the same seam.
@@ -188,16 +189,6 @@ const DEFAULT_CLONE_REFQUOTA: &str = "10G";
 /// Default ZFS `quota` for the pile-root dataset (a ZFS size string). Global cap
 /// across all tenants' piles (self + shared) so pile writes cannot fill the pool.
 const DEFAULT_PILE_ROOT_QUOTA: &str = "50G";
-/// Domain separator for the deterministic tenant-assistant identity. The
-/// lower 128 bits of SHA-256 become an opaque, deterministic GenId. This is
-/// deliberately not called an intrinsic entity id: intrinsic identity hashes
-/// canonical facts with Blake3, while this operational identity hashes one
-/// agreed namespace + tenant key and reuses the provider's existing SHA-256
-/// dependency.
-const TENANT_ASSISTANT_ID_DOMAIN: &[u8] = b"playground/tenant-assistant/v1\0";
-/// `relations::label_norm` is a ShortString, so the human-facing persona label
-/// supplied to `relations add` must fit its 32-byte inline representation.
-const RELATIONS_LABEL_MAX_BYTES: usize = 32;
 /// Default per-jail `rctl(8)` rules (the `<resource>:<action>=<amount>` tails).
 /// Applied whenever a jail is created or reused while host RACCT is enabled;
 /// dynamic RCTL rules do not survive a reboot, and repeated `rctl -a` calls for
@@ -214,71 +205,6 @@ const DEFAULT_RCTL_RULES: &[&str] = &[
     "pcpu:deny=90",
     "nthr:deny=2048",
 ];
-
-/// The single source of truth for a tenant's assistant identity.
-///
-/// Both the `PERSONA` profile export and the person inserted into
-/// `/shared/shared.pile` are rendered from this one value. Identity is scoped
-/// by the original (unsanitised) tenant label, so labels that happen to map to
-/// similar jail names cannot share an assistant.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct TenantAssistantPersona {
-    id_hex: String,
-    label: String,
-}
-
-impl TenantAssistantPersona {
-    fn for_tenant(tenant: &str) -> Result<Self> {
-        if tenant.trim() != tenant {
-            bail!(
-                "invalid tenant label: leading/trailing whitespace would make its assistant \
-                 persona resolve differently in the relations faculty"
-            );
-        }
-
-        let label = format!("{tenant} assistant");
-        if label.len() > RELATIONS_LABEL_MAX_BYTES {
-            bail!(
-                "tenant assistant label '{label}' is {} bytes but relations labels hold at most \
-                 {RELATIONS_LABEL_MAX_BYTES}; shorten the tenant label",
-                label.len()
-            );
-        }
-
-        let mut hasher = Sha256::new();
-        hasher.update(TENANT_ASSISTANT_ID_DOMAIN);
-        hasher.update(tenant.as_bytes());
-        let digest_hex = format!("{:x}", hasher.finalize());
-        let id_hex = digest_hex[digest_hex.len() - 32..].to_string();
-
-        Ok(Self { id_hex, label })
-    }
-}
-
-/// Tri-state, ERROR-PRESERVING result of a "does this ZFS dataset exist?" probe.
-///
-/// A plain `bool` collapses transport failure, permission failure, timeout, and
-/// true absence all into "no", and a lifecycle op that then runs destructive
-/// cleanup (`zfs destroy`) on a merely-transient probe failure can DESTROY a
-/// valid persistent workspace (the 2026-07-24 blocker-#3 data-loss class). This
-/// enum keeps the three cases apart so a caller can fail CLOSED on doubt:
-///
-///   - [`DatasetState::Exists`] — `zfs list` returned success. The dataset is
-///     definitely present.
-///   - [`DatasetState::Absent`] — `zfs list` failed with the CANONICAL
-///     "dataset does not exist" signal (exit non-zero AND the stderr ZFS emits
-///     for a genuinely missing name). Only in this state is it safe to treat a
-///     tenant as un-provisioned / free to clone into.
-///   - [`DatasetState::Unknown`] — anything else: a transport error (ssh 255),
-///     a local timeout, a permission failure, a faulted pool, or any non-zero
-///     exit whose stderr is NOT the not-found signal. The probe simply does not
-///     know, so NO destructive action may run on this state — the caller bails.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DatasetState {
-    Exists,
-    Absent,
-    Unknown,
-}
 
 /// FreeBSD-jail-backed sandbox. One [`SessionId`] maps to one jail name, which
 /// equals the session's ZFS dataset leaf under `dataset_parent`.
@@ -835,75 +761,37 @@ fi
     /// the pile target).
     const PILE_FSTYPE: &'static str = "nullfs";
 
-    /// Parse one FreeBSD `mount(8)` line into `(source, target, fstype)`.
-    /// All paths this backend creates are whitespace-safe, so the literal
-    /// delimiters emitted by mount(8) are unambiguous here.
-    fn mount_line_parts(line: &str) -> Option<(&str, &str, &str)> {
-        let (source, rest) = line.split_once(" on ")?;
-        let (target, tail) = rest.split_once(" (")?;
-        let fstype = tail.split([',', ')']).next()?.trim();
-        Some((source.trim(), target.trim(), fstype))
-    }
-
-    /// True iff a `mount(8)` listing shows the exact intended tuple.
-    fn mount_listing_has_exact_fstype(
-        listing: &str,
-        source: &str,
-        target: &str,
-        fstype: &str,
-    ) -> bool {
-        listing.lines().any(|line| {
-            Self::mount_line_parts(line)
-                .map(|(src, tgt, fs)| src == source && tgt == target && fs == fstype)
-                .unwrap_or(false)
-        })
-    }
-
-    /// Return whether `target` has exactly the intended mount, or is absent.
-    /// Any wrong or duplicate occupant is ambiguous authority and fails closed.
-    fn exact_mount_or_absent(
-        listing: &str,
-        source: &str,
-        target: &str,
-        fstype: &str,
-    ) -> Result<bool> {
-        let occupants: Vec<_> = listing
-            .lines()
-            .filter(|line| Self::line_target_is(line, target))
-            .collect();
-        match occupants.as_slice() {
-            [] => Ok(false),
-            [_] if Self::mount_listing_has_exact_fstype(listing, source, target, fstype) => {
-                Ok(true)
-            }
-            _ => bail!(
-                "mount target {target} has {} occupant(s), not exactly one ({source}, {target}, {fstype})",
-                occupants.len()
-            ),
-        }
-    }
-
-    /// True iff a `mount(8)` listing already shows EXACTLY the intended mount:
-    /// `<host_file> on <target> (nullfs, …)`. Parses each line in the FreeBSD
-    /// shape `"<src> on <TARGET> (<fstype>, <opts>)"` and requires all three of
-    /// source, whole-token target, and fstype to match — so a DIFFERENT source
-    /// mounted at `target` (a tenant-planted redirection), or a non-nullfs
-    /// filesystem, is NOT accepted as our mount. This is the exact-mount
-    /// validation the reattach path needs before it trusts a reused jail's pile
-    /// mount instead of blindly starting the jail.
-    fn mount_listing_has_exact(listing: &str, host_file: &str, target: &str) -> bool {
-        Self::mount_listing_has_exact_fstype(listing, host_file, target, Self::PILE_FSTYPE)
-    }
-
-    /// Read the current `mount(8)` listing, failing CLOSED if the command itself
-    /// failed (we must never proceed on an unreadable mount table — a silently
-    /// empty listing would let a missing mount pass as "already correct").
-    fn mount_listing(&self) -> Result<String> {
+    /// Read the current `mount(8)` listing as normalised [`MountRow`]s, failing
+    /// CLOSED if the command itself failed (we must never proceed on an
+    /// unreadable mount table — a silently empty listing would let a missing
+    /// mount pass as "already correct").
+    ///
+    /// The comparison rules over these rows — whole-token targets, exactly one
+    /// occupant, all three of source/target/fstype matching — live in
+    /// [`super::policy`], shared with the Linux backend. Only the FreeBSD line
+    /// FORMAT is this backend's business.
+    fn mount_listing(&self) -> Result<Vec<MountRow>> {
         let out = self.run(&["sudo", "-n", "mount"], None, ADMIN_TIMEOUT)?;
         if !out.success() {
             bail!("`mount` failed: {}", out.stderr_lossy());
         }
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        Ok(policy::parse_bsd_mount(&String::from_utf8_lossy(
+            &out.stdout,
+        )))
+    }
+
+    /// True iff the table already shows EXACTLY the intended pile mount:
+    /// `(host_file, target, nullfs)`. A DIFFERENT source mounted at `target` (a
+    /// tenant-planted redirection) or a non-nullfs filesystem is NOT accepted as
+    /// our mount.
+    fn has_exact_pile_mount(rows: &[MountRow], host_file: &str, target: &str) -> bool {
+        policy::has_exact(rows, host_file, target, Self::PILE_FSTYPE)
+    }
+
+    /// Whether anything at all is mounted at exactly `target` (whole-token, so
+    /// `/pile/self.pile` never matches a longer path).
+    fn target_occupied(rows: &[MountRow], target: &str) -> bool {
+        !policy::occupants(rows, target).is_empty()
     }
 
     /// Resolve the target token mount(8) uses for this exact ZFS dataset. On a
@@ -912,13 +800,11 @@ fi
     /// exposes the physical/global path. devfs entries use that global spelling,
     /// so deriving it from the dataset's exact source tuple avoids suffix or
     /// guessed-prefix matching.
-    fn reported_dataset_mountpoint(&self, listing: &str, dataset: &str) -> Result<String> {
-        let targets: Vec<&str> = listing
-            .lines()
-            .filter_map(Self::mount_line_parts)
-            .filter_map(|(source, target, fstype)| {
-                (source == dataset && fstype == "zfs").then_some(target)
-            })
+    fn reported_dataset_mountpoint(&self, rows: &[MountRow], dataset: &str) -> Result<String> {
+        let targets: Vec<&str> = rows
+            .iter()
+            .filter(|row| row.source == dataset && row.fstype == "zfs")
+            .map(|row| row.target.as_str())
             .collect();
         match targets.as_slice() {
             [target] if target.starts_with('/') => Ok((*target).to_string()),
@@ -954,7 +840,7 @@ fi
         let before = self.mount_listing()?;
         let reported_root = self.reported_dataset_mountpoint(&before, dataset)?;
         let listed_target = format!("{reported_root}/dev");
-        if Self::exact_mount_or_absent(&before, "devfs", &listed_target, "devfs")? {
+        if policy::exact_or_absent(&before, "devfs", &listed_target, "devfs")? {
             return Ok(());
         }
 
@@ -976,7 +862,7 @@ fi
         let after = self.mount_listing()?;
         let after_root = self.reported_dataset_mountpoint(&after, dataset)?;
         let after_target = format!("{after_root}/dev");
-        if Self::exact_mount_or_absent(&after, "devfs", &after_target, "devfs")? {
+        if policy::exact_or_absent(&after, "devfs", &after_target, "devfs")? {
             return Ok(());
         }
         bail!(
@@ -1023,11 +909,8 @@ fi
         // is a redirection we refuse to trust (blocker #3: a tenant-controlled
         // underlying mountpoint must never become a silently-accepted PILE).
         let listing = self.mount_listing()?;
-        if listing
-            .lines()
-            .any(|line| Self::line_target_is(line, &target))
-        {
-            if Self::mount_listing_has_exact(&listing, host_file, &target) {
+        if Self::target_occupied(&listing, &target) {
+            if Self::has_exact_pile_mount(&listing, host_file, &target) {
                 // Reattach no-op: the pre-existing mount is precisely ours.
                 return Ok(());
             }
@@ -1073,22 +956,13 @@ fi
         // pile on the EMPTY clone file, silently redirecting PILE to throwaway
         // scratch that `destroy_session` later `zfs destroy`s (data loss).
         let after = self.mount_listing()?;
-        if !Self::mount_listing_has_exact(&after, host_file, &target) {
+        if !Self::has_exact_pile_mount(&after, host_file, &target) {
             bail!(
                 "nullfs mount {host_file} -> {target} did not take exactly \
                  (not present as ({host_file}, {target}, nullfs) in `mount` output)"
             );
         }
         Ok(())
-    }
-
-    /// Whether a `mount` line's TARGET token equals `target` (whole-token, so
-    /// `/pile/self.pile` never matches a longer path). Shared by the
-    /// already-mounted probe and the exact-tuple check.
-    fn line_target_is(line: &str, target: &str) -> bool {
-        Self::mount_line_parts(line)
-            .map(|(_, tgt, _)| tgt == target)
-            .unwrap_or(false)
     }
 
     /// Re-establish BOTH single-file pile mounts (self + shared) over a jail
@@ -1723,10 +1597,7 @@ fi
         for guest in [Self::GUEST_SELF_PILE, Self::GUEST_SHARED_PILE, "/dev"] {
             let target = format!("{root}{guest}");
             let before = self.mount_listing()?;
-            if !before
-                .lines()
-                .any(|line| Self::line_target_is(line, &target))
-            {
+            if !Self::target_occupied(&before, &target) {
                 continue;
             }
             let unmounted = self.run(
@@ -1735,10 +1606,7 @@ fi
                 ADMIN_TIMEOUT,
             )?;
             let after = self.mount_listing()?;
-            if after
-                .lines()
-                .any(|line| Self::line_target_is(line, &target))
-            {
+            if Self::target_occupied(&after, &target) {
                 bail!(
                     "cleanup could not unmount {target}: {}",
                     unmounted.stderr_lossy()
@@ -1752,12 +1620,12 @@ fi
             ADMIN_TIMEOUT,
         )?;
         match self.dataset_state(&dataset) {
-            DatasetState::Absent => Ok(()),
-            DatasetState::Exists => bail!(
+            ResourceState::Absent => Ok(()),
+            ResourceState::Exists => bail!(
                 "cleanup zfs destroy {dataset} did not remove the operation-owned clone: {}",
                 destroyed.stderr_lossy()
             ),
-            DatasetState::Unknown => bail!(
+            ResourceState::Unknown => bail!(
                 "cleanup cannot prove operation-owned dataset {dataset} absent after zfs destroy: {}",
                 destroyed.stderr_lossy()
             ),
@@ -1774,51 +1642,27 @@ fi
             .unwrap_or(false)
     }
 
-    /// TRI-STATE, error-preserving probe for a ZFS dataset (see
-    /// [`DatasetState`]). `zfs list <dataset>` exits 0 when the dataset is
-    /// present; on absence it exits non-zero with a stderr that includes the
-    /// canonical `dataset does not exist` phrase. We classify:
-    ///
-    ///   - runner `Err`, a local timeout, or the runner's transport-error exit
-    ///     (ssh 255) -> [`DatasetState::Unknown`] (we never reached / trusted
-    ///     the answer);
-    ///   - exit 0 -> [`DatasetState::Exists`];
-    ///   - a non-zero exit whose stderr contains the not-found phrase ->
-    ///     [`DatasetState::Absent`];
-    ///   - ANY OTHER non-zero exit (permission denied, faulted pool, an
-    ///     unexpected message) -> [`DatasetState::Unknown`].
+    /// The canonical stderr phrase `zfs list` emits for a name that genuinely
+    /// does not exist. This is ZFS's absence signal and nothing else's: any
+    /// other non-zero exit (permission denied, faulted pool) must classify as
+    /// Unknown, never as "free to clone into / safe to destroy".
+    const ZFS_ABSENT_MARKER: &'static str = "does not exist";
+
+    /// TRI-STATE, error-preserving probe for a ZFS dataset. The fail-closed
+    /// ordering lives once in [`policy::classify_probe`]; this supplies only
+    /// ZFS's spelling of "absent" and the runner's transport-error code.
     ///
     /// Callers must NEVER run destructive cleanup on `Unknown`: on doubt, fail
     /// closed and destroy nothing. This is the primary fix for the blocker-#3
     /// data-loss class where a transient SSH failure looked identical to a real
     /// absence and triggered a `zfs destroy` of a valid workspace.
-    fn dataset_state(&self, dataset: &str) -> DatasetState {
-        let out = match self.run(&["sudo", "-n", "zfs", "list", dataset], None, ADMIN_TIMEOUT) {
-            Ok(out) => out,
-            // The command never produced a trustworthy status (spawn failed,
-            // pipe error, ...). We do not know — fail closed.
-            Err(_) => return DatasetState::Unknown,
-        };
-        if out.success() {
-            return DatasetState::Exists;
-        }
-        // A local wall-clock kill or the transport's own error exit (ssh 255)
-        // means we never got ZFS's real answer — Unknown, not Absent.
-        if out.timed_out
-            || (out.exit_code.is_some() && out.exit_code == self.runner.transport_error_exit())
-        {
-            return DatasetState::Unknown;
-        }
-        // Non-zero from ZFS itself: only the canonical not-found stderr proves a
-        // genuine absence. Anything else (permission, faulted pool, an
-        // unexpected error) is Unknown — we refuse to treat it as "free to
-        // clone into / safe to destroy".
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        if stderr.contains("does not exist") {
-            DatasetState::Absent
-        } else {
-            DatasetState::Unknown
-        }
+    fn dataset_state(&self, dataset: &str) -> ResourceState {
+        let probe = self.run(&["sudo", "-n", "zfs", "list", dataset], None, ADMIN_TIMEOUT);
+        policy::classify_probe(
+            &probe,
+            self.runner.transport_error_exit(),
+            Self::ZFS_ABSENT_MARKER,
+        )
     }
 
     /// Detect and MANDATORILY unmount any LEGACY directory-style pile mount over
@@ -1841,18 +1685,15 @@ fi
     /// `listing` is the mount table already read by the caller (reattach reads it
     /// once for the devfs check); we re-read only after an actual unmount to
     /// confirm it cleared.
-    fn migrate_legacy_pile_mounts(&self, jail: &str, root: &str, listing: &str) -> Result<()> {
+    fn migrate_legacy_pile_mounts(&self, jail: &str, root: &str, rows: &[MountRow]) -> Result<()> {
         let mut unmounted_any = false;
         for guest_dir in Self::LEGACY_GUEST_PILE_DIRS {
             let target = format!("{root}{guest_dir}");
             // A legacy mount is any mount whose whole-token TARGET is exactly the
             // pile PARENT DIR (`/pile` or `/shared`) — never the single-file
-            // targets under them. `line_target_is` matches the whole target
-            // token, so `/pile` does not match `/pile/self.pile`.
-            let present = listing
-                .lines()
-                .any(|line| Self::line_target_is(line, &target));
-            if !present {
+            // targets under them. Occupancy matches the whole target token, so
+            // `/pile` does not match `/pile/self.pile`.
+            if !Self::target_occupied(rows, &target) {
                 continue;
             }
             eprintln!(
@@ -1877,10 +1718,7 @@ fi
         let after = self.mount_listing()?;
         for guest_dir in Self::LEGACY_GUEST_PILE_DIRS {
             let target = format!("{root}{guest_dir}");
-            if after
-                .lines()
-                .any(|line| Self::line_target_is(line, &target))
-            {
+            if Self::target_occupied(&after, &target) {
                 bail!(
                     "reattach {jail}: legacy directory pile mount at {target} could not be \
                      unmounted (refusing to start jail on the pre-repair writable-parent topology)"
@@ -2063,7 +1901,7 @@ impl SandboxBackend for JailBackend {
                 // `jail -c`, keeping the dataset and its /etc/profile as they are.
                 // Never destroy the dataset — it is the tenant's PERSISTENT
                 // storage. VERIFY the recorded tenant first, same as the reuse arm.
-                DatasetState::Exists => {
+                ResourceState::Exists => {
                     self.verify_tenant_property(&dataset, &spec.tenant.label)
                         .with_context(|| format!("verify tenant provenance for jail '{jail}'"))?;
                     // Independent persistent-pile provenance (repair #1 reopened).
@@ -2081,7 +1919,7 @@ impl SandboxBackend for JailBackend {
                     Ok(SessionId::new(jail.clone()))
                 }
                 // 3. No dataset at all: the tenant was never provisioned.
-                DatasetState::Absent => bail!(
+                ResourceState::Absent => bail!(
                     "sandbox for tenant '{}' is not provisioned — run `playground user create {}`",
                     spec.tenant.label,
                     spec.tenant.label
@@ -2090,7 +1928,7 @@ impl SandboxBackend for JailBackend {
                 // (transport error, timeout, permission, faulted pool). Fail
                 // closed: do not reattach a box we cannot confirm and do not claim
                 // it is unprovisioned.
-                DatasetState::Unknown => bail!(
+                ResourceState::Unknown => bail!(
                     "cannot determine sandbox state for tenant '{}' (dataset {} probe was \
                      inconclusive — transport/permission/timeout); refusing to act",
                     spec.tenant.label,
@@ -2133,7 +1971,7 @@ impl SandboxBackend for JailBackend {
             // by a failure, is exactly the situation that used to `zfs destroy` a
             // valid dataset. Fail closed instead.
             match self.dataset_state(&dataset) {
-                DatasetState::Exists => {
+                ResourceState::Exists => {
                     self.verify_tenant_property(&dataset, &spec.tenant.label)
                         .with_context(|| format!("verify tenant provenance for jail '{jail}'"))?;
                     // Independent persistent-pile provenance (repair #1 reopened).
@@ -2156,7 +1994,7 @@ impl SandboxBackend for JailBackend {
                     }
                     return Ok(());
                 }
-                DatasetState::Unknown => bail!(
+                ResourceState::Unknown => bail!(
                     "cannot determine sandbox state for tenant '{}' (dataset {} probe was \
                  inconclusive — transport/permission/timeout); refusing to provision \
                  (would risk cloning over or destroying an existing workspace)",
@@ -2164,7 +2002,7 @@ impl SandboxBackend for JailBackend {
                     dataset
                 ),
                 // Definitely absent: safe to clone a fresh box below.
-                DatasetState::Absent => {}
+                ResourceState::Absent => {}
             }
 
             eprintln!(
@@ -3277,9 +3115,9 @@ mod tests {
 
     /// A `zfs list` reply that means "dataset genuinely does NOT exist": the
     /// tri-state probe ([`JailBackend::dataset_state`]) classifies this as
-    /// [`DatasetState::Absent`] only because the stderr carries ZFS's canonical
+    /// [`ResourceState::Absent`] only because the stderr carries ZFS's canonical
     /// not-found phrase. A bare non-zero `fail()` is instead classified as
-    /// [`DatasetState::Unknown`] (an error we cannot interpret as clean
+    /// [`ResourceState::Unknown`] (an error we cannot interpret as clean
     /// absence), which is the whole point — a transient failure must NOT look
     /// like an absence and trigger a clone/cleanup.
     fn dataset_absent() -> HostOutput {
@@ -3292,7 +3130,7 @@ mod tests {
 
     /// A `zfs list` reply that means "the probe FAILED for a reason that is NOT
     /// clean absence" (permission denied here; a transport 255 or timeout would
-    /// be equivalent). Classified [`DatasetState::Unknown`], so a lifecycle op
+    /// be equivalent). Classified [`ResourceState::Unknown`], so a lifecycle op
     /// must fail closed and destroy nothing.
     fn dataset_probe_error() -> HostOutput {
         HostOutput {
@@ -3388,20 +3226,6 @@ mod tests {
                 &format!("{root}/shared/shared.pile"),
                 "nullfs",
             )
-    }
-
-    #[test]
-    fn tenant_assistant_identity_is_stable_and_tenant_scoped() {
-        let alice = TenantAssistantPersona::for_tenant("alice").expect("alice persona");
-        let alice_again = TenantAssistantPersona::for_tenant("alice").expect("same alice persona");
-        let bob = TenantAssistantPersona::for_tenant("bob").expect("bob persona");
-
-        assert_eq!(alice, alice_again);
-        assert_eq!(alice.label, "alice assistant");
-        assert_eq!(alice.id_hex, "25c147ed19fde75186fef26c7217f5db");
-        assert_ne!(alice.id_hex, bob.id_hex);
-        assert!(TenantAssistantPersona::for_tenant(" alice").is_err());
-        assert!(TenantAssistantPersona::for_tenant("abcdefghijklmnopqrstuvw").is_err());
     }
 
     /// Exit 255 is a *transport* error only where a transport exists (ssh).
@@ -4224,20 +4048,20 @@ mod tests {
     /// timeout) is `Unknown` — never mistaken for a clean absence.
     #[test]
     fn dataset_state_distinguishes_absent_from_error() {
-        let cases: &[(HostOutput, DatasetState)] = &[
+        let cases: &[(HostOutput, ResourceState)] = &[
             (
                 ok_with_stdout("aitemp/playground/x\n"),
-                DatasetState::Exists,
+                ResourceState::Exists,
             ),
-            (dataset_absent(), DatasetState::Absent),
-            (dataset_probe_error(), DatasetState::Unknown),
-            (fail(), DatasetState::Unknown), // bare non-zero, no stderr
+            (dataset_absent(), ResourceState::Absent),
+            (dataset_probe_error(), ResourceState::Unknown),
+            (fail(), ResourceState::Unknown), // bare non-zero, no stderr
             (
                 HostOutput {
                     exit_code: Some(255),
                     ..Default::default()
                 },
-                DatasetState::Unknown,
+                ResourceState::Unknown,
             ),
             (
                 HostOutput {
@@ -4245,7 +4069,7 @@ mod tests {
                     exit_code: None,
                     ..Default::default()
                 },
-                DatasetState::Unknown,
+                ResourceState::Unknown,
             ),
         ];
         for (out, want) in cases {
