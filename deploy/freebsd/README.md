@@ -55,17 +55,18 @@ Two hosting modes exist and stay interchangeable:
 
 ## TRUST BOUNDARY (Model B — host-owned per-tenant piles)
 
-- **The caller-supplied pile never goes to this server.** The
-  `pile_host_path` tool argument is ignored. Instead each tenant
-  jail gets its OWN host-owned, server-born piles, provisioned on this box
+- **The caller cannot supply a pile to this server.** `open_session` carries
+  only authenticated tenant identity, and jail provisioning accepts only
+  backend-owned storage. Each tenant jail gets its OWN host-owned, server-born
+  piles, provisioned on this box
   under `--jail-pile-root` (`/var/db/playground/piles` in this profile): a
   per-tenant `self.pile` (seeded from a generic `bootstrap.pile` — no operator memory)
   single-file-mounted at guest `/pile/self.pile`, plus one org-wide
   `shared.pile` single-file-mounted at guest `/shared/shared.pile`. Both are
   `chflags sappnd` append-only and decoupled from the jail lifecycle
   (`destroy_session` never deletes them). A stolen tenant token thus reaches
-  only that tenant's own seeded pile and the shared org pile — never the
-  caller-supplied pile, and never any other pile on the host.
+  only that tenant's own seeded pile and the shared org pile — never any other
+  pile on the host.
 - **Only the pile FILES are mounted — never a host directory (2026-07-24).**
   Each pile is a single-FILE nullfs mount (the host pile file onto a pre-created
   empty target file inside the jail's own ZFS clone), so the jail's `/pile` and

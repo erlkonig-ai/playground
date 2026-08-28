@@ -93,9 +93,9 @@
 //!
 //! ## Pile provisioning (Model B: host-owned, server-born piles)
 //!
-//! This backend does NOT use the caller-supplied `tenant.pile.host_path` (that
-//! field is ignored); every tenant jail is given its OWN piles, created on
-//! the server under `pile_root`. Two host-owned pile FILES are mounted in via
+//! This backend accepts only [`super::FacultyPile::BackendOwned`]; every tenant
+//! jail is given its OWN piles, created on the server under `pile_root`. Two
+//! host-owned pile FILES are mounted in via
 //! single-FILE `nullfs` (FreeBSD nullfs mounts a plain file onto a plain file,
 //! verified on 15.1 — NOT only directories). Each pile file is mounted directly
 //! onto a pre-created empty target file that lives INSIDE the jail's own ZFS
@@ -157,8 +157,8 @@ use super::proc::DEFAULT_MAX_OUTPUT_BYTES;
 // FreeBSD policy, and the Linux backend drives the same seam.
 pub use super::runner::{HostOutput, HostRunner, LocalRunner, SshRunner, shell_quote};
 use super::{
-    ExecControl, ExecRequest, ExecResult, ExecShellMode, LifecycleLocks, SandboxBackend, SessionId,
-    SessionSpec, sandbox_control_lost,
+    ExecControl, ExecRequest, ExecResult, ExecShellMode, FacultyPile, LifecycleLocks, OpenSpec,
+    ProvisionSpec, SandboxBackend, SessionId, sandbox_control_lost,
 };
 
 /// Default per-command timeout when an [`ExecRequest`] does not specify one.
@@ -1838,7 +1838,7 @@ impl SandboxBackend for JailBackend {
         self.jail_name(&tenant.label)
     }
 
-    fn open_session(&self, spec: &SessionSpec) -> Result<SessionId> {
+    fn open_session(&self, spec: &OpenSpec) -> Result<SessionId> {
         Self::validate_label(&spec.tenant.label)?;
         let jail = self.jail_name(&spec.tenant.label);
         let dataset = self.dataset(&jail);
@@ -1849,14 +1849,8 @@ impl SandboxBackend for JailBackend {
             jail,
             dataset
         );
-        // This backend does not use the caller-supplied `spec.tenant.pile`
-        // path: the session operates on its own server-born pile, provisioned
-        // under `pile_root` and mounted at /pile/self.pile by provision_sandbox.
-        // Do not echo the ignored caller path into service logs: it is neither
-        // authority nor useful provenance in Model B, only untrusted text.
         eprintln!(
-            "[{}] session operates on its server-born pile under pile_root \
-             (caller pile_host_path is ignored by this backend)",
+            "[{}] session operates on its server-born pile under pile_root",
             self.name()
         );
 
@@ -1938,13 +1932,16 @@ impl SandboxBackend for JailBackend {
         })
     }
 
-    fn provision_sandbox(&self, spec: &SessionSpec) -> Result<()> {
+    fn provision_sandbox(&self, spec: &ProvisionSpec) -> Result<()> {
+        if !matches!(&spec.faculty_pile, FacultyPile::BackendOwned) {
+            bail!("jail provisioning requires backend-owned faculty storage");
+        }
         Self::validate_label(&spec.tenant.label)?;
         let assistant = TenantAssistantPersona::for_tenant(&spec.tenant.label)?;
         if spec.env.iter().any(|(key, _)| key == "PERSONA") {
             bail!(
                 "PERSONA is reserved by Playground and derives from tenant '{}'; \
-                 do not supply it in SessionSpec::env",
+                 do not supply it in ProvisionSpec::env",
                 spec.tenant.label
             );
         }
@@ -2110,8 +2107,8 @@ impl SandboxBackend for JailBackend {
                 //
                 // These live OUTSIDE the ZFS clone tree, so destroy_session (which
                 // destroys the dataset) never touches them. The `self.pile` is the
-                // tenant's server-born pile under `pile_root`, distinct from the
-                // caller-supplied `spec.tenant.pile` path (not used by this backend).
+                // tenant's server-born pile under `pile_root`. The provisioning
+                // API carries no caller path for this backend.
                 //
                 // SYMLINK CONFUSED-DEPUTY FIX (2026-07-24): the bootstrap `cp` NEVER
                 // writes to a tenant-reachable path. Every seed is `cp`'d into a
@@ -2682,7 +2679,7 @@ impl SandboxBackend for JailBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sandbox::{PileMount, Tenant};
+    use crate::sandbox::Tenant;
     use std::path::PathBuf;
     // The live-host tests below drive `ssh` themselves rather than through a
     // runner, so they need the raw spawn API the runners moved out with.
@@ -3140,18 +3137,22 @@ mod tests {
         }
     }
 
-    fn spec(label: &str) -> SessionSpec {
-        SessionSpec {
+    fn spec(label: &str) -> ProvisionSpec {
+        ProvisionSpec {
             tenant: Tenant {
                 label: label.to_string(),
-                pile: PileMount {
-                    host_path: PathBuf::from("/caller/supplied/arbitrary.pile"),
-                    guest_path: PathBuf::from("/pile/self.pile"),
-                    append_only: true,
-                },
             },
             cwd: None,
             env: vec![("FOO".to_string(), "bar's".to_string())],
+            faculty_pile: FacultyPile::BackendOwned,
+        }
+    }
+
+    fn open_spec(label: &str) -> OpenSpec {
+        OpenSpec {
+            tenant: Tenant {
+                label: label.to_string(),
+            },
         }
     }
 
@@ -3389,8 +3390,12 @@ mod tests {
         backend
             .provision_sandbox(&spec("alice"))
             .expect("second repeated provision");
-        backend.open_session(&spec("alice")).expect("reconnect one");
-        backend.open_session(&spec("alice")).expect("reconnect two");
+        backend
+            .open_session(&open_spec("alice"))
+            .expect("reconnect one");
+        backend
+            .open_session(&open_spec("alice"))
+            .expect("reconnect two");
 
         let raw_calls = mock.calls.lock().unwrap();
         assert!(
@@ -3728,7 +3733,7 @@ mod tests {
             )
             .into_backend();
 
-        backend.open_session(&spec("alice")).expect("reattach");
+        backend.open_session(&open_spec("alice")).expect("reattach");
         let calls = mock.calls();
         let jail = alice_jail();
         let maxproc_rule = format!("jail:{jail}:maxproc:deny=512");
@@ -3767,8 +3772,12 @@ mod tests {
             )
             .into_backend();
 
-        backend.open_session(&spec("alice")).expect("first reuse");
-        backend.open_session(&spec("alice")).expect("second reuse");
+        backend
+            .open_session(&open_spec("alice"))
+            .expect("first reuse");
+        backend
+            .open_session(&open_spec("alice"))
+            .expect("second reuse");
 
         let calls = mock.calls();
         let maxproc = format!("jail:{jail}:maxproc:deny=512");
@@ -4134,7 +4143,7 @@ mod tests {
             .reply(&["sudo", "-n", "zfs", "list"], dataset_probe_error())
             .into_backend();
         let err = backend
-            .open_session(&spec("alice"))
+            .open_session(&open_spec("alice"))
             .expect_err("must refuse on an inconclusive probe");
         assert!(format!("{err:#}").contains("inconclusive"), "{err:#}");
         let calls = mock.calls();
@@ -4300,7 +4309,7 @@ mod tests {
             )
             .into_backend();
         let err = backend
-            .open_session(&spec("alice"))
+            .open_session(&open_spec("alice"))
             .expect_err("a redirected pile mount must abort the reattach");
         assert!(
             format!("{err:#}").contains("mount redirection")
@@ -4446,7 +4455,7 @@ mod tests {
     /// host-PRIVATE staging copy published with a no-follow / create-only
     /// hardlink, the guest target files touched, and /etc/profile seeded with the
     /// faculties PATH + PILE=/pile/self.pile. The piles derive from
-    /// `pile_root`+jail name, NOT from the caller-supplied `spec.tenant.pile`.
+    /// `pile_root`+jail name; provisioning accepts no caller-supplied host path.
     #[test]
     fn provision_mounts_both_piles_seeds_path_and_pile() {
         let (backend, mock) = mock_provision_ready()
@@ -4613,16 +4622,25 @@ mod tests {
             seed.contains("export PILE='/pile/self.pile'"),
             "profile must export PILE at the mounted self.pile: {seed}"
         );
+    }
 
-        // The caller-supplied pile path is NEVER referenced by any host
-        // command (ignored): the mounted pile is the coworker's server-born
-        // artifact under pile_root.
+    #[test]
+    fn provision_rejects_host_storage_before_host_mutation() {
+        let mut host_storage = spec("alice");
+        host_storage.faculty_pile = FacultyPile::Host(crate::sandbox::PileMount {
+            host_path: PathBuf::from("/caller/chosen/self.pile"),
+            guest_path: PathBuf::from("/pile/self.pile"),
+            append_only: true,
+        });
+        let (backend, mock) = MockRunner::default().into_backend();
+
+        let error = backend
+            .provision_sandbox(&host_storage)
+            .expect_err("jail must accept backend-owned storage only");
+        assert!(error.to_string().contains("backend-owned"));
         assert!(
-            calls
-                .iter()
-                .flatten()
-                .all(|a| !a.contains("/caller/supplied/arbitrary.pile")),
-            "must never reference the caller-supplied pile path: {calls:?}"
+            mock.calls().is_empty(),
+            "storage topology must fail before any host mutation"
         );
     }
 
@@ -4634,7 +4652,9 @@ mod tests {
             .reply(&["sudo", "-n", "jls", "-j"], fail())
             .reply(&["sudo", "-n", "zfs", "list"], dataset_absent())
             .into_backend();
-        let err = backend.open_session(&spec("alice")).expect_err("must bail");
+        let err = backend
+            .open_session(&open_spec("alice"))
+            .expect_err("must bail");
         assert!(err.to_string().contains("not provisioned"), "err: {err}");
         assert!(err.to_string().contains("playground user create alice"));
         // Crucially: no clone was attempted.
@@ -4656,7 +4676,7 @@ mod tests {
             .reply(&["sudo", "-n", "jls", "-j"], fail())
             // dataset present: zfs list succeeds (default success from the mock).
             .into_backend();
-        let id = backend.open_session(&spec("alice")).expect("open");
+        let id = backend.open_session(&open_spec("alice")).expect("open");
         assert_eq!(id.as_str(), alice_jail());
 
         let calls = mock.calls();
@@ -4719,7 +4739,7 @@ mod tests {
             .reply(&["sudo", "-n", "jls", "-j"], fail())
             .into_backend();
 
-        backend.open_session(&spec("alice")).expect("reattach");
+        backend.open_session(&open_spec("alice")).expect("reattach");
         backend
             .ensure_devfs_mount(&dataset, &local_root)
             .expect("existing globalized devfs is a verified no-op");
@@ -4755,7 +4775,7 @@ mod tests {
             .reply(&["sudo", "-n", "jls", "-j"], fail())
             // dataset present (default success) -> reattach on open.
             .into_backend();
-        backend.open_session(&spec("alice")).expect("open");
+        backend.open_session(&open_spec("alice")).expect("open");
         let calls = mock.calls();
         let jail = alice_jail();
         let root = alice_root();
@@ -4808,7 +4828,7 @@ mod tests {
             .reply(&["sudo", "-n", "jls", "-j"], fail()) // not running -> reattach
             .into_backend();
         let id = backend
-            .open_session(&spec("alice"))
+            .open_session(&open_spec("alice"))
             .expect("reattach no-op");
         assert_eq!(id.as_str(), alice_jail());
         // The jail is (re)started even though the mounts were already live.
@@ -5802,7 +5822,7 @@ echo "PASS: playground:tenant provenance property round-trips"
             )
             .into_backend();
         let err = backend
-            .open_session(&spec("alice"))
+            .open_session(&open_spec("alice"))
             .expect_err("must refuse");
         assert!(
             err.to_string().contains("tenant mismatch")
@@ -5946,7 +5966,7 @@ echo "PASS: playground:tenant provenance property round-trips"
         let (backend, mock) = mock_with_mountpoint()
             .with_running_jail(&alice_jail())
             .into_backend();
-        let id = backend.open_session(&spec("alice")).expect("open");
+        let id = backend.open_session(&open_spec("alice")).expect("open");
         assert_eq!(id.as_str(), alice_jail());
 
         let calls = mock.calls();
@@ -6442,7 +6462,7 @@ echo "PASS: playground:tenant provenance property round-trips"
             .with_file(&marker, b"mallory")
             .into_backend();
         let err = backend
-            .open_session(&spec("alice"))
+            .open_session(&open_spec("alice"))
             .expect_err("reuse must refuse a foreign pile marker");
         assert!(
             format!("{err:#}").contains("persistent pile provenance mismatch"),

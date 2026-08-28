@@ -65,7 +65,8 @@ use anyhow::{Context, Result, anyhow, bail};
 
 use super::proc::{DEFAULT_MAX_OUTPUT_BYTES, drive_child, drive_child_capped_controlled};
 use super::{
-    ExecControl, ExecRequest, ExecResult, ExecShellMode, SandboxBackend, SessionId, SessionSpec,
+    ExecControl, ExecRequest, ExecResult, ExecShellMode, FacultyPile, OpenSpec, ProvisionSpec,
+    SandboxBackend, SessionId,
 };
 
 /// Default per-command timeout when an [`ExecRequest`] does not specify one.
@@ -316,12 +317,17 @@ impl LimaBackend {
     /// Render this session's Lima config from the template. Mirrors
     /// `crate::main::render_lima_template` (same `__TOKEN__` scheme) but is
     /// self-contained so the backend does not depend on `main.rs`.
-    fn render_config(&self, spec: &SessionSpec, out_path: &Path) -> Result<()> {
+    fn render_config(&self, spec: &ProvisionSpec, out_path: &Path) -> Result<()> {
         let template = self.template_path()?;
         let mut text = std::fs::read_to_string(&template)
             .with_context(|| format!("read Lima template {}", template.display()))?;
 
-        let pile = &spec.tenant.pile;
+        let pile = match &spec.faculty_pile {
+            FacultyPile::Host(pile) => pile,
+            FacultyPile::BackendOwned => {
+                bail!("Lima provisioning requires an explicit host faculty pile")
+            }
+        };
         let pile_root = pile
             .host_path
             .parent()
@@ -400,7 +406,7 @@ impl SandboxBackend for LimaBackend {
         "lima"
     }
 
-    fn open_session(&self, spec: &SessionSpec) -> Result<SessionId> {
+    fn open_session(&self, spec: &OpenSpec) -> Result<SessionId> {
         let instance = self.instance_name(&spec.tenant.label);
         eprintln!(
             "[{}] opening session for tenant '{}' -> instance '{}'",
@@ -444,7 +450,10 @@ impl SandboxBackend for LimaBackend {
         }
     }
 
-    fn provision_sandbox(&self, spec: &SessionSpec) -> Result<()> {
+    fn provision_sandbox(&self, spec: &ProvisionSpec) -> Result<()> {
+        if !matches!(&spec.faculty_pile, FacultyPile::Host(_)) {
+            bail!("Lima provisioning requires an explicit host faculty pile");
+        }
         let instance = self.instance_name(&spec.tenant.label);
 
         // Idempotent: a tenant whose instance already exists is already
@@ -830,7 +839,7 @@ mod tests {
         ok_with_stdout(&body)
     }
 
-    fn render(spec: &SessionSpec, faculties_bundle: Option<PathBuf>) -> String {
+    fn render(spec: &ProvisionSpec, faculties_bundle: Option<PathBuf>) -> String {
         let mut backend = LimaBackend::new("t");
         // Point at the real session template so the markers actually exist.
         backend.template =
@@ -847,18 +856,26 @@ mod tests {
         text
     }
 
-    fn spec(label: &str) -> SessionSpec {
-        SessionSpec {
+    fn provision_spec(label: &str) -> ProvisionSpec {
+        ProvisionSpec {
             tenant: Tenant {
                 label: label.to_string(),
-                pile: PileMount {
-                    host_path: PathBuf::from("/tmp/scratch/self.pile"),
-                    guest_path: PathBuf::from("/pile/self.pile"),
-                    append_only: true,
-                },
             },
             cwd: None,
             env: vec![],
+            faculty_pile: FacultyPile::Host(PileMount {
+                host_path: PathBuf::from("/tmp/scratch/self.pile"),
+                guest_path: PathBuf::from("/pile/self.pile"),
+                append_only: true,
+            }),
+        }
+    }
+
+    fn open_spec(label: &str) -> OpenSpec {
+        OpenSpec {
+            tenant: Tenant {
+                label: label.to_string(),
+            },
         }
     }
 
@@ -869,7 +886,14 @@ mod tests {
     /// empty but PILE is still exported.
     #[test]
     fn render_wires_faculties_and_pile() {
-        let with = render(&spec("with"), Some(PathBuf::from("/host/faculties-bundle")));
+        let with = render(
+            &provision_spec("with"),
+            Some(PathBuf::from("/host/faculties-bundle")),
+        );
+        assert!(
+            with.contains("location: \"/tmp/scratch\""),
+            "the explicitly provisioned durable pile root must be mounted:\n{with}"
+        );
         assert!(
             with.contains("location: \"/host/faculties-bundle\"")
                 && with.contains("mountPoint: \"/opt/faculties\"")
@@ -907,7 +931,7 @@ mod tests {
         assert!(!with.contains("__FACULTIES_MOUNT__"));
         assert!(!with.contains("__FACULTIES_PATH_EXPORT__"));
 
-        let without = render(&spec("without"), None);
+        let without = render(&provision_spec("without"), None);
         // No actual mount / PATH export (the header comment mentions
         // /opt/faculties in prose, so assert on the load-bearing lines only).
         assert!(
@@ -922,6 +946,56 @@ mod tests {
         assert!(without.contains("export PILE='/pile/self.pile'"));
         assert!(!without.contains("__FACULTIES_MOUNT__"));
         assert!(!without.contains("__FACULTIES_PATH_EXPORT__"));
+    }
+
+    #[test]
+    fn provision_requires_an_explicit_host_faculty_pile() {
+        let (backend, mock) = MockRunner::default().into_backend("t");
+        let mut missing = provision_spec("alice");
+        missing.faculty_pile = FacultyPile::BackendOwned;
+
+        let error = backend
+            .provision_sandbox(&missing)
+            .expect_err("Lima cannot invent durable faculty storage");
+        assert!(error.to_string().contains("explicit host faculty pile"));
+        assert!(
+            mock.calls().is_empty(),
+            "missing storage must fail before querying or mutating Lima"
+        );
+    }
+
+    #[test]
+    fn reopening_a_lima_tenant_cannot_rewrite_its_provisioned_storage() {
+        let state_root = std::env::temp_dir().join(format!(
+            "playground-lima-reopen-storage-{}",
+            std::process::id()
+        ));
+        let config_path = state_root.join("t-alice").join("lima.yaml");
+        std::fs::create_dir_all(config_path.parent().unwrap()).expect("create state dir");
+        std::fs::write(&config_path, b"durable-storage-sentinel\n").expect("write sentinel");
+
+        let (mut backend, mock) = MockRunner::default()
+            .reply(&["list"], list_reply(&[("t-alice", "Running")]))
+            .into_backend("t");
+        backend.state_root = state_root.clone();
+        backend
+            .open_session(&open_spec("alice"))
+            .expect("reopen existing tenant");
+
+        assert_eq!(
+            std::fs::read(&config_path).expect("read config after reopen"),
+            b"durable-storage-sentinel\n"
+        );
+        assert_eq!(
+            mock.calls(),
+            vec![vec![
+                "list".to_string(),
+                "--format".to_string(),
+                "{{.Name}} {{.Status}}".to_string(),
+            ]],
+            "reopen may inspect instance state but cannot render or recreate storage"
+        );
+        let _ = std::fs::remove_dir_all(state_root);
     }
 
     #[test]
@@ -983,24 +1057,26 @@ mod tests {
         std::fs::write(&pile_path, b"").expect("create scratch pile");
 
         let backend = LimaBackend::new("playground-sbxtest");
-        let spec = SessionSpec {
+        let provision = ProvisionSpec {
             tenant: Tenant {
                 label: "pipes".to_string(),
-                pile: PileMount {
-                    host_path: pile_path,
-                    guest_path: PathBuf::from("/pile/test.pile"),
-                    append_only: true,
-                },
             },
             cwd: None,
             env: vec![],
+            faculty_pile: FacultyPile::Host(PileMount {
+                host_path: pile_path,
+                guest_path: PathBuf::from("/pile/test.pile"),
+                append_only: true,
+            }),
         };
 
         // Persistent lifecycle: provision (create) first, then open (reuse).
         backend
-            .provision_sandbox(&spec)
+            .provision_sandbox(&provision)
             .expect("provision lima sandbox");
-        let id = backend.open_session(&spec).expect("open lima session");
+        let id = backend
+            .open_session(&open_spec("pipes"))
+            .expect("open lima session");
         // 256 KiB of 'a' — several pipe buffers deep.
         let req = ExecRequest {
             command: "dd if=/dev/zero bs=1024 count=256 2>/dev/null | tr '\\0' 'a'".to_string(),
@@ -1044,7 +1120,7 @@ mod tests {
         let (backend, mock) = MockRunner::default()
             .reply(&["list"], list_reply(&[("t-alice", "Running")]))
             .into_backend("t");
-        let id = backend.open_session(&spec("alice")).expect("open");
+        let id = backend.open_session(&open_spec("alice")).expect("open");
         assert_eq!(id.as_str(), "t-alice");
         let calls = mock.calls();
         assert!(
@@ -1055,6 +1131,72 @@ mod tests {
         );
     }
 
+    /// Live topology gate: a faculty-style write through `$PILE` reaches the
+    /// durable pile chosen at provisioning, while an unrelated cognition
+    /// ledger on the host remains byte-for-byte unchanged. Run alongside the
+    /// other live Lima gate with `SANDBOX_LIMA_TESTS=1`.
+    #[test]
+    fn lima_faculty_write_targets_durable_pile_not_cognition_ledger() {
+        if std::env::var("SANDBOX_LIMA_TESTS").as_deref() != Ok("1") {
+            eprintln!("skipping: set SANDBOX_LIMA_TESTS=1 to run (boots a real Lima VM)");
+            return;
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "playground-lima-pile-topology-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("create live topology dir");
+        let durable = root.join("self.pile");
+        let ledger = root.join("cognition.pile");
+        std::fs::write(&durable, b"durable-before\n").expect("create durable pile");
+        std::fs::write(&ledger, b"ledger-before\n").expect("create cognition ledger");
+
+        let backend = LimaBackend::new("playground-piletopologytest");
+        let provision = ProvisionSpec {
+            tenant: Tenant {
+                label: "faculty-write".to_string(),
+            },
+            cwd: None,
+            env: vec![],
+            faculty_pile: FacultyPile::Host(PileMount {
+                host_path: durable.clone(),
+                guest_path: PathBuf::from("/pile/self.pile"),
+                append_only: true,
+            }),
+        };
+        backend
+            .provision_sandbox(&provision)
+            .expect("provision live topology sandbox");
+        let id = backend
+            .open_session(&open_spec("faculty-write"))
+            .expect("open live topology sandbox");
+        let result = backend.exec(
+            &id,
+            &ExecRequest {
+                command: "printf 'faculty-write\\n' >> \"$PILE\"".to_string(),
+                shell_mode: ExecShellMode::Login,
+                cwd: None,
+                stdin: None,
+                timeout: Some(Duration::from_secs(120)),
+            },
+            &ExecControl::default(),
+        );
+        let _ = backend.destroy_session(&id);
+
+        let result = result.expect("write through provisioned PILE");
+        assert_eq!(result.exit_code, Some(0));
+        assert_eq!(
+            std::fs::read(&durable).expect("read durable pile"),
+            b"durable-before\nfaculty-write\n"
+        );
+        assert_eq!(
+            std::fs::read(&ledger).expect("read cognition ledger"),
+            b"ledger-before\n"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     /// A stopped instance is brought up on open with `limactl start <instance>`
     /// (no `--name`, no config file — never re-renders).
     #[test]
@@ -1062,7 +1204,7 @@ mod tests {
         let (backend, mock) = MockRunner::default()
             .reply(&["list"], list_reply(&[("t-alice", "Stopped")]))
             .into_backend("t");
-        let id = backend.open_session(&spec("alice")).expect("open");
+        let id = backend.open_session(&open_spec("alice")).expect("open");
         assert_eq!(id.as_str(), "t-alice");
         let calls = mock.calls();
         // Exactly a bring-up start (no --name, no config path).
@@ -1091,7 +1233,9 @@ mod tests {
         let (backend, mock) = MockRunner::default()
             .reply(&["list"], list_reply(&[("t-other", "Running")]))
             .into_backend("t");
-        let err = backend.open_session(&spec("alice")).expect_err("must bail");
+        let err = backend
+            .open_session(&open_spec("alice"))
+            .expect_err("must bail");
         let msg = err.to_string();
         assert!(msg.contains("not provisioned"), "err: {msg}");
         assert!(
@@ -1115,7 +1259,7 @@ mod tests {
             .reply(&["list"], list_reply(&[])) // nothing exists yet
             .into_backend("t");
         backend
-            .provision_sandbox(&spec("alice"))
+            .provision_sandbox(&provision_spec("alice"))
             .expect("provision");
         let calls = mock.calls();
         let create = calls
@@ -1143,7 +1287,7 @@ mod tests {
             .reply(&["list"], list_reply(&[("t-alice", "Running")]))
             .into_backend("t");
         backend
-            .provision_sandbox(&spec("alice"))
+            .provision_sandbox(&provision_spec("alice"))
             .expect("provision");
         let calls = mock.calls();
         assert!(
@@ -1162,7 +1306,7 @@ mod tests {
             .reply(&["list"], list_reply(&[("t-alice", "Stopped")]))
             .into_backend("t");
         backend
-            .provision_sandbox(&spec("alice"))
+            .provision_sandbox(&provision_spec("alice"))
             .expect("provision");
         let calls = mock.calls();
         let starts: Vec<_> = calls

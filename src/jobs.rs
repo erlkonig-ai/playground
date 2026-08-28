@@ -721,7 +721,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
 
-    use crate::sandbox::SessionSpec;
+    use crate::sandbox::OpenSpec;
 
     struct GateBackend {
         entered: mpsc::Sender<()>,
@@ -751,7 +751,7 @@ mod tests {
             true
         }
 
-        fn open_session(&self, _spec: &SessionSpec) -> Result<SessionId> {
+        fn open_session(&self, _spec: &OpenSpec) -> Result<SessionId> {
             Ok(SessionId::new("fail-once-alice"))
         }
 
@@ -786,7 +786,7 @@ mod tests {
             true
         }
 
-        fn open_session(&self, _spec: &SessionSpec) -> Result<SessionId> {
+        fn open_session(&self, _spec: &OpenSpec) -> Result<SessionId> {
             Ok(SessionId::new("error-alice"))
         }
 
@@ -813,7 +813,7 @@ mod tests {
             "unsupported-control-loss"
         }
 
-        fn open_session(&self, _spec: &SessionSpec) -> Result<SessionId> {
+        fn open_session(&self, _spec: &OpenSpec) -> Result<SessionId> {
             Ok(SessionId::new("unsupported-alice"))
         }
 
@@ -840,7 +840,7 @@ mod tests {
             true
         }
 
-        fn open_session(&self, _spec: &SessionSpec) -> Result<SessionId> {
+        fn open_session(&self, _spec: &OpenSpec) -> Result<SessionId> {
             Ok(SessionId::new("late-alice"))
         }
 
@@ -876,7 +876,7 @@ mod tests {
             true
         }
 
-        fn open_session(&self, _spec: &SessionSpec) -> Result<SessionId> {
+        fn open_session(&self, _spec: &OpenSpec) -> Result<SessionId> {
             Ok(SessionId::new("gate-alice"))
         }
 

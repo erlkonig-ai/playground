@@ -4,8 +4,8 @@
 //! Because a shell is **stateful** (cwd, env, running processes), the MCP
 //! surface is a *session* model rather than a stateless tool call:
 //!
-//!   - `open_session` -> provision a sandbox via the backend, return a session
-//!     id (one tenant = one pile mount × driver).
+//!   - `open_session` -> open an already-provisioned sandbox via the backend,
+//!     return a session id (one tenant = one persistent sandbox).
 //!   - `exec`         -> run a short command and wait for its result.
 //!   - `read`/`write` -> exchange bounded, lossless file payloads with an open
 //!     session through that same synchronous execution path.
@@ -48,17 +48,9 @@ use crate::jobs::{JobManager, JobSnapshot, JobState};
 #[cfg(test)]
 use crate::sandbox::ExecControl;
 use crate::sandbox::{
-    ExecRequest, ExecResult, ExecShellMode, ExecStream, LifecycleLocks, PileMount, SandboxBackend,
-    SessionId, SessionSpec, Tenant,
+    ExecRequest, ExecResult, ExecShellMode, ExecStream, LifecycleLocks, OpenSpec, SandboxBackend,
+    SessionId, Tenant,
 };
-
-/// Parameters for the `open_session` MCP method.
-#[derive(Debug, Clone)]
-pub struct OpenSessionParams {
-    pub tenant: Tenant,
-    pub cwd: Option<std::path::PathBuf>,
-    pub env: Vec<(String, String)>,
-}
 
 /// Parameters for the `exec` MCP method.
 #[derive(Debug, Clone)]
@@ -126,8 +118,9 @@ impl SandboxProvider {
         }
     }
 
-    /// MCP `open_session`: provision a sandbox and register it (or attach to an
-    /// already-open one from the same tenant, sharing the backend session).
+    /// MCP `open_session`: open an already-provisioned sandbox and register it
+    /// (or attach to an already-open one from the same tenant, sharing the
+    /// backend session).
     ///
     /// The backend maps a tenant to a stable session id, so every call first
     /// performs its idempotent open/re-attach check. A second endpoint from the
@@ -135,30 +128,25 @@ impl SandboxProvider {
     /// A different tenant resolving to the same id is rejected here
     /// (provider-layer defence complementing the jail backend's ZFS-property
     /// provenance check).
-    pub fn open_session(&self, params: OpenSessionParams) -> Result<SessionId> {
+    pub fn open_session(&self, spec: OpenSpec) -> Result<SessionId> {
         // Serialize against a concurrent same-tenant close: hold the per-tenant
         // lifecycle lock across the backend open AND the refcount bump, so this
         // open cannot land in the window where close has decremented to 0 but not
         // yet removed the entry (which would orphan us).
-        let key = self.backend.canonical_key(&params.tenant);
+        let key = self.backend.canonical_key(&spec.tenant);
         self.lifecycle.with_lock(&key, || {
-            let spec = SessionSpec {
-                tenant: params.tenant.clone(),
-                cwd: params.cwd.clone(),
-                env: params.env.clone(),
-            };
             let id = self.backend.open_session(&spec)?;
             let mut guard = self.sessions.lock().expect("sessions poisoned");
             let entry = guard.entry(id.clone()).or_insert(SessionEntry {
-                tenant: params.tenant.clone(),
+                tenant: spec.tenant.clone(),
                 refs: 0,
             });
-            if entry.tenant.label != params.tenant.label {
+            if entry.tenant.label != spec.tenant.label {
                 return Err(anyhow!(
                     "session id {} already bound to tenant '{}', refusing to attach tenant '{}'",
                     id.as_str(),
                     entry.tenant.label,
-                    params.tenant.label
+                    spec.tenant.label
                 ));
             }
             entry.refs += 1;
@@ -641,11 +629,7 @@ impl McpServer {
 
     fn tool_open_session(&self, args: Value) -> Result<String> {
         let tenant = parse_tenant(&args)?;
-        let cwd = args.get("cwd").and_then(Value::as_str).map(PathBuf::from);
-        let env = parse_env(&args);
-        let id = self
-            .provider
-            .open_session(OpenSessionParams { tenant, cwd, env })?;
+        let id = self.provider.open_session(OpenSpec { tenant })?;
         Ok(id.as_str().to_string())
     }
 
@@ -1015,17 +999,14 @@ fn tool_schemas() -> Value {
     json!([
         {
             "name": "open_session",
-            "description": "Provision an isolated sandbox shell bound to a pile (append-only) and driver, and return its session id.",
+            "description": "Open or reattach an already-provisioned persistent sandbox and return its session id.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "tenant": { "type": "string", "description": "Tenant label (persona / instance)." },
-                    "pile_host_path": { "type": "string", "description": "Absolute host path to the pile file." },
-                    "pile_guest_path": { "type": "string", "description": "Path the pile appears at inside the sandbox (default /pile/<name>)." },
-                    "cwd": { "type": "string", "description": "Working directory (guest path) the shell starts in." },
-                    "env": { "type": "object", "description": "Extra environment variables.", "additionalProperties": { "type": "string" } }
+                    "tenant": { "type": "string", "description": "Tenant label (persona / instance)." }
                 },
-                "required": ["tenant", "pile_host_path"]
+                "required": ["tenant"],
+                "additionalProperties": false
             }
         },
         {
@@ -1140,44 +1121,20 @@ fn tool_err(text: &str) -> Value {
 }
 
 fn parse_tenant(args: &Value) -> Result<Tenant> {
+    let args = args
+        .as_object()
+        .ok_or_else(|| anyhow!("open_session arguments must be an object"))?;
+    if let Some(unexpected) = args.keys().find(|key| key.as_str() != "tenant") {
+        return Err(anyhow!(
+            "open_session unexpected argument '{unexpected}'; storage is fixed at provisioning"
+        ));
+    }
     let label = args
         .get("tenant")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("open_session missing 'tenant'"))?
         .to_string();
-    let host_path = PathBuf::from(
-        args.get("pile_host_path")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("open_session missing 'pile_host_path'"))?,
-    );
-    let guest_path = match args.get("pile_guest_path").and_then(Value::as_str) {
-        Some(p) => PathBuf::from(p),
-        None => {
-            let name = host_path
-                .file_name()
-                .ok_or_else(|| anyhow!("pile_host_path has no filename"))?;
-            PathBuf::from("/pile").join(name)
-        }
-    };
-    Ok(Tenant {
-        label,
-        pile: PileMount {
-            host_path,
-            guest_path,
-            append_only: true,
-        },
-    })
-}
-
-fn parse_env(args: &Value) -> Vec<(String, String)> {
-    args.get("env")
-        .and_then(Value::as_object)
-        .map(|m| {
-            m.iter()
-                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                .collect()
-        })
-        .unwrap_or_default()
+    Ok(Tenant { label })
 }
 
 /// Render an [`ExecResult`] as the text a model client sees.
@@ -1262,7 +1219,7 @@ pub(crate) mod testing {
         fn supports_background_jobs(&self) -> bool {
             true
         }
-        fn open_session(&self, spec: &SessionSpec) -> Result<SessionId> {
+        fn open_session(&self, spec: &OpenSpec) -> Result<SessionId> {
             Ok(SessionId::new(format!("mock-{}", spec.tenant.label)))
         }
         fn exec(
@@ -1327,7 +1284,7 @@ mod tests {
             "file-test"
         }
 
-        fn open_session(&self, _spec: &SessionSpec) -> Result<SessionId> {
+        fn open_session(&self, _spec: &OpenSpec) -> Result<SessionId> {
             Ok(SessionId::new("file-alice"))
         }
 
@@ -1368,7 +1325,7 @@ mod tests {
             "profile-poison-test"
         }
 
-        fn open_session(&self, _spec: &SessionSpec) -> Result<SessionId> {
+        fn open_session(&self, _spec: &OpenSpec) -> Result<SessionId> {
             Ok(SessionId::new("file-alice"))
         }
 
@@ -1406,17 +1363,10 @@ mod tests {
     fn file_server(backend: impl SandboxBackend + 'static) -> McpServer {
         let provider = SandboxProvider::new(Box::new(backend));
         provider
-            .open_session(OpenSessionParams {
+            .open_session(OpenSpec {
                 tenant: Tenant {
                     label: "alice".to_string(),
-                    pile: PileMount {
-                        host_path: PathBuf::from("/tmp/alice/self.pile"),
-                        guest_path: PathBuf::from("/pile/self.pile"),
-                        append_only: true,
-                    },
                 },
-                cwd: None,
-                env: Vec::new(),
             })
             .unwrap();
         McpServer::new(provider)
@@ -1432,6 +1382,49 @@ mod tests {
             }))
             .unwrap()["result"]
             .clone()
+    }
+
+    #[test]
+    fn open_session_rejects_storage_arguments() {
+        let server = McpServer::new(SandboxProvider::new(Box::new(MockBackend::default())));
+        let result = call_tool(
+            &server,
+            "open_session",
+            json!({
+                "tenant": "alice",
+                "pile_host_path": "/tmp/attacker-selected.pile"
+            }),
+        );
+
+        assert_eq!(result["isError"], true);
+        assert!(
+            result["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("storage is fixed at provisioning")
+        );
+    }
+
+    #[test]
+    fn open_session_schema_requires_only_tenant() {
+        let schemas = tool_schemas();
+        let open = schemas
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "open_session")
+            .expect("open_session schema");
+
+        assert_eq!(open["inputSchema"]["required"], json!(["tenant"]));
+        assert_eq!(
+            open["inputSchema"]["properties"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .collect::<Vec<_>>(),
+            vec!["tenant"]
+        );
+        assert_eq!(open["inputSchema"]["additionalProperties"], false);
     }
 
     #[test]
@@ -1682,7 +1675,7 @@ mod tests {
             r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
             r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
             r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
-            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"open_session","arguments":{"tenant":"alice","pile_host_path":"/tmp/alice/self.pile"}}}"#,
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"open_session","arguments":{"tenant":"alice"}}}"#,
             r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"exec","arguments":{"session":"mock-alice","command":"echo hi"}}}"#,
             r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"close_session","arguments":{"session":"mock-alice"}}}"#,
         ]
@@ -1752,7 +1745,7 @@ mod tests {
     #[test]
     fn destroy_session_is_not_an_mcp_tool() {
         let requests = [
-            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"open_session","arguments":{"tenant":"alice","pile_host_path":"/tmp/alice/self.pile"}}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"open_session","arguments":{"tenant":"alice"}}}"#,
             r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"destroy_session","arguments":{"session":"mock-alice"}}}"#,
             r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"exec","arguments":{"session":"mock-alice","command":"echo hi"}}}"#,
         ]
@@ -1810,8 +1803,8 @@ mod tests {
     fn serve_loop_closes_open_sessions_on_eof() {
         // Two open_sessions, no close_session, then EOF (end of input).
         let requests = [
-            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"open_session","arguments":{"tenant":"alice","pile_host_path":"/tmp/alice/self.pile"}}}"#,
-            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"open_session","arguments":{"tenant":"bob","pile_host_path":"/tmp/bob/self.pile"}}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"open_session","arguments":{"tenant":"alice"}}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"open_session","arguments":{"tenant":"bob"}}}"#,
         ]
         .join("\n");
 
@@ -1838,24 +1831,16 @@ mod tests {
 
     // -- Security repair #1(3): reference-counted sessions --------------------
 
-    use crate::sandbox::{PileMount, Tenant};
+    use crate::sandbox::Tenant;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// Build `OpenSessionParams` for a tenant label (the pile fields are inert
-    /// for the mock backend, which keys the session id on the label only).
-    fn params(label: &str) -> OpenSessionParams {
-        OpenSessionParams {
+    /// Build an `OpenSpec` for a tenant label.
+    fn params(label: &str) -> OpenSpec {
+        OpenSpec {
             tenant: Tenant {
                 label: label.to_string(),
-                pile: PileMount {
-                    host_path: std::path::PathBuf::from(format!("/tmp/{label}/self.pile")),
-                    guest_path: std::path::PathBuf::from("/pile/self.pile"),
-                    append_only: true,
-                },
             },
-            cwd: None,
-            env: Vec::new(),
         }
     }
 
@@ -1932,7 +1917,7 @@ mod tests {
             fn name(&self) -> &'static str {
                 "colliding"
             }
-            fn open_session(&self, _spec: &SessionSpec) -> Result<SessionId> {
+            fn open_session(&self, _spec: &OpenSpec) -> Result<SessionId> {
                 Ok(SessionId::new("shared-id"))
             }
             fn exec(
@@ -1999,7 +1984,7 @@ mod tests {
             fn name(&self) -> &'static str {
                 "blocking-close"
             }
-            fn open_session(&self, spec: &SessionSpec) -> Result<SessionId> {
+            fn open_session(&self, spec: &OpenSpec) -> Result<SessionId> {
                 Ok(SessionId::new(format!("box-{}", spec.tenant.label)))
             }
             fn exec(
@@ -2087,7 +2072,7 @@ mod tests {
             fn supports_background_jobs(&self) -> bool {
                 true
             }
-            fn open_session(&self, spec: &SessionSpec) -> Result<SessionId> {
+            fn open_session(&self, spec: &OpenSpec) -> Result<SessionId> {
                 Ok(SessionId::new(format!("box-{}", spec.tenant.label)))
             }
             fn exec(

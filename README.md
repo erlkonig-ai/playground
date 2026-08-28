@@ -10,8 +10,8 @@ an isolated sandbox. This crate is only the provider.
 Because a shell is **stateful** (cwd, env, running processes), the surface is a
 small session model, exposed as eight tools:
 
-- `open_session` — provision a sandbox bound to a pile (append-only) and a
-  tenant, and return a session id.
+- `open_session` — open or reattach an already-provisioned tenant sandbox and
+  return a session id. Storage placement is never selected over MCP.
 - `exec` — run a short shell command and wait for its result.
 - `read` — read up to 3 MiB from a sandbox file without byte loss; textual
   files are returned as text, images as MCP image content, and other binary
@@ -91,13 +91,19 @@ TLS-terminating reverse proxy (this server speaks plain HTTP only). See
 ## Users & tokens (for `mcp-http`)
 
 A **user** is a tenant: its persistent sandbox plus the bearer token that
-authorizes it. `user create` provisions the tenant's sandbox (jail backend) and
-mints its token into a JSON store bound to that tenant + backend. The token is
-printed once, then only lives in the store:
+authorizes it. `user create` provisions the tenant's sandbox and mints its
+token into a JSON store bound to that tenant + backend. Jail allocates faculty
+storage itself; Lima requires the operator to name an existing durable
+`self.pile` explicitly. The token is printed once, then only lives in the
+store:
 
 ```bash
 cargo run --manifest-path playground/Cargo.toml -- \
   user create alice --backend jail --tokens ./tokens.json
+
+cargo run --manifest-path playground/Cargo.toml -- \
+  user create alice --backend lima --faculty-pile /srv/alice/self.pile \
+  --tokens ./tokens.json
 ```
 
 The first jail provision also creates one stable person in the shared pile's

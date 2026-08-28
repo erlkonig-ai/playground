@@ -2858,7 +2858,7 @@ mod tests {
             &rpc(
                 2,
                 "tools/call",
-                json!({ "name": "open_session", "arguments": { "pile_host_path": "/tmp/alice/self.pile" } }),
+                json!({ "name": "open_session", "arguments": {} }),
             ),
         );
         assert_eq!(opened.status, 200);

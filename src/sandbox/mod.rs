@@ -14,13 +14,12 @@
 //!   environment (a **session**). Backends: Lima ([`lima::LimaBackend`], local
 //!   VM) and FreeBSD jails ([`jail::JailBackend`], remote host over SSH);
 //!   `sandbox-exec`/seatbelt slots in behind the same trait later.
-//! - A [`Session`] is one live sandbox with stateful shell context (cwd, env,
+//! - A session is one live sandbox with stateful shell context (cwd, env,
 //!   running processes). Commands ([`SandboxBackend::exec`]) run *inside* a
 //!   session, so state persists across calls the way a real terminal does.
-//! - The pile is mounted into every session as an **append-only** file
-//!   ([`PileMount`]): a process inside the sandbox can read and append the pile
-//!   but cannot truncate it. This is the structural fix for the 2026-07 pile
-//!   truncation incident.
+//! - A durable faculty pile is chosen once, while provisioning. Opening an
+//!   existing sandbox names only its tenant; no reconnecting client can swap
+//!   the storage underneath it.
 
 pub mod faculties;
 pub mod jail;
@@ -104,7 +103,7 @@ impl SessionId {
     }
 }
 
-/// How the pile is exposed inside a session.
+/// How a host-owned faculty pile is exposed inside a provisioned sandbox.
 ///
 /// `append_only` is the load-bearing invariant: the guest gets a handle it can
 /// read and `>>`-append but not `O_TRUNC`. Backends realise it differently
@@ -113,16 +112,16 @@ impl SessionId {
 ///
 /// ## TRUST BOUNDARY (which backends realise this, and how)
 ///
-/// A pile may only be exposed to a session whose substrate is an
+/// A pile may only be exposed to a sandbox whose substrate is an
 /// **operator-controlled surface**. Local backends (Lima on the Mac) qualify and
-/// mount the caller-supplied pile directly. The jail backend
-/// ([`jail::JailBackend`]) runs on a shared host, so it does NOT expose the
-/// caller-supplied pile — `host_path` is logged and ignored. Instead (Model B)
+/// mount the explicitly provisioned pile directly. The jail backend
+/// ([`jail::JailBackend`]) runs on a shared host and accepts only
+/// [`FacultyPile::BackendOwned`]. Instead (Model B)
 /// each tenant jail gets its OWN host-owned, server-born piles under the
 /// backend's `pile_root`: a per-tenant `self.pile` seeded from a generic
 /// bootstrap plus one shared `shared.pile`, both append-only (`chflags sappnd`)
 /// and decoupled from the jail lifecycle. A stolen jail token thus reaches only
-/// that tenant's own seeded pile — never the caller-supplied pile, and never any
+/// that tenant's own seeded pile — never a client-selected pile, and never any
 /// other pile on the host. See the pile-provisioning section in [`jail`]'s
 /// module docs.
 #[derive(Debug, Clone)]
@@ -135,25 +134,43 @@ pub struct PileMount {
     pub append_only: bool,
 }
 
-/// A tenant = (pile mount × driver). The same infra will later serve both our
-/// own drive and colleagues' Claude/ChatGPT sandboxes, each pinned to its own
-/// pile and its own driver identity.
+/// A stable sandbox identity. Storage is deliberately absent: it is fixed by
+/// [`ProvisionSpec`] and cannot be supplied while opening a session.
 #[derive(Debug, Clone)]
 pub struct Tenant {
     /// Stable label for the tenant (e.g. persona / instance name).
     pub label: String,
-    /// The pile this tenant's sessions may touch.
-    pub pile: PileMount,
 }
 
-/// Everything a backend needs to provision one session.
+/// The two supported ownership topologies for a sandbox's durable faculty pile.
 #[derive(Debug, Clone)]
-pub struct SessionSpec {
+pub enum FacultyPile {
+    /// An operator-controlled host pile mounted into a local sandbox (Lima).
+    Host(PileMount),
+    /// Storage allocated and retained by the backend itself (FreeBSD jail).
+    BackendOwned,
+}
+
+/// Everything a backend needs to create one persistent sandbox.
+#[derive(Debug, Clone)]
+pub struct ProvisionSpec {
     pub tenant: Tenant,
     /// Working directory the shell starts in (guest path), if any.
     pub cwd: Option<PathBuf>,
     /// Extra environment variables to seed into the session shell.
     pub env: Vec<(String, String)>,
+    /// Durable pile used by faculties inside the provisioned sandbox.
+    pub faculty_pile: FacultyPile,
+}
+
+/// Everything a backend needs to open an already-provisioned sandbox.
+///
+/// This type intentionally carries only a tenant. In particular, it has no
+/// host path, cwd, or environment: those are provisioning facts, not reconnect
+/// choices.
+#[derive(Debug, Clone)]
+pub struct OpenSpec {
+    pub tenant: Tenant,
 }
 
 /// How an [`ExecRequest`] enters the sandbox shell.
@@ -366,13 +383,13 @@ pub trait SandboxBackend: Send + Sync {
     /// down/stopped box is brought back up, and an unprovisioned tenant is an
     /// error (run `playground user create`). Explicit creation is
     /// `provision_sandbox`.
-    fn open_session(&self, spec: &SessionSpec) -> Result<SessionId>;
+    fn open_session(&self, spec: &OpenSpec) -> Result<SessionId>;
 
     /// Explicitly create a tenant's PERSISTENT sandbox (idempotent: an existing
     /// box is just brought up, not recreated). Both shipped backends — jail and
     /// lima — are persistent/provision-based and implement this; the default
     /// no-op exists only for a hypothetical ephemeral (create-on-open) backend.
-    fn provision_sandbox(&self, _spec: &SessionSpec) -> Result<()> {
+    fn provision_sandbox(&self, _spec: &ProvisionSpec) -> Result<()> {
         Ok(())
     }
 
