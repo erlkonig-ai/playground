@@ -266,6 +266,12 @@ if [ ! -x "$HOME/.cargo/bin/cargo" ]; then
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
 fi
 . "$HOME/.cargo/env"
+# Enter the pinned-toolchain workspace before installing target components.
+# Running this from /src selects rustup's `stable` toolchain, while the
+# faculties workspace selects its explicit `1.98.0` toolchain; rustup stores
+# target components per toolchain even when both currently name the same
+# compiler release.
+cd /src/{facdir}
 # triblespace-core's build script compiles a wasm formatter, so the wasm
 # target must be present (same requirement as the `playground run` template).
 rustup target add wasm32-unknown-unknown
@@ -274,7 +280,6 @@ sudo apt-get update
 # (a non-optional faculties dep, used for audio device enumeration) links
 # alsa-sys, which needs the ALSA headers to build on Linux.
 sudo apt-get install -y --no-install-recommends build-essential pkg-config libasound2-dev
-cd /src/{facdir}
 BINARGS=""
 for b in {bins}; do BINARGS="$BINARGS --bin $b"; done
 echo "[faculties-build] cargo build --release --locked --no-default-features $BINARGS"
