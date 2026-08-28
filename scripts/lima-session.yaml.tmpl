@@ -35,9 +35,7 @@ memory: "8GiB"
 disk: "30GiB"
 
 mounts:
-  - location: "__PILE_ROOT__"
-    mountPoint: "/pile"
-    writable: true
+__FACULTY_FILE_MOUNTS__
 __FACULTIES_MOUNT__
 
 provision:
@@ -50,7 +48,7 @@ provision:
       # audio device enumeration), so the runtime ALSA lib must be present or
       # they fail to load. e2fsprogs provides chattr for the append-only pile.
       apt-get install -y --no-install-recommends ca-certificates curl e2fsprogs libasound2
-      ln -sfn __PILE_PATH__ /self.pile
+      ln -sfn /pile/self.pile /self.pile
       echo "[playground-sandbox] system provision done"
   - mode: system
     script: |
@@ -61,7 +59,8 @@ provision:
       # the session's mounted pile.
       cat >/etc/profile.d/playground-session.sh <<'ENVEOF'
       __FACULTIES_PATH_EXPORT__
-      export PILE='__PILE_PATH__'
+      __FACULTY_ENV_EXPORTS__
+      __PERSONA_EXPORT__
       __SESSION_ENV__
       ENVEOF
   - mode: user

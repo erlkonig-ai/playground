@@ -490,8 +490,9 @@ enum UserTokenCommand {
 struct UserCreateArgs {
     /// Tenant label (persona / instance); sandbox + token are scoped to it.
     name: String,
-    /// Lima only: durable host self-pile mounted for faculties at
-    /// `/pile/self.pile`. Required for Lima; jail storage is backend-owned.
+    /// Lima only: lexical durable host `self.pile`. Its real file and the
+    /// lexical sibling `self.key` are mounted at fixed guest paths. Required
+    /// for Lima; jail storage is backend-owned.
     #[arg(long, value_name = "PATH")]
     faculty_pile: Option<PathBuf>,
     #[command(flatten)]
@@ -778,27 +779,8 @@ fn provision_spec_for(
     faculty_pile: Option<&std::path::Path>,
 ) -> Result<sandbox::ProvisionSpec> {
     let faculty_pile = match (backend, faculty_pile) {
-        (McpBackendKind::Lima, Some(host_path))
-            if host_path.is_absolute()
-                && host_path.file_name() == Some(std::ffi::OsStr::new("self.pile")) =>
-        {
-            sandbox::FacultyPile::Host(sandbox::PileMount {
-                host_path: host_path.to_path_buf(),
-                guest_path: PathBuf::from("/pile/self.pile"),
-                append_only: true,
-            })
-        }
-        (McpBackendKind::Lima, Some(host_path)) if host_path.is_absolute() => {
-            anyhow::bail!(
-                "--faculty-pile must name self.pile so the durable host file is mounted at /pile/self.pile (got {})",
-                host_path.display()
-            )
-        }
         (McpBackendKind::Lima, Some(host_path)) => {
-            anyhow::bail!(
-                "--faculty-pile must be an absolute host path for Lima (got {})",
-                host_path.display()
-            )
+            sandbox::FacultyPile::Host(sandbox::HostFacultyFiles::resolve(host_path)?)
         }
         (McpBackendKind::Lima, None) => {
             anyhow::bail!("Lima provisioning requires --faculty-pile <absolute-host-path>")
@@ -823,13 +805,14 @@ fn provision_spec_for(
 /// keeps it (mode 0600) for the server to check against.
 #[cfg(feature = "mcp-http")]
 fn run_user_create(args: UserCreateArgs) -> Result<()> {
-    let backend = args.backend.build_backend()?;
     let backend_name = args.backend.backend.name();
     let spec = provision_spec_for(
         &args.name,
         args.backend.backend,
         args.faculty_pile.as_deref(),
     )?;
+    // Validate storage before the potentially expensive faculties-bundle build.
+    let backend = args.backend.build_backend()?;
     backend
         .provision_sandbox(&spec)
         .with_context(|| format!("provision sandbox for tenant '{}'", args.name))?;
@@ -1178,19 +1161,30 @@ mod tests {
         assert!(args.backend.jail_external_rctl);
     }
 
+    #[cfg(unix)]
     #[test]
     fn provisioning_storage_is_explicit_and_backend_specific() {
-        let lima = provision_spec_for(
-            "alice",
-            McpBackendKind::Lima,
-            Some(std::path::Path::new("/srv/alice/self.pile")),
-        )
-        .expect("explicit Lima storage");
-        let sandbox::FacultyPile::Host(mount) = lima.faculty_pile else {
-            panic!("Lima must receive a host mount")
+        let root =
+            std::env::temp_dir().join(format!("playground-main-storage-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let lexical = root.join("workspace");
+        let custody = root.join("custody");
+        std::fs::create_dir_all(&lexical).expect("create lexical pile directory");
+        std::fs::create_dir_all(&custody).expect("create custody directory");
+        let real_pile = custody.join("self.pile");
+        let lexical_pile = lexical.join("self.pile");
+        let lexical_key = lexical.join("self.key");
+        std::fs::write(&real_pile, b"pile").expect("create real pile");
+        std::fs::write(&lexical_key, b"key").expect("create lexical signing key");
+        std::os::unix::fs::symlink(&real_pile, &lexical_pile).expect("create lexical pile symlink");
+
+        let lima = provision_spec_for("alice", McpBackendKind::Lima, Some(&lexical_pile))
+            .expect("explicit Lima storage");
+        let sandbox::FacultyPile::Host(files) = lima.faculty_pile else {
+            panic!("Lima must receive resolved host faculty files")
         };
-        assert_eq!(mount.host_path, PathBuf::from("/srv/alice/self.pile"));
-        assert_eq!(mount.guest_path, PathBuf::from("/pile/self.pile"));
+        assert_eq!(files.pile(), real_pile.canonicalize().unwrap());
+        assert_eq!(files.signing_key(), lexical_key.canonicalize().unwrap());
 
         assert!(
             provision_spec_for("alice", McpBackendKind::Lima, None)
@@ -1212,7 +1206,7 @@ mod tests {
             provision_spec_for(
                 "alice",
                 McpBackendKind::Lima,
-                Some(std::path::Path::new("/srv/alice/other.pile")),
+                Some(&lexical.join("other.pile")),
             )
             .unwrap_err()
             .to_string()
@@ -1226,14 +1220,18 @@ mod tests {
             sandbox::FacultyPile::BackendOwned
         ));
         assert!(
-            provision_spec_for(
-                "alice",
-                McpBackendKind::Jail,
-                Some(std::path::Path::new("/srv/alice/self.pile")),
-            )
-            .unwrap_err()
-            .to_string()
-            .contains("backend-owned")
+            provision_spec_for("alice", McpBackendKind::Jail, Some(&lexical_pile),)
+                .unwrap_err()
+                .to_string()
+                .contains("backend-owned")
+        );
+
+        std::fs::remove_file(&lexical_key).expect("remove lexical signing key");
+        let missing_key = provision_spec_for("alice", McpBackendKind::Lima, Some(&lexical_pile))
+            .expect_err("missing lexical signing key must fail");
+        assert!(
+            format!("{missing_key:#}").contains("faculty signing key"),
+            "unexpected missing-key error: {missing_key:#}"
         );
     }
 }

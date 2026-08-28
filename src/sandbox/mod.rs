@@ -34,7 +34,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 
 /// Per-canonical-key lifecycle lock manager.
 ///
@@ -103,35 +103,92 @@ impl SessionId {
     }
 }
 
-/// How a host-owned faculty pile is exposed inside a provisioned sandbox.
+/// Fixed guest path of the durable faculty pile.
+pub const GUEST_FACULTY_PILE: &str = "/pile/self.pile";
+
+/// Fixed guest path of the signing key belonging to the lexical pile identity.
+pub const GUEST_FACULTY_KEY: &str = "/identity/self.key";
+
+/// The two host files that make a writable faculty installation useful.
 ///
-/// `append_only` is the load-bearing invariant: the guest gets a handle it can
-/// read and `>>`-append but not `O_TRUNC`. Backends realise it differently
-/// (macOS `chflags uappend` / `uappnd`, a read-only virtiofs mount plus an
-/// append-only overlay in the guest, a jail with `sappnd`, ...).
+/// Callers provide the *lexical* `self.pile` path once. [`Self::resolve`] finds
+/// the real pile file while deliberately finding `self.key` beside the lexical
+/// path first. This distinction matters when a convenient workspace
+/// `self.pile` is a symlink into a custody directory but its durable signing key
+/// remains in the workspace. Both stored paths are canonical regular files, so
+/// a backend never has to reinterpret a symlink chain.
 ///
-/// ## TRUST BOUNDARY (which backends realise this, and how)
-///
-/// A pile may only be exposed to a sandbox whose substrate is an
-/// **operator-controlled surface**. Local backends (Lima on the Mac) qualify and
-/// mount the explicitly provisioned pile directly. The jail backend
-/// ([`jail::JailBackend`]) runs on a shared host and accepts only
-/// [`FacultyPile::BackendOwned`]. Instead (Model B)
-/// each tenant jail gets its OWN host-owned, server-born piles under the
-/// backend's `pile_root`: a per-tenant `self.pile` seeded from a generic
-/// bootstrap plus one shared `shared.pile`, both append-only (`chflags sappnd`)
-/// and decoupled from the jail lifecycle. A stolen jail token thus reaches only
-/// that tenant's own seeded pile — never a client-selected pile, and never any
-/// other pile on the host. See the pile-provisioning section in [`jail`]'s
-/// module docs.
-#[derive(Debug, Clone)]
-pub struct PileMount {
-    /// Absolute path to the pile on the host.
-    pub host_path: PathBuf,
-    /// Path at which the pile appears inside the sandbox.
-    pub guest_path: PathBuf,
-    /// When true, the guest may read+append but not truncate/replace the file.
-    pub append_only: bool,
+/// Guest destinations are not caller-controlled: every backend exposes these
+/// files at [`GUEST_FACULTY_PILE`] and [`GUEST_FACULTY_KEY`]. That keeps
+/// `PILE`/`TRIBLESPACE_KEY` stable while allowing Lima to hardlink only these
+/// two inodes into private per-tenant view directories. Neither the source
+/// parents nor their potentially huge common ancestor cross the guest boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostFacultyFiles {
+    pile: PathBuf,
+    signing_key: PathBuf,
+}
+
+impl HostFacultyFiles {
+    /// Resolve one lexical `.../self.pile` and its lexical sibling `self.key`.
+    pub fn resolve(lexical_pile: &std::path::Path) -> Result<Self> {
+        if !lexical_pile.is_absolute() {
+            bail!(
+                "faculty pile must be an absolute host path (got {})",
+                lexical_pile.display()
+            );
+        }
+        if lexical_pile.file_name() != Some(std::ffi::OsStr::new("self.pile")) {
+            bail!(
+                "faculty pile must name self.pile (got {})",
+                lexical_pile.display()
+            );
+        }
+
+        let lexical_parent = lexical_pile.parent().ok_or_else(|| {
+            anyhow::anyhow!(
+                "faculty pile path has no lexical parent: {}",
+                lexical_pile.display()
+            )
+        })?;
+        let lexical_key = lexical_parent.join("self.key");
+
+        Ok(Self {
+            pile: canonical_regular_file("faculty pile", lexical_pile)?,
+            signing_key: canonical_regular_file("faculty signing key", &lexical_key)?,
+        })
+    }
+
+    pub fn pile(&self) -> &std::path::Path {
+        &self.pile
+    }
+
+    pub fn signing_key(&self) -> &std::path::Path {
+        &self.signing_key
+    }
+
+    /// Recheck the provisioning-time invariant after resolution. This catches
+    /// a file removed or replaced between CLI parsing and backend mutation.
+    pub fn validate(&self) -> Result<()> {
+        validate_regular_file("faculty pile", &self.pile)?;
+        validate_regular_file("faculty signing key", &self.signing_key)
+    }
+}
+
+fn canonical_regular_file(kind: &str, path: &std::path::Path) -> Result<PathBuf> {
+    let canonical = std::fs::canonicalize(path)
+        .with_context(|| format!("resolve {kind} {}", path.display()))?;
+    validate_regular_file(kind, &canonical)?;
+    Ok(canonical)
+}
+
+fn validate_regular_file(kind: &str, path: &std::path::Path) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("inspect {kind} {}", path.display()))?;
+    if !metadata.is_file() {
+        bail!("{kind} is not a regular file: {}", path.display());
+    }
+    Ok(())
 }
 
 /// A stable sandbox identity. Storage is deliberately absent: it is fixed by
@@ -143,10 +200,18 @@ pub struct Tenant {
 }
 
 /// The two supported ownership topologies for a sandbox's durable faculty pile.
+///
+/// Append-only intent is the load-bearing invariant: the guest gets a handle it
+/// can read and `>>`-append but not `O_TRUNC`. A host pile may only be exposed
+/// to an operator-controlled substrate such as local Lima. The jail backend
+/// runs on a shared host and therefore accepts only [`Self::BackendOwned`]: it
+/// allocates per-tenant piles under its own `pile_root` rather than accepting a
+/// caller-selected host path.
 #[derive(Debug, Clone)]
 pub enum FacultyPile {
-    /// An operator-controlled host pile mounted into a local sandbox (Lima).
-    Host(PileMount),
+    /// Operator-controlled host pile + signing key mounted into a local sandbox
+    /// (Lima).
+    Host(HostFacultyFiles),
     /// Storage allocated and retained by the backend itself (FreeBSD jail).
     BackendOwned,
 }
@@ -444,5 +509,49 @@ pub trait SandboxBackend: Send + Sync {
     /// own cleanup.
     fn shutdown(&self) -> Result<usize> {
         Ok(0)
+    }
+}
+
+#[cfg(test)]
+mod host_faculty_files_tests {
+    use super::*;
+
+    fn fixture(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "playground-host-faculty-files-{}-{name}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create fixture root");
+        root
+    }
+
+    #[test]
+    fn resolve_rejects_missing_and_non_regular_files() {
+        let missing_pile = fixture("missing-pile");
+        std::fs::write(missing_pile.join("self.key"), b"key").expect("create key");
+        let error = HostFacultyFiles::resolve(&missing_pile.join("self.pile"))
+            .expect_err("missing pile must fail");
+        assert!(format!("{error:#}").contains("faculty pile"));
+
+        let missing_key = fixture("missing-key");
+        std::fs::write(missing_key.join("self.pile"), b"pile").expect("create pile");
+        let error = HostFacultyFiles::resolve(&missing_key.join("self.pile"))
+            .expect_err("missing key must fail");
+        assert!(format!("{error:#}").contains("faculty signing key"));
+
+        let pile_directory = fixture("pile-directory");
+        std::fs::create_dir(pile_directory.join("self.pile")).expect("create pile directory");
+        std::fs::write(pile_directory.join("self.key"), b"key").expect("create key");
+        let error = HostFacultyFiles::resolve(&pile_directory.join("self.pile"))
+            .expect_err("directory pile must fail");
+        assert!(error.to_string().contains("not a regular file"));
+
+        let key_directory = fixture("key-directory");
+        std::fs::write(key_directory.join("self.pile"), b"pile").expect("create pile");
+        std::fs::create_dir(key_directory.join("self.key")).expect("create key directory");
+        let error = HostFacultyFiles::resolve(&key_directory.join("self.pile"))
+            .expect_err("directory key must fail");
+        assert!(error.to_string().contains("not a regular file"));
     }
 }

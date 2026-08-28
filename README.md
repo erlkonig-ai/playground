@@ -94,8 +94,12 @@ A **user** is a tenant: its persistent sandbox plus the bearer token that
 authorizes it. `user create` provisions the tenant's sandbox and mints its
 token into a JSON store bound to that tenant + backend. Jail allocates faculty
 storage itself; Lima requires the operator to name an existing durable
-`self.pile` explicitly. The token is printed once, then only lives in the
-store:
+`self.pile` explicitly, with an existing `self.key` beside that lexical path.
+Lima resolves both real files independently, hardlinks only those two inodes
+into private per-tenant mount views, and exposes them as
+`PILE=/pile/self.pile` and `TRIBLESPACE_KEY=/identity/self.key`, and exports the
+tenant label itself as `PERSONA`. The token is printed once, then only lives in
+the store:
 
 ```bash
 cargo run --manifest-path playground/Cargo.toml -- \

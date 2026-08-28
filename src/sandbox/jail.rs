@@ -4627,11 +4627,15 @@ mod tests {
     #[test]
     fn provision_rejects_host_storage_before_host_mutation() {
         let mut host_storage = spec("alice");
-        host_storage.faculty_pile = FacultyPile::Host(crate::sandbox::PileMount {
-            host_path: PathBuf::from("/caller/chosen/self.pile"),
-            guest_path: PathBuf::from("/pile/self.pile"),
-            append_only: true,
-        });
+        let root =
+            std::env::temp_dir().join(format!("playground-jail-host-files-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("create host-files fixture");
+        std::fs::write(root.join("self.pile"), b"pile").expect("create fixture pile");
+        std::fs::write(root.join("self.key"), b"key").expect("create fixture key");
+        host_storage.faculty_pile = FacultyPile::Host(
+            crate::sandbox::HostFacultyFiles::resolve(&root.join("self.pile"))
+                .expect("resolve fixture faculty files"),
+        );
         let (backend, mock) = MockRunner::default().into_backend();
 
         let error = backend
