@@ -12,7 +12,10 @@
 //!     per-coworker signing key mounted read-only at `/pile/self.key`; seeded
 //!     `/etc/profile` exports PATH, PILE, TRIBLESPACE_KEY, and the tenant-derived
 //!     `PERSONA`, then `jail -c name=playground-<session> path=<mountpoint>
-//!     persist ...`, and registers that same persona in the shared pile.
+//!     persist ...`, and registers that same persona in the operator-selected
+//!     shared Relations collection. The registration command names both the
+//!     tenant key and exact collection descriptor explicitly; the collection
+//!     override is never persisted in the tenant profile.
 //!     Idempotent: a
 //!     tenant whose dataset already exists is treated as already-provisioned
 //!     (skip the clone, just ensure the jail is up). This is what `playground
@@ -237,6 +240,12 @@ pub struct JailBackend {
     /// coworker's `self.pile` (and used to seed the shared pile the first time).
     /// This is the server-side bootstrap seed, not any caller-supplied pile.
     pub bootstrap_pile: String,
+    /// Exact descriptor handle of the operator-rooted Relations collection in
+    /// `shared.pile`. This is public routing configuration, not a key. Fresh
+    /// tenant provisioning requires one canonical 64-hex handle and passes it
+    /// only to the administrative `relations add` invocation; it is never
+    /// exported from `/etc/profile` as an ambient override.
+    pub relations_collection: Option<String>,
     /// ZFS `refquota` (bytes) set on each per-tenant clone at provision so a
     /// tenant cannot fill the host pool via its own dataset's writes (repair #4
     /// storage bound). `refquota` (vs `quota`) bounds the dataset's OWN data
@@ -298,6 +307,7 @@ impl JailBackend {
             dataset_parent: "aitemp/playground".to_string(),
             pile_root: "/aitemp/playground/piles".to_string(),
             bootstrap_pile: "/aitemp/playground/bootstrap.pile".to_string(),
+            relations_collection: None,
             // Sane default: 10 GiB per tenant clone. Generous for a working
             // sandbox, finite enough that no tenant can fill the pool. Operators
             // tune it with `--jail-clone-refquota` (`0`/empty disables).
@@ -396,6 +406,28 @@ impl JailBackend {
     /// under this; the cap stops a pathological label from ballooning argv /
     /// property values.
     const MAX_LABEL_LEN: usize = 200;
+
+    /// Return the exact configured Relations descriptor in the spelling the
+    /// Faculties override accepts. A missing or malformed value is a
+    /// provisioning error: silently falling back to a tenant-private
+    /// descriptor would fork the shared graph under the tenant signer.
+    fn relations_collection_handle(&self) -> Result<String> {
+        let configured = self.relations_collection.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "fresh jail provisioning requires --jail-relations-collection or \
+                 PLAYGROUND_JAIL_RELATIONS_COLLECTION"
+            )
+        })?;
+        let trimmed = configured.trim();
+        let hex = trimmed.strip_prefix("blake3:").unwrap_or(trimmed);
+        if hex.len() != 64 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            bail!(
+                "jail Relations collection must be one exact 64-digit hexadecimal descriptor \
+                 handle (optionally prefixed by blake3:)"
+            );
+        }
+        Ok(hex.to_ascii_lowercase())
+    }
 
     fn dataset(&self, jail: &str) -> String {
         format!("{}/{}", self.dataset_parent, jail)
@@ -1203,16 +1235,22 @@ LC_ALL=C grep -Eq '^[0-9A-Fa-f]{64}$' "$p"
         &self,
         jail: &str,
         assistant: &TenantAssistantPersona,
+        relations_collection: &str,
     ) -> Result<()> {
+        let collection_env = format!("TRIBLESPACE_COLLECTION_RELATIONS={relations_collection}");
         let added = self.run(
             &[
                 "sudo",
                 "-n",
                 "jexec",
                 jail,
+                "/usr/bin/env",
+                &collection_env,
                 "/opt/faculties/relations",
                 "--pile",
                 Self::GUEST_SHARED_PILE,
+                "--key",
+                Self::GUEST_SELF_KEY,
                 "add",
                 &assistant.label,
                 "--id",
@@ -2169,6 +2207,18 @@ impl SandboxBackend for JailBackend {
                 spec.tenant.label
             );
         }
+        if spec
+            .env
+            .iter()
+            .any(|(key, _)| key == "TRIBLESPACE_COLLECTION_RELATIONS")
+        {
+            bail!(
+                "TRIBLESPACE_COLLECTION_RELATIONS is reserved by Playground for the \
+                 command-scoped shared Relations handle; do not persist it in \
+                 ProvisionSpec::env"
+            );
+        }
+        let relations_collection = self.relations_collection_handle()?;
         let jail = self.jail_name(&spec.tenant.label);
         let dataset = self.dataset(&jail);
 
@@ -2527,7 +2577,7 @@ impl SandboxBackend for JailBackend {
                     .with_context(|| format!("apply resource limits to new jail '{jail}'"))?;
                 self.bootstrap_tenant_pile(&jail)
                     .with_context(|| format!("bootstrap tenant '{}'", spec.tenant.label))?;
-                self.register_tenant_assistant(&jail, &assistant)
+                self.register_tenant_assistant(&jail, &assistant, &relations_collection)
                     .with_context(|| {
                         format!("register assistant for tenant '{}'", spec.tenant.label)
                     })?;
@@ -2923,6 +2973,9 @@ mod tests {
     use std::process::Command;
     use std::sync::{Arc, Mutex};
 
+    const TEST_RELATIONS_COLLECTION: &str =
+        "1111111111111111111111111111111111111111111111111111111111111111";
+
     /// Records every host invocation; replies from a script keyed on the argv
     /// prefix, defaulting to success with empty output. Tests hold an `Arc`
     /// to it and hand a clone to the backend (mirrors the mock-backend
@@ -3069,7 +3122,9 @@ mod tests {
         /// Backend + handle pair: the backend owns one Arc clone, the test the other.
         fn into_backend(self) -> (JailBackend, Arc<MockRunner>) {
             let mock = Arc::new(self);
-            (JailBackend::with_runner(Box::new(mock.clone())), mock)
+            let mut backend = JailBackend::with_runner(Box::new(mock.clone()));
+            backend.relations_collection = Some(TEST_RELATIONS_COLLECTION.to_string());
+            (backend, mock)
         }
     }
 
@@ -3574,8 +3629,8 @@ mod tests {
             .iter()
             .filter(|call| {
                 call.get(2).map(String::as_str) == Some("jexec")
-                    && call.get(4).map(String::as_str) == Some("/opt/faculties/relations")
-                    && call.get(7).map(String::as_str) == Some("add")
+                    && call.get(6).map(String::as_str) == Some("/opt/faculties/relations")
+                    && call.get(11).map(String::as_str) == Some("add")
             })
             .collect();
         assert_eq!(
@@ -3584,10 +3639,19 @@ mod tests {
             "fresh provision must register exactly one assistant: {calls:?}"
         );
         let add = persona_calls[0];
-        assert_eq!(add.get(6).map(String::as_str), Some("/shared/shared.pile"));
-        assert_eq!(add.get(8), Some(&expected.label));
-        assert_eq!(add.get(9).map(String::as_str), Some("--id"));
-        assert_eq!(add.get(10), Some(&expected.id_hex));
+        assert_eq!(add.get(4).map(String::as_str), Some("/usr/bin/env"));
+        assert_eq!(
+            add.get(5).map(String::as_str),
+            Some(
+                "TRIBLESPACE_COLLECTION_RELATIONS=1111111111111111111111111111111111111111111111111111111111111111"
+            )
+        );
+        assert_eq!(add.get(8).map(String::as_str), Some("/shared/shared.pile"));
+        assert_eq!(add.get(9).map(String::as_str), Some("--key"));
+        assert_eq!(add.get(10).map(String::as_str), Some("/pile/self.key"));
+        assert_eq!(add.get(12), Some(&expected.label));
+        assert_eq!(add.get(13).map(String::as_str), Some("--id"));
+        assert_eq!(add.get(14), Some(&expected.id_hex));
 
         let (_, seed_stdin) = mock
             .calls
@@ -3607,6 +3671,10 @@ mod tests {
         assert!(
             profile.contains(&persona_export),
             "profile and relations identity must share the same label: {profile}"
+        );
+        assert!(
+            !profile.contains("TRIBLESPACE_COLLECTION_RELATIONS"),
+            "the shared collection override must remain command-scoped: {profile}"
         );
     }
 
@@ -3638,7 +3706,7 @@ mod tests {
         assert!(
             !raw_calls.iter().any(|(argv, _)| {
                 argv.get(2).map(String::as_str) == Some("jexec")
-                    && argv.get(4).map(String::as_str) == Some("/opt/faculties/relations")
+                    && argv.get(6).map(String::as_str) == Some("/opt/faculties/relations")
             }),
             "reuse must not register another assistant: {raw_calls:?}"
         );
@@ -3668,6 +3736,54 @@ mod tests {
         assert!(
             mock.calls().is_empty(),
             "conflict must fail before any host mutation"
+        );
+    }
+
+    #[test]
+    fn provision_rejects_a_persistent_relations_override_before_host_mutation() {
+        let mut conflicting = spec("alice");
+        conflicting.env.push((
+            "TRIBLESPACE_COLLECTION_RELATIONS".to_string(),
+            TEST_RELATIONS_COLLECTION.to_string(),
+        ));
+        let (backend, mock) = MockRunner::default().into_backend();
+
+        let error = backend
+            .provision_sandbox(&conflicting)
+            .expect_err("the shared handle must remain command-scoped");
+        assert!(
+            error
+                .to_string()
+                .contains("TRIBLESPACE_COLLECTION_RELATIONS is reserved")
+        );
+        assert!(
+            mock.calls().is_empty(),
+            "conflict must fail before any host mutation"
+        );
+    }
+
+    #[test]
+    fn fresh_provision_requires_one_exact_relations_descriptor_before_host_mutation() {
+        let mock = Arc::new(MockRunner::default());
+        let backend = JailBackend::with_runner(Box::new(mock.clone()));
+        let error = backend
+            .provision_sandbox(&spec("alice"))
+            .expect_err("missing collection identity must fail closed");
+        assert!(error.to_string().contains("--jail-relations-collection"));
+        assert!(mock.calls().is_empty());
+
+        let mut backend = JailBackend::with_runner(Box::new(mock.clone()));
+        backend.relations_collection = Some("not-a-handle".to_string());
+        let error = backend
+            .provision_sandbox(&spec("alice"))
+            .expect_err("malformed collection identity must fail closed");
+        assert!(error.to_string().contains("64-digit hexadecimal"));
+        assert!(mock.calls().is_empty());
+
+        backend.relations_collection = Some(format!("blake3:{TEST_RELATIONS_COLLECTION}"));
+        assert_eq!(
+            backend.relations_collection_handle().unwrap(),
+            TEST_RELATIONS_COLLECTION
         );
     }
 
@@ -4632,7 +4748,9 @@ mod tests {
             gate_rx: Mutex::new(Some(gate_rx)),
             entered: entered_tx,
         });
-        let backend = Arc::new(JailBackend::with_runner(Box::new(runner.clone())));
+        let mut backend = JailBackend::with_runner(Box::new(runner.clone()));
+        backend.relations_collection = Some(TEST_RELATIONS_COLLECTION.to_string());
+        let backend = Arc::new(backend);
 
         // Op 1: grabs the lock, blocks inside the probe.
         let b1 = backend.clone();

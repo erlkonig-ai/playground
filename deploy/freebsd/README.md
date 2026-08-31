@@ -67,6 +67,13 @@ Two hosting modes exist and stay interchangeable:
   (`destroy_session` never deletes them). A stolen tenant token thus reaches
   only that tenant's own seeded pile and the shared org pile — never any other
   pile on the host.
+- The shared Relations collection has one separate, persistent operator root
+  key. That key creates the collection descriptor and issues exact READ and
+  WRITE grants to each tenant application's public key. It stays in the trusted
+  parent, is never mounted into a child jail, and is never placed in a child
+  profile. The child sees only its own `/pile/self.key`; Playground passes that
+  key and the public Relations descriptor handle explicitly to the one
+  registration command.
 - **Only the pile FILES are mounted — never a host directory (2026-07-24).**
   Each pile is a single-FILE nullfs mount (the host pile file onto a pre-created
   empty target file inside the jail's own ZFS clone), so the jail's `/pile` and
@@ -165,14 +172,53 @@ sudo zfs list -H -o name,mountpoint,quota airoot/jails/playground/jails/piles
 sudo install -o root -g wheel -m 0444 <generic-bootstrap.pile> \
   /var/db/playground/bootstrap.pile
 
+# SHARED RELATIONS GATE. Before provisioning any tenant, initialize exactly one
+# operator-rooted `relations` descriptor in the shared pile and record its exact
+# 64-hex descriptor handle. The operator root stays outside every child jail.
+#
+# This checkout intentionally does not guess that first handle: current
+# `relations` can register a descriptor but does not print it, while `trible pile
+# collection show/list` can resolve only descriptors already referenced by a
+# collection record. Wait for/use the reviewed Trible collection-init command
+# that atomically creates the named descriptor and prints its handle; do not
+# scrape blob listings or create a synthetic Relations commit merely to discover
+# it. The remaining per-tenant flow below is ready for that exact output.
+RELATIONS_ROOT_KEY=/var/db/playground/relations-root.key
+RELATIONS_COLLECTION='<64-hex-descriptor-handle>'
+SHARED_PILE=/var/db/playground/piles/shared/shared.pile
+[ "${#RELATIONS_COLLECTION}" -eq 64 ] && \
+  printf '%s' "$RELATIONS_COLLECTION" | grep -Eq '^[0-9A-Fa-f]{64}$' || {
+    echo "RELATIONS_COLLECTION must be the exact 64-hex descriptor handle" >&2
+    exit 70
+  }
+
 # STOP: before this command, complete the per-tenant RACCT/RCTL procedure below
 # from the PHYSICAL host and prove all six name-keyed rules are loaded. Jailed
 # root cannot add them after the child exists. `user create` then provisions
 # the persistent jail and mints its token; --jail-local uses no ssh hop.
 test "$(sysctl -n security.jail.enforce_statfs)" = 0
 TENANT='<label>'
-sudo env TENANT="$TENANT" sh -c '
+sudo env TENANT="$TENANT" RELATIONS_ROOT_KEY="$RELATIONS_ROOT_KEY" \
+  RELATIONS_COLLECTION="$RELATIONS_COLLECTION" SHARED_PILE="$SHARED_PILE" sh -c '
   umask 077
+  JAIL=$(/usr/local/bin/playground user jail-name "$TENANT")
+  SELF_DIR="/var/db/playground/piles/$JAIL"
+  install -d -o root -g wheel -m 0700 "$SELF_DIR"
+  TENANT_PUBLIC=$(
+    /usr/local/bin/trible pile signing-key init "$SELF_DIR/self.pile" \
+      --key "$SELF_DIR/self.key" |
+      sed -n "s/^public-key: //p"
+  )
+  [ "${#TENANT_PUBLIC}" -eq 64 ] || {
+    echo "could not derive tenant application public key" >&2
+    exit 70
+  }
+  /usr/local/bin/trible pile collection grant-read \
+    "$SHARED_PILE" "blake3:$RELATIONS_COLLECTION" "$TENANT_PUBLIC" \
+    --key "$RELATIONS_ROOT_KEY"
+  /usr/local/bin/trible pile collection grant-write \
+    "$SHARED_PILE" "blake3:$RELATIONS_COLLECTION" "$TENANT_PUBLIC" \
+    --key "$RELATIONS_ROOT_KEY"
   install -o root -g wheel -m 0600 /dev/null "/var/db/playground/$TENANT.token"
   exec /usr/local/bin/playground user create "$TENANT" \
     --backend jail --jail-local --jail-external-rctl \
@@ -180,6 +226,7 @@ sudo env TENANT="$TENANT" sh -c '
     --jail-dataset-parent airoot/jails/playground/jails \
     --jail-pile-root /var/db/playground/piles \
     --jail-bootstrap-pile /var/db/playground/bootstrap.pile \
+    --jail-relations-collection "$RELATIONS_COLLECTION" \
     --tokens /var/db/playground/tokens.json \
     > "/var/db/playground/$TENANT.token"
 '
@@ -248,6 +295,9 @@ sudo jexec playground /bin/sh
 
 # The remaining commands run INSIDE that parent jail.
 TENANT='<existing-label>'
+RELATIONS_ROOT_KEY=/var/db/playground/relations-root.key
+RELATIONS_COLLECTION='<64-hex-descriptor-handle>'
+SHARED_PILE=/var/db/playground/piles/shared/shared.pile
 case "$TENANT" in
   ''|[[:space:]]*|*[[:space:]])
     echo "tenant label is empty or has surrounding whitespace" >&2
@@ -255,6 +305,22 @@ case "$TENANT" in
     ;;
 esac
 JAIL=$(/usr/local/bin/playground user jail-name "$TENANT")
+TENANT_KEY="/var/db/playground/piles/$JAIL/self.key"
+TENANT_PILE="/var/db/playground/piles/$JAIL/self.pile"
+TENANT_PUBLIC=$(
+  /usr/local/bin/trible pile signing-key init "$TENANT_PILE" --key "$TENANT_KEY" |
+    sed -n 's/^public-key: //p'
+)
+[ "${#TENANT_PUBLIC}" -eq 64 ] || {
+  echo "could not derive tenant application public key" >&2
+  exit 70
+}
+/usr/local/bin/trible pile collection grant-read \
+  "$SHARED_PILE" "blake3:$RELATIONS_COLLECTION" "$TENANT_PUBLIC" \
+  --key "$RELATIONS_ROOT_KEY"
+/usr/local/bin/trible pile collection grant-write \
+  "$SHARED_PILE" "blake3:$RELATIONS_COLLECTION" "$TENANT_PUBLIC" \
+  --key "$RELATIONS_ROOT_KEY"
 LABEL="${TENANT} assistant"
 LABEL_BYTES=$(LC_ALL=C printf '%s' "$LABEL" | wc -c | tr -d ' ')
 [ "$LABEL_BYTES" -le 32 ] || {
@@ -271,8 +337,11 @@ PERSONA_ID=$(
 
 # Insert first. Do not use --force: an existing label on another id is a
 # conflict to inspect, not something rollout should paper over.
-/usr/sbin/jexec "$JAIL" /opt/faculties/relations \
+/usr/sbin/jexec "$JAIL" /usr/bin/env \
+  "TRIBLESPACE_COLLECTION_RELATIONS=$RELATIONS_COLLECTION" \
+  /opt/faculties/relations \
   --pile /shared/shared.pile \
+  --key /pile/self.key \
   add "$LABEL" --id "$PERSONA_ID" --display-name "$LABEL" \
   --affinity assistant --source playground
 
@@ -286,8 +355,9 @@ PROFILE_LINE="export PERSONA='$ESCAPED_LABEL'"
 
 # Agreement check: the next login shell resolves PERSONA to the shared person.
 /usr/sbin/jexec "$JAIL" /bin/sh -lc \
-  'test "$PERSONA" = "$1" && relations --pile /shared/shared.pile show "$PERSONA"' \
-  sh "$LABEL"
+  'test "$PERSONA" = "$1" && env "TRIBLESPACE_COLLECTION_RELATIONS=$2" \
+    relations --pile /shared/shared.pile --key /pile/self.key show "$PERSONA"' \
+  sh "$LABEL" "$RELATIONS_COLLECTION"
 ```
 
 The person id is deterministic and `relations` has set semantics, so rerunning

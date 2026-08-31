@@ -360,6 +360,12 @@ struct UserBackendArgs {
     /// coworker's `self.pile` (and the shared pile) when absent.
     #[arg(long, default_value = "/aitemp/playground/bootstrap.pile")]
     jail_bootstrap_pile: String,
+    /// Jail backend: exact descriptor handle of the operator-rooted Relations
+    /// collection already resident in `shared.pile`. Required when creating a
+    /// fresh jail tenant; policy grants are provisioned separately by the host
+    /// operator and this public handle is passed only to `relations add`.
+    #[arg(long, env = "PLAYGROUND_JAIL_RELATIONS_COLLECTION")]
+    jail_relations_collection: Option<String>,
     /// Jail backend: run zfs/jail/jexec directly on this machine instead of
     /// over SSH (server-side hosting on the FreeBSD jail host itself).
     #[arg(long, default_value_t = false)]
@@ -398,6 +404,7 @@ impl UserBackendArgs {
                 backend.dataset_parent = self.jail_dataset_parent.clone();
                 backend.pile_root = self.jail_pile_root.clone();
                 backend.bootstrap_pile = self.jail_bootstrap_pile.clone();
+                backend.relations_collection = self.jail_relations_collection.clone();
                 backend.clone_refquota = quota_opt(self.jail_clone_refquota.clone());
                 backend.pile_root_quota = quota_opt(self.jail_pile_quota.clone());
                 if self.jail_external_rctl {
@@ -1150,6 +1157,8 @@ mod tests {
             "tokens.json",
             "--jail-local",
             "--jail-external-rctl",
+            "--jail-relations-collection",
+            "blake3:1111111111111111111111111111111111111111111111111111111111111111",
         ])
         .unwrap();
         let Some(CommandMode::User {
@@ -1159,6 +1168,10 @@ mod tests {
             panic!("user create command did not parse");
         };
         assert!(args.backend.jail_external_rctl);
+        assert_eq!(
+            args.backend.jail_relations_collection.as_deref(),
+            Some("blake3:1111111111111111111111111111111111111111111111111111111111111111")
+        );
     }
 
     #[cfg(unix)]
