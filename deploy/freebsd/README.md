@@ -373,16 +373,205 @@ pile or any other pile on the host. Append-only (`chflags sappnd`,
 malicious-proof once `securelevel>=1`) bounds the damage to appends, not
 truncation.
 
-## One-time assistant-persona backfill for existing tenants
+## One-time durable-signer and assistant-persona backfill for existing tenants
 
-Jails created by a version predating tenant assistant provisioning keep their
-persisted `/etc/profile` unchanged on restart/reattach. This is intentional:
-deploying a new daemon must not silently rewrite an existing workspace. New
-tenants need no rollout step. Inventory every pre-feature tenant first with
-`playground user list --backend jail --jail-local --tokens
-/var/db/playground/tokens.json`; use the original labels from that output, not
-the sanitized jail names. For each label, enter the trusted `playground` parent
-jail as root and run this explicit, idempotent backfill once:
+Jails created before durable per-tenant signing keys or tenant assistant
+provisioning keep their persisted workspace and `/etc/profile` unchanged on a
+daemon restart. This is intentional: deploying a new daemon must not silently
+rewrite an existing workspace. New tenants need no rollout step.
+
+This is not a tenant-pile migration. The new `self.key` is a separate 0600
+host file beside the retained `self.pile`; the provider mounts it read-only and
+does not append to, replace, or reseed that pile. The assistant registration
+appends only to the org-wide `shared.pile`, and the profile change lives in the
+persistent jail dataset. The procedure below proves the dataset GUID plus the
+tenant pile's device/inode, size, flags, and SHA-256 remain unchanged across the
+reattach.
+
+Inventory every pre-feature tenant first with `playground user list --backend
+jail --jail-local --tokens /var/db/playground/tokens.json`; use the original
+labels from that output, not the sanitized jail names.
+
+### Converge a missing signer through the provider's reattach path
+
+A graceful provider restart leaves an already-running child jail alive, and
+the startup sweep correctly skips it. That means a daemon restart alone cannot
+add the new signer mount to a legacy running child. While the public edge is
+off, stop the provider and remove only that child's in-kernel jail context with
+`jail -r`. Never use `playground user destroy` here: destroy removes the
+workspace dataset. The new provider's startup sweep then takes its ordinary
+reattach path, which atomically creates the missing host key, restores the
+existing mounts, adds the exact read-only key mount, and starts the same
+dataset.
+
+Run this only after the exact new provider is staged and the separately
+reviewed, collection-aware tenant Faculties cohort is activated in every
+retained child (and selected in a new template snapshot for future tenants).
+That cohort has its own build and activation receipt; do not infer it from the
+provider revision. On a live retrofit, inventory first, stop Caddy and the
+provider, initialize the shared Relations descriptor above, and keep Caddy off;
+the conditional stops below deliberately accept that already-quiescent state.
+
+The example does one tenant so its before/after values stay in one root shell;
+repeat it for each pre-feature label while Caddy remains stopped. Set the staged
+provider path and expected digest from its reviewed build receipt, never from
+the installed destination.
+
+```sh
+# From the physical host, enter the trusted parent first:
+sudo jexec playground /bin/sh
+
+# The remaining commands run INSIDE that parent jail.
+set -eu
+TENANT='<existing-label>'
+STAGED_PROVIDER='<absolute-path-to-reviewed-staged-playground>'
+EXPECTED_PROVIDER_SHA256='<64-lowercase-hex-from-build-receipt>'
+case "$EXPECTED_PROVIDER_SHA256" in
+  *[!0-9a-f]*|'')
+    echo "expected provider SHA-256 is not lowercase hexadecimal" >&2
+    exit 64
+    ;;
+esac
+[ "${#EXPECTED_PROVIDER_SHA256}" -eq 64 ] || {
+  echo "expected provider SHA-256 is not 64 digits" >&2
+  exit 64
+}
+[ "$(sha256 -q "$STAGED_PROVIDER")" = "$EXPECTED_PROVIDER_SHA256" ] || {
+  echo "staged provider checksum mismatch" >&2
+  exit 70
+}
+
+JAIL=$(/usr/local/bin/playground user jail-name "$TENANT")
+case "$JAIL" in
+  playground-?*) ;;
+  *)
+    echo "derived jail is outside the playground child namespace: $JAIL" >&2
+    exit 70
+    ;;
+esac
+DATASET="airoot/jails/playground/jails/$JAIL"
+SELF_DIR="/var/db/playground/piles/$JAIL"
+SELF_PILE="$SELF_DIR/self.pile"
+TENANT_KEY="$SELF_DIR/self.key"
+[ -f "$SELF_PILE" ] && [ ! -L "$SELF_PILE" ] || {
+  echo "existing tenant pile is absent or unsafe: $SELF_PILE" >&2
+  exit 70
+}
+zfs list -H -o name "$DATASET" >/dev/null
+/usr/sbin/jls -j "$JAIL" >/dev/null
+[ "$(zfs get -H -o value playground:tenant "$DATASET")" = "$TENANT" ] || {
+  echo "dataset tenant provenance does not match the requested label" >&2
+  exit 70
+}
+ROOT=$(zfs get -H -o value mountpoint "$DATASET")
+JAIL_PATH=$(/usr/sbin/jls -j "$JAIL" -n path | sed 's/^path=//')
+[ "$JAIL_PATH" = "$ROOT" ] || {
+  echo "running child path does not match the retained dataset mountpoint" >&2
+  exit 70
+}
+
+# Close public ingress first. A graceful provider stop drains/cancels its jobs
+# but deliberately leaves the persistent child jail alive.
+if service caddy status >/dev/null 2>&1; then
+  service caddy stop
+fi
+if service playground_mcp status >/dev/null 2>&1; then
+  service playground_mcp stop
+fi
+service playground_mcp status >/dev/null 2>&1 && {
+  echo "provider did not stop" >&2
+  exit 70
+}
+
+# Capture the preservation receipt after traffic is quiescent but BEFORE
+# removing the child context. The dataset GUID proves this is the same workspace
+# clone; the remaining fields pin the exact host-owned tenant pile across the
+# child bounce and provider upgrade.
+GUID_BEFORE=$(zfs get -H -o value guid "$DATASET")
+PILE_ID_BEFORE=$(stat -f '%d:%i:%z:%Sf' "$SELF_PILE")
+PILE_SHA_BEFORE=$(sha256 -q "$SELF_PILE")
+
+# Stop ONLY the child context. Its ZFS dataset and host-owned piles remain.
+/usr/sbin/jail -r "$JAIL"
+/usr/sbin/jls -j "$JAIL" >/dev/null 2>&1 && {
+  echo "tenant child is still running: $JAIL" >&2
+  exit 70
+}
+zfs list -H -o name "$DATASET" >/dev/null
+
+# Install only the already-verified provider. Keep an exact rollback copy on
+# the first pass; a retry that already has the intended binary does not make a
+# misleading copy of new-as-old.
+if [ "$(sha256 -q /usr/local/bin/playground)" != "$EXPECTED_PROVIDER_SHA256" ]; then
+  ROLLBACK="/usr/local/bin/playground.pre-signer-$(date -u +%Y%m%dT%H%M%SZ)"
+  test ! -e "$ROLLBACK"
+  install -o root -g wheel -m 0755 /usr/local/bin/playground "$ROLLBACK"
+  install -o root -g wheel -m 0755 "$STAGED_PROVIDER" /usr/local/bin/playground
+fi
+[ "$(sha256 -q /usr/local/bin/playground)" = "$EXPECTED_PROVIDER_SHA256" ] || {
+  echo "installed provider checksum mismatch" >&2
+  exit 70
+}
+
+# mcp-http calls reattach_all before binding. Because this child is down, the
+# new reattach path creates self.key if absent and mounts it read-only.
+service playground_mcp start
+i=0
+until /usr/sbin/jls -j "$JAIL" >/dev/null 2>&1; do
+  i=$((i + 1))
+  [ "$i" -lt 30 ] || {
+    echo "provider did not reattach $JAIL; keep Caddy stopped" >&2
+    exit 70
+  }
+  sleep 1
+done
+service playground_mcp status
+
+[ -f "$TENANT_KEY" ] && [ ! -L "$TENANT_KEY" ] || {
+  echo "reattach did not create a safe tenant key: $TENANT_KEY" >&2
+  exit 70
+}
+[ "$(stat -f '%Su:%Sg:%Lp:%z' "$TENANT_KEY")" = 'root:wheel:600:64' ] &&
+  LC_ALL=C grep -Eq '^[0-9A-Fa-f]{64}$' "$TENANT_KEY" || {
+    echo "tenant key violates the private 64-hex-byte contract" >&2
+    exit 70
+  }
+
+KEY_MOUNTS=$(
+  mount -p | awk -v source="$TENANT_KEY" -v target="$ROOT/pile/self.key" '
+    $1 == source && $2 == target && $3 == "nullfs" &&
+      $4 ~ /(^|,)ro(,|$)/ { count++ }
+    END { print count + 0 }
+  '
+)
+[ "$KEY_MOUNTS" -eq 1 ] || {
+  echo "tenant key does not have one exact read-only nullfs mount" >&2
+  exit 70
+}
+/usr/sbin/jexec "$JAIL" test -f /pile/self.key
+
+# Reattach may add only the sibling key and its mount. It must retain the exact
+# workspace dataset and leave self.pile byte-for-byte and inode-for-inode alone.
+[ "$(zfs get -H -o value guid "$DATASET")" = "$GUID_BEFORE" ] &&
+  [ "$(stat -f '%d:%i:%z:%Sf' "$SELF_PILE")" = "$PILE_ID_BEFORE" ] &&
+  [ "$(sha256 -q "$SELF_PILE")" = "$PILE_SHA_BEFORE" ] || {
+    echo "reattach changed the tenant dataset identity or self.pile" >&2
+    exit 70
+  }
+
+# The existing child must carry the reviewed collection-aware faculty before
+# any grant or shared-pile append. Keep Caddy stopped if this gate fails.
+/usr/sbin/jexec "$JAIL" /opt/faculties/relations --help 2>&1 |
+  grep -q -- '--key' || {
+    echo "tenant relations faculty is not collection/key aware" >&2
+    exit 70
+  }
+```
+
+### Grant and register the existing assistant
+
+For each converged label, enter the trusted `playground` parent jail as root
+and run this explicit, idempotent backfill once:
 
 ```sh
 # From the physical host, enter the trusted parent first:
@@ -491,28 +680,40 @@ PERSONA_ID=$(
   add "$LABEL" --id "$PERSONA_ID" --display-name "$LABEL" \
   --affinity assistant --source playground
 
-# Then persist that exact same label for future login shells. Pass the line as
-# argv (not interpolated into shell code); grep makes the append idempotent.
+# Then persist the complete faculty identity environment for future login
+# shells. Pass each line as argv (not interpolated into shell code); grep makes
+# every append idempotent. These lines are added only after registration works.
 ESCAPED_LABEL=$(printf '%s' "$LABEL" | sed "s/'/'\\\\''/g")
+PATH_LINE='export PATH=/opt/faculties:$PATH'
+PILE_LINE="export PILE='/pile/self.pile'"
+KEY_LINE="export TRIBLESPACE_KEY='/pile/self.key'"
 PROFILE_LINE="export PERSONA='$ESCAPED_LABEL'"
 /usr/sbin/jexec "$JAIL" /bin/sh -c \
-  'grep -Fqx "$1" /etc/profile || printf "%s\n" "$1" >> /etc/profile' \
-  sh "$PROFILE_LINE"
+  'for LINE in "$@"; do
+     grep -Fqx "$LINE" /etc/profile || printf "%s\n" "$LINE" >> /etc/profile
+   done' \
+  sh "$PATH_LINE" "$PILE_LINE" "$KEY_LINE" "$PROFILE_LINE"
 
-# Agreement check: the next login shell resolves PERSONA to the shared person.
+# Agreement check: the next login shell resolves the exact pile, signer,
+# faculty executable, and PERSONA to the shared person.
 /usr/sbin/jexec "$JAIL" /bin/sh -lc \
-  'test "$PERSONA" = "$1" && env "TRIBLESPACE_COLLECTION_RELATIONS=$2" \
-    relations --pile /shared/shared.pile --key /pile/self.key show "$PERSONA"' \
+  'test "$PILE" = /pile/self.pile &&
+   test "$TRIBLESPACE_KEY" = /pile/self.key &&
+   test "$PERSONA" = "$1" &&
+   test "$(command -v relations)" = /opt/faculties/relations &&
+   env "TRIBLESPACE_COLLECTION_RELATIONS=$2" \
+     relations --pile /shared/shared.pile --key /pile/self.key show "$PERSONA"' \
   sh "$LABEL" "$RELATIONS_COLLECTION"
 ```
 
 The person id is deterministic and `relations` has set semantics, so rerunning
-after an interrupted backfill converges on the same entity. The profile line is
-added only after the relation succeeds; a relation conflict therefore cannot
-leave `PERSONA` pointing at an unknown identity. The operator root key appears
-only on the two parent-side grant commands: no `jexec` argv, child mount, or
-profile line contains it. Repeat the agreement check for every label in the
-pre-backfill inventory before declaring rollout complete.
+after an interrupted backfill converges on the same entity. The profile lines
+are added only after the relation succeeds; a relation conflict therefore
+cannot leave `PERSONA` pointing at an unknown identity. The operator root key
+appears only on the two parent-side grant commands: no `jexec` argv, child
+mount, or profile line contains it. Repeat the agreement check for every label
+in the pre-backfill inventory before declaring rollout complete. Keep Caddy
+off until every agreement check and both private smokes below pass.
 
 ## Verify privately before enabling Caddy
 
