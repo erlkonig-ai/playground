@@ -62,10 +62,12 @@ the old cursor is safe and replays the same retained chunks.
   host. The pile is mounted append-only into the session.
 - **Jail** (`--backend jail`): a FreeBSD jail per tenant on a remote host over
   SSH (or locally with `--jail-local`). Host-owned per-tenant piles (a seeded
-  `self.pile` + a shared `shared.pile`) are mounted in append-only (Model B) —
-  see the pile-provisioning section in `src/sandbox/jail.rs`. Background jobs
-  are enabled only for the root, jail-local FreeBSD deployment, where
-  cancellation has a descendant-reaping proof; remote SSH and Lima retain
+  `self.pile` + an operator-preinitialized shared `shared.pile`) are mounted in
+  append-only (Model B) — see the pile-provisioning section in
+  `src/sandbox/jail.rs`. Tenant creation refuses to proceed if the shared pile
+  is absent and never creates or replaces that org-wide policy state.
+  Background jobs are enabled only for the root, jail-local FreeBSD deployment,
+  where cancellation has a descendant-reaping proof; remote SSH and Lima retain
   synchronous `exec` and reject `job_exec`.
 
 ## Serving

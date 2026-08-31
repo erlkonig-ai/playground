@@ -237,8 +237,9 @@ pub struct JailBackend {
     /// `/shared`. Destroying a jail never deletes anything under this root.
     pub pile_root: String,
     /// Host path to the `bootstrap.pile` seed copied into a brand-new
-    /// coworker's `self.pile` (and used to seed the shared pile the first time).
-    /// This is the server-side bootstrap seed, not any caller-supplied pile.
+    /// coworker's `self.pile`. This is the server-side bootstrap seed, not any
+    /// caller-supplied pile. The shared pile is initialized separately by the
+    /// trusted operator before the first tenant is provisioned.
     pub bootstrap_pile: String,
     /// Exact descriptor handle of the operator-rooted Relations collection in
     /// `shared.pile`. This is public routing configuration, not a key. Fresh
@@ -427,6 +428,35 @@ impl JailBackend {
             );
         }
         Ok(hex.to_ascii_lowercase())
+    }
+
+    /// Require the operator-owned shared pile before a tenant operation can
+    /// create a clone, key, marker, mount, or collection record. Its descriptor
+    /// and root key are initialized out of band: tenant provisioning must never
+    /// manufacture org-wide policy as an incidental side effect.
+    fn require_preinitialized_shared_pile(&self) -> Result<()> {
+        let shared_pile = self.shared_pile_file();
+        let checked = self.run(
+            &[
+                "sudo",
+                "-n",
+                "sh",
+                "-c",
+                "set -eu\ntest -f \"$1\"\ntest ! -L \"$1\"",
+                "sh",
+                &shared_pile,
+            ],
+            None,
+            ADMIN_TIMEOUT,
+        )?;
+        if !checked.success() {
+            bail!(
+                "shared Relations pile {shared_pile} is not preinitialized as a regular \
+                 non-symlink file; create it from the reviewed generic bootstrap and run \
+                 `trible pile collection init ... relations` before provisioning any tenant"
+            );
+        }
+        Ok(())
     }
 
     fn dataset(&self, jail: &str) -> String {
@@ -2228,6 +2258,7 @@ impl SandboxBackend for JailBackend {
         // probe + operation-owned cleanup below, a concurrent create can neither
         // clone-over nor destroy a valid dataset.
         self.lifecycle.with_lock(&jail, || {
+            self.require_preinitialized_shared_pile()?;
             self.require_mount_lifecycle_visibility()?;
 
             // Idempotent: a tenant whose dataset already exists is already
@@ -2394,7 +2425,6 @@ impl SandboxBackend for JailBackend {
                 // cannot redirect the privileged copy onto a chosen host file.
                 let self_dir = self.self_pile_dir(&jail);
                 let self_pile = self.self_pile_file(&jail);
-                let shared_dir = self.shared_pile_dir();
                 let shared_pile = self.shared_pile_file();
 
                 // Per-coworker pile dir + seed self.pile from bootstrap if absent.
@@ -2454,34 +2484,15 @@ impl SandboxBackend for JailBackend {
                     );
                 }
 
-                // Shared pile dir + shared.pile: a SINGLE file shared by ALL jails.
-                // Create-if-absent and race-safe against concurrent provisions — and
-                // the seed must be ATOMIC (a coworker must never mount a partial
-                // shared.pile). `stage_and_publish_pile` copies bootstrap into the
-                // host-private staging dir, then publishes with a no-follow /
-                // create-only rename: the winner installs a complete file in one
-                // atomic rename; a loser no-ops on the existing target. No reader ever
-                // observes a partial file, and no tenant-reachable path is ever
-                // written through. (`mkdir -p` stays idempotent; same append-only
-                // semantics as self.pile — many concurrent appenders on one pile file
-                // is fine, verified on FreeBSD 15.1.)
-                let mkdir_shared = self.run(
-                    &["sudo", "-n", "mkdir", "-p", &shared_dir],
-                    None,
-                    ADMIN_TIMEOUT,
-                )?;
-                if !mkdir_shared.success() {
-                    bail!(
-                        "mkdir shared pile dir failed: {}",
-                        mkdir_shared.stderr_lossy()
-                    );
-                }
+                // shared.pile is org-wide policy state, initialized by the trusted
+                // operator before the first tenant. The read-only preflight above
+                // requires it before any clone/mutation; provisioning never seeds or
+                // replaces it. This operation only reapplies the storage/append-only
+                // bounds and mounts that exact pre-existing file.
                 // STORAGE BOUND (repair #4): ensure the global pile-storage quota is
                 // set on the pile-root dataset so no tenant can fill the pool via
                 // pile appends. Best-effort + idempotent (see the helper).
                 self.ensure_pile_root_quota();
-                self.stage_and_publish_pile(&jail, &shared_pile)
-                    .context("seed shared.pile from bootstrap")?;
                 // Same append-only protection on the SHARED pile — the higher-stakes
                 // one, since a truncation here would corrupt org-wide data for every
                 // coworker, not just the one who did it.
@@ -3652,6 +3663,10 @@ mod tests {
         assert_eq!(add.get(12), Some(&expected.label));
         assert_eq!(add.get(13).map(String::as_str), Some("--id"));
         assert_eq!(add.get(14), Some(&expected.id_hex));
+        assert!(
+            !add.iter().any(|arg| arg.contains("relations-root")),
+            "the operator root key must never cross the child-jail boundary: {add:?}"
+        );
 
         let (_, seed_stdin) = mock
             .calls
@@ -3784,6 +3799,44 @@ mod tests {
         assert_eq!(
             backend.relations_collection_handle().unwrap(),
             TEST_RELATIONS_COLLECTION
+        );
+    }
+
+    #[test]
+    fn fresh_provision_requires_preinitialized_shared_pile_before_host_mutation() {
+        let (backend, mock) = MockRunner::default()
+            .reply(
+                &[
+                    "sudo",
+                    "-n",
+                    "sh",
+                    "-c",
+                    "set -eu\ntest -f \"$1\"\ntest ! -L \"$1\"",
+                    "sh",
+                    "/aitemp/playground/piles/shared/shared.pile",
+                ],
+                fail(),
+            )
+            .into_backend();
+
+        let error = backend
+            .provision_sandbox(&spec("alice"))
+            .expect_err("the operator-owned shared pile must exist first");
+        assert!(error.to_string().contains("is not preinitialized"));
+        let calls = mock.calls();
+        assert_eq!(
+            calls.len(),
+            1,
+            "only the read-only pile gate may run: {calls:?}"
+        );
+        assert!(
+            !calls.iter().flatten().any(|arg| {
+                matches!(
+                    arg.as_str(),
+                    "clone" | "mkdir" | "tee" | "cp" | "ln" | "mount" | "chflags"
+                )
+            }),
+            "a missing shared pile must fail before any host mutation: {calls:?}"
         );
     }
 
@@ -4806,11 +4859,12 @@ mod tests {
 
     /// Model-B pile provisioning: a brand-new tenant gets BOTH host-owned pile
     /// FILES single-file-nullfs-mounted rw (self at guest /pile/self.pile, shared
-    /// at guest /shared/shared.pile), each seeded from bootstrap.pile via a
-    /// host-PRIVATE staging copy published with a no-follow / create-only
-    /// hardlink, the guest target files touched, and /etc/profile seeded with the
-    /// faculties PATH + PILE=/pile/self.pile. The piles derive from
-    /// `pile_root`+jail name; provisioning accepts no caller-supplied host path.
+    /// at guest /shared/shared.pile). The tenant self.pile is seeded from
+    /// bootstrap.pile through host-private staging; shared.pile must already be
+    /// operator-initialized and is never seeded or replaced by tenant creation.
+    /// The guest target files are touched and /etc/profile is seeded with the
+    /// faculties PATH + PILE=/pile/self.pile. Provisioning accepts no
+    /// caller-supplied host path.
     #[test]
     fn provision_mounts_both_piles_seeds_path_and_pile() {
         let (backend, mock) = mock_provision_ready()
@@ -4828,8 +4882,7 @@ mod tests {
         let self_dir = format!("/aitemp/playground/piles/{jail}");
         let self_dir = self_dir.as_str();
         let self_pile = format!("{self_dir}/self.pile");
-        let shared_dir = "/aitemp/playground/piles/shared";
-        let shared_pile = format!("{shared_dir}/shared.pile");
+        let shared_pile = "/aitemp/playground/piles/shared/shared.pile";
         let staging_root = "/aitemp/playground/piles/.staging";
         let staging_tmp = format!("{staging_root}/{jail}.pile.tmp");
 
@@ -4855,51 +4908,45 @@ mod tests {
                     .ends_with(&["chmod".into(), "700".into(), staging_root.into()] as &[String])),
             "must chmod 700 the host-private staging dir: {calls:?}"
         );
-        // Both piles are made append-only (`chflags sappnd`) after seeding: an
-        // in-jail process can append but not truncate them.
-        for pile in [&self_pile, &shared_pile] {
+        // Both piles are made append-only (`chflags sappnd`): an in-jail process
+        // can append but not truncate them.
+        for pile in [self_pile.as_str(), shared_pile] {
             assert!(
                 calls.iter().any(|c| c
-                    .ends_with(&["chflags".into(), "sappnd".into(), pile.clone(),] as &[String])),
+                    .ends_with(&["chflags".into(), "sappnd".into(), pile.into(),] as &[String])),
                 "must chflags sappnd {pile}: {calls:?}"
             );
         }
-        assert!(
-            calls.iter().any(
-                |c| c.ends_with(&["mkdir".into(), "-p".into(), shared_dir.into()] as &[String])
-            ),
-            "must mkdir the shared pile dir: {calls:?}"
-        );
 
-        // BOTH piles are seeded the SAME tenant-safe way: cp bootstrap into the
-        // host-PRIVATE staging temp (never a tenant-reachable path), then publish
-        // with a no-follow / create-only HARDLINK into place.
-        for dest in [&self_pile, &shared_pile] {
-            // Stage: cp bootstrap -> host-private staging temp.
-            assert!(
-                calls.iter().any(|c| c.ends_with(&[
-                    "cp".into(),
-                    "/aitemp/playground/bootstrap.pile".into(),
+        // Only the tenant pile is seeded: cp bootstrap into the host-private
+        // staging temp, then publish with a no-follow/create-only hardlink.
+        assert!(
+            calls.iter().any(|c| c.ends_with(&[
+                "cp".into(),
+                "/aitemp/playground/bootstrap.pile".into(),
+                staging_tmp.clone(),
+            ] as &[String])),
+            "must cp bootstrap.pile into the host-private staging temp: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c
+                == &[
+                    "sudo".to_string(),
+                    "-n".into(),
+                    "ln".into(),
+                    "-h".into(),
                     staging_tmp.clone(),
-                ] as &[String])),
-                "must cp bootstrap.pile into the host-private staging temp: {calls:?}"
-            );
-            // Publish: `ln -h staging_tmp -> dest` (atomic, create-only,
-            // no-follow). `-h` is required so a symlink-to-a-DIRECTORY dest is
-            // NOT followed (sol's review of repair #2).
-            assert!(
-                calls.iter().any(|c| c
-                    == &[
-                        "sudo".to_string(),
-                        "-n".into(),
-                        "ln".into(),
-                        "-h".into(),
-                        staging_tmp.clone(),
-                        dest.clone(),
-                    ]),
-                "must publish {dest} via no-follow/create-only `ln -h` from staging: {calls:?}"
-            );
-        }
+                    self_pile.clone(),
+                ]),
+            "must publish {self_pile} via no-follow/create-only `ln -h`: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| {
+                c.get(2).map(String::as_str) == Some("ln")
+                    && c.last().map(String::as_str) == Some(shared_pile)
+            }),
+            "tenant provisioning must never publish or replace shared.pile: {calls:?}"
+        );
         // The bootstrap `cp` must NEVER write to a tenant-reachable pile path
         // (the symlink confused-deputy fix): its destination is always the
         // host-private staging temp.
@@ -4907,7 +4954,7 @@ mod tests {
             !calls.iter().any(|c| {
                 let is_cp = c.iter().any(|a| a == "cp");
                 let dest = c.last().map(String::as_str);
-                is_cp && (dest == Some(self_pile.as_str()) || dest == Some(shared_pile.as_str()))
+                is_cp && (dest == Some(self_pile.as_str()) || dest == Some(shared_pile))
             }),
             "must NOT cp bootstrap directly into a pile path (must stage privately): {calls:?}"
         );
@@ -4950,7 +4997,7 @@ mod tests {
                     "mount".into(),
                     "-t".into(),
                     "nullfs".into(),
-                    shared_pile.clone(),
+                    shared_pile.into(),
                     format!("{root}/shared/shared.pile"),
                 ]),
             "must single-file-nullfs-mount shared.pile at /shared/shared.pile: {calls:?}"
@@ -5330,89 +5377,41 @@ mod tests {
         );
     }
 
-    /// The shared-pile seed is create-if-absent, race-safe, ATOMIC, AND
-    /// tenant-unreachable: bootstrap is staged to a per-provision temp in the
-    /// host-PRIVATE staging dir (never a tenant-writable path), then published
-    /// into shared.pile with a no-follow / create-only HARDLINK (`ln`). It never
-    /// `cp`s directly into shared.pile (non-atomic AND, historically, the symlink
-    /// confused-deputy sink). The staging temp is per-jail-name so two concurrent
-    /// provisions never collide, and the leftover is cleaned up. `mkdir -p` stays
-    /// idempotent. Two back-to-back provisions of different tenants both publish
-    /// the SAME shared.pile via create-only `ln`, so a concurrent race is a
-    /// harmless no-op on the loser (the existing regular file is accepted).
+    /// shared.pile is policy-bearing operator state. Tenant provisioning proves
+    /// that exact file is already a regular non-symlink before cloning anything,
+    /// then mounts it; it never mkdirs, seeds, publishes, or replaces it.
     #[test]
-    fn shared_pile_seed_is_atomic_and_create_if_absent() {
+    fn shared_pile_is_preinitialized_operator_state_not_a_tenant_side_effect() {
         for label in ["alice", "bob"] {
-            let jail = JailBackend::local().jail_name(label);
             let (backend, mock) = mock_provision_ready()
                 .reply(&["sudo", "-n", "zfs", "list"], dataset_absent())
                 .into_backend();
             backend.provision_sandbox(&spec(label)).expect("provision");
             let calls = mock.calls();
             let shared_pile = "/aitemp/playground/piles/shared/shared.pile";
-            let staging_tmp = format!("/aitemp/playground/piles/.staging/{jail}.pile.tmp");
-            // Shared dir mkdir is idempotent (`-p`).
             assert!(
-                calls.iter().any(|c| c
-                    == &[
-                        "sudo".to_string(),
-                        "-n".into(),
-                        "mkdir".into(),
-                        "-p".into(),
-                        "/aitemp/playground/piles/shared".into(),
-                    ]),
-                "shared dir mkdir must be idempotent (-p): {calls:?}"
+                calls.first().is_some_and(|c| {
+                    c.get(2).map(String::as_str) == Some("sh")
+                        && c.get(4).is_some_and(|script| script.contains("test ! -L"))
+                        && c.last().map(String::as_str) == Some(shared_pile)
+                }),
+                "the shared-pile no-follow gate must precede every other host call: {calls:?}"
             );
-            // Stage to the host-PRIVATE staging temp (NOT a tenant-reachable path).
-            assert!(
-                calls.iter().any(|c| c.ends_with(&[
-                    "cp".into(),
-                    "/aitemp/playground/bootstrap.pile".into(),
-                    staging_tmp.clone(),
-                ] as &[String])),
-                "shared seed must stage to the host-private staging temp: {calls:?}"
-            );
-            // Publish via a create-only, no-follow HARDLINK temp -> shared.pile.
-            let shared_lns: Vec<_> = calls
-                .iter()
-                .filter(|c| {
-                    c.last().map(String::as_str) == Some(shared_pile)
-                        && c.get(2).map(String::as_str) == Some("ln")
-                })
-                .collect();
-            assert_eq!(
-                shared_lns.len(),
-                1,
-                "one create-only shared-pile publish: {calls:?}"
-            );
-            assert!(
-                shared_lns[0].iter().any(|a| a == staging_tmp.as_str()),
-                "publish must hardlink the host-private staging temp: {:?}",
-                shared_lns[0]
-            );
-            // The `ln` must be a plain hardlink (no `-s`): a symlink publish would
-            // reintroduce a follow-through, and only a hardlink gives EEXIST
-            // create-only semantics.
-            assert!(
-                !shared_lns[0].iter().any(|a| a == "-s"),
-                "publish must be a HARDLINK (no -s), for create-only no-follow: {:?}",
-                shared_lns[0]
-            );
-            // The `ln` must carry `-h` (no-follow): plain `ln` follows a
-            // symlink-to-a-DIRECTORY dest and succeeds inside it (sol's review).
-            assert!(
-                shared_lns[0].iter().any(|a| a == "-h"),
-                "publish must be no-follow (`ln -h`), so a symlink-to-dir dest is \
-                 refused not followed: {:?}",
-                shared_lns[0]
-            );
-            // NEVER a `cp` straight into shared.pile — non-atomic AND the
-            // historical symlink confused-deputy sink this fix removes.
             assert!(
                 !calls.iter().any(|c| {
-                    c.last().map(String::as_str) == Some(shared_pile) && c.iter().any(|a| a == "cp")
+                    c.last().map(String::as_str) == Some(shared_pile)
+                        && c.iter()
+                            .any(|arg| matches!(arg.as_str(), "cp" | "ln" | "tee" | "install"))
                 }),
-                "must not cp directly into shared.pile (non-atomic + unsafe): {calls:?}"
+                "tenant provisioning must never create or replace shared.pile: {calls:?}"
+            );
+            assert!(
+                !calls.iter().any(|c| c.ends_with(&[
+                    "mkdir".into(),
+                    "-p".into(),
+                    "/aitemp/playground/piles/shared".into(),
+                ] as &[String])),
+                "tenant provisioning must not create the operator-owned shared dir: {calls:?}"
             );
         }
     }

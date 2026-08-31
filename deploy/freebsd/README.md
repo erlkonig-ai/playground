@@ -61,8 +61,10 @@ Two hosting modes exist and stay interchangeable:
   piles, provisioned on this box
   under `--jail-pile-root` (`/var/db/playground/piles` in this profile): a
   per-tenant `self.pile` (seeded from a generic `bootstrap.pile` — no operator memory)
-  single-file-mounted at guest `/pile/self.pile`, plus one org-wide
-  `shared.pile` single-file-mounted at guest `/shared/shared.pile`. Both are
+  single-file-mounted at guest `/pile/self.pile`, plus one pre-tenant,
+  operator-initialized org-wide `shared.pile` single-file-mounted at guest
+  `/shared/shared.pile`. Tenant creation never creates or replaces that shared
+  policy state. Both files are
   `chflags sappnd` append-only and decoupled from the jail lifecycle
   (`destroy_session` never deletes them). A stolen tenant token thus reaches
   only that tenant's own seeded pile and the shared org pile — never any other
@@ -174,23 +176,101 @@ sudo install -o root -g wheel -m 0444 <generic-bootstrap.pile> \
 
 # SHARED RELATIONS GATE. Before provisioning any tenant, initialize exactly one
 # operator-rooted `relations` descriptor in the shared pile and record its exact
-# 64-hex descriptor handle. The operator root stays outside every child jail.
-#
-# This checkout intentionally does not guess that first handle: current
-# `relations` can register a descriptor but does not print it, while `trible pile
-# collection show/list` can resolve only descriptors already referenced by a
-# collection record. Wait for/use the reviewed Trible collection-init command
-# that atomically creates the named descriptor and prints its handle; do not
-# scrape blob listings or create a synthetic Relations commit merely to discover
-# it. The remaining per-tenant flow below is ready for that exact output.
+# 64-hex descriptor handle. This uses the reviewed collection-init API in
+# TribleSpace 7ddf1cc5 or later. It stores only the descriptor closure and prints
+# its identity; it does not manufacture a synthetic Relations payload commit.
+# The operator root remains a sibling of the pile dataset and is never mounted
+# into a child jail.
+SHARED_DIR=/var/db/playground/piles/shared
+SHARED_PILE="$SHARED_DIR/shared.pile"
 RELATIONS_ROOT_KEY=/var/db/playground/relations-root.key
-RELATIONS_COLLECTION='<64-hex-descriptor-handle>'
-SHARED_PILE=/var/db/playground/piles/shared/shared.pile
-[ "${#RELATIONS_COLLECTION}" -eq 64 ] && \
-  printf '%s' "$RELATIONS_COLLECTION" | grep -Eq '^[0-9A-Fa-f]{64}$' || {
-    echo "RELATIONS_COLLECTION must be the exact 64-hex descriptor handle" >&2
+
+# Existing hosts may already have accumulated shared.pile data. Retain that
+# exact regular file; seed from the reviewed generic bootstrap only when absent.
+# Never use `trible pile create` here: that command truncates an existing path.
+sudo test ! -L "$SHARED_DIR" || {
+  echo "shared pile directory is a symlink" >&2
+  exit 70
+}
+if sudo test -e "$SHARED_DIR"; then
+  sudo test -d "$SHARED_DIR" || {
+    echo "shared pile path is not a directory" >&2
     exit 70
   }
+else
+  sudo install -d -o root -g wheel -m 0700 "$SHARED_DIR"
+fi
+sudo chown root:wheel "$SHARED_DIR"
+sudo chmod 0700 "$SHARED_DIR"
+sudo test ! -L "$SHARED_PILE" || {
+  echo "shared pile path is a symlink" >&2
+  exit 70
+}
+if sudo test -e "$SHARED_PILE"; then
+  sudo test -f "$SHARED_PILE" || {
+    echo "existing shared pile is not a regular file" >&2
+    exit 70
+  }
+else
+  sudo install -o root -g wheel -m 0600 \
+    /var/db/playground/bootstrap.pile "$SHARED_PILE"
+fi
+
+sudo test ! -L "$RELATIONS_ROOT_KEY" || {
+  echo "Relations root key path is a symlink" >&2
+  exit 70
+}
+if sudo test -e "$RELATIONS_ROOT_KEY"; then
+  sudo test -f "$RELATIONS_ROOT_KEY" || {
+    echo "existing Relations root key is not a regular file" >&2
+    exit 70
+  }
+fi
+
+RELATIONS_ROOT_PUBLIC=$(
+  sudo /usr/local/bin/trible pile signing-key init "$SHARED_PILE" \
+    --key "$RELATIONS_ROOT_KEY" |
+    sed -n 's/^public-key: //p'
+)
+[ "${#RELATIONS_ROOT_PUBLIC}" -eq 64 ] && \
+  printf '%s' "$RELATIONS_ROOT_PUBLIC" | grep -Eq '^[0-9A-F]{64}$' || {
+    echo "could not derive the Relations root public key" >&2
+    exit 70
+  }
+sudo chown root:wheel "$RELATIONS_ROOT_KEY"
+sudo chmod 0600 "$RELATIONS_ROOT_KEY"
+
+# Idempotent for this exact name + root key: a rerun returns the same descriptor
+# handle and only restores missing descriptor closure blobs.
+RELATIONS_COLLECTION=$(
+  sudo /usr/local/bin/trible pile collection init \
+    "$SHARED_PILE" relations --key "$RELATIONS_ROOT_KEY" |
+    sed -n 's/^blake3://p'
+)
+[ "${#RELATIONS_COLLECTION}" -eq 64 ] && \
+  printf '%s' "$RELATIONS_COLLECTION" | grep -Eq '^[0-9a-f]{64}$' || {
+    echo "collection init did not return one canonical descriptor handle" >&2
+    exit 70
+  }
+
+# Pin the immutable descriptor before issuing any tenant grant: exact name and
+# exact direct READ/WRITE root. An arbitrary 64-hex blob is not sufficient.
+COLLECTION_INFO=$(
+  sudo /usr/local/bin/trible pile collection show \
+    "$SHARED_PILE" "blake3:$RELATIONS_COLLECTION"
+)
+COLLECTION_NAME=$(printf '%s\n' "$COLLECTION_INFO" | sed -n 's/^name:[[:space:]]*//p')
+READ_POLICY=$(printf '%s\n' "$COLLECTION_INFO" | sed -n 's/^read policy:[[:space:]]*//p')
+WRITE_POLICY=$(printf '%s\n' "$COLLECTION_INFO" | sed -n 's/^write policy:[[:space:]]*//p')
+EXPECTED_POLICY="1/1 [$RELATIONS_ROOT_PUBLIC]"
+[ "$COLLECTION_NAME" = relations ] && \
+  [ "$READ_POLICY" = "$EXPECTED_POLICY" ] && \
+  [ "$WRITE_POLICY" = "$EXPECTED_POLICY" ] || {
+    echo "Relations descriptor name/root policy mismatch; refusing provisioning" >&2
+    exit 70
+  }
+sudo chflags sappnd "$SHARED_PILE"
+printf 'RELATIONS_COLLECTION=%s\n' "$RELATIONS_COLLECTION"
 
 # STOP: before this command, complete the per-tenant RACCT/RCTL procedure below
 # from the PHYSICAL host and prove all six name-keyed rules are loaded. Jailed
@@ -200,7 +280,19 @@ test "$(sysctl -n security.jail.enforce_statfs)" = 0
 TENANT='<label>'
 sudo env TENANT="$TENANT" RELATIONS_ROOT_KEY="$RELATIONS_ROOT_KEY" \
   RELATIONS_COLLECTION="$RELATIONS_COLLECTION" SHARED_PILE="$SHARED_PILE" sh -c '
+  set -eu
   umask 077
+  [ "${#RELATIONS_COLLECTION}" -eq 64 ] &&
+    printf "%s" "$RELATIONS_COLLECTION" | grep -Eq "^[0-9a-f]{64}$" || {
+      echo "Relations descriptor handle is not canonical" >&2
+      exit 70
+    }
+  for REQUIRED in "$RELATIONS_ROOT_KEY" "$SHARED_PILE"; do
+    [ -f "$REQUIRED" ] && [ ! -L "$REQUIRED" ] || {
+      echo "required operator file is absent or unsafe: $REQUIRED" >&2
+      exit 70
+    }
+  done
   JAIL=$(/usr/local/bin/playground user jail-name "$TENANT")
   SELF_DIR="/var/db/playground/piles/$JAIL"
   install -d -o root -g wheel -m 0700 "$SELF_DIR"
@@ -286,18 +378,27 @@ truncation.
 Jails created by a version predating tenant assistant provisioning keep their
 persisted `/etc/profile` unchanged on restart/reattach. This is intentional:
 deploying a new daemon must not silently rewrite an existing workspace. New
-tenants need no rollout step. For each pre-feature tenant, enter the trusted
-`playground` parent jail as root and run this explicit, idempotent backfill once:
+tenants need no rollout step. Inventory every pre-feature tenant first with
+`playground user list --backend jail --jail-local --tokens
+/var/db/playground/tokens.json`; use the original labels from that output, not
+the sanitized jail names. For each label, enter the trusted `playground` parent
+jail as root and run this explicit, idempotent backfill once:
 
 ```sh
 # From the physical host, enter the trusted parent first:
 sudo jexec playground /bin/sh
 
 # The remaining commands run INSIDE that parent jail.
+set -eu
 TENANT='<existing-label>'
 RELATIONS_ROOT_KEY=/var/db/playground/relations-root.key
-RELATIONS_COLLECTION='<64-hex-descriptor-handle>'
+RELATIONS_COLLECTION='<paste-the-64-lowercase-hex-handle-printed-above>'
 SHARED_PILE=/var/db/playground/piles/shared/shared.pile
+[ "${#RELATIONS_COLLECTION}" -eq 64 ] && \
+  printf '%s' "$RELATIONS_COLLECTION" | grep -Eq '^[0-9a-f]{64}$' || {
+    echo "Relations descriptor handle is not canonical" >&2
+    exit 70
+  }
 case "$TENANT" in
   ''|[[:space:]]*|*[[:space:]])
     echo "tenant label is empty or has surrounding whitespace" >&2
@@ -307,11 +408,56 @@ esac
 JAIL=$(/usr/local/bin/playground user jail-name "$TENANT")
 TENANT_KEY="/var/db/playground/piles/$JAIL/self.key"
 TENANT_PILE="/var/db/playground/piles/$JAIL/self.pile"
+
+# Fail before any grant or shared-pile append. In particular, never let
+# signing-key init mint a replacement identity for an incorrectly named or
+# damaged existing tenant.
+for REQUIRED in \
+  "$RELATIONS_ROOT_KEY" "$SHARED_PILE" "$TENANT_KEY" "$TENANT_PILE"
+do
+  [ -f "$REQUIRED" ] && [ ! -L "$REQUIRED" ] || {
+    echo "required existing file is absent or unsafe: $REQUIRED" >&2
+    exit 70
+  }
+done
+/usr/sbin/jls -j "$JAIL" >/dev/null 2>&1 || {
+  echo "existing tenant jail is not running: $JAIL" >&2
+  exit 70
+}
+
+RELATIONS_ROOT_PUBLIC=$(
+  /usr/local/bin/trible pile signing-key init "$SHARED_PILE" \
+    --key "$RELATIONS_ROOT_KEY" |
+    sed -n 's/^public-key: //p'
+)
+[ "${#RELATIONS_ROOT_PUBLIC}" -eq 64 ] && \
+  printf '%s' "$RELATIONS_ROOT_PUBLIC" | grep -Eq '^[0-9A-F]{64}$' || {
+    echo "could not derive the existing Relations root public key" >&2
+    exit 70
+  }
+COLLECTION_INFO=$(
+  /usr/local/bin/trible pile collection show \
+    "$SHARED_PILE" "blake3:$RELATIONS_COLLECTION"
+)
+COLLECTION_NAME=$(printf '%s\n' "$COLLECTION_INFO" | sed -n 's/^name:[[:space:]]*//p')
+READ_POLICY=$(printf '%s\n' "$COLLECTION_INFO" | sed -n 's/^read policy:[[:space:]]*//p')
+WRITE_POLICY=$(printf '%s\n' "$COLLECTION_INFO" | sed -n 's/^write policy:[[:space:]]*//p')
+EXPECTED_POLICY="1/1 [$RELATIONS_ROOT_PUBLIC]"
+[ "$COLLECTION_NAME" = relations ] && \
+  [ "$READ_POLICY" = "$EXPECTED_POLICY" ] && \
+  [ "$WRITE_POLICY" = "$EXPECTED_POLICY" ] || {
+    echo "Relations descriptor name/root policy mismatch; refusing backfill" >&2
+    exit 70
+  }
+
+# Both files were required above, so this invocation can only load the existing
+# tenant signer. It cannot silently create a new tenant key or pile.
 TENANT_PUBLIC=$(
   /usr/local/bin/trible pile signing-key init "$TENANT_PILE" --key "$TENANT_KEY" |
     sed -n 's/^public-key: //p'
 )
-[ "${#TENANT_PUBLIC}" -eq 64 ] || {
+[ "${#TENANT_PUBLIC}" -eq 64 ] && \
+  printf '%s' "$TENANT_PUBLIC" | grep -Eq '^[0-9A-F]{64}$' || {
   echo "could not derive tenant application public key" >&2
   exit 70
 }
@@ -363,7 +509,10 @@ PROFILE_LINE="export PERSONA='$ESCAPED_LABEL'"
 The person id is deterministic and `relations` has set semantics, so rerunning
 after an interrupted backfill converges on the same entity. The profile line is
 added only after the relation succeeds; a relation conflict therefore cannot
-leave `PERSONA` pointing at an unknown identity.
+leave `PERSONA` pointing at an unknown identity. The operator root key appears
+only on the two parent-side grant commands: no `jexec` argv, child mount, or
+profile line contains it. Repeat the agreement check for every label in the
+pre-backfill inventory before declaring rollout complete.
 
 ## Verify privately before enabling Caddy
 

@@ -91,7 +91,8 @@ struct McpArgs {
     #[arg(long, default_value = "/aitemp/playground/piles")]
     jail_pile_root: String,
     /// Jail backend: host path to the `bootstrap.pile` seed copied into a new
-    /// coworker's `self.pile` (and the shared pile) when absent.
+    /// coworker's `self.pile` when absent. The operator must initialize the
+    /// shared pile and its policy collection before provisioning any tenant.
     #[arg(long, default_value = "/aitemp/playground/bootstrap.pile")]
     jail_bootstrap_pile: String,
     /// Jail backend: run zfs/jail/jexec directly on this machine instead of
@@ -271,7 +272,8 @@ struct McpHttpArgs {
     #[arg(long, default_value = "/aitemp/playground/piles")]
     jail_pile_root: String,
     /// Jail backend: host path to the `bootstrap.pile` seed copied into a new
-    /// coworker's `self.pile` (and the shared pile) when absent.
+    /// coworker's `self.pile` when absent. The operator must initialize the
+    /// shared pile and its policy collection before provisioning any tenant.
     #[arg(long, default_value = "/aitemp/playground/bootstrap.pile")]
     jail_bootstrap_pile: String,
     /// Jail backend: run zfs/jail/jexec directly on this machine instead of
@@ -357,7 +359,8 @@ struct UserBackendArgs {
     #[arg(long, default_value = "/aitemp/playground/piles")]
     jail_pile_root: String,
     /// Jail backend: host path to the `bootstrap.pile` seed copied into a new
-    /// coworker's `self.pile` (and the shared pile) when absent.
+    /// coworker's `self.pile` when absent. The operator must initialize the
+    /// shared pile and its policy collection before provisioning any tenant.
     #[arg(long, default_value = "/aitemp/playground/bootstrap.pile")]
     jail_bootstrap_pile: String,
     /// Jail backend: exact descriptor handle of the operator-rooted Relations
