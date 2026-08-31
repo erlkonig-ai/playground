@@ -8,9 +8,10 @@
 //!     (`aitemp/playground/template@base`) into a per-tenant dataset
 //!     (`aitemp/playground/<session>`), given a manual `devfs` mount, its two
 //!     host-owned piles (per-coworker `self.pile` + the shared `shared.pile`)
-//!     nullfs-mounted rw at guest `/pile` and `/shared`, seeded `/etc/profile`
-//!     (PATH=/opt/faculties + PILE=/pile/self.pile + the tenant-derived
-//!     `PERSONA`), then `jail -c name=playground-<session> path=<mountpoint>
+//!     nullfs-mounted rw at guest `/pile` and `/shared`, plus a durable
+//!     per-coworker signing key mounted read-only at `/pile/self.key`; seeded
+//!     `/etc/profile` exports PATH, PILE, TRIBLESPACE_KEY, and the tenant-derived
+//!     `PERSONA`, then `jail -c name=playground-<session> path=<mountpoint>
 //!     persist ...`, and registers that same persona in the shared pile.
 //!     Idempotent: a
 //!     tenant whose dataset already exists is treated as already-provisioned
@@ -107,6 +108,10 @@
 //!     if absent. **Model B: DECOUPLED from the jail lifecycle** — destroying
 //!     the jail unmounts but never deletes it, and a re-provision reattaches the
 //!     same accumulated pile.
+//!   - **`self.key`** — per-tenant, host <pile_root>/<jail>/self.key,
+//!     generated once from OS entropy and nullfs-mounted **read-only** onto
+//!     guest `/pile/self.key` (so `TRIBLESPACE_KEY=/pile/self.key`). The key is
+//!     the stable collection author and survives jail teardown with the pile.
 //!   - **`shared.pile`** — a SINGLE host file shared by ALL tenant jails,
 //!     host <pile_root>/shared/shared.pile, nullfs-mounted **rw** onto guest
 //!     `/shared/shared.pile` (same append-only semantics as self.pile; multiple
@@ -140,8 +145,9 @@
 //! The full faculty CLI bin set is **baked into the ZFS template** at
 //! `/opt/faculties` server-side (a template-baking step, not this backend's
 //! job — every `zfs clone` inherits it copy-on-write). This backend's part is
-//! two `/etc/profile` lines seeded at provision alongside the session env
-//! block: `export PATH=/opt/faculties:$PATH` and `export PILE=/pile/self.pile`,
+//! three `/etc/profile` lines seeded at provision alongside the session env
+//! block: `export PATH=/opt/faculties:$PATH`, `export PILE=/pile/self.pile`, and
+//! `export TRIBLESPACE_KEY=/pile/self.key`,
 //! so a faculty run in the jail resolves and operates on the coworker's own
 //! mounted pile (the jail analogue of the Lima template's faculties staging in
 //! `render_config`).
@@ -408,6 +414,13 @@ impl JailBackend {
         format!("{}/self.pile", self.self_pile_dir(jail))
     }
 
+    /// Host path of this coworker's durable signing key. It is stored beside
+    /// `self.pile` so both survive disposal/recreation of the ZFS clone, but is
+    /// exposed to the tenant as one read-only file rather than a host dir.
+    fn self_signing_key_file(&self, jail: &str) -> String {
+        format!("{}/self.key", self.self_pile_dir(jail))
+    }
+
     /// Host-PRIVATE tenant-provenance marker for this coworker's persistent pile
     /// dir (`<pile_root>/<jail>/.tenant`). Written 0600 root-owned at provision,
     /// containing the canonical tenant label, and verified on every reuse /
@@ -453,6 +466,11 @@ impl JailBackend {
     /// pre-place anything at this path.
     fn staging_pile_tmp(&self, jail: &str) -> String {
         format!("{}/{}.pile.tmp", self.staging_root(), jail)
+    }
+
+    /// Private staging name used while publishing a freshly generated signer.
+    fn staging_key_tmp(&self, jail: &str) -> String {
+        format!("{}/{}.key.tmp", self.staging_root(), jail)
     }
 
     /// Ensure the host-private staging dir exists and is mode 0700 (root-owned).
@@ -616,6 +634,139 @@ fi
                 cp.stderr_lossy()
             );
         }
+        self.publish_staged_file(&staging_tmp, dest, "pile")
+    }
+
+    /// Generate (or retain) one durable Ed25519 seed file in the host-owned
+    /// storage directory. Generation is local to the trusted provider process;
+    /// publication uses the same create-only hardlink discipline as pile
+    /// seeding, so concurrent provisioning has one winner and never replaces a
+    /// previously established identity.
+    fn ensure_signing_key(&self, jail: &str, dest: &str) -> Result<()> {
+        let present = self.run(&["sudo", "-n", "test", "-f", dest], None, ADMIN_TIMEOUT)?;
+        if present.success() {
+            return self.validate_signing_key(dest);
+        }
+
+        self.ensure_staging_root()?;
+        let staging_tmp = self.staging_key_tmp(jail);
+
+        let mut seed = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut seed);
+        let mut encoded = String::with_capacity(64);
+        use std::fmt::Write as _;
+        for byte in seed {
+            write!(&mut encoded, "{byte:02x}").expect("writing into String cannot fail");
+        }
+
+        let wrote = self.run(
+            &["sudo", "-n", "tee", &staging_tmp],
+            Some(encoded.as_bytes()),
+            ADMIN_TIMEOUT,
+        )?;
+        if !wrote.success() {
+            bail!(
+                "stage signing key at {staging_tmp} failed: {}",
+                wrote.stderr_lossy()
+            );
+        }
+        // ZFS may inherit a nontrivial NFSv4 ACL even when the Unix mode is
+        // 0600. Faculties' canonical loader rejects that additional authority,
+        // so strip it before publishing the key rather than relying on chmod to
+        // make an inherited ACL trivial.
+        let stripped = self.run(
+            &["sudo", "-n", "setfacl", "-b", &staging_tmp],
+            None,
+            ADMIN_TIMEOUT,
+        )?;
+        if !stripped.success() {
+            let _ = self.run(
+                &["sudo", "-n", "rm", "-f", &staging_tmp],
+                None,
+                ADMIN_TIMEOUT,
+            );
+            bail!(
+                "strip inherited ACL from staged signing key {staging_tmp} failed: {}",
+                stripped.stderr_lossy()
+            );
+        }
+        for (verb, value) in [("chmod", "600"), ("chown", "root:wheel")] {
+            let changed = self.run(
+                &["sudo", "-n", verb, value, &staging_tmp],
+                None,
+                ADMIN_TIMEOUT,
+            )?;
+            if !changed.success() {
+                let _ = self.run(
+                    &["sudo", "-n", "rm", "-f", &staging_tmp],
+                    None,
+                    ADMIN_TIMEOUT,
+                );
+                bail!(
+                    "{verb} {value} staged signing key {staging_tmp} failed: {}",
+                    changed.stderr_lossy()
+                );
+            }
+        }
+        let synced = self.run(&["sudo", "-n", "fsync", &staging_tmp], None, ADMIN_TIMEOUT)?;
+        if !synced.success() {
+            let _ = self.run(
+                &["sudo", "-n", "rm", "-f", &staging_tmp],
+                None,
+                ADMIN_TIMEOUT,
+            );
+            bail!(
+                "fsync staged signing key {staging_tmp} failed: {}",
+                synced.stderr_lossy()
+            );
+        }
+
+        self.publish_staged_file(&staging_tmp, dest, "signing key")?;
+        let parent = dest
+            .rsplit_once('/')
+            .map(|(parent, _)| parent)
+            .filter(|parent| !parent.is_empty())
+            .unwrap_or("/");
+        let synced = self.run(&["sudo", "-n", "fsync", parent], None, ADMIN_TIMEOUT)?;
+        if !synced.success() {
+            bail!(
+                "fsync signing-key parent {parent} failed after publishing {dest}: {}",
+                synced.stderr_lossy()
+            );
+        }
+        self.validate_signing_key(dest)
+    }
+
+    /// Validate the durable-key file contract without reading its secret bytes
+    /// into diagnostics: regular non-symlink, root-owned, mode 0600, and exactly
+    /// 64 hexadecimal bytes. This also rejects an unsafe pre-existing file on a
+    /// retry rather than silently treating it as the tenant's identity.
+    fn validate_signing_key(&self, path: &str) -> Result<()> {
+        let script = r#"
+set -eu
+p="$1"
+test -f "$p" && test ! -L "$p"
+[ "$(stat -f '%u' "$p")" = 0 ]
+[ "$(stat -f '%Lp' "$p")" = 600 ]
+[ "$(stat -f '%z' "$p")" = 64 ]
+LC_ALL=C grep -Eq '^[0-9A-Fa-f]{64}$' "$p"
+"#;
+        let checked = self.run(
+            &["sudo", "-n", "sh", "-c", script, "sh", path],
+            None,
+            ADMIN_TIMEOUT,
+        )?;
+        if !checked.success() {
+            bail!(
+                "durable signing key {path} is absent or violates the private 64-hex-byte file contract"
+            );
+        }
+        Ok(())
+    }
+
+    /// Atomically publish a prepared file without following a destination
+    /// symlink. This is shared by pile seeding and signing-key generation.
+    fn publish_staged_file(&self, staging_tmp: &str, dest: &str, kind: &str) -> Result<()> {
         // Atomic create-only, no-follow publish via hardlink. `-h` is REQUIRED:
         // plain `ln` follows a symlink-to-a-DIRECTORY at `<dest>` and silently
         // succeeds by writing INSIDE the attacker-pointed dir; `ln -h` operates
@@ -651,7 +802,7 @@ fi
             );
             if staging_ino != dest_ino {
                 bail!(
-                    "publish pile -> {dest} succeeded but the dest inode ({dest_ino}) does not \
+                    "publish {kind} -> {dest} succeeded but the dest inode ({dest_ino}) does not \
                      match the just-linked staging inode ({staging_ino}) — dest is not the file \
                      we created (refusing)"
                 );
@@ -664,7 +815,7 @@ fi
             // failure, so the caller never mounts something a tenant redirected.
             self.assert_regular_nonsymlink(dest).with_context(|| {
                 format!(
-                    "publish pile -> {dest} succeeded but the destination is not a \
+                    "publish {kind} -> {dest} succeeded but the destination is not a \
                      regular non-symlink file at the expected path (refusing)"
                 )
             })?;
@@ -681,7 +832,7 @@ fi
             // special file, or a real link error) is refused loudly.
             self.assert_regular_nonsymlink(dest).with_context(|| {
                 format!(
-                    "publish pile -> {dest} failed and destination is not a safe \
+                    "publish {kind} -> {dest} failed and destination is not a safe \
                      regular file: {}",
                     link.stderr_lossy()
                 )
@@ -740,6 +891,9 @@ fi
     /// file. `/pile` itself is the jail's OWN clone directory (not a host mount),
     /// so a tenant creating siblings there only dirties the throwaway clone.
     const GUEST_SELF_PILE: &'static str = "/pile/self.pile";
+    /// Guest target for the tenant's durable signer. The host file is mounted
+    /// read-only: faculties need to sign, never to rotate identity implicitly.
+    const GUEST_SELF_KEY: &'static str = "/pile/self.key";
     /// Guest mount TARGET for the shared.pile FILE. The single host `shared.pile`
     /// is single-file-nullfs-mounted directly onto this path. `/shared` is the
     /// jail's OWN clone directory — never a writable host directory.
@@ -901,7 +1055,13 @@ fi
     /// redirected `PILE`. `mkdir`/`touch` of the guest target traverse the jail's
     /// OWN clone dir (never a host dir); the exact-tuple check is what makes the
     /// mount itself trustworthy.
-    fn ensure_pile_mount(&self, host_file: &str, root: &str, guest_file: &str) -> Result<()> {
+    fn ensure_pile_mount(
+        &self,
+        host_file: &str,
+        root: &str,
+        guest_file: &str,
+        read_only: bool,
+    ) -> Result<()> {
         let target = format!("{root}{guest_file}");
 
         // If the target is ALREADY mounted, it must be EXACTLY our mount — same
@@ -940,11 +1100,14 @@ fi
                 touch.stderr_lossy()
             );
         }
-        let mount = self.run(
-            &["sudo", "-n", "mount", "-t", "nullfs", host_file, &target],
-            None,
-            ADMIN_TIMEOUT,
-        )?;
+        let mount_args = if read_only {
+            vec![
+                "sudo", "-n", "mount", "-t", "nullfs", "-o", "ro", host_file, &target,
+            ]
+        } else {
+            vec!["sudo", "-n", "mount", "-t", "nullfs", host_file, &target]
+        };
+        let mount = self.run(&mount_args, None, ADMIN_TIMEOUT)?;
         if !mount.success() {
             bail!(
                 "nullfs mount {host_file} -> {target} failed: {}",
@@ -970,8 +1133,24 @@ fi
     /// primitive. Used by BOTH fresh provision and reattach: a failure `bail!`s
     /// so no jail is ever started or kept with a missing/redirected pile mount.
     fn mount_piles(&self, jail: &str, root: &str) -> Result<()> {
-        self.ensure_pile_mount(&self.self_pile_file(jail), root, Self::GUEST_SELF_PILE)?;
-        self.ensure_pile_mount(&self.shared_pile_file(), root, Self::GUEST_SHARED_PILE)?;
+        self.ensure_pile_mount(
+            &self.self_pile_file(jail),
+            root,
+            Self::GUEST_SELF_PILE,
+            false,
+        )?;
+        self.ensure_pile_mount(
+            &self.self_signing_key_file(jail),
+            root,
+            Self::GUEST_SELF_KEY,
+            true,
+        )?;
+        self.ensure_pile_mount(
+            &self.shared_pile_file(),
+            root,
+            Self::GUEST_SHARED_PILE,
+            false,
+        )?;
         Ok(())
     }
 
@@ -1054,6 +1233,40 @@ fi
                 assistant.label,
                 assistant.id_hex,
                 added.stderr_lossy()
+            );
+        }
+        Ok(())
+    }
+
+    /// Publish the embedded onboarding corpus into the tenant's own native
+    /// collections. The bootstrap seed is authored by this tenant's durable
+    /// signer; merely copying a generic pile can no longer establish readable
+    /// roots now that admission policy is part of collection identity.
+    ///
+    /// `bootstrap import` is intrinsically idempotent, so a provision retry
+    /// after a later failure completes the same authored records rather than
+    /// duplicating them.
+    fn bootstrap_tenant_pile(&self, jail: &str) -> Result<()> {
+        let imported = self.run(
+            &[
+                "sudo",
+                "-n",
+                "jexec",
+                jail,
+                "/opt/faculties/bootstrap",
+                "--pile",
+                Self::GUEST_SELF_PILE,
+                "--key",
+                Self::GUEST_SELF_KEY,
+                "import",
+            ],
+            None,
+            ADMIN_TIMEOUT,
+        )?;
+        if !imported.success() {
+            bail!(
+                "recipient-authored bootstrap import for jail '{jail}' failed: {}",
+                imported.stderr_lossy()
             );
         }
         Ok(())
@@ -1594,7 +1807,12 @@ fi
         // enumeration is available because lifecycle preflight required it.
         // An unmounted target is already clean; a mounted one must disappear
         // from a separately-read table after the unmount attempt.
-        for guest in [Self::GUEST_SELF_PILE, Self::GUEST_SHARED_PILE, "/dev"] {
+        for guest in [
+            Self::GUEST_SELF_PILE,
+            Self::GUEST_SELF_KEY,
+            Self::GUEST_SHARED_PILE,
+            "/dev",
+        ] {
             let target = format!("{root}{guest}");
             let before = self.mount_listing()?;
             if !Self::target_occupied(&before, &target) {
@@ -1729,8 +1947,9 @@ fi
     }
 
     /// Re-establish a jail context over an EXISTING persistent dataset: the
-    /// ephemeral devfs mount (does not survive a reboot) plus the two pile mounts
-    /// plus `jail -c`. The dataset and its `/etc/profile` are left exactly as
+    /// ephemeral devfs mount (does not survive a reboot), the two pile mounts,
+    /// the durable signer mount, plus `jail -c`. The dataset and its
+    /// `/etc/profile` are left exactly as
     /// they are — this clones nothing and re-seeds nothing. Shared by
     /// `open_session`'s reattach arm, `provision_sandbox`'s already-provisioned
     /// arm, and `reattach_all`.
@@ -1772,6 +1991,11 @@ fi
             .with_context(|| {
                 format!("verify persistent pile marker before reattaching '{jail}'")
             })?;
+        // A tenant identity belongs to the persistent pile, not the disposable
+        // ZFS clone. Older deployments have no key yet; create one once, beside
+        // the pile, before exposing either file to the reattached jail.
+        self.ensure_signing_key(jail, &self.self_signing_key_file(jail))
+            .with_context(|| format!("ensure durable signer before reattaching '{jail}'"))?;
         let root = self.mountpoint(dataset)?;
         // A nested jail may expose the devfs target in the physical namespace
         // even though mount(8) accepts the jail-local path. Derive and verify
@@ -2150,6 +2374,8 @@ impl SandboxBackend for JailBackend {
                 // privileged copy never follows a symlink at the destination.
                 self.stage_and_publish_pile(&jail, &self_pile)
                     .context("seed self.pile from bootstrap")?;
+                self.ensure_signing_key(&jail, &self.self_signing_key_file(&jail))
+                    .context("initialize durable tenant signing key")?;
                 // Write the host-private tenant marker (0600 root-owned) recording
                 // this pile's canonical owner — the persistent pile's OWN provenance,
                 // verified on every future reuse/reattach independent of the dataset's
@@ -2247,6 +2473,10 @@ impl SandboxBackend for JailBackend {
                     shell_quote(Self::GUEST_SELF_PILE)
                 ));
                 profile.push_str(&format!(
+                    "export TRIBLESPACE_KEY={}\n",
+                    shell_quote(Self::GUEST_SELF_KEY)
+                ));
+                profile.push_str(&format!(
                     "export PERSONA={}\n",
                     shell_quote(&assistant.label)
                 ));
@@ -2295,6 +2525,8 @@ impl SandboxBackend for JailBackend {
                 // runs on reattach/reuse because dynamic rules vanish on reboot.
                 self.apply_rctl_rules(&jail)
                     .with_context(|| format!("apply resource limits to new jail '{jail}'"))?;
+                self.bootstrap_tenant_pile(&jail)
+                    .with_context(|| format!("bootstrap tenant '{}'", spec.tenant.label))?;
                 self.register_tenant_assistant(&jail, &assistant)
                     .with_context(|| {
                         format!("register assistant for tenant '{}'", spec.tenant.label)
@@ -2616,7 +2848,12 @@ impl SandboxBackend for JailBackend {
             // delete the host self.pile or shared.pile — they are host-owned and
             // outlive the jail (a re-provision reattaches the same self.pile).
             if let Ok(root) = self.mountpoint(&dataset) {
-                for guest in [Self::GUEST_SELF_PILE, Self::GUEST_SHARED_PILE, "/dev"] {
+                for guest in [
+                    Self::GUEST_SELF_PILE,
+                    Self::GUEST_SELF_KEY,
+                    Self::GUEST_SHARED_PILE,
+                    "/dev",
+                ] {
                     let _ = self.run(
                         &["sudo", "-n", "umount", "-f", &format!("{root}{guest}")],
                         None,
@@ -4571,6 +4808,22 @@ mod tests {
                 ]),
             "must single-file-nullfs-mount self.pile at /pile/self.pile: {calls:?}"
         );
+        let self_key = format!("/aitemp/playground/piles/{jail}/self.key");
+        assert!(
+            calls.iter().any(|c| c
+                == &[
+                    "sudo".to_string(),
+                    "-n".into(),
+                    "mount".into(),
+                    "-t".into(),
+                    "nullfs".into(),
+                    "-o".into(),
+                    "ro".into(),
+                    self_key.clone(),
+                    format!("{root}/pile/self.key"),
+                ]),
+            "must read-only-mount the durable signer at /pile/self.key: {calls:?}"
+        );
         assert!(
             calls.iter().any(|c| c
                 == &[
@@ -4621,6 +4874,27 @@ mod tests {
         assert!(
             seed.contains("export PILE='/pile/self.pile'"),
             "profile must export PILE at the mounted self.pile: {seed}"
+        );
+        assert!(
+            seed.contains("export TRIBLESPACE_KEY='/pile/self.key'"),
+            "profile must export the durable signer path: {seed}"
+        );
+
+        assert!(
+            calls.iter().any(|c| c
+                == &[
+                    "sudo".to_string(),
+                    "-n".into(),
+                    "jexec".into(),
+                    jail.clone(),
+                    "/opt/faculties/bootstrap".into(),
+                    "--pile".into(),
+                    "/pile/self.pile".into(),
+                    "--key".into(),
+                    "/pile/self.key".into(),
+                    "import".into(),
+                ]),
+            "fresh provision must author bootstrap collections with the tenant signer: {calls:?}"
         );
     }
 
@@ -4703,9 +4977,8 @@ mod tests {
         assert!(
             !calls
                 .iter()
-                .any(|c| c.get(3).map(String::as_str) == Some("tee")
-                    || c.get(2).map(String::as_str) == Some("tee")),
-            "reattach must not re-seed /etc/profile"
+                .any(|c| { c.iter().any(|arg| arg == "tee") && c.iter().any(|arg| arg == "-a") }),
+            "reattach may initialize a missing durable signer, but must not re-seed /etc/profile"
         );
     }
 
@@ -4769,7 +5042,7 @@ mod tests {
         assert_eq!(listed_devfs, 1, "one exact physical devfs must be live");
     }
 
-    /// Reattach re-establishes BOTH single-file pile mounts (self + shared) —
+    /// Reattach re-establishes both pile mounts and the durable key mount —
     /// they do not survive a jail restart, exactly like the devfs re-mount —
     /// without re-seeding self.pile or the profile (the persisted host piles
     /// carry their accumulated content).
@@ -4797,6 +5070,21 @@ mod tests {
                     format!("{root}/pile/self.pile"),
                 ]),
             "reattach must re-mount the self.pile at /pile/self.pile: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c
+                == &[
+                    "sudo".to_string(),
+                    "-n".into(),
+                    "mount".into(),
+                    "-t".into(),
+                    "nullfs".into(),
+                    "-o".into(),
+                    "ro".into(),
+                    format!("/aitemp/playground/piles/{jail}/self.key"),
+                    format!("{root}/pile/self.key"),
+                ]),
+            "reattach must read-only-mount the durable signer at /pile/self.key: {calls:?}"
         );
         assert!(
             calls.iter().any(|c| c
@@ -4846,8 +5134,8 @@ mod tests {
         );
     }
 
-    /// destroy_session unmounts BOTH single-file pile mounts (self AND shared)
-    /// plus devfs BEFORE `zfs destroy` (a dataset with mounts under its tree
+    /// destroy_session unmounts both pile files, the signer, and devfs BEFORE
+    /// `zfs destroy` (a dataset with mounts under its tree
     /// cannot be destroyed), and — Model B — issues NO delete of the host pile
     /// dirs or pile files: they are host-owned and outlive the jail.
     #[test]
@@ -4867,11 +5155,12 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing umount of {suffix} in {calls:?}"))
         };
         let self_umount = idx_of(&format!("{root}/pile/self.pile"));
+        let key_umount = idx_of(&format!("{root}/pile/self.key"));
         let shared_umount = idx_of(&format!("{root}/shared/shared.pile"));
         let dev_umount = idx_of(&format!("{root}/dev"));
 
         // All three unmounts happen...
-        for i in [self_umount, shared_umount, dev_umount] {
+        for i in [self_umount, key_umount, shared_umount, dev_umount] {
             assert_eq!(
                 calls[i].get(2).map(String::as_str),
                 Some("umount"),
@@ -4888,8 +5177,11 @@ mod tests {
             })
             .expect("zfs destroy issued");
         assert!(
-            self_umount < destroy_idx && shared_umount < destroy_idx && dev_umount < destroy_idx,
-            "all pile/devfs unmounts must precede zfs destroy: {calls:?}"
+            self_umount < destroy_idx
+                && key_umount < destroy_idx
+                && shared_umount < destroy_idx
+                && dev_umount < destroy_idx,
+            "all pile/key/devfs unmounts must precede zfs destroy: {calls:?}"
         );
 
         // Model-B guarantee: the host pile dirs and files are NEVER removed.
@@ -5220,8 +5512,9 @@ mod tests {
             .expect("provision");
         let calls = mock.calls();
 
-        // Every nullfs mount's SOURCE (5th argv token) must be a pile FILE, never
-        // a bare pile DIRECTORY.
+        // Every nullfs mount's penultimate token is its SOURCE. It must be one
+        // of the three files, never a bare host directory; the key mount has
+        // `-o ro` before that source.
         let nullfs_mounts: Vec<_> = calls
             .iter()
             .filter(|c| {
@@ -5233,16 +5526,22 @@ mod tests {
             "expected nullfs mounts: {calls:?}"
         );
         for m in &nullfs_mounts {
-            // argv shape: sudo -n mount -t nullfs <source> <target>
-            let source = m.get(5).map(String::as_str).unwrap_or("");
-            let target = m.get(6).map(String::as_str).unwrap_or("");
+            let source = m
+                .get(m.len().saturating_sub(2))
+                .map(String::as_str)
+                .unwrap_or("");
+            let target = m.last().map(String::as_str).unwrap_or("");
             assert!(
-                source.ends_with("/self.pile") || source.ends_with("/shared.pile"),
-                "nullfs SOURCE must be a pile FILE, not a host dir: {source:?} ({m:?})"
+                source.ends_with("/self.pile")
+                    || source.ends_with("/self.key")
+                    || source.ends_with("/shared.pile"),
+                "nullfs SOURCE must be a tenant storage FILE, not a host dir: {source:?} ({m:?})"
             );
             assert!(
-                target.ends_with("/self.pile") || target.ends_with("/shared.pile"),
-                "nullfs TARGET must be a pile FILE inside the jail clone: {target:?} ({m:?})"
+                target.ends_with("/self.pile")
+                    || target.ends_with("/self.key")
+                    || target.ends_with("/shared.pile"),
+                "nullfs TARGET must be a storage FILE inside the jail clone: {target:?} ({m:?})"
             );
         }
     }

@@ -54,20 +54,35 @@ use super::proc::drive_child;
 /// (rather than "everything cargo builds") so the bundle is small and the build
 /// command is a clear allow-list.
 pub const SESSION_FACULTIES: &[&str] = &[
-    "wiki",
+    "archive",
+    "atlas",
+    "body",
+    "bootstrap",
+    "cognition",
     "compass",
-    "orient",
-    "message",
-    "files",
-    "teams",
-    "memory",
-    "relations",
-    "status",
     "decide",
+    "discord",
+    "files",
     "gauge",
+    "habit",
+    "headspace",
+    "linkedin",
+    "mail",
+    "memory",
+    "message",
+    "orient",
     "patience",
+    "planner",
+    "posture",
     "reason",
+    "relations",
+    "secrets",
+    "status",
+    "teams",
+    "triage",
+    "voice",
     "web",
+    "wiki",
 ];
 
 /// Timeout for the (slow) in-guest cargo build.
@@ -87,15 +102,23 @@ fn cache_root() -> Result<PathBuf> {
     Ok(base.join("playground").join("faculties-linux-aarch64"))
 }
 
-/// A cheap, order-independent content hash of the faculty sources, so the cache
-/// key changes exactly when a rebuild is warranted (a `.rs` bin, the lib, or a
-/// manifest changed). We hash file paths + sizes + mtimes rather than full
-/// contents: fast, and mtime bumps on every real edit.
+/// A content-derived source identity for the faculty cohort.
+///
+/// Faculties uses local path dependencies. Hashing only `faculties/src` (the
+/// former implementation) could therefore reuse a stale bundle after a
+/// TribleSpace, CubeCL, or Soma API change. Include every sibling source tree
+/// that the lean cohort actually links. Hash bytes rather than mtimes: two
+/// checkouts can legitimately give different same-sized files the same
+/// second-resolution timestamp, and a stale executable cohort is much more
+/// expensive than reading its source once before a build.
 fn source_fingerprint(faculties_src: &Path) -> Result<String> {
+    use sha2::Digest as _;
     use std::collections::BTreeMap;
-    let mut entries: BTreeMap<String, (u64, i64)> = BTreeMap::new();
+    use std::io::Read;
 
-    fn visit(dir: &Path, root: &Path, out: &mut BTreeMap<String, (u64, i64)>) -> Result<()> {
+    let mut entries: BTreeMap<String, PathBuf> = BTreeMap::new();
+
+    fn visit(dir: &Path, root: &Path, out: &mut BTreeMap<String, PathBuf>) -> Result<()> {
         for entry in
             std::fs::read_dir(dir).with_context(|| format!("read_dir {}", dir.display()))?
         {
@@ -104,62 +127,68 @@ fn source_fingerprint(faculties_src: &Path) -> Result<String> {
             let name = entry.file_name();
             let name = name.to_string_lossy();
             // Skip build artifacts and VCS noise — they don't affect the output.
-            if name == "target" || name == ".git" {
+            if name.starts_with("target") || name == ".git" || name == ".claude" {
                 continue;
             }
-            let meta = entry.metadata()?;
-            if meta.is_dir() {
+            let kind = entry.file_type()?;
+            if kind.is_dir() {
                 visit(&path, root, out)?;
-            } else if meta.is_file() {
+            } else if kind.is_file() {
                 let rel = path
                     .strip_prefix(root)
                     .unwrap_or(&path)
                     .to_string_lossy()
                     .into_owned();
-                let mtime = meta
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs() as i64)
-                    .unwrap_or(0);
-                out.insert(rel, (meta.len(), mtime));
+                out.insert(rel, path);
             }
         }
         Ok(())
     }
 
-    // Cargo.toml, Cargo.lock, src/ are what determine the build.
-    for sub in ["Cargo.toml", "Cargo.lock", "src"] {
-        let p = faculties_src.join(sub);
-        if p.is_dir() {
-            visit(&p, faculties_src, &mut entries)?;
-        } else if p.is_file() {
-            let meta = std::fs::metadata(&p)?;
-            let mtime = meta
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-            entries.insert(sub.to_string(), (meta.len(), mtime));
+    let mut roots = vec![("faculties", faculties_src.to_path_buf())];
+    if let Some(workspace) = faculties_src.parent() {
+        for (name, relative) in [
+            ("triblespace-rs", "triblespace-rs"),
+            ("soma-client", "soma/soma-client"),
+            ("cubecl-runtime", "cubecl-fork/cubecl-runtime"),
+            ("cubecl-wgpu", "cubecl-fork/cubecl-wgpu"),
+        ] {
+            let path = workspace.join(relative);
+            if path.is_dir() {
+                roots.push((name, path));
+            }
         }
+    }
+    for (name, root) in roots {
+        let mut cohort_entries = BTreeMap::new();
+        visit(&root, &root, &mut cohort_entries)?;
+        entries.extend(
+            cohort_entries
+                .into_iter()
+                .map(|(path, source)| (format!("{name}/{path}"), source)),
+        );
     }
 
-    // FNV-1a over the sorted (path,size,mtime) triples.
-    let mut hash: u64 = 0xcbf29ce484222325;
-    for (path, (size, mtime)) in &entries {
-        for byte in path
-            .as_bytes()
-            .iter()
-            .copied()
-            .chain(size.to_le_bytes())
-            .chain((*mtime as u64).to_le_bytes())
-        {
-            hash ^= byte as u64;
-            hash = hash.wrapping_mul(0x100000001b3);
+    let mut hash = sha2::Sha256::new();
+    for (path, source) in entries {
+        hash.update((path.len() as u64).to_le_bytes());
+        hash.update(path.as_bytes());
+        let mut file = std::fs::File::open(&source)
+            .with_context(|| format!("open faculty cohort source {}", source.display()))?;
+        let length = file.metadata()?.len();
+        hash.update(length.to_le_bytes());
+        let mut chunk = [0u8; 64 * 1024];
+        loop {
+            let read = file
+                .read(&mut chunk)
+                .with_context(|| format!("read faculty cohort source {}", source.display()))?;
+            if read == 0 {
+                break;
+            }
+            hash.update(&chunk[..read]);
         }
     }
-    Ok(format!("{hash:016x}"))
+    Ok(format!("{:x}", hash.finalize()))
 }
 
 /// Ensure a Linux-aarch64 faculty bundle exists on the host and return its path.
@@ -282,8 +311,8 @@ sudo apt-get update
 sudo apt-get install -y --no-install-recommends build-essential pkg-config libasound2-dev
 BINARGS=""
 for b in {bins}; do BINARGS="$BINARGS --bin $b"; done
-echo "[faculties-build] cargo build --release --locked --no-default-features $BINARGS"
-cargo build --release --locked --no-default-features $BINARGS
+echo "[faculties-build] cargo build --release --locked --no-default-features -p faculties $BINARGS"
+cargo build --release --locked --no-default-features -p faculties $BINARGS
 echo "[faculties-build] done"
 ls -la /build/release | head -40
 "#
@@ -432,8 +461,9 @@ mod tests {
         let b = source_fingerprint(&dir).unwrap();
         assert_eq!(a, b, "fingerprint must be stable for unchanged sources");
 
-        // A content change (size bump) must change the fingerprint.
-        std::fs::write(src.join("lib.rs"), b"// a much longer line than before\n").unwrap();
+        // A same-sized content change must change the fingerprint too; mtimes
+        // and lengths are deliberately not the cache identity.
+        std::fs::write(src.join("lib.rs"), b"// b\n").unwrap();
         let c = source_fingerprint(&dir).unwrap();
         assert_ne!(a, c, "fingerprint must change when a source file changes");
 
@@ -450,5 +480,10 @@ mod tests {
                 "duplicate faculty in SESSION_FACULTIES: {f}"
             );
         }
+        assert!(SESSION_FACULTIES.contains(&"bootstrap"));
+        assert!(
+            !SESSION_FACULTIES.contains(&"migrations"),
+            "one-shot operator migrations must never enter the tenant command allow-list"
+        );
     }
 }
