@@ -46,6 +46,13 @@ restart loses their handles. Provider shutdown cancels and reaps live jobs
 before detaching sandboxes. HTTP transport sessions are deliberately separate
 from persistent sandbox and job lifetimes.
 
+One tenant may run eight jobs concurrently, within a global active limit of
+32. Retention remains bounded to eight handles per tenant and 64 globally.
+Capacity eviction only removes a terminal job after a poll returned its final
+page; starting a new command cannot evict another command's unread tail. If
+every retained handle is still running or unread, submission is refused.
+The one-hour terminal expiry still applies even to unread outcomes.
+
 On the root-local FreeBSD path, losing the kernel descendant-reaping proof is
 a process-fatal invariant violation: the provider exits nonzero and stays down
 for explicit operator recovery. Ordinary command, SSH, and backend errors are

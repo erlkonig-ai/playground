@@ -1060,7 +1060,7 @@ fn tool_schemas() -> Value {
         },
         {
             "name": "job_exec",
-            "description": "Start a cancellable shell command and return a job id immediately. Poll incremental output with job_poll.",
+            "description": "Start a cancellable shell command and return a job id immediately. At most 8 active/retained jobs per tenant and 32 active jobs globally; excess is refused, not queued. Poll terminal output to release retention capacity.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1075,7 +1075,7 @@ fn tool_schemas() -> Value {
         },
         {
             "name": "job_poll",
-            "description": "Read one retry-safe page of incremental stdout/stderr and job state. Advance next_cursor and continue until state is terminal and has_more is false.",
+            "description": "Read one retry-safe page of incremental stdout/stderr and job state. Advance next_cursor until state is terminal and has_more is false; retain that final reply before submitting more work, which may evict observed terminal jobs. Unobserved terminal handles remain until the 1-hour expiry; bounded output reports gaps explicitly.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2052,11 +2052,10 @@ mod tests {
 
     // -- One bounded execution state machine ---------------------------------
 
-    /// A tenant has one foreground mutation lane. Long work returns a handle
-    /// immediately; a second command is refused rather than parking another
-    /// blocking worker in a hidden admission queue.
+    /// A listener and other same-tenant work may run concurrently up to the
+    /// fixed bound. Excess work is refused rather than queued invisibly.
     #[test]
-    fn provider_rejects_second_active_command_for_tenant() {
+    fn provider_admits_concurrent_tenant_jobs_up_to_the_bound() {
         use std::sync::mpsc;
 
         /// Backend whose `exec` blocks until released, so a test can hold N execs
@@ -2105,21 +2104,35 @@ mod tests {
         }));
 
         let id = provider.open_session(params("alice")).expect("open");
-        let first = provider.job_exec(exec_params(&id)).expect("job starts");
-        entered_rx.recv().expect("job entered backend");
+        let mut jobs = Vec::new();
+        for _ in 0..crate::jobs::MAX_ACTIVE_JOBS_PER_TENANT {
+            jobs.push(provider.job_exec(exec_params(&id)).expect("job starts"));
+            entered_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("job entered backend");
+        }
         let err = provider
             .job_exec(exec_params(&id))
-            .expect_err("second same-tenant job must be refused");
-        assert!(err.to_string().contains("sandbox busy"), "err: {err}");
+            .expect_err("same-tenant job beyond the bound must be refused");
+        assert!(err.to_string().contains("live/retained jobs"), "err: {err}");
 
-        // Once terminal, the tenant lane is immediately reusable.
-        release_tx.send(()).unwrap();
+        // Once terminal, the tenant slots are immediately reusable.
+        for _ in &jobs {
+            release_tx.send(()).unwrap();
+        }
         for _ in 0..100 {
-            if provider.job_poll(&first, 0).unwrap().state == JobState::Terminal {
+            if jobs
+                .iter()
+                .all(|job| provider.job_poll(job, 0).unwrap().state == JobState::Terminal)
+            {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+        assert!(
+            jobs.iter()
+                .all(|job| provider.job_poll(job, 0).unwrap().state == JobState::Terminal)
+        );
         let second = provider.job_exec(exec_params(&id)).expect("lane reused");
         entered_rx.recv().expect("second entered backend");
         release_tx.send(()).unwrap();

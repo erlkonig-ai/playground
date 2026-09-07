@@ -8,6 +8,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -21,15 +22,17 @@ use crate::sandbox::{
     is_sandbox_control_lost, sandbox_control_lost,
 };
 
-/// One foreground command per tenant keeps mutation ordering legible and stops
-/// one public user from occupying every daemon worker. FreeBSD `timeout(1)` is
-/// the command's kernel descendant reaper, so the lane remains occupied until
-/// its entire command tree has exited.
-pub const MAX_ACTIVE_JOBS_PER_TENANT: usize = 1;
+/// A listener and ordinary commands can coexist without one tenant occupying
+/// every daemon worker. Callers own ordering between concurrent mutations.
+/// FreeBSD `timeout(1)` is the command's kernel descendant reaper, so each slot
+/// remains occupied until its entire command tree has exited.
+pub const MAX_ACTIVE_JOBS_PER_TENANT: usize = 8;
 /// The daemon-wide process/memory bound. This is policy, not a user-facing
 /// scheduler knob.
 pub const MAX_ACTIVE_JOBS_GLOBAL: usize = 32;
-/// Completed handles remain replayable, but never grow the daemon forever.
+/// Completed handles remain replayable until capacity requires eviction, but
+/// only after a poll returned their terminal state and final output page.
+/// Unobserved terminal handles still expire at TERMINAL_JOB_TTL.
 /// Together with the 4 MiB per-job ring this caps retained output at 256 MiB.
 pub const MAX_RETAINED_JOBS_GLOBAL: usize = 64;
 pub const MAX_RETAINED_JOBS_PER_TENANT: usize = 8;
@@ -270,6 +273,7 @@ struct Job {
     control: ExecControl,
     output: Arc<Mutex<OutputLog>>,
     state: Mutex<InnerState>,
+    terminal_observed: AtomicBool,
     changed: Condvar,
 }
 
@@ -287,6 +291,13 @@ impl Job {
             InnerState::Terminal { at, .. } => Some(*at),
             InnerState::Running | InnerState::Cancelling => None,
         }
+    }
+
+    fn observed_terminal_at(&self) -> Option<Instant> {
+        self.terminal_observed
+            .load(Ordering::Acquire)
+            .then(|| self.terminal_at())
+            .flatten()
     }
 
     fn request_cancel(&self) -> JobState {
@@ -332,6 +343,13 @@ impl Job {
         };
         let mut output = self.output.lock().expect("job output poisoned");
         let (chunks, next_cursor, gap, has_more) = output.poll(cursor);
+        if state == JobState::Terminal && !has_more {
+            // Terminal publication sealed the output sink, so this snapshot
+            // owns the last page. This records server-side observation, not a
+            // network delivery acknowledgement: callers must retain returned
+            // pages before submitting work that may recycle a completed id.
+            self.terminal_observed.store(true, Ordering::Release);
+        }
         JobSnapshot {
             id: self.id.clone(),
             state,
@@ -467,12 +485,12 @@ impl JobManager {
         });
     }
 
-    fn evict_oldest_terminal(state: &mut ManagerState, tenant: Option<&str>) -> bool {
+    fn evict_oldest_observed_terminal(state: &mut ManagerState, tenant: Option<&str>) -> bool {
         let oldest = state
             .jobs
             .iter()
             .filter(|(_, job)| tenant.map(|want| want == job.tenant).unwrap_or(true))
-            .filter_map(|(id, job)| job.terminal_at().map(|at| (id.clone(), at)))
+            .filter_map(|(id, job)| job.observed_terminal_at().map(|at| (id.clone(), at)))
             .min_by_key(|(_, at)| *at)
             .map(|(id, _)| id);
         oldest.and_then(|id| state.jobs.remove(&id)).is_some()
@@ -487,16 +505,16 @@ impl JobManager {
             .count()
             >= MAX_RETAINED_JOBS_PER_TENANT
         {
-            if !Self::evict_oldest_terminal(state, Some(tenant)) {
+            if !Self::evict_oldest_observed_terminal(state, Some(tenant)) {
                 return Err(anyhow!(
-                    "tenant '{tenant}' already has {MAX_RETAINED_JOBS_PER_TENANT} live/retained jobs"
+                    "tenant '{tenant}' already has {MAX_RETAINED_JOBS_PER_TENANT} live/retained jobs; poll terminal output before submitting more"
                 ));
             }
         }
         while state.jobs.len() >= MAX_RETAINED_JOBS_GLOBAL {
-            if !Self::evict_oldest_terminal(state, None) {
+            if !Self::evict_oldest_observed_terminal(state, None) {
                 return Err(anyhow!(
-                    "job table is full ({MAX_RETAINED_JOBS_GLOBAL} live jobs)"
+                    "job table is full ({MAX_RETAINED_JOBS_GLOBAL} live/unobserved jobs); poll terminal output before submitting more"
                 ));
             }
         }
@@ -529,7 +547,7 @@ impl JobManager {
             let tenant_active = state.active_per_tenant.get(&tenant).copied().unwrap_or(0);
             if tenant_active >= MAX_ACTIVE_JOBS_PER_TENANT {
                 return Err(anyhow!(
-                    "sandbox busy: tenant '{tenant}' already has an active command"
+                    "sandbox busy: tenant '{tenant}' already has {MAX_ACTIVE_JOBS_PER_TENANT} active commands"
                 ));
             }
             if state.active_global >= MAX_ACTIVE_JOBS_GLOBAL {
@@ -551,6 +569,7 @@ impl JobManager {
                 control,
                 output,
                 state: Mutex::new(InnerState::Running),
+                terminal_observed: AtomicBool::new(false),
                 changed: Condvar::new(),
             });
             state.active_global += 1;
@@ -948,6 +967,141 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         panic!("job did not become terminal");
+    }
+
+    #[test]
+    fn same_tenant_jobs_run_concurrently_and_excess_is_refused() {
+        let (manager, entered, _release) = manager();
+        let mut jobs = Vec::new();
+        for _ in 0..MAX_ACTIVE_JOBS_PER_TENANT {
+            jobs.push(
+                manager
+                    .start("alice".to_string(), SessionId::new("gate-alice"), request())
+                    .expect("same-tenant job admitted below the bound"),
+            );
+            entered
+                .recv_timeout(Duration::from_secs(1))
+                .expect("each job entered backend");
+        }
+        assert_eq!(MAX_ACTIVE_JOBS_PER_TENANT, 8);
+        assert!(
+            jobs.iter()
+                .all(|id| manager.poll(id, 0).unwrap().state == JobState::Running)
+        );
+        let began = Instant::now();
+        let error = manager
+            .start("alice".to_string(), SessionId::new("gate-alice"), request())
+            .expect_err("ninth job must be refused, not queued");
+        assert!(began.elapsed() < Duration::from_secs(1));
+        // Active and retained bounds are both eight: retention admission can
+        // reject this before the active-count check, without evicting live work.
+        assert!(error.to_string().contains("live/retained jobs"), "{error}");
+        assert_eq!(manager.state.lock().unwrap().active_global, 8);
+        for id in &jobs {
+            manager.cancel(id).unwrap();
+        }
+        for id in &jobs {
+            assert_eq!(
+                wait_terminal(&manager, id).terminal.unwrap().kind(),
+                "cancelled"
+            );
+        }
+        assert_eq!(manager.state.lock().unwrap().active_global, 0);
+        // Fully polled terminal handles yield retention room; there is no
+        // sticky admission state or need for a forget endpoint.
+        let next = manager
+            .start("alice".to_string(), SessionId::new("gate-alice"), request())
+            .expect("slot reusable after terminal cleanup");
+        entered.recv_timeout(Duration::from_secs(1)).unwrap();
+        manager.cancel(&next).unwrap();
+        wait_terminal(&manager, &next);
+    }
+
+    #[test]
+    fn concurrent_tenant_slots_keep_the_global_process_bound() {
+        let (manager, entered, _release) = manager();
+        for n in 0..MAX_ACTIVE_JOBS_GLOBAL {
+            let tenant = format!("tenant-{}", n / MAX_ACTIVE_JOBS_PER_TENANT);
+            manager
+                .start(tenant.clone(), SessionId::new(tenant), request())
+                .unwrap();
+            entered
+                .recv_timeout(Duration::from_secs(1))
+                .expect("job entered backend");
+        }
+        let began = Instant::now();
+        let error = manager
+            .start("another".to_string(), SessionId::new("another"), request())
+            .expect_err("global slot 33 must be refused");
+        assert!(began.elapsed() < Duration::from_secs(1));
+        assert!(
+            error.to_string().contains("32/32 commands active globally"),
+            "{error}"
+        );
+        manager.cancel_all_and_wait();
+        assert_eq!(manager.state.lock().unwrap().active_global, 0);
+    }
+
+    #[test]
+    fn unread_terminal_pages_survive_while_observed_jobs_yield_capacity() {
+        let (manager, entered, release) = manager();
+        let a = manager
+            .start("alice".to_string(), SessionId::new("gate-alice"), request())
+            .unwrap();
+        entered.recv_timeout(Duration::from_secs(1)).unwrap();
+        let a_job = manager.get(&a).unwrap();
+        let payload = vec![b'a'; MAX_POLL_OUTPUT_BYTES + 1];
+        a_job.control.emit(ExecStream::Stdout, &payload);
+        release.send(()).unwrap();
+        a_job.wait_terminal(); // Waiting is not a poll/observation of output.
+        let first = manager.poll(&a, 0).unwrap();
+        assert_eq!(first.state, JobState::Terminal);
+        assert!(first.has_more);
+        assert!(a_job.observed_terminal_at().is_none());
+
+        let mut later = Vec::new();
+        for _ in 1..MAX_RETAINED_JOBS_PER_TENANT {
+            let id = manager
+                .start("alice".to_string(), SessionId::new("gate-alice"), request())
+                .unwrap();
+            entered.recv_timeout(Duration::from_secs(1)).unwrap();
+            release.send(()).unwrap();
+            manager.get(&id).unwrap().wait_terminal();
+            later.push(id);
+        }
+        let denied = manager
+            .start("alice".to_string(), SessionId::new("gate-alice"), request())
+            .expect_err("eight unobserved outcomes are not disposable");
+        assert!(denied.to_string().contains("poll terminal output"));
+
+        // B is newer than A, but only B's final page has been observed.
+        let b = manager.poll(&later[0], 0).unwrap();
+        assert_eq!(b.state, JobState::Terminal);
+        assert!(!b.has_more);
+        let next = manager
+            .start("alice".to_string(), SessionId::new("gate-alice"), request())
+            .expect("observed B yields a slot without discarding A's tail");
+        entered.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(manager.get(&later[0]).is_err(), "observed B was recycled");
+        assert!(later[1..].iter().all(|id| manager.get(id).is_ok()));
+
+        let tail = manager.poll(&a, first.next_cursor).unwrap();
+        assert!(!tail.has_more);
+        assert!(!tail.gap);
+        assert_eq!(tail.dropped_bytes, 0);
+        let text: String = first
+            .chunks
+            .iter()
+            .chain(&tail.chunks)
+            .map(|chunk| chunk.text.as_str())
+            .collect();
+        assert_eq!(
+            text,
+            format!("first\n{}last\n", String::from_utf8(payload).unwrap())
+        );
+        assert!(a_job.observed_terminal_at().is_some());
+        manager.cancel(&next).unwrap();
+        wait_terminal(&manager, &next);
     }
 
     #[test]
