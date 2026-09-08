@@ -24,6 +24,8 @@ mod mcp_http;
 #[cfg(feature = "mcp-http")]
 mod oauth;
 mod sandbox;
+#[cfg(all(test, feature = "mcp-http"))]
+mod user_attach_tests;
 
 #[derive(Subcommand, Debug)]
 enum CommandMode {
@@ -324,9 +326,6 @@ struct McpHttpArgs {
 #[cfg(feature = "mcp-http")]
 #[derive(Args, Debug, Clone)]
 struct UserBackendArgs {
-    /// Token store (JSON) — where bearer tokens live; created if missing.
-    #[arg(long, env = "PLAYGROUND_MCP_TOKENS")]
-    tokens: PathBuf,
     /// Which sandbox backend owns this tenant (must match the serving
     /// `mcp-http --backend`; the minted token is scoped to it).
     #[arg(long, value_enum, default_value_t = McpBackendKind::Jail)]
@@ -482,6 +481,8 @@ impl UserBackendArgs {
 enum UserCommand {
     #[command(about = "Provision a tenant's persistent sandbox and mint its bearer token")]
     Create(UserCreateArgs),
+    #[command(about = "Reattach one existing sandbox; print its session ID and persona as JSON")]
+    Attach(UserAttachArgs),
     #[command(about = "List the tenants known to the token store (and whether their jail is live)")]
     List(UserListArgs),
     #[command(about = "Print a tenant's deterministic jail name for host-owned RCTL rules")]
@@ -511,6 +512,18 @@ struct UserCreateArgs {
     /// for Lima; jail storage is backend-owned.
     #[arg(long, value_name = "PATH")]
     faculty_pile: Option<PathBuf>,
+    /// Token store (JSON) — created if missing.
+    #[arg(long, env = "PLAYGROUND_MCP_TOKENS")]
+    tokens: PathBuf,
+    #[command(flatten)]
+    backend: UserBackendArgs,
+}
+
+#[cfg(feature = "mcp-http")]
+#[derive(Args, Debug, Clone)]
+struct UserAttachArgs {
+    /// Already-provisioned tenant to reuse or reattach. Never creates a tenant.
+    name: String,
     #[command(flatten)]
     backend: UserBackendArgs,
 }
@@ -518,6 +531,9 @@ struct UserCreateArgs {
 #[cfg(feature = "mcp-http")]
 #[derive(Args, Debug, Clone)]
 struct UserListArgs {
+    /// Token store (JSON) whose tenants should be listed.
+    #[arg(long, env = "PLAYGROUND_MCP_TOKENS")]
+    tokens: PathBuf,
     #[command(flatten)]
     backend: UserBackendArgs,
 }
@@ -541,6 +557,9 @@ struct UserJailNameArgs {
 struct UserDestroyArgs {
     /// Tenant label to destroy (its sandbox is torn down, tokens removed).
     name: String,
+    /// Token store (JSON) from which this tenant's tokens should be removed.
+    #[arg(long, env = "PLAYGROUND_MCP_TOKENS")]
+    tokens: PathBuf,
     #[command(flatten)]
     backend: UserBackendArgs,
     #[command(flatten)]
@@ -552,6 +571,9 @@ struct UserDestroyArgs {
 struct UserTokenShowArgs {
     /// Tenant whose token(s) to print.
     name: String,
+    /// Token store (JSON) to read.
+    #[arg(long, env = "PLAYGROUND_MCP_TOKENS")]
+    tokens: PathBuf,
     #[command(flatten)]
     backend: UserBackendArgs,
 }
@@ -561,6 +583,9 @@ struct UserTokenShowArgs {
 struct UserTokenResetArgs {
     /// Tenant whose token(s) to revoke and re-mint.
     name: String,
+    /// Token store (JSON) in which this tenant's tokens should be replaced.
+    #[arg(long, env = "PLAYGROUND_MCP_TOKENS")]
+    tokens: PathBuf,
     #[command(flatten)]
     backend: UserBackendArgs,
     #[command(flatten)]
@@ -635,6 +660,7 @@ fn main() -> Result<()> {
         #[cfg(feature = "mcp-http")]
         CommandMode::User { command } => match command {
             UserCommand::Create(args) => run_user_create(args),
+            UserCommand::Attach(args) => run_user_attach(args),
             UserCommand::List(args) => run_user_list(args),
             UserCommand::JailName(args) => run_user_jail_name(args),
             UserCommand::Destroy(args) => run_user_destroy(args),
@@ -835,18 +861,46 @@ fn run_user_create(args: UserCreateArgs) -> Result<()> {
         .provision_sandbox(&spec)
         .with_context(|| format!("provision sandbox for tenant '{}'", args.name))?;
 
-    let mut store = mcp_http::TokenStore::load(&args.backend.tokens)?;
+    let mut store = mcp_http::TokenStore::load(&args.tokens)?;
     let token = store.mint(&args.name, backend_name);
-    store.save(&args.backend.tokens)?;
+    store.save(&args.tokens)?;
     eprintln!(
         "provisioned sandbox and minted token for tenant '{}' (backend {}) into {} — \
          shown once below, store it now:",
         args.name,
         backend_name,
-        args.backend.tokens.display(),
+        args.tokens.display(),
     );
     println!("{token}");
     Ok(())
+}
+
+/// Operator-only lifecycle step, separate from both credential provisioning
+/// and MCP sessions. Leave the persistent box running when this command exits.
+/// In particular, native gateway startup need not construct a sandbox backend.
+#[cfg(feature = "mcp-http")]
+fn run_user_attach(args: UserAttachArgs) -> Result<()> {
+    let backend = args.backend.build_backend()?;
+    println!("{}", attach_user(backend.as_ref(), &args.name)?);
+    Ok(())
+}
+
+#[cfg(feature = "mcp-http")]
+fn attach_user(backend: &dyn sandbox::SandboxBackend, name: &str) -> Result<serde_json::Value> {
+    // Reuse the provisioned identity rule; never infer identity from a mutable
+    // guest login profile or duplicate the jail-name hashing in an rc script.
+    let persona = sandbox::policy::TenantAssistantPersona::for_tenant(name)?;
+    let session = backend
+        .open_session(&sandbox::OpenSpec {
+            tenant: sandbox::Tenant {
+                label: name.to_owned(),
+            },
+        })
+        .with_context(|| format!("attach existing sandbox for tenant '{name}'"))?;
+    Ok(serde_json::json!({
+        "session_id": session.as_str(),
+        "persona": persona.label,
+    }))
 }
 
 /// `user list`: the distinct tenants named in the token store, annotated with
@@ -854,7 +908,7 @@ fn run_user_create(args: UserCreateArgs) -> Result<()> {
 /// (jail, lima) can answer the liveness probe.
 #[cfg(feature = "mcp-http")]
 fn run_user_list(args: UserListArgs) -> Result<()> {
-    let store = mcp_http::TokenStore::load(&args.backend.tokens)?;
+    let store = mcp_http::TokenStore::load(&args.tokens)?;
     // Distinct tenants, sorted for stable output.
     let mut tenants: Vec<String> = store
         .tokens
@@ -865,7 +919,7 @@ fn run_user_list(args: UserListArgs) -> Result<()> {
     tenants.dedup();
 
     if tenants.is_empty() {
-        eprintln!("no tenants in {}", args.backend.tokens.display());
+        eprintln!("no tenants in {}", args.tokens.display());
         return Ok(());
     }
 
@@ -925,16 +979,16 @@ fn run_user_destroy(args: UserDestroyArgs) -> Result<()> {
         .destroy_session(&session)
         .with_context(|| format!("destroy sandbox for tenant '{}'", args.name))?;
 
-    let mut store = mcp_http::TokenStore::load(&args.backend.tokens)?;
+    let mut store = mcp_http::TokenStore::load(&args.tokens)?;
     let before = store.tokens.len();
     store.tokens.retain(|_, entry| entry.tenant != args.name);
     let removed = before - store.tokens.len();
-    store.save(&args.backend.tokens)?;
+    store.save(&args.tokens)?;
     eprintln!(
         "destroyed sandbox '{}' and removed {removed} token(s) for tenant '{}' from {}",
         session.as_str(),
         args.name,
-        args.backend.tokens.display(),
+        args.tokens.display(),
     );
     if let (Some(path), Some(revoked)) = (&args.oauth.oauth_state, oauth_revoked) {
         eprintln!(
@@ -955,7 +1009,7 @@ fn run_user_destroy(args: UserDestroyArgs) -> Result<()> {
 /// just surfaces it.
 #[cfg(feature = "mcp-http")]
 fn run_user_token_show(args: UserTokenShowArgs) -> Result<()> {
-    let store = mcp_http::TokenStore::load(&args.backend.tokens)?;
+    let store = mcp_http::TokenStore::load(&args.tokens)?;
     let mut found = false;
     for (token, entry) in &store.tokens {
         if entry.tenant == args.name {
@@ -964,11 +1018,7 @@ fn run_user_token_show(args: UserTokenShowArgs) -> Result<()> {
         }
     }
     if !found {
-        eprintln!(
-            "no token for '{}' in {}",
-            args.name,
-            args.backend.tokens.display()
-        );
+        eprintln!("no token for '{}' in {}", args.name, args.tokens.display());
     }
     Ok(())
 }
@@ -987,18 +1037,18 @@ fn run_user_token_reset(args: UserTokenResetArgs) -> Result<()> {
         .as_deref()
         .map(|path| oauth::revoke_tenant_locked(path, &args.name))
         .transpose()?;
-    let mut store = mcp_http::TokenStore::load(&args.backend.tokens)?;
+    let mut store = mcp_http::TokenStore::load(&args.tokens)?;
     let before = store.tokens.len();
     store.tokens.retain(|_, entry| entry.tenant != args.name);
     let revoked = before - store.tokens.len();
     let token = store.mint(&args.name, backend_name);
-    store.save(&args.backend.tokens)?;
+    store.save(&args.tokens)?;
     eprintln!(
         "revoked {revoked} token(s) and minted a fresh one for tenant '{}' (backend {}) into {} — \
          shown once below, store it now:",
         args.name,
         backend_name,
-        args.backend.tokens.display(),
+        args.tokens.display(),
     );
     if let (Some(path), Some(revoked)) = (&args.oauth.oauth_state, oauth_revoked) {
         eprintln!(
