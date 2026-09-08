@@ -1,0 +1,10 @@
+# Install as /usr/local/etc/playground-workers/playground_faculties_pilot.conf,
+# root:wheel 0600, inside a root:wheel 0700 directory. Enablement belongs in
+# /etc/rc.conf: playground_faculties_pilot_enable="YES".
+# These are shell assignments in an operator-only file, not an environment
+# forwarded to the guest. Do not add secrets, command overrides, or worker_env.
+worker_tenant='pilot'
+worker_manifest='/var/db/playground/workers.json'
+worker_dataset_parent='airoot/jails/playground/jails'
+worker_pile_root='/var/db/playground/piles'
+worker_jail_prefix='playground'

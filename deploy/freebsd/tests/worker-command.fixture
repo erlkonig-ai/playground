@@ -1,0 +1,33 @@
+#!/bin/sh
+# Rewritten into a private temporary fixture directory by worker-service.sh.
+# No production command accepts this path or any runtime testing override.
+fixture_root='@FIXTURE_ROOT@'
+case "${0##*/}" in
+id) printf '0\n' ;;
+sysctl)
+	case "$2" in
+	security.jail.jailed)
+		if [ -f "$fixture_root/unsafe-parent" ]; then printf '0\n'; else printf '1\n'; fi ;;
+	security.jail.enforce_statfs) printf '0\n' ;;
+	kern.racct.enable|kern.securelevel) printf '1\n' ;;
+	*) exit 1 ;;
+	esac ;;
+stat)
+	case "$2" in
+	%u:%Lp) printf '0:%s\n' "$(/usr/bin/stat -c '%a' "$3")" ;;
+	%z) /usr/bin/stat -c '%s' "$3" ;;
+	*) exit 1 ;;
+	esac ;;
+playground)
+	printf '%s\n' "$@" > "$fixture_root/attach.args"
+	/usr/bin/env > "$fixture_root/attach.env"
+	[ ! -f "$fixture_root/attach-fails" ] || exit 1
+	printf '{"session_id":"playground-pilot-hash","persona":"pilot assistant"}\n' ;;
+jexec)
+	printf '%s\n' "$@" > "$fixture_root/jexec.args"
+	/bin/cat > "$fixture_root/staged.token" ;;
+daemon)
+	printf '%s\n' "$@" > "$fixture_root/daemon.args"
+	/usr/bin/env > "$fixture_root/daemon.env" ;;
+*) exit 1 ;;
+esac

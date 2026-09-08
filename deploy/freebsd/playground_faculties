@@ -1,0 +1,175 @@
+#!/bin/sh
+#
+# PROVIDE: playground_faculties
+# REQUIRE: NETWORKING FILESYSTEMS zfs
+# BEFORE: playground_mcp
+# KEYWORD: shutdown
+#
+# Per-tenant native Faculties worker, supervised in the trusted parent jail.
+# Install as playground_faculties_<instance>, replacing the PROVIDE condition
+# with that same literal name. See native-workers.md; do not install unchanged.
+
+. /etc/rc.subr
+
+# rc_service, unlike $0, also identifies this file when /etc/rc sources it.
+name=${rc_service##*/}
+case "$name" in
+playground_faculties_?*) ;;
+*) err 1 "install with a playground_faculties_<instance> service name" ;;
+esac
+case "$name" in
+*[!a-z0-9_]*) err 1 "service name must contain only lowercase letters, digits, underscores" ;;
+esac
+rcvar=${name}_enable
+# Only global rc.conf controls enablement. The private per-worker file is read
+# during start, so a missing/broken manifest or config cannot prevent stop.
+load_rc_config
+eval ": \${${rcvar}:=NO}"
+
+pidfile="/var/run/${name}.pid"
+command=/usr/sbin/daemon
+procname=/usr/sbin/daemon
+start_cmd=faculties_start
+
+faculties_private_file()
+{
+	[ -f "$1" ] && [ ! -L "$1" ] &&
+	    case "$(/usr/bin/stat -f '%u:%Lp' "$1")" in
+	    0:400|0:600) return 0 ;;
+	    esac
+	warn "requires a root-owned, non-symlink 0400/0600 regular file: $1"
+	return 1
+}
+
+faculties_start()
+{
+	# rc_fast (including boot) skips rc.subr's usual existing-PID check.
+	# Refuse before staging a token, not merely at daemon's eventual PID lock.
+	[ -z "$(check_pidfile "$pidfile" "$procname")" ] || {
+		warn "${name} already has a supervisor; use restart to change its token"
+		return 1
+	}
+	# Keep these checks in the action itself: rc.subr's 'force' prefix can
+	# bypass start_precmd failures. No command/path overrides are supported.
+	[ "$(/usr/bin/id -u)" = 0 ] &&
+	    [ "$(/sbin/sysctl -n security.jail.jailed)" = 1 ] &&
+	    [ "$(/sbin/sysctl -n kern.racct.enable)" = 1 ] &&
+	    [ "$(/sbin/sysctl -n security.jail.enforce_statfs)" = 0 ] || {
+		warn "requires root in the trusted parent jail, RACCT, and enforce_statfs=0"
+		return 1
+	}
+	worker_securelevel=$(/sbin/sysctl -n kern.securelevel) || return 1
+	[ "$worker_securelevel" -ge 1 ] || {
+		warn "requires kern.securelevel >= 1"
+		return 1
+	}
+	umask 077
+	ulimit -c 0 || return 1
+	worker_config="/usr/local/etc/playground-workers/${name}.conf"
+	faculties_private_file "$worker_config" || return 1
+	worker_tenant= worker_manifest= worker_dataset_parent= worker_pile_root= worker_jail_prefix=
+	. "$worker_config"
+	[ -n "$worker_tenant" ] && [ -n "$worker_dataset_parent" ] &&
+	    [ -n "$worker_jail_prefix" ] || {
+		warn "worker config requires tenant, dataset parent, and jail prefix"
+		return 1
+	}
+	for worker_path in "$worker_manifest" "$worker_pile_root"; do
+		case "$worker_path" in
+		/*) ;;
+		*) warn "manifest and pile root must be absolute paths"; return 1 ;;
+		esac
+	done
+	faculties_private_file "$worker_manifest" || return 1
+	[ "$(/usr/bin/stat -f '%z' "$worker_manifest")" -le 1048576 ] || {
+		warn "worker manifest exceeds 1 MiB"; return 1
+	}
+	# Select one exact label, never a shell pattern or caller-selected URL.
+	# Validate the shared manifest shape/duplicates before touching the jail.
+	worker_record=$(/usr/local/bin/jq -cser --arg tenant "$worker_tenant" '
+	  if length == 1 then .[0] else error("expected one manifest object") end |
+	  if (type == "object" and keys == ["workers"] and
+	      (.workers | type == "array" and length >= 1 and length <= 1024) and
+	      all(.workers[];
+	        type == "object" and keys == ["address", "tenant", "token_file"] and
+	        all(.tenant, .address, .token_file;
+	          type == "string" and length > 0 and
+	          (test("[\u0000-\u001f\u007f]") | not))) and
+	      ([.workers[].tenant] | length == (unique | length)) and
+	      ([.workers[].address] | length == (unique | length)))
+	  then [.workers[] | select(.tenant == $tenant)] |
+	    if length == 1 then .[0] else error("tenant needs exactly one worker") end
+	  else error("invalid worker manifest") end
+	' "$worker_manifest") || return 1
+	worker_address=$(printf '%s' "$worker_record" | /usr/local/bin/jq -er '
+	  .address | select(test("^(127[.]0[.]0[.]1|\\[::1\\]):[1-9][0-9]{0,4}$")) |
+	  select((split(":")[-1] | tonumber) <= 65535)
+	') || { warn "worker address must be 127.0.0.1:PORT or [::1]:PORT"; return 1; }
+	worker_token=$(printf '%s' "$worker_record" | /usr/local/bin/jq -er '.token_file') || return 1
+	case "$worker_token" in
+	/*) ;;
+	*) worker_token="${worker_manifest%/*}/$worker_token" ;;
+	esac
+	faculties_private_file "$worker_token" || return 1
+	[ "$(/usr/bin/stat -f '%z' "$worker_token")" -le 1026 ] &&
+	    /usr/local/bin/jq -eRs '
+	      sub("\\r?\\n\\z"; "") | test("\\A[A-Za-z0-9._~+/=-]{32,1024}\\z")
+	    ' "$worker_token" >/dev/null || {
+		warn "invalid internal bearer file"; return 1
+	}
+
+	# This only opens an existing provisioned context. It mints no bearer,
+	# reads no OAuth store, and refuses an unknown tenant rather than creating it.
+	worker_attachment=$(/usr/bin/env -i PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/bin \
+	    /usr/local/bin/playground user attach \
+	    --backend jail --jail-local --jail-external-rctl \
+	    --jail-dataset-parent "$worker_dataset_parent" \
+	    --jail-pile-root "$worker_pile_root" --jail-prefix "$worker_jail_prefix" \
+	    -- "$worker_tenant") || return 1
+	worker_jail=$(printf '%s' "$worker_attachment" | /usr/local/bin/jq -er '
+	  .session_id | select(type == "string" and test("^[A-Za-z0-9_.-]+$"))
+	') || return 1
+	worker_persona=$(printf '%s' "$worker_attachment" | /usr/local/bin/jq -er '
+	  .persona | select(type == "string" and length > 0 and
+	    (test("[\u0000-\u001f\u007f]") | not))
+	') || return 1
+
+	# Resolve every writable guest path AFTER entering the jail. Only this
+	# tenant's bearer bytes cross stdin; no parent directory or credential set
+	# is mounted. Atomic replacement also supports an explicit token rotation.
+	/usr/bin/env -i PATH=/sbin:/bin:/usr/sbin:/usr/bin \
+	    /usr/sbin/jexec -l -U root -d / "$worker_jail" \
+	    /usr/bin/env -i PATH=/sbin:/bin:/usr/sbin:/usr/bin /bin/sh -c '
+		set -eu
+		umask 077
+		test -x /opt/faculties/faculties
+		test -f /pile/self.pile && test ! -L /pile/self.pile
+		test -s /pile/self.key && test ! -L /pile/self.key
+		test ! -L /var/run/faculties-mcp
+		/usr/bin/install -d -m 0700 /var/run/faculties-mcp
+		worker_tmp=$(/usr/bin/mktemp /var/run/faculties-mcp/.token.XXXXXXXX)
+		trap '\''/bin/rm -f "$worker_tmp"'\'' EXIT HUP INT TERM
+		/bin/cat > "$worker_tmp"
+		/bin/chmod 0400 "$worker_tmp"
+		/bin/mv -f "$worker_tmp" /var/run/faculties-mcp/token
+	' < "$worker_token" || return 1
+
+	worker_log="/var/log/${name}.log"
+	[ ! -L "$worker_log" ] || { warn "log must not be a symlink"; return 1; }
+	[ ! -e "$worker_log" ] || [ -f "$worker_log" ] || {
+		warn "log must be a regular file"; return 1
+	}
+	/usr/bin/touch "$worker_log" && /bin/chmod 0600 "$worker_log" || return 1
+	# -P records the supervisor, so rc.subr stop suppresses automatic restart.
+	# Both environments are explicit; jexec -l is NOT a login-profile shell.
+	/usr/bin/env -i PATH=/sbin:/bin:/usr/sbin:/usr/bin \
+	    /usr/sbin/daemon -f -H -P "$pidfile" -R 10 -o "$worker_log" -- \
+	    /usr/sbin/jexec -l -U root -d / "$worker_jail" \
+	    /usr/bin/env -i PATH=/opt/faculties:/usr/local/bin:/usr/bin:/bin \
+	    HOME=/root USER=root LOGNAME=root SHELL=/bin/sh \
+	    PILE=/pile/self.pile TRIBLESPACE_KEY=/pile/self.key PERSONA="$worker_persona" \
+	    /opt/faculties/faculties mcp --pile /pile/self.pile --key /pile/self.key \
+	    --http-listen "$worker_address" --http-token-file /var/run/faculties-mcp/token
+}
+
+run_rc_command "$1"

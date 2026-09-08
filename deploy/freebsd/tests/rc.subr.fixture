@@ -1,0 +1,15 @@
+# Minimal shell fixture, not an rc.subr compatibility test.
+fixture_root='@FIXTURE_ROOT@'
+rc_service="$fixture_root/playground_faculties_fixture"
+load_rc_config() { :; }
+warn() { printf '%s\n' "$*" >&2; }
+err() { fixture_status=$1; shift; warn "$*"; exit "$fixture_status"; }
+check_pidfile() { if [ -f "$fixture_root/running" ]; then printf '42\n'; fi; }
+run_rc_command()
+{
+	case "$1" in
+	start|faststart|forcestart) faculties_start ;;
+	stop|status) printf '%s\n' "$pidfile" "$procname" > "$fixture_root/status.args" ;;
+	*) return 1 ;;
+	esac
+}

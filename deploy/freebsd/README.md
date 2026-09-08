@@ -13,7 +13,10 @@ the parent jail is delegated only that ZFS subtree.
 An opt-in [native Faculties gateway](../../README.md#native-faculties-gateway-opt-in)
 can reuse this TLS/OAuth edge with `--faculties-workers`. It selects a different
 root catalogue and skips sandbox startup; workers must already be supervised
-in their fixed tenant contexts. The option can be passed in
+in their fixed tenant contexts. The source-only
+[per-worker startup and reboot recipe](native-workers.md) uses existing
+persistent child jails and base-system `daemon`, independently of the gateway.
+The option can be passed in
 `playground_mcp_args`, but is not enabled by this deployment profile. The
 deployment receipts below describe the sandbox provider, not a native-worker
 rollout.

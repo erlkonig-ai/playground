@@ -150,6 +150,12 @@ boundary: keep the internal bearer mandatory and tokens private to their
 respective worker contexts. Other network layouts need an explicit secure
 internal transport; this initial mode intentionally accepts only loopback.
 
+The opt-in [FreeBSD worker service](deploy/freebsd/native-workers.md) handles
+one colleague per parent-jail rc instance. It reattaches that existing jail
+before launching the fixed-context native worker under `daemon(8)`. It is
+separate from the gateway service and does not change the public catalogue
+merely by being installed.
+
 The JSON request/response bodies pass through byte-for-byte, retaining native
 image, audio, and embedded-resource content and their order. The gateway
 substitutes the internal bearer and wraps each upstream MCP session in a
