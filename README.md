@@ -221,8 +221,25 @@ show <name>`, `user token reset <name>` (revoke + re-mint). Pass
 OAuth invites, pending authorization codes, access tokens, and refresh tokens
 at the same time; the running daemon observes the change without a restart.
 `PLAYGROUND_MCP_OAUTH_STATE` supplies the same path by environment.
-`PLAYGROUND_MCP_TOKENS` sets the default static-token store path for the `user`
-verbs and `mcp-http`.
+`PLAYGROUND_MCP_TOKENS` sets the default static-token store path for these
+credential verbs and `mcp-http`.
+
+`user attach <name>` reuses or reattaches **one already-provisioned** sandbox
+without minting tokens, registering identities, or starting an MCP server.
+Pass the same backend topology settings used at provision. It leaves the
+sandbox running and prints one JSON object with `session_id` and `persona`;
+diagnostics stay on stderr. The session ID comes from the backend, and the
+persona follows that backend's existing provisioned convention (jail:
+`<tenant> assistant`; Lima: the tenant label itself). It does not read a
+guest login profile. Missing or unverifiable storage is an error, not a
+request to recreate the tenant. Neither `attach` nor `clean` takes a token
+store: those commands operate on sandbox lifecycle, not account credentials.
+
+```sh
+playground user attach alice --backend jail --jail-local \
+  --jail-external-rctl --jail-dataset-parent pool/playground/jails \
+  --jail-pile-root /var/db/playground/piles
+```
 
 ## Deployment
 

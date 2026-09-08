@@ -881,15 +881,27 @@ fn run_user_create(args: UserCreateArgs) -> Result<()> {
 #[cfg(feature = "mcp-http")]
 fn run_user_attach(args: UserAttachArgs) -> Result<()> {
     let backend = args.backend.build_backend()?;
-    println!("{}", attach_user(backend.as_ref(), &args.name)?);
+    println!(
+        "{}",
+        attach_user(backend.as_ref(), args.backend.backend, &args.name)?
+    );
     Ok(())
 }
 
 #[cfg(feature = "mcp-http")]
-fn attach_user(backend: &dyn sandbox::SandboxBackend, name: &str) -> Result<serde_json::Value> {
+fn attach_user(
+    backend: &dyn sandbox::SandboxBackend,
+    kind: McpBackendKind,
+    name: &str,
+) -> Result<serde_json::Value> {
     // Reuse the provisioned identity rule; never infer identity from a mutable
     // guest login profile or duplicate the jail-name hashing in an rc script.
-    let persona = sandbox::policy::TenantAssistantPersona::for_tenant(name)?;
+    let persona = match kind {
+        McpBackendKind::Jail => sandbox::policy::TenantAssistantPersona::for_tenant(name)?.label,
+        // Lima's existing provisioner exports the tenant label itself. This
+        // operation restores a context; it must not rename that persona.
+        McpBackendKind::Lima => name.to_owned(),
+    };
     let session = backend
         .open_session(&sandbox::OpenSpec {
             tenant: sandbox::Tenant {
@@ -899,7 +911,7 @@ fn attach_user(backend: &dyn sandbox::SandboxBackend, name: &str) -> Result<serd
         .with_context(|| format!("attach existing sandbox for tenant '{name}'"))?;
     Ok(serde_json::json!({
         "session_id": session.as_str(),
-        "persona": persona.label,
+        "persona": persona,
     }))
 }
 

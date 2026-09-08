@@ -50,7 +50,7 @@ impl SandboxBackend for AttachOnly {
 #[test]
 fn attach_uses_only_open_and_returns_backend_identity_as_json() {
     let backend = AttachOnly::default();
-    let result = attach_user(&backend, "Alice \"QA\"").unwrap();
+    let result = attach_user(&backend, McpBackendKind::Jail, "Alice \"QA\"").unwrap();
     let persona = sandbox::policy::TenantAssistantPersona::for_tenant("Alice \"QA\"").unwrap();
     assert_eq!(
         result,
@@ -74,7 +74,7 @@ fn attach_propagates_verification_failure_without_fallback() {
         fail: true,
         ..Default::default()
     };
-    let error = attach_user(&backend, "Alice \"QA\"").unwrap_err();
+    let error = attach_user(&backend, McpBackendKind::Jail, "Alice \"QA\"").unwrap_err();
     assert!(format!("{error:#}").contains("existing sandbox could not be verified"));
     assert_eq!(backend.opens.load(Ordering::SeqCst), 1);
 }
@@ -83,9 +83,17 @@ fn attach_propagates_verification_failure_without_fallback() {
 fn attach_rejects_an_invalid_persona_before_open() {
     let backend = AttachOnly::default();
     for name in [" Alice", "Alice ", "abcdefghijklmnopqrstuvw"] {
-        assert!(attach_user(&backend, name).is_err());
+        assert!(attach_user(&backend, McpBackendKind::Jail, name).is_err());
     }
     assert_eq!(backend.opens.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn attach_preserves_limas_existing_persona_convention() {
+    let backend = AttachOnly::default();
+    let result = attach_user(&backend, McpBackendKind::Lima, "Alice \"QA\"").unwrap();
+    assert_eq!(result["persona"], "Alice \"QA\"");
+    assert_eq!(backend.opens.load(Ordering::SeqCst), 1);
 }
 
 #[test]
