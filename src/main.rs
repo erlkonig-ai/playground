@@ -215,6 +215,12 @@ struct McpHttpArgs {
     /// Token store (JSON) provisioned with `playground user create`.
     #[arg(long, env = "PLAYGROUND_MCP_TOKENS")]
     tokens: PathBuf,
+    /// Serve each authenticated tenant's native Faculties worker instead of
+    /// sandbox tools. Operator-owned JSON maps tenants to loopback addresses
+    /// and internal token files. Workers must already be running; this mode
+    /// does not build, provision, reattach, or stop sandboxes.
+    #[arg(long)]
+    faculties_workers: Option<PathBuf>,
     /// Origin header values to accept (repeatable). Requests carrying any
     /// other Origin are rejected (DNS-rebinding defence); requests without an
     /// Origin header (plain MCP clients) always pass.
@@ -688,23 +694,6 @@ fn run_mcp(args: McpArgs) -> Result<()> {
 /// the concurrency design.
 #[cfg(feature = "mcp-http")]
 fn run_mcp_http(args: McpHttpArgs) -> Result<()> {
-    let backend = args.backend.build(
-        args.instance_prefix,
-        args.state_root,
-        args.template,
-        args.faculties_src,
-        args.jail_host,
-        args.jail_local,
-        args.jail_external_rctl,
-        args.jail_prefix,
-        args.jail_template_snapshot,
-        args.jail_dataset_parent,
-        args.jail_pile_root,
-        args.jail_bootstrap_pile,
-        args.jail_clone_refquota,
-        args.jail_pile_quota,
-    )?;
-
     let tokens = mcp_http::TokenStore::load(&args.tokens)?;
     let usable = tokens
         .tokens
@@ -753,13 +742,31 @@ fn run_mcp_http(args: McpHttpArgs) -> Result<()> {
     // own rules during this sweep; external-RCTL mode deliberately relies on
     // the physical host's preloaded name-keyed rules, which this jailed process
     // cannot inspect.
-    let reattached = backend
-        .reattach_all()
-        .context("reattach persistent sandboxes before starting HTTP service")?;
-    eprintln!("playground mcp-http: reattached {reattached} persistent sandbox(es)");
-
-    let provider = mcp::SandboxProvider::new(backend);
-    let server = mcp::McpServer::new(provider);
+    let server = if args.faculties_workers.is_some() {
+        None
+    } else {
+        let backend = args.backend.build(
+            args.instance_prefix,
+            args.state_root,
+            args.template,
+            args.faculties_src,
+            args.jail_host,
+            args.jail_local,
+            args.jail_external_rctl,
+            args.jail_prefix,
+            args.jail_template_snapshot,
+            args.jail_dataset_parent,
+            args.jail_pile_root,
+            args.jail_bootstrap_pile,
+            args.jail_clone_refquota,
+            args.jail_pile_quota,
+        )?;
+        let reattached = backend
+            .reattach_all()
+            .context("reattach persistent sandboxes before starting HTTP service")?;
+        eprintln!("playground mcp-http: reattached {reattached} persistent sandbox(es)");
+        Some(mcp::McpServer::new(mcp::SandboxProvider::new(backend)))
+    };
     mcp_http::serve(
         server,
         tokens,
@@ -773,6 +780,7 @@ fn run_mcp_http(args: McpHttpArgs) -> Result<()> {
             oauth,
             max_sessions_global: args.max_sessions,
             max_sessions_per_tenant: args.max_sessions_per_tenant,
+            faculties_workers: args.faculties_workers,
         },
     )
 }
@@ -1069,6 +1077,44 @@ fn run_token_invite(args: TokenInviteArgs) -> Result<()> {
 #[cfg(all(test, feature = "mcp-http"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn faculties_gateway_is_explicit_and_keeps_account_backend_identity() {
+        let cli = Cli::try_parse_from([
+            "playground",
+            "mcp-http",
+            "--tokens",
+            "tokens.json",
+            "--backend",
+            "jail",
+            "--faculties-workers",
+            "workers.json",
+        ])
+        .unwrap();
+        let Some(CommandMode::McpHttp(args)) = cli.command else {
+            panic!("HTTP args")
+        };
+        assert_eq!(args.faculties_workers, Some(PathBuf::from("workers.json")));
+        assert_eq!(args.backend.name(), "jail");
+        assert!(
+            args.jail_host.is_none(),
+            "gateway does not need sandbox connection options"
+        );
+        let cli =
+            Cli::try_parse_from(["playground", "mcp-http", "--tokens", "tokens.json"]).unwrap();
+        let Some(CommandMode::McpHttp(args)) = cli.command else {
+            panic!("HTTP args")
+        };
+        assert!(
+            args.faculties_workers.is_none(),
+            "default remains sandbox catalogue"
+        );
+        assert!(
+            Cli::try_parse_from(["playground", "mcp", "--faculties-workers", "workers.json",])
+                .is_err(),
+            "worker routing belongs only to the authenticated HTTP edge"
+        );
+    }
 
     #[test]
     fn oauth_revocation_path_is_scoped_to_reset_and_destroy() {

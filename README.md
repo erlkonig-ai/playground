@@ -97,6 +97,91 @@ Bind is loopback by default; internet exposure is expected to go behind a
 TLS-terminating reverse proxy (this server speaks plain HTTP only). See
 `src/mcp_http.rs` for the protocol and auth model.
 
+### Native Faculties gateway (opt-in)
+
+`mcp-http --faculties-workers /etc/playground/workers.json` serves the native
+Faculties catalogue through the same authenticated origin-root endpoint. The
+default remains the eight sandbox tools; this option **selects** the worker
+catalogue, not a union of the two. It does not create a `/faculties` route or
+another OAuth database. Keep the existing `--public-url`, OAuth state, and
+account `--backend jail`/`lima` identity when testing a catalogue switch.
+
+The operator-owned manifest names already-running workers:
+
+```json
+{
+  "workers": [
+    { "tenant": "alice", "address": "127.0.0.1:8401", "token_file": "alice-worker.key" },
+    { "tenant": "bob", "address": "127.0.0.1:8402", "token_file": "bob-worker.key" }
+  ]
+}
+```
+
+Tenant labels match authenticated accounts exactly. Each address must be a
+distinct literal loopback address with a nonzero port; token paths resolve
+relative to the manifest. Token files contain 32–1024 ASCII bearer characters,
+with an optional final newline. Protect them and the manifest as operator
+configuration. Mappings and internal tokens are read once; rotation requires
+restarting the gateway. Public token/OAuth revocation still takes effect live
+on subsequent requests, including requests in an existing MCP session.
+
+Start each **native HTTP-capable** Faculties process separately in its tenant's
+fixed filesystem and environment, with its own pile, signer, credentials, and
+internal token. For example, *inside Alice's existing jail*:
+
+```sh
+faculties mcp --pile /pile/self.pile --key /pile/self.key \
+  --http-listen 127.0.0.1:8401 --http-token-file /etc/faculties/worker.key
+```
+
+The gateway reads the same internal token through its operator-controlled copy
+or mount. No account bearer, cookie, caller-selected pile/key, or environment
+is forwarded. The worker's own configured persona/collection capabilities are
+provisioning facts. A mounted shared pile is **not** automatically included in
+the native catalogue's configured pile; shared-pile tools/access remain an
+explicit design/provisioning choice. In particular, never use an operator's
+personal pile or shared operator signer for all coworkers.
+
+Gateway mode skips all sandbox construction, build, reattach, and shutdown
+operations. It does not supervise workers. A missing tenant mapping returns
+503; it never falls back to the sandbox catalogue or another account. Jails
+that inherit networking share loopback, so loopback alone is not an account
+boundary: keep the internal bearer mandatory and tokens private to their
+respective worker contexts. Other network layouts need an explicit secure
+internal transport; this initial mode intentionally accepts only loopback.
+
+The JSON request/response bodies pass through byte-for-byte, retaining native
+image, audio, and embedded-resource content and their order. The gateway
+substitutes the internal bearer and wraps each upstream MCP session in a
+tenant-owned public session ID. Explicit DELETE closes both. An upstream 404
+discards the public wrapper; the client must initialize again. Both sides'
+session bounds/idle expiry apply. At a gateway per-tenant cap, initialization
+is refused rather than evicting a still-live worker session. Abandoned upstream
+sessions expire at the worker, including after a gateway restart or an
+initialize whose response was lost.
+
+Internal HTTP makes one direct socket request: no DNS, environment proxy,
+redirect, or retry. A failed/timed-out response after sending has an **unknown
+execution outcome**; it does not mean a side-effecting tool was cancelled or
+is safe to repeat. Worker 401/403/redirects become a gateway configuration error,
+not a second login flow. This mode supports the native JSON/202 transport, not
+SSE or resumable streams. Clients must still send the MCP media/protocol headers
+required by the native worker.
+
+The gateway admits at most 16 exchanges, retaining admission while buffered
+response bytes are still held for delivery. Request size uses
+`--max-body-bytes` (1 MiB default); response size is capped at 8 MiB. Body reads
+have 30 seconds, connecting has 5 seconds, and a worker exchange has 10 minutes.
+These are gateway bounds, not limits on native model allocations or promises
+to cancel accepted work. A slow output reader may delay graceful shutdown;
+workers remain externally supervised and are not stopped by this gateway.
+
+This is a source-level integration option, **not a public deployment receipt**.
+Automatic jail worker installation/supervision and a deliberate public
+catalogue choice still precede a hosted rollout. The existing FreeBSD service
+can pass the option through `playground_mcp_args`; its current deployment
+defaults are unchanged.
+
 ## Users & tokens (for `mcp-http`)
 
 A **user** is a tenant: its persistent sandbox plus the bearer token that
@@ -151,4 +236,13 @@ verbs and `mcp-http`.
 cargo build                       # default: mcp + mcp-http + user
 cargo build --no-default-features # stdio mcp only (no tokio/axum)
 cargo test
+```
+
+The native-worker integration smoke requires a separately built Faculties
+binary with HTTP support. It runs both real executables on ephemeral loopback
+ports and verifies discovery without creating tenant storage:
+
+```sh
+FACULTIES_HTTP_BINARY=/absolute/path/to/faculties \
+  cargo test --test cli_gateway -- --ignored --nocapture
 ```

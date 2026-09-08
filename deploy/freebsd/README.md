@@ -10,6 +10,14 @@ sessions are ZFS clones of
 `airoot/jails/playground/jails/template-faculties-df087a2@base`, jails are `playground-*`, and
 the parent jail is delegated only that ZFS subtree.
 
+An opt-in [native Faculties gateway](../../README.md#native-faculties-gateway-opt-in)
+can reuse this TLS/OAuth edge with `--faculties-workers`. It selects a different
+root catalogue and skips sandbox startup; workers must already be supervised
+in their fixed tenant contexts. The option can be passed in
+`playground_mcp_args`, but is not enabled by this deployment profile. The
+deployment receipts below describe the sandbox provider, not a native-worker
+rollout.
+
 The trusted parent must set `enforce_statfs = 0`. FreeBSD otherwise allows it
 to create the nested single-file nullfs mounts but redacts those mounts (and
 their FSIDs) from the parent afterward, which prevents exact verification and

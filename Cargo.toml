@@ -11,11 +11,14 @@ default = ["mcp-http"]
 # auth. On by default; feature-gated so `--no-default-features` builds stay
 # free of the async stack (the stdio MCP transport needs neither) — that's the
 # FreeBSD server profile in deploy/freebsd/.
-mcp-http = ["dep:tokio", "dep:axum", "dep:libc"]
+mcp-http = ["dep:tokio", "dep:axum", "dep:libc", "dep:hyper", "dep:hyper-util", "dep:http-body-util"]
 
 [dependencies]
 anyhow = "1"
 axum = { version = "0.8", optional = true, default-features = false, features = ["http1", "json", "tokio"] }
+hyper = { version = "1", optional = true, features = ["client", "http1"] }
+hyper-util = { version = "0.1", optional = true, features = ["tokio"] }
+http-body-util = { version = "0.1", optional = true }
 base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
 ctrlc = "3"
@@ -23,7 +26,9 @@ infer = { version = "0.22", default-features = false, features = ["alloc"] }
 mime_guess = "2.0"
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# Gateway envelope inspection must compare native integer JSON-RPC IDs exactly,
+# including IDs beyond u64; response/request bodies themselves stay raw bytes.
+serde_json = { version = "1", features = ["arbitrary_precision"] }
 # SHA-256: PKCE S256 verification (src/oauth.rs, feature mcp-http) AND the
 # injective jail-name digest (src/sandbox/jail.rs, all builds), so it is an
 # unconditional dependency — every distinct tenant label must map to a distinct
@@ -33,7 +38,7 @@ sha2 = "0.10"
 # CLI serialise their read-modify-write of the OAuth state file — no new crate
 # in the tree, libc is already resolved transitively via sha2/cpufeatures.
 libc = { version = "0.2", optional = true }
-tokio = { version = "1", optional = true, features = ["rt-multi-thread", "net", "time", "signal"] }
+tokio = { version = "1", optional = true, features = ["rt-multi-thread", "net", "time", "signal", "sync"] }
 
 [dev-dependencies]
 # The mcp-http integration test acts as an HTTP client against the live server.

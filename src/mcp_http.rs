@@ -56,6 +56,12 @@
 //! so every downstream check (backend, session, tenant scope) is shared.
 //! Without those flags this file's behavior is unchanged.
 //!
+//! `--faculties-workers` selects a native tenant-worker catalogue instead of
+//! sandbox tools. [`workers`] reuses this account authority and session table,
+//! wrapping worker sessions and forwarding native JSON bodies unchanged. No
+//! sandbox is constructed in that mode; worker lifetime and fixed pile/key
+//! context belong to provisioning, not to MCP calls.
+//!
 //! ## Concurrency design
 //!
 //! The provider and its backends are blocking (limactl/ssh subprocesses), the
@@ -88,6 +94,8 @@ use serde_json::{Value, json};
 
 use crate::mcp::McpServer;
 use crate::sandbox::SessionId;
+
+mod workers;
 
 // ---------------------------------------------------------------------------
 // Token store
@@ -395,10 +403,14 @@ pub struct HttpServerConfig {
     /// memory without bound.
     pub max_sessions_global: usize,
     /// Ceiling on live transport sessions per tenant. A tenant at its cap has
-    /// its own idlest session evicted to make room, so a single token can never
+    /// its own idlest session evicted to make room in sandbox mode. Worker mode
+    /// refuses instead (forgetting a wrapper does not close the worker slot).
+    /// A single token can never
     /// hold more than this many `Mcp-Session-Id`s (and so can't crowd the
     /// global table on its own).
     pub max_sessions_per_tenant: usize,
+    /// Opt-in native catalogue, using already-running tenant-owned workers.
+    pub faculties_workers: Option<std::path::PathBuf>,
 }
 
 /// Default explicit request-body ceiling (1 MiB). Comfortably fits any JSON-RPC
@@ -423,10 +435,12 @@ pub const DEFAULT_MAX_SESSIONS_PER_TENANT: usize = 64;
 pub(crate) struct HttpSession {
     tenant: String,
     last_seen: Instant,
+    worker_session: Option<String>,
 }
 
 pub(crate) struct HttpState {
-    pub(crate) server: McpServer,
+    pub(crate) server: Option<McpServer>,
+    workers: Option<workers::Gateway>,
     /// The live static-token authority (disk-tracking; picks up CLI
     /// create/reset/destroy without a restart). See [`TokenAuthority`].
     pub(crate) tokens: TokenAuthority,
@@ -437,7 +451,8 @@ pub(crate) struct HttpState {
     pub(crate) config: HttpServerConfig,
 }
 
-/// Serve `server` over Streamable HTTP until the process is killed.
+/// Serve a sandbox or configured native workers over Streamable HTTP.
+/// `server` is absent exactly when `config.faculties_workers` is present.
 ///
 /// `tokens` is the startup snapshot of the static token store and `tokens_path`
 /// the file it came from — the live [`TokenAuthority`] tracks that file so a CLI
@@ -447,15 +462,30 @@ pub(crate) struct HttpState {
 /// Owns the tokio runtime, so callers (the sync `main`) need no async of
 /// their own.
 pub fn serve(
-    server: McpServer,
+    server: Option<McpServer>,
     tokens: TokenStore,
     tokens_path: std::path::PathBuf,
     config: HttpServerConfig,
 ) -> Result<()> {
     let bind = config.bind;
-    server
-        .provider()
-        .set_fatal_handler(Arc::new(|_reason| std::process::exit(1)));
+    let workers = config
+        .faculties_workers
+        .as_deref()
+        .map(workers::Gateway::load)
+        .transpose()?;
+    anyhow::ensure!(
+        server.is_some() != workers.is_some(),
+        "select exactly one MCP catalogue"
+    );
+    anyhow::ensure!(
+        config.max_sessions_per_tenant > 0 && config.max_sessions_global > 0,
+        "MCP session limits must be positive"
+    );
+    if let Some(server) = &server {
+        server
+            .provider()
+            .set_fatal_handler(Arc::new(|_reason| std::process::exit(1)));
+    }
     // OAuth is opt-in: a runtime (persistent state + in-memory auth codes)
     // exists exactly when it was configured, and its routes mount exactly then.
     let oauth = config
@@ -465,6 +495,7 @@ pub fn serve(
         .transpose()?;
     let state = Arc::new(HttpState {
         server,
+        workers,
         tokens: TokenAuthority::from_disk(tokens, tokens_path),
         sessions: Mutex::new(HashMap::new()),
         oauth,
@@ -476,8 +507,9 @@ pub fn serve(
             .await
             .with_context(|| format!("bind {bind}"))?;
         eprintln!(
-            "playground mcp-http: MCP at http://{}/ (backend {}, {} token(s); plain HTTP — front with a TLS proxy for the internet)",
+            "playground mcp-http: MCP at http://{}/ (catalogue {}, account backend {}, {} token(s); plain HTTP — front with a TLS proxy for the internet)",
             listener.local_addr()?,
+            if state.workers.is_some() { "native faculties" } else { "sandbox" },
             state.config.backend_name,
             state.tokens.len(),
         );
@@ -498,8 +530,10 @@ pub fn serve(
         // spin DOWN every owned sandbox that must not outlive this process
         // (Lima VMs; jail is a no-op). A HARD kill skips this path entirely —
         // `playground clean` is the backstop for that case.
-        let spun = state.server.provider().shutdown();
-        eprintln!("playground mcp-http: spun down {spun} owned sandbox(es) on shutdown");
+        if let Some(server) = &state.server {
+            let spun = server.provider().shutdown();
+            eprintln!("playground mcp-http: spun down {spun} owned sandbox(es) on shutdown");
+        }
         serve_result
     })
 }
@@ -530,8 +564,14 @@ async fn shutdown_signal(state: Arc<HttpState>) {
     // Start cancellation before Axum drains in-flight requests. Otherwise a
     // synchronous exec can hold graceful shutdown open until its full command
     // timeout and invite the service supervisor to SIGKILL us first.
-    state.server.provider().begin_shutdown();
-    eprintln!("playground mcp-http: shutdown signal received — cancelling jobs, then draining");
+    if let Some(server) = &state.server {
+        server.provider().begin_shutdown();
+        eprintln!("playground mcp-http: shutdown signal received — cancelling jobs, then draining");
+    } else {
+        eprintln!(
+            "playground mcp-http: draining gateway requests; workers remain externally supervised"
+        );
+    }
 }
 
 fn router(state: Arc<HttpState>) -> Router {
@@ -559,12 +599,25 @@ fn router(state: Arc<HttpState>) -> Router {
 /// `POST /`: one JSON-RPC message in, one JSON-RPC response (or 202) out.
 async fn post_mcp(
     State(state): State<Arc<HttpState>>,
-    headers: HeaderMap,
-    body: Bytes,
+    request: axum::extract::Request,
 ) -> Response {
+    let (parts, body) = request.into_parts();
+    let headers = parts.headers;
     let token = match authenticate(&state, &headers) {
         Ok(token) => token,
         Err(response) => return response,
+    };
+    if let Some(workers) = &state.workers {
+        return worker_response(workers.post(&state, &token, &headers, body).await);
+    }
+    let body = match axum::body::to_bytes(body, state.config.max_body_bytes).await {
+        Ok(body) => body,
+        Err(_) => {
+            return http_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "request body exceeds limit or could not be read",
+            );
+        }
     };
 
     let mut request: Value = match serde_json::from_slice(&body) {
@@ -607,18 +660,23 @@ async fn post_mcp(
     // Dispatch on the blocking pool: the provider/backends shell out
     // (limactl/ssh), and handle_request itself is cheap but synchronous.
     let dispatch_state = state.clone();
-    let response =
-        match tokio::task::spawn_blocking(move || dispatch_state.server.handle_request(&request))
-            .await
-        {
-            Ok(response) => response,
-            Err(e) => {
-                return http_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    &format!("dispatch panicked: {e}"),
-                );
-            }
-        };
+    let response = match tokio::task::spawn_blocking(move || {
+        dispatch_state
+            .server
+            .as_ref()
+            .expect("sandbox mode")
+            .handle_request(&request)
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(e) => {
+            return http_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("dispatch panicked: {e}"),
+            );
+        }
+    };
 
     match response {
         // Notification (no `id`): accepted, nothing to say. Per spec, 202.
@@ -696,6 +754,9 @@ async fn delete_mcp(State(state): State<Arc<HttpState>>, headers: HeaderMap) -> 
         Ok(token) => token,
         Err(response) => return response,
     };
+    if let Some(workers) = &state.workers {
+        return worker_response(workers.delete(&state, &token, &headers).await);
+    }
     let Some(session_id) = header_str(&headers, "mcp-session-id") else {
         return http_error(StatusCode::BAD_REQUEST, "missing Mcp-Session-Id header");
     };
@@ -711,6 +772,14 @@ async fn delete_mcp(State(state): State<Arc<HttpState>>, headers: HeaderMap) -> 
             StatusCode::NO_CONTENT.into_response()
         }
     }
+}
+
+fn worker_response(mut response: Response) -> Response {
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        "no-store".parse().expect("static header"),
+    );
+    response
 }
 
 // ---------------------------------------------------------------------------
@@ -751,6 +820,14 @@ fn open_session(state: &HttpState, tenant: &str) -> Result<String, Response> {
         .map(|(id, s)| (id.clone(), s.last_seen))
         .collect();
     if mine.len() >= state.config.max_sessions_per_tenant {
+        // Forgetting a worker session does not free its upstream slot. Worker
+        // mode refuses at capacity; explicit DELETE closes both sides.
+        if state.workers.is_some() {
+            return Err(http_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "tenant MCP session limit reached; close a session first",
+            ));
+        }
         // Oldest first, evict down to (cap - 1) so the new one fits at the cap.
         mine.sort_by_key(|(_, last_seen)| *last_seen);
         let evict = mine.len() + 1 - state.config.max_sessions_per_tenant;
@@ -773,6 +850,7 @@ fn open_session(state: &HttpState, tenant: &str) -> Result<String, Response> {
         HttpSession {
             tenant: tenant.to_string(),
             last_seen: now,
+            worker_session: None,
         },
     );
     Ok(session_id)
@@ -789,6 +867,30 @@ fn open_session(state: &HttpState, tenant: &str) -> Result<String, Response> {
 /// same [`TokenEntry`] shape so everything downstream (backend check, session
 /// ownership, tenant scope) treats both token kinds identically.
 fn authenticate(state: &HttpState, headers: &HeaderMap) -> Result<TokenEntry, Response> {
+    for name in [
+        "authorization",
+        "origin",
+        "mcp-session-id",
+        "mcp-protocol-version",
+        "content-type",
+        "content-encoding",
+    ] {
+        if headers.get_all(name).iter().count() > 1 {
+            return Err(http_error(
+                StatusCode::BAD_REQUEST,
+                "duplicate security or MCP header",
+            ));
+        }
+        if headers
+            .get(name)
+            .is_some_and(|value| value.to_str().is_err())
+        {
+            return Err(http_error(
+                StatusCode::BAD_REQUEST,
+                "invalid security or MCP header",
+            ));
+        }
+    }
     // Origin check (DNS-rebinding defence): only requests that *carry* an
     // Origin header are candidates for rejection — plain MCP clients send none.
     if let Some(origin) = header_str(headers, header::ORIGIN.as_str()) {
@@ -933,6 +1035,8 @@ fn enforce_tenant_scope(
             };
             match state
                 .server
+                .as_ref()
+                .expect("sandbox mode")
                 .provider()
                 .session_tenant(&SessionId::new(session))
             {
@@ -952,7 +1056,13 @@ fn enforce_tenant_scope(
             let Some(job_id) = job_id else {
                 return Ok(());
             };
-            match state.server.provider().job_tenant(job_id) {
+            match state
+                .server
+                .as_ref()
+                .expect("sandbox mode")
+                .provider()
+                .job_tenant(job_id)
+            {
                 Some(owner) if owner != token.tenant => Err(http_error(
                     StatusCode::FORBIDDEN,
                     "job belongs to a different tenant",
@@ -1044,7 +1154,8 @@ pub(crate) mod tests {
             );
         }
         Arc::new(HttpState {
-            server,
+            server: Some(server),
+            workers: None,
             tokens: TokenAuthority::in_memory(tokens),
             sessions: Mutex::new(HashMap::new()),
             oauth: None,
@@ -1057,6 +1168,7 @@ pub(crate) mod tests {
                 oauth: None,
                 max_sessions_global: DEFAULT_MAX_SESSIONS_GLOBAL,
                 max_sessions_per_tenant: DEFAULT_MAX_SESSIONS_PER_TENANT,
+                faculties_workers: None,
             },
         })
     }
@@ -1722,7 +1834,8 @@ pub(crate) mod tests {
             },
         );
         let state = Arc::new(HttpState {
-            server,
+            server: Some(server),
+            workers: None,
             tokens: TokenAuthority::in_memory(tokens),
             sessions: Mutex::new(HashMap::new()),
             oauth: None,
@@ -1735,6 +1848,7 @@ pub(crate) mod tests {
                 oauth: None,
                 max_sessions_global: DEFAULT_MAX_SESSIONS_GLOBAL,
                 max_sessions_per_tenant: DEFAULT_MAX_SESSIONS_PER_TENANT,
+                faculties_workers: None,
             },
         });
         let addr = spawn_server(state);
@@ -1938,7 +2052,8 @@ pub(crate) mod tests {
         let server = McpServer::new(provider);
         let loaded = TokenStore::load(&path).unwrap();
         let state = Arc::new(HttpState {
-            server,
+            server: Some(server),
+            workers: None,
             tokens: TokenAuthority::from_disk(loaded, path.clone()),
             sessions: Mutex::new(HashMap::new()),
             oauth: None,
@@ -1951,6 +2066,7 @@ pub(crate) mod tests {
                 oauth: None,
                 max_sessions_global: DEFAULT_MAX_SESSIONS_GLOBAL,
                 max_sessions_per_tenant: DEFAULT_MAX_SESSIONS_PER_TENANT,
+                faculties_workers: None,
             },
         });
         let addr = spawn_server(state);
@@ -2062,7 +2178,8 @@ pub(crate) mod tests {
             );
         }
         let state = Arc::new(HttpState {
-            server,
+            server: Some(server),
+            workers: None,
             tokens: TokenAuthority::in_memory(tokens),
             sessions: Mutex::new(HashMap::new()),
             oauth: None,
@@ -2075,6 +2192,7 @@ pub(crate) mod tests {
                 oauth: None,
                 max_sessions_global: 3,
                 max_sessions_per_tenant: 2,
+                faculties_workers: None,
             },
         });
         let addr = spawn_server(state.clone());
