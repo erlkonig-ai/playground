@@ -229,10 +229,13 @@ fn native_faculties_discovery_through_real_gateway_is_inert() {
             std::thread::sleep(Duration::from_millis(10));
         }
     }
-    let post = |session: Option<&str>, body: serde_json::Value| {
+    let post_to = |address: std::net::SocketAddr,
+                   bearer: &str,
+                   session: Option<&str>,
+                   body: serde_json::Value| {
         let mut request = agent
             .post(format!("http://{address}/"))
-            .header("Authorization", "Bearer public-alice")
+            .header("Authorization", format!("Bearer {bearer}"))
             .header("Accept", "application/json, text/event-stream")
             .header("MCP-Protocol-Version", "2025-06-18");
         if let Some(session) = session {
@@ -240,7 +243,57 @@ fn native_faculties_discovery_through_real_gateway_is_inert() {
         }
         request.send_json(body).unwrap()
     };
-    let mut init = post(
+    let mut native_init = post_to(
+        worker_address,
+        "native-worker-only-test-token-with-32-characters",
+        None,
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+            "protocolVersion":"2025-06-18", "capabilities":{}, "clientInfo":{"name":"direct-test","version":"1"}
+        }}),
+    );
+    assert_eq!(native_init.status().as_u16(), 200);
+    let native_session = native_init
+        .headers()
+        .get("mcp-session-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let _: serde_json::Value = native_init.body_mut().read_json().unwrap();
+    assert_eq!(
+        post_to(
+            worker_address,
+            "native-worker-only-test-token-with-32-characters",
+            Some(&native_session),
+            serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized"})
+        )
+        .status()
+        .as_u16(),
+        202
+    );
+    let mut native_listed = post_to(
+        worker_address,
+        "native-worker-only-test-token-with-32-characters",
+        Some(&native_session),
+        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
+    );
+    assert_eq!(native_listed.status().as_u16(), 200);
+    let native_tools: serde_json::Value = native_listed.body_mut().read_json().unwrap();
+    let native_deleted = agent
+        .delete(format!("http://{worker_address}/"))
+        .header(
+            "Authorization",
+            "Bearer native-worker-only-test-token-with-32-characters",
+        )
+        .header("MCP-Session-Id", &native_session)
+        .header("MCP-Protocol-Version", "2025-06-18")
+        .call()
+        .unwrap();
+    assert_eq!(native_deleted.status().as_u16(), 204);
+
+    let mut init = post_to(
+        address,
+        "public-alice",
         None,
         serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
             "protocolVersion":"2025-06-18", "capabilities":{}, "clientInfo":{"name":"gateway-test","version":"1"}
@@ -262,7 +315,9 @@ fn native_faculties_discovery_through_real_gateway_is_inert() {
     let result: serde_json::Value = init.body_mut().read_json().unwrap();
     assert_eq!(result["result"]["protocolVersion"], "2025-06-18");
     assert_eq!(
-        post(
+        post_to(
+            address,
+            "public-alice",
             Some(&session),
             serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized"})
         )
@@ -270,7 +325,9 @@ fn native_faculties_discovery_through_real_gateway_is_inert() {
         .as_u16(),
         202
     );
-    let mut listed = post(
+    let mut listed = post_to(
+        address,
+        "public-alice",
         Some(&session),
         serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
     );
@@ -283,7 +340,10 @@ fn native_faculties_discovery_through_real_gateway_is_inert() {
         .iter()
         .map(|tool| tool["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names.len(), 218);
+    assert_eq!(
+        tools["result"]["tools"], native_tools["result"]["tools"],
+        "gateway changed the exact catalogue discovered from its native worker"
+    );
     assert!(
         names.contains(&"files_view")
             && names.contains(&"files_get")
