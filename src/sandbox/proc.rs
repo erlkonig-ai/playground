@@ -88,16 +88,28 @@ fn read_capped(
     control: &ExecControl,
     stream: ExecStream,
     stop_on_cap: bool,
+    limit_streamed: bool,
 ) -> Vec<u8> {
     let mut buf = Vec::new();
+    let mut produced = 0usize;
     let capture_output = control.captures_output();
     let mut chunk = [0u8; 64 * 1024];
     loop {
         match pipe.read(&mut chunk) {
             Ok(0) => break, // EOF
             Ok(n) => {
-                control.emit(stream, &chunk[..n]);
-                let exceeded_cap = capture_output && cap != 0 && n > cap.saturating_sub(buf.len());
+                let emitted = if limit_streamed && cap != 0 {
+                    n.min(cap.saturating_sub(produced))
+                } else {
+                    n
+                };
+                if emitted != 0 {
+                    control.emit(stream, &chunk[..emitted]);
+                }
+                let exceeded_cap = (capture_output || limit_streamed)
+                    && cap != 0
+                    && n > cap.saturating_sub(produced);
+                produced = produced.saturating_add(n);
                 if capture_output {
                     let remaining = cap.saturating_sub(buf.len());
                     let retained = if cap == 0 { n } else { n.min(remaining) };
@@ -215,10 +227,42 @@ pub fn drive_child_capped_controlled_process_group(
     .map_err(|error| sandbox_control_lost(format!("{error:#}")))
 }
 
-#[derive(Debug, Clone, Copy)]
-enum CancelTarget {
+/// A kernel-owned execution subtree, independent of process groups. Its owner
+/// must kill AND establish that the subtree is empty before returning success.
+/// This runs even after a natural leader exit, before joining inherited pipes.
+pub trait ChildScope {
+    fn kill_and_wait(&self) -> Result<()>;
+}
+
+pub fn drive_child_capped_controlled_scope(
+    child: Child,
+    stdin: Option<Vec<u8>>,
+    timeout: Duration,
+    max_output_bytes: usize,
+    control: &ExecControl,
+    scope: &dyn ChildScope,
+) -> Result<ChildOutput> {
+    let result = drive_child_capped_inner(
+        child,
+        stdin,
+        timeout,
+        max_output_bytes,
+        control,
+        CancelTarget::Scope(scope),
+        CANCEL_TERM_GRACE,
+    );
+    // Covers early driver errors as well as the normal in-loop boundary.
+    scope
+        .kill_and_wait()
+        .map_err(|e| sandbox_control_lost(format!("{e:#}")))?;
+    result
+}
+
+#[derive(Clone, Copy)]
+enum CancelTarget<'a> {
     Child,
     ProcessGroup,
+    Scope(&'a dyn ChildScope),
 }
 
 #[cfg(unix)]
@@ -250,7 +294,7 @@ fn drive_child_capped_inner(
     timeout: Duration,
     max_output_bytes: usize,
     control: &ExecControl,
-    cancel_target: CancelTarget,
+    cancel_target: CancelTarget<'_>,
     cancel_term_grace: Duration,
 ) -> Result<ChildOutput> {
     let stdin_thread = match (stdin, child.stdin.take()) {
@@ -267,7 +311,8 @@ fn drive_child_capped_inner(
     // keeps draining past the retained prefix so its descendant reaper remains
     // the authoritative cleanup boundary.
     let tripped = Arc::new(AtomicBool::new(false));
-    let stop_on_cap = matches!(cancel_target, CancelTarget::Child);
+    let stop_on_cap = !matches!(cancel_target, CancelTarget::ProcessGroup);
+    let limit_streamed = matches!(cancel_target, CancelTarget::Scope(_));
 
     let out_thread = child.stdout.take().map(|pipe| {
         let tripped = tripped.clone();
@@ -280,6 +325,7 @@ fn drive_child_capped_inner(
                 &control,
                 ExecStream::Stdout,
                 stop_on_cap,
+                limit_streamed,
             )
         })
     });
@@ -294,6 +340,7 @@ fn drive_child_capped_inner(
                 &control,
                 ExecStream::Stderr,
                 stop_on_cap,
+                limit_streamed,
             )
         })
     });
@@ -305,8 +352,28 @@ fn drive_child_capped_inner(
     let mut cancelled_process_group = false;
     let status = 'wait: loop {
         match child.try_wait().context("wait on sandbox child")? {
-            Some(status) => break status,
+            Some(status) => {
+                if let CancelTarget::Scope(scope) = cancel_target {
+                    scope
+                        .kill_and_wait()
+                        .map_err(|e| sandbox_control_lost(format!("{e:#}")))?;
+                }
+                break status;
+            }
             None => {
+                if let CancelTarget::Scope(scope) = cancel_target {
+                    cancelled = control.is_cancelled();
+                    timed_out = Instant::now() >= deadline;
+                    output_truncated = tripped.load(Ordering::SeqCst);
+                    if cancelled || timed_out || output_truncated {
+                        scope
+                            .kill_and_wait()
+                            .map_err(|e| sandbox_control_lost(format!("{e:#}")))?;
+                        break child.wait().context("reap contained sandbox child")?;
+                    }
+                    std::thread::sleep(EXEC_POLL);
+                    continue;
+                }
                 if control.is_cancelled() {
                     if matches!(cancel_target, CancelTarget::ProcessGroup) {
                         if signal_process_group(child.id(), 15).is_ok() {
@@ -427,6 +494,74 @@ fn drive_child_capped_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn contained_natural_exit_checks_scope_before_return() {
+        struct EmptyScope(std::sync::atomic::AtomicUsize);
+        impl ChildScope for EmptyScope {
+            fn kill_and_wait(&self) -> Result<()> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+        let scope = EmptyScope(std::sync::atomic::AtomicUsize::new(0));
+        let child = sh("printf synthetic").spawn().unwrap();
+        let out = drive_child_capped_controlled_scope(
+            child,
+            None,
+            Duration::from_secs(1),
+            1024,
+            &ExecControl::default(),
+            &scope,
+        )
+        .unwrap();
+        assert_eq!(out.stdout, b"synthetic");
+        assert!(scope.0.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn contained_cleanup_failure_revokes_control() {
+        struct FailedScope;
+        impl ChildScope for FailedScope {
+            fn kill_and_wait(&self) -> Result<()> {
+                anyhow::bail!("synthetic cleanup failure")
+            }
+        }
+        let child = sh("exit 0").spawn().unwrap();
+        let error = drive_child_capped_controlled_scope(
+            child,
+            None,
+            Duration::from_secs(1),
+            1024,
+            &ExecControl::default(),
+            &FailedScope,
+        )
+        .unwrap_err();
+        assert!(crate::sandbox::is_sandbox_control_lost(&error));
+    }
+
+    #[test]
+    fn contained_streaming_output_trips_its_producer_cap() {
+        struct Sink;
+        impl super::super::ExecOutputSink for Sink {
+            fn on_output(&self, _: ExecStream, _: &[u8]) {}
+        }
+        let control = ExecControl::with_output_sink(Arc::new(Sink));
+        let tripped = AtomicBool::new(false);
+        let retained = read_capped(
+            std::io::Cursor::new(vec![0; 128]),
+            32,
+            &tripped,
+            &control,
+            ExecStream::Stdout,
+            true,
+            true,
+        );
+        assert!(tripped.load(Ordering::SeqCst));
+        assert!(retained.is_empty());
+    }
     use std::process::{Command, Stdio};
     use std::sync::Mutex;
 

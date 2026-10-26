@@ -79,6 +79,69 @@ the old cursor is safe and replays the same retained chunks.
 
 ## Serving
 
+### Linux Bubblewrap fixture profile (candidate; background jobs disabled)
+
+The stdio-only `--backend bubblewrap` candidate implements `SandboxBackend`
+and uses the existing job manager and child-process driver. It is not a second
+Drive executor. **`job_exec` remains refused** until the deployed Linux
+confinement and descendant-cleanup gate has passed and the capability is
+explicitly promoted in source. There is no flag to bypass that admission gate.
+The ignored operational test calls the same backend directly, without enabling
+background admission. No native-model trial has been performed.
+
+Inputs are `--bubblewrap-fixture` (one absolute, regular, non-symlink synthetic
+UTF-8 file of 1–4096 bytes), `--bubblewrap-tenant` (one explicit tenant), and
+`--bubblewrap-cgroup-parent` (an existing delegated cgroup-v2 subtree).
+The fixture is read once, copied to a sealed descriptor, and exposed read-only
+as `/fixture/record.txt`; its host directory is never mounted. The profile is
+ephemeral per execution: cwd is `/work`; no persistent HOME, faculty pile,
+signing key, or session profile is provisioned.
+
+The installed, non-setid `/usr/bin/bwrap` must successfully create user, PID,
+network, IPC, UTS, cgroup and mount namespaces. There is no `*-try` fallback.
+Only the fixed distro `/usr/bin`, `/usr/lib`, and optional `/usr/lib64` are
+mounted read-only. `/bin`, `/lib`, and `/lib64` are corresponding guest aliases.
+Private `/proc` and `/dev` are constructed by Bubblewrap; `/tmp` and `/work`
+each have a 16 MiB tmpfs. The root is remounted read-only. The child receives a
+cleared environment, a fixed PATH/HOME/locale, no inherited non-stdio file
+descriptors except the consumed fixture descriptor, no capabilities, and
+`no_new_privs`. Nested user namespaces are disabled. Host `/etc`, `/home`,
+`/run`, `/tmp`, `/sys`, source trees and model storage are not exposed.
+
+The supplied parent must already enable `cpu memory pids`. The backend creates
+new owned groups beneath it; it never changes the parent's controllers,
+delegation, host sysctls, firewall, or service configuration. Its owned aggregate
+defaults to 512 MiB RAM, zero swap, 64 tasks and one CPU, configurable with
+`--bubblewrap-memory-mib`, `--bubblewrap-tasks`, `--bubblewrap-cpu-percent`
+within the bootstrap bounds documented by CLI errors. Each execution receives
+half the aggregate RAM/task limit and at most the aggregate CPU limit. Only one
+execution is admitted concurrently. Commands/stdin are limited to 8192/4096
+bytes, each output stream to 1 MiB (including streamed output), and wall time
+to at most 10 seconds. Cleanup has a separate 3-second observation deadline.
+An independent finite outer unit remains required for the operational gate.
+
+Before executing bwrap, the child joins its owned job cgroup. On completion,
+timeout, cancellation or output breach, the driver uses `cgroup.kill` and checks
+`cgroup.events` for `populated 0` before joining pipes and returning a result.
+This covers detached/`setsid` descendants by cgroup membership, not `killpg`.
+The direct child is reaped; `populated 0` alone is **not** claimed as proof that
+every descendant zombie has been reaped. The Linux operational test additionally
+records synthetic host PID/start-time identities and requires their disappearance.
+Failure to establish an empty subtree returns `SandboxControlLost` and revokes
+provider admission through the existing fatal-error path.
+
+Synthetic gate, only inside an approved finite delegated test unit:
+
+```sh
+PLAYGROUND_BWRAP_TEST_CGROUP=/sys/fs/cgroup/EXPLICIT_OWNED_UNIT \
+  cargo test --no-default-features --bin playground \
+  linux_confinement_and_detached_descendants -- --ignored --test-threads=1
+```
+
+The test refuses missing prerequisites. It does not install Bubblewrap, start
+a service, alter delegation or weaken a failing namespace restriction. Default
+macOS/CPU builds still work; selecting this backend off Linux is an error.
+
 Serve over stdio (JSON-RPC 2.0), operator-local and unauthenticated:
 
 ```bash

@@ -21,6 +21,7 @@
 //!   existing sandbox names only its tenant; no reconnecting client can swap
 //!   the storage underneath it.
 
+pub mod bubblewrap;
 pub mod faculties;
 pub mod jail;
 pub mod lima;

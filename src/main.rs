@@ -56,6 +56,8 @@ enum CommandMode {
 #[derive(Args, Debug, Clone)]
 #[command(about = "MCP sandbox-provider server settings")]
 struct McpArgs {
+    #[command(flatten)]
+    bubblewrap: sandbox::bubblewrap::Options,
     /// Which sandbox backend provisions sessions.
     #[arg(long, value_enum, default_value_t = McpBackendKind::Lima)]
     backend: McpBackendKind,
@@ -110,6 +112,8 @@ struct McpArgs {
 
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
 enum McpBackendKind {
+    /// Linux ephemeral fixture profile (stdio only; background admission pending validation).
+    Bubblewrap,
     /// Local Lima VM per session (macOS host).
     Lima,
     /// FreeBSD jail per tenant on a remote host over SSH (or locally with
@@ -124,6 +128,7 @@ impl McpBackendKind {
     #[cfg_attr(not(feature = "mcp-http"), allow(dead_code))]
     fn name(self) -> &'static str {
         match self {
+            McpBackendKind::Bubblewrap => "bubblewrap",
             McpBackendKind::Lima => "lima",
             McpBackendKind::Jail => "jail",
         }
@@ -149,6 +154,9 @@ impl McpBackendKind {
         jail_pile_quota: String,
     ) -> Result<Box<dyn sandbox::SandboxBackend>> {
         match self {
+            McpBackendKind::Bubblewrap => anyhow::bail!(
+                "bubblewrap fixture profile is available only through mcp stdio with explicit fixture settings"
+            ),
             McpBackendKind::Lima => {
                 let mut backend = sandbox::lima::LimaBackend::new(instance_prefix);
                 if let Some(root) = state_root {
@@ -401,6 +409,9 @@ impl UserBackendArgs {
     /// this — they only touch the token store.
     fn build_backend(&self) -> Result<Box<dyn sandbox::SandboxBackend>> {
         match self.backend {
+            McpBackendKind::Bubblewrap => anyhow::bail!(
+                "bubblewrap has no persistent user provisioning; configure its stdio fixture profile"
+            ),
             McpBackendKind::Jail => {
                 let mut backend = if self.jail_local {
                     sandbox::jail::JailBackend::local()
@@ -444,6 +455,7 @@ impl UserBackendArgs {
     /// the CLI's `destroy` targets the exact box the backend provisioned.
     fn session_id_for(&self, label: &str) -> sandbox::SessionId {
         let name = match self.backend {
+            McpBackendKind::Bubblewrap => label.to_owned(),
             McpBackendKind::Jail => {
                 // Reuse the backend's own derivation so prefixes/sanitisation agree.
                 let mut b = sandbox::jail::JailBackend::local();
@@ -461,6 +473,9 @@ impl UserBackendArgs {
     /// running? Both persistent backends can answer.
     fn running_for_label(&self, label: &str) -> Result<bool> {
         Ok(match self.backend {
+            McpBackendKind::Bubblewrap => {
+                anyhow::bail!("bubblewrap fixture sessions are ephemeral and stdio-only")
+            }
             McpBackendKind::Jail => {
                 let mut b = if self.jail_local {
                     sandbox::jail::JailBackend::local()
@@ -689,24 +704,28 @@ fn main() -> Result<()> {
 /// leak a VM/jail — the guarantee lives here, in the provider, never in the
 /// client.
 fn run_mcp(args: McpArgs) -> Result<()> {
-    let backend = args.backend.build(
-        args.instance_prefix,
-        args.state_root,
-        args.template,
-        args.faculties_src,
-        args.jail_host,
-        args.jail_local,
-        args.jail_external_rctl,
-        args.jail_prefix,
-        args.jail_template_snapshot,
-        args.jail_dataset_parent,
-        args.jail_pile_root,
-        args.jail_bootstrap_pile,
-        // Stdio is the operator-local transport; keep the backend's default
-        // storage quotas (these strings match `JailBackend`'s defaults).
-        "10G".to_string(),
-        "50G".to_string(),
-    )?;
+    let backend = if args.backend == McpBackendKind::Bubblewrap {
+        args.bubblewrap.build()?
+    } else {
+        args.backend.build(
+            args.instance_prefix,
+            args.state_root,
+            args.template,
+            args.faculties_src,
+            args.jail_host,
+            args.jail_local,
+            args.jail_external_rctl,
+            args.jail_prefix,
+            args.jail_template_snapshot,
+            args.jail_dataset_parent,
+            args.jail_pile_root,
+            args.jail_bootstrap_pile,
+            // Stdio is the operator-local transport; keep the backend's default
+            // storage quotas (these strings match `JailBackend`'s defaults).
+            "10G".to_string(),
+            "50G".to_string(),
+        )?
+    };
 
     let provider = mcp::SandboxProvider::new(backend);
     let server = mcp::McpServer::new(provider);
@@ -823,6 +842,9 @@ fn provision_spec_for(
     faculty_pile: Option<&std::path::Path>,
 ) -> Result<sandbox::ProvisionSpec> {
     let faculty_pile = match (backend, faculty_pile) {
+        (McpBackendKind::Bubblewrap, _) => {
+            anyhow::bail!("bubblewrap fixture profile never provisions or mounts faculty piles")
+        }
         (McpBackendKind::Lima, Some(host_path)) => {
             sandbox::FacultyPile::Host(sandbox::HostFacultyFiles::resolve(host_path)?)
         }
@@ -901,6 +923,9 @@ fn attach_user(
         // Lima's existing provisioner exports the tenant label itself. This
         // operation restores a context; it must not rename that persona.
         McpBackendKind::Lima => name.to_owned(),
+        McpBackendKind::Bubblewrap => {
+            anyhow::bail!("bubblewrap fixture profile has no persistent attachment")
+        }
     };
     let session = backend
         .open_session(&sandbox::OpenSpec {

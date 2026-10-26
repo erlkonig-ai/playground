@@ -11,7 +11,7 @@ default = ["mcp-http"]
 # auth. On by default; feature-gated so `--no-default-features` builds stay
 # free of the async stack (the stdio MCP transport needs neither) — that's the
 # FreeBSD server profile in deploy/freebsd/.
-mcp-http = ["dep:tokio", "dep:axum", "dep:libc", "dep:hyper", "dep:hyper-util", "dep:http-body-util"]
+mcp-http = ["dep:tokio", "dep:axum", "dep:hyper", "dep:hyper-util", "dep:http-body-util"]
 
 [dependencies]
 anyhow = "1"
@@ -37,7 +37,7 @@ sha2 = "0.10"
 # Advisory file locking (flock) so the running server and the `token invite`
 # CLI serialise their read-modify-write of the OAuth state file — no new crate
 # in the tree, libc is already resolved transitively via sha2/cpufeatures.
-libc = { version = "0.2", optional = true }
+libc = "0.2"
 tokio = { version = "1", optional = true, features = ["rt-multi-thread", "net", "time", "signal", "sync"] }
 
 [dev-dependencies]
