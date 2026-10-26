@@ -640,11 +640,54 @@ mod linux {
             }
             let host_net = fs::read_link("/proc/self/ns/net")?;
             let host_pid = fs::read_link("/proc/self/ns/pid")?;
+            let namespaces = backend.execute(
+                &request(
+                    "readlink /proc/self/ns/net && readlink /proc/self/ns/pid",
+                    1000,
+                ),
+                &ExecControl::default(),
+            )?;
+            assert_eq!(
+                namespaces.exit_code,
+                Some(0),
+                "namespace reads must succeed"
+            );
+            let namespaces = String::from_utf8(namespaces.stdout)?;
+            let ids: Vec<_> = namespaces.lines().collect();
+            assert_eq!(ids.len(), 2);
+            for (value, kind, host) in [(ids[0], "net", host_net), (ids[1], "pid", host_pid)] {
+                let number = value
+                    .strip_prefix(&format!("{kind}:["))
+                    .and_then(|s| s.strip_suffix(']'))
+                    .context("missing namespace identity")?;
+                ensure!(number.parse::<u64>()? != 0, "empty namespace identity");
+                assert_ne!(value, host.to_str().unwrap(), "namespace was not isolated");
+            }
+            let mounts = backend.execute(
+                &request("cat /proc/self/mountinfo", 1000),
+                &ExecControl::default(),
+            )?;
+            assert_eq!(mounts.exit_code, Some(0));
+            let mounts = String::from_utf8(mounts.stdout)?;
+            for target in ["/", "/usr/bin", "/usr/lib", "/fixture/record.txt"] {
+                let options: Vec<_> = mounts
+                    .lines()
+                    .filter_map(|line| {
+                        let fields: Vec<_> = line.split_whitespace().collect();
+                        (fields.get(4) == Some(&target)).then(|| fields[5])
+                    })
+                    .collect();
+                assert!(!options.is_empty(), "missing guest mount {target}");
+                assert!(
+                    options
+                        .iter()
+                        .all(|s| s.split(',').any(|flag| flag == "ro")),
+                    "guest mount is not read-only: {target}"
+                );
+            }
             let check = format!(
-                "test ! -e '{}' && test ! -e /sys/fs/cgroup && test ! -e /home && test ! -e /etc && test ! -w /usr/bin && test \"$(readlink /proc/self/ns/net)\" != '{}' && test \"$(readlink /proc/self/ns/pid)\" != '{}' && env",
-                path.display(),
-                host_net.display(),
-                host_pid.display()
+                "test ! -e '{}' && test ! -e /sys/fs/cgroup && test ! -e /home && test ! -e /etc && env",
+                path.display()
             );
             let out = backend.execute(&request(&check, 1000), &ExecControl::default())?;
             assert_eq!(
@@ -662,13 +705,23 @@ mod linux {
                     "unexpected inherited env: {line}"
                 );
             }
-            for command in [
-                "printf overwrite > /fixture/record.txt",
-                "dd if=/dev/zero of=/work/large bs=1048576 count=32",
-            ] {
-                let out = backend.execute(&request(command, 2000), &ExecControl::default())?;
-                assert_ne!(out.exit_code, Some(0), "write/size restriction failed");
-            }
+            let out = backend.execute(
+                &request("printf overwrite > /fixture/record.txt", 1000),
+                &ExecControl::default(),
+            )?;
+            assert_ne!(out.exit_code, Some(0), "fixture must reject writes");
+            // Demonstrate a usable tool and writable work mount first; a
+            // missing dd or permission failure is not evidence of a quota.
+            let out = backend.execute(&request(
+                "command -v dd && printf writable > /work/check && dd if=/dev/zero of=/work/small bs=1048576 count=1 && test -s /work/small && { dd if=/dev/zero of=/work/large bs=1048576 count=32 2>/tmp/dd-error; status=$?; test \"$status\" -ne 0 && grep -F 'No space left on device' /tmp/dd-error; }",
+                2000), &ExecControl::default())?;
+            assert_eq!(
+                out.exit_code,
+                Some(0),
+                "tmpfs quota was not demonstrated: {} {}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
             assert_eq!(fs::read(&path)?, b"synthetic-marker-7a91\n");
             let out = backend.execute(
                 &request("yes synthetic-output", 2000),
@@ -683,7 +736,8 @@ mod linux {
 
             // Capture host PID/start-time identities from ONLY our new job
             // group. setsid and a nested background child cannot escape cgroup
-            // ancestry. Check disappearance, not merely killpg or populated=0.
+            // ancestry. This checks bounded EVENTUAL disappearance after the
+            // result, not that all descendant zombies were reaped before it.
             let control = ExecControl::default();
             let identities = std::thread::scope(|scope| -> Result<Vec<(u32, String)>> {
                 let thread = scope.spawn(|| {

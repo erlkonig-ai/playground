@@ -165,13 +165,13 @@ pub fn drive_child(child: Child, stdin: Option<Vec<u8>>, timeout: Duration) -> R
 
 /// Like [`drive_child`], with cooperative cancellation and streaming output.
 pub fn drive_child_controlled(
-    child: Child,
+    mut child: Child,
     stdin: Option<Vec<u8>>,
     timeout: Duration,
     control: &ExecControl,
 ) -> Result<ChildOutput> {
     drive_child_capped_inner(
-        child,
+        &mut child,
         stdin,
         timeout,
         0,
@@ -185,14 +185,14 @@ pub fn drive_child_controlled(
 /// cancellation, and streamed stdout/stderr chunks. Cancellation kills and
 /// reaps the transported child.
 pub fn drive_child_capped_controlled(
-    child: Child,
+    mut child: Child,
     stdin: Option<Vec<u8>>,
     timeout: Duration,
     max_output_bytes: usize,
     control: &ExecControl,
 ) -> Result<ChildOutput> {
     drive_child_capped_inner(
-        child,
+        &mut child,
         stdin,
         timeout,
         max_output_bytes,
@@ -209,14 +209,14 @@ pub fn drive_child_capped_controlled(
 /// force-killed, descendant cleanup is no longer provable: return a typed fatal
 /// error immediately instead of waiting on a possibly stuck leader or pipe.
 pub fn drive_child_capped_controlled_process_group(
-    child: Child,
+    mut child: Child,
     stdin: Option<Vec<u8>>,
     timeout: Duration,
     max_output_bytes: usize,
     control: &ExecControl,
 ) -> Result<ChildOutput> {
     drive_child_capped_inner(
-        child,
+        &mut child,
         stdin,
         timeout,
         max_output_bytes,
@@ -235,7 +235,7 @@ pub trait ChildScope {
 }
 
 pub fn drive_child_capped_controlled_scope(
-    child: Child,
+    mut child: Child,
     stdin: Option<Vec<u8>>,
     timeout: Duration,
     max_output_bytes: usize,
@@ -243,7 +243,7 @@ pub fn drive_child_capped_controlled_scope(
     scope: &dyn ChildScope,
 ) -> Result<ChildOutput> {
     let result = drive_child_capped_inner(
-        child,
+        &mut child,
         stdin,
         timeout,
         max_output_bytes,
@@ -251,11 +251,49 @@ pub fn drive_child_capped_controlled_scope(
         CancelTarget::Scope(scope),
         CANCEL_TERM_GRACE,
     );
-    // Covers early driver errors as well as the normal in-loop boundary.
-    scope
-        .kill_and_wait()
-        .map_err(|e| sandbox_control_lost(format!("{e:#}")))?;
-    result
+    // Keep the Child handle in this frame: a failed scope cleanup must not
+    // drop a live/unreaped direct child. Still do not infer subtree cleanup
+    // from this individual reap, or join potentially escaped pipe holders.
+    let cleanup = scope.kill_and_wait();
+    let reaped = reap_direct_child_bounded(&mut child);
+    match (result, cleanup, reaped) {
+        (Ok(output), Ok(()), Ok(_)) => Ok(output),
+        (result, cleanup, reaped) => Err(sandbox_control_lost(format!(
+            "contained execution failed; driver={:?}; subtree={:?}; direct-child={:?}",
+            result.err().map(|e| format!("{e:#}")),
+            cleanup.err().map(|e| format!("{e:#}")),
+            reaped.err().map(|e| format!("{e:#}")),
+        ))),
+    }
+}
+
+/// Reap only the child we own. A three-second backstop is not a descendant
+/// proof; failure remains explicit and the provider's fatal path owns exit.
+fn reap_direct_child_bounded(child: &mut Child) -> Result<std::process::ExitStatus> {
+    if let Some(status) = child.try_wait().context("inspect direct child")? {
+        return Ok(status);
+    }
+    if let Err(error) = child.kill() {
+        if let Some(status) = child
+            .try_wait()
+            .context("recheck direct child after kill race")?
+        {
+            return Ok(status);
+        }
+        return Err(error).context("kill direct sandbox child");
+    }
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if let Some(status) = child.try_wait().context("reap direct sandbox child")? {
+            return Ok(status);
+        }
+        if Instant::now() >= deadline {
+            return Err(anyhow!(
+                "direct sandbox child not reaped within three seconds"
+            ));
+        }
+        std::thread::sleep(EXEC_POLL);
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -289,7 +327,7 @@ fn signal_process_group(_process_group: u32, _signal: i32) -> std::io::Result<()
 }
 
 fn drive_child_capped_inner(
-    mut child: Child,
+    child: &mut Child,
     stdin: Option<Vec<u8>>,
     timeout: Duration,
     max_output_bytes: usize,
@@ -369,7 +407,7 @@ fn drive_child_capped_inner(
                         scope
                             .kill_and_wait()
                             .map_err(|e| sandbox_control_lost(format!("{e:#}")))?;
-                        break child.wait().context("reap contained sandbox child")?;
+                        break reap_direct_child_bounded(child)?;
                     }
                     std::thread::sleep(EXEC_POLL);
                     continue;
@@ -529,17 +567,31 @@ mod tests {
                 anyhow::bail!("synthetic cleanup failure")
             }
         }
-        let child = sh("exit 0").spawn().unwrap();
+        let child = sh("exec sleep 60").spawn().unwrap();
+        let pid = child.id() as libc::pid_t;
+        let control = ExecControl::default();
+        control.cancel();
+        let started = Instant::now();
         let error = drive_child_capped_controlled_scope(
             child,
             None,
             Duration::from_secs(1),
             1024,
-            &ExecControl::default(),
+            &control,
             &FailedScope,
         )
         .unwrap_err();
         assert!(crate::sandbox::is_sandbox_control_lost(&error));
+        assert!(started.elapsed() < Duration::from_secs(4));
+        // No remaining waitable child: the error path actually reaped it.
+        assert_eq!(
+            unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
     }
 
     #[test]
@@ -1006,10 +1058,10 @@ mod tests {
         });
         let mut command = sh("trap '' TERM; while :; do sleep 1; done");
         command.process_group(0);
-        let child = command.spawn().expect("spawn");
+        let mut child = command.spawn().expect("spawn");
         let start = Instant::now();
         let error = drive_child_capped_inner(
-            child,
+            &mut child,
             None,
             Duration::from_secs(30),
             1024 * 1024,

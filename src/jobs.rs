@@ -584,7 +584,6 @@ impl JobManager {
         let spawn = std::thread::Builder::new()
             .name(format!("playground-job-{}", &id[..8]))
             .spawn(move || {
-                let fail_stop_capable = manager.backend.supports_background_jobs();
                 let result = catch_unwind(AssertUnwindSafe(|| {
                     manager
                         .backend
@@ -598,7 +597,10 @@ impl JobManager {
                 let fatal_reason = result
                     .as_ref()
                     .err()
-                    .filter(|error| fail_stop_capable && is_sandbox_control_lost(error))
+                    // Background capability gates retained-job admission, not
+                    // loss of authority. Synchronous exec uses this same
+                    // manager and must also stop after containment is lost.
+                    .filter(|error| is_sandbox_control_lost(error))
                     .map(|error| format!("{error:#}"));
 
                 // Terminal state is also an output fence: after this returns no
@@ -1354,9 +1356,14 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_backend_marker_is_not_a_process_fatal_event() {
+    fn synchronous_control_loss_closes_admission_without_background_capability() {
         let backend: Arc<dyn SandboxBackend> = Arc::new(UnsupportedControlLossBackend);
+        assert!(!backend.supports_background_jobs());
         let manager = JobManager::new(backend);
+        let (fatal_tx, fatal_rx) = mpsc::channel();
+        manager.set_fatal_handler(Arc::new(move |reason| {
+            let _ = fatal_tx.send(reason);
+        }));
         let first = manager
             .start(
                 "alice".to_string(),
@@ -1364,22 +1371,26 @@ mod tests {
                 request(),
             )
             .expect("first job starts");
-        assert_eq!(
-            wait_terminal(&manager, &first).terminal.unwrap().kind(),
-            "failed"
+        // This is the synchronous MCP exec completion path, not job polling.
+        let result = manager.wait_result_and_forget(&first).expect("sync result");
+        assert!(result.error.unwrap().contains("unsupported backend marker"));
+        assert!(manager.fatal_reason().is_some());
+        assert!(
+            fatal_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .contains("unsupported backend marker")
         );
-        assert!(manager.fatal_reason().is_none());
-        let second = manager
+        let error = manager
             .start(
                 "bob".to_string(),
                 SessionId::new("unsupported-bob"),
                 request(),
             )
-            .expect("unsupported backend errors must not close global admission");
-        assert_eq!(
-            wait_terminal(&manager, &second).terminal.unwrap().kind(),
-            "failed"
-        );
+            .expect_err(
+                "typed control loss must close global admission even for synchronous backends",
+            );
+        assert!(error.to_string().contains("losing execution control"));
     }
 
     #[cfg(feature = "mcp-http")]

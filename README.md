@@ -126,9 +126,15 @@ timeout, cancellation or output breach, the driver uses `cgroup.kill` and checks
 This covers detached/`setsid` descendants by cgroup membership, not `killpg`.
 The direct child is reaped; `populated 0` alone is **not** claimed as proof that
 every descendant zombie has been reaped. The Linux operational test additionally
-records synthetic host PID/start-time identities and requires their disappearance.
+records synthetic host PID/start-time identities and requires their disappearance
+within three seconds AFTER the result. That establishes bounded eventual
+disposal on the tested host, not pre-terminal reaping of every descendant.
+The scope driver retains its direct child handle across early cleanup errors
+and makes a separate bounded kill/reap attempt; neither failure is hidden.
 Failure to establish an empty subtree returns `SandboxControlLost` and revokes
-provider admission through the existing fatal-error path.
+provider admission through the existing fatal-error path, independently of
+whether the backend supports background jobs. Synchronous MCP `exec` is subject
+to the same loss-of-authority rule.
 
 Synthetic gate, only inside an approved finite delegated test unit:
 
