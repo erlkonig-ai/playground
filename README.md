@@ -79,15 +79,16 @@ the old cursor is safe and replays the same retained chunks.
 
 ## Serving
 
-### Linux Bubblewrap fixture profile (candidate; background jobs disabled)
+### Linux Bubblewrap fixture profile (candidate; bounded managed jobs)
 
 The stdio-only `--backend bubblewrap` candidate implements `SandboxBackend`
 and uses the existing job manager and child-process driver. It is not a second
-Drive executor. **`job_exec` remains refused** until the deployed Linux
-confinement and descendant-cleanup gate has passed and the capability is
-explicitly promoted in source. There is no flag to bypass that admission gate.
-The ignored operational test calls the same backend directly, without enabling
-background admission. No native-model trial has been performed.
+Drive executor. This candidate enables `job_exec` for bounded managed jobs,
+not escaped daemons. The underlying confinement/descendant gate passed on Stars
+at source `ad0ef45c`; that did not test retained-job admission. **This successor
+is unaccepted until both Linux operational gates pass against its exact source.**
+There is no operator flag or test-only wrapper to bypass capability admission.
+No native-model trial has been performed.
 
 Inputs are `--bubblewrap-fixture` (one absolute, regular, non-symlink synthetic
 UTF-8 file of 1–4096 bytes), `--bubblewrap-tenant` (one explicit tenant), and
@@ -119,6 +120,11 @@ execution is admitted concurrently. Commands/stdin are limited to 8192/4096
 bytes, each output stream to 1 MiB (including streamed output), and wall time
 to at most 10 seconds. Cleanup has a separate 3-second observation deadline.
 An independent finite outer unit remains required for the operational gate.
+The existing manager bounds retained handles and cursor-based output; only one
+backend subprocess tree runs at once. A competing execution fails busy rather
+than waiting in a new queue. Provider EOF cancels and waits for managed jobs;
+closing an individual session handle does not cancel a retained job, matching
+the existing provider lifecycle. Its command timeout remains authoritative.
 
 Before executing bwrap, the child joins its owned job cgroup. On completion,
 timeout, cancellation or output breach, the driver uses `cgroup.kill` and checks
@@ -142,9 +148,21 @@ Synthetic gate, only inside an approved finite delegated test unit:
 PLAYGROUND_BWRAP_TEST_CGROUP=/sys/fs/cgroup/EXPLICIT_OWNED_UNIT \
   cargo test --no-default-features --bin playground \
   linux_confinement_and_detached_descendants -- --ignored --test-threads=1
+PLAYGROUND_BWRAP_TEST_CGROUP=/sys/fs/cgroup/EXPLICIT_OWNED_UNIT \
+  cargo test --no-default-features --bin playground \
+  linux_mcp_managed_jobs_lifecycle -- --ignored --test-threads=1
 ```
 
-The test refuses missing prerequisites. It does not install Bubblewrap, start
+The second gate uses actual JSON-RPC `tools/call` dispatch through
+`SandboxProvider` and `JobManager`: fixture output with cursor/terminal receipts,
+cancellation after observing a receipt and detached descendant identities,
+timeout, streamed output cap, slot reuse, and provider EOF cancellation plus
+refused admission after teardown. Terminal observations immediately require an
+empty aggregate/no job subgroups; recorded descendants must disappear within
+three seconds afterward. Poll/receipt loops have explicit deadlines. The EOF
+call exercises the real synchronous teardown path under the outer unit deadline.
+
+The tests refuse missing prerequisites. They do not install Bubblewrap, start
 a service, alter delegation or weaken a failing namespace restriction. Default
 macOS/CPU builds still work; selecting this backend off Linux is an error.
 

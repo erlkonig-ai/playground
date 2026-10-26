@@ -3,8 +3,9 @@
 //! No persistent tenant provisioning, faculty mounts, network, or fallback.
 //! A delegated cgroup parent is an operator prerequisite. Only newly created
 //! groups below it are configured; the parent and host policy are never changed.
-//! Background admission deliberately remains OFF until the Linux descendant
-//! and confinement tests below have been run against the deployed binaries.
+//! Retained jobs use the same bounded command path, not detached daemons.
+//! Promotion requires the Linux confinement AND MCP managed-job gates below
+//! against the exact candidate; source implementation is not runtime evidence.
 
 use std::path::PathBuf;
 
@@ -433,8 +434,10 @@ mod linux {
             "bubblewrap"
         }
         fn supports_background_jobs(&self) -> bool {
-            // Source implementation is not runtime acceptance. No CLI override.
-            false
+            // Retained handles, not escaped daemons: the same cgroup-owned
+            // tree, output cap and ten-second maximum apply to every command.
+            // The real MCP lifecycle is covered by the managed-job Linux gate.
+            true
         }
         fn open_session(&self, spec: &OpenSpec) -> Result<SessionId> {
             ensure!(spec.tenant.label == self.tenant, "unknown fixture tenant");
@@ -626,10 +629,7 @@ mod linux {
                 bubblewrap_tasks: 64,
                 bubblewrap_cpu_percent: 100,
             })?;
-            assert!(
-                !backend.supports_background_jobs(),
-                "operational gate must not enable itself"
-            );
+            assert!(backend.supports_background_jobs());
             for command in [
                 "cat /fixture/record.txt",
                 "head -c 4096 /fixture/record.txt",
@@ -810,6 +810,337 @@ mod linux {
             );
             backend.shutdown()?;
             Ok(())
+        }
+
+        mod managed_jobs {
+            use super::*;
+            use crate::mcp::{McpServer, SandboxProvider, StdioTransport};
+            use serde_json::{Value, json};
+
+            struct Fixture {
+                server: McpServer,
+                group: PathBuf,
+                path: PathBuf,
+            }
+
+            impl Fixture {
+                fn eof(&self) -> Result<()> {
+                    let mut transport = StdioTransport::new(
+                        std::io::Cursor::new(Vec::<u8>::new()),
+                        Vec::<u8>::new(),
+                    );
+                    self.server.serve_loop(&mut transport)
+                }
+
+                fn empty(&self) -> Result<()> {
+                    let events = fs::read_to_string(self.group.join("cgroup.events"))?;
+                    ensure!(events.lines().any(|line| line == "populated 0"));
+                    for entry in fs::read_dir(&self.group)? {
+                        ensure!(
+                            !entry?.file_type()?.is_dir(),
+                            "job cgroup remains at terminal"
+                        );
+                    }
+                    Ok(())
+                }
+
+                fn identities(&self) -> Result<Vec<(u32, String)>> {
+                    let mut identities = Vec::new();
+                    for entry in fs::read_dir(&self.group)? {
+                        let entry = entry?;
+                        if !entry.file_type()?.is_dir() {
+                            continue;
+                        }
+                        // Cancellation/timeout can remove this owned job group
+                        // between enumeration and the read; never hide other errors.
+                        let procs = match fs::read_to_string(entry.path().join("cgroup.procs")) {
+                            Ok(procs) => procs,
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                            Err(e) => return Err(e.into()),
+                        };
+                        for pid in procs.split_whitespace() {
+                            let pid = pid.parse::<u32>()?;
+                            if let Some(start) = process_start(pid) {
+                                identities.push((pid, start));
+                            }
+                        }
+                    }
+                    Ok(identities)
+                }
+            }
+
+            impl Drop for Fixture {
+                fn drop(&mut self) {
+                    // Assertion/error paths use the real EOF cancellation hook,
+                    // too. The independently bounded outer unit is the backstop.
+                    if let Err(error) = self.eof() {
+                        eprintln!("managed-job test teardown failed: {error:#}");
+                    }
+                    let _ = fs::remove_file(&self.path);
+                }
+            }
+
+            fn text(server: &McpServer, name: &str, arguments: Value) -> Result<String> {
+                let reply = server
+                    .handle_request(&json!({
+                        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                        "params": { "name": name, "arguments": arguments },
+                    }))
+                    .context("missing MCP reply")?;
+                ensure!(reply.get("error").is_none(), "MCP error: {reply}");
+                let result = &reply["result"];
+                ensure!(result["isError"] == false, "tool error: {result}");
+                result["content"][0]["text"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .context("missing tool text")
+            }
+
+            fn call(server: &McpServer, name: &str, arguments: Value) -> Result<Value> {
+                Ok(serde_json::from_str(&text(server, name, arguments)?)?)
+            }
+
+            struct Pending {
+                id: String,
+                cursor: u64,
+                stdout: String,
+                stderr: String,
+                terminal: Option<Value>,
+            }
+
+            impl Pending {
+                fn submit(
+                    server: &McpServer,
+                    session: &str,
+                    command: &str,
+                    millis: u64,
+                ) -> Result<Self> {
+                    let value = call(
+                        server,
+                        "job_exec",
+                        json!({
+                            "session": session, "command": command, "timeout_ms": millis,
+                        }),
+                    )?;
+                    ensure!(value["state"] == "running");
+                    ensure!(value["cursor"] == 0);
+                    Ok(Self {
+                        id: value["job_id"].as_str().context("missing job id")?.into(),
+                        cursor: 0,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                        terminal: None,
+                    })
+                }
+
+                fn poll(&mut self, fixture: &Fixture) -> Result<()> {
+                    ensure!(self.terminal.is_none(), "poll after consumed terminal");
+                    let value = call(
+                        &fixture.server,
+                        "job_poll",
+                        json!({
+                            "job_id": self.id, "cursor": self.cursor,
+                        }),
+                    )?;
+                    ensure!(value["job_id"] == self.id);
+                    ensure!(value["gap"] == false && value["dropped_bytes"] == 0);
+                    let next = value["next_cursor"].as_u64().context("missing cursor")?;
+                    let mut cursor = self.cursor;
+                    for chunk in value["chunks"].as_array().context("missing chunks")? {
+                        let sequence = chunk["sequence"].as_u64().context("missing sequence")?;
+                        ensure!(sequence == cursor, "repeated or missing output sequence");
+                        cursor += 1;
+                        let output = match chunk["stream"].as_str() {
+                            Some("stdout") => &mut self.stdout,
+                            Some("stderr") => &mut self.stderr,
+                            _ => bail!("unknown output stream"),
+                        };
+                        output.push_str(chunk["text"].as_str().context("missing output text")?);
+                        ensure!(output.len() <= OUTPUT_CAP, "stream exceeded backend cap");
+                    }
+                    ensure!(cursor == next, "cursor did not account for returned chunks");
+                    self.cursor = next;
+                    if value["state"] == "terminal" {
+                        // This observation is immediate, not after a grace sleep.
+                        fixture.empty()?;
+                        if value["has_more"] == false {
+                            ensure!(value["terminal"].is_object(), "missing terminal receipt");
+                            self.terminal = Some(value["terminal"].clone());
+                        }
+                    }
+                    Ok(())
+                }
+
+                fn finish(&mut self, fixture: &Fixture) -> Result<Value> {
+                    let deadline = Instant::now() + Duration::from_secs(8);
+                    while self.terminal.is_none() {
+                        ensure!(Instant::now() < deadline, "bounded terminal poll expired");
+                        self.poll(fixture)?;
+                        if self.terminal.is_none() {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                    }
+                    Ok(self.terminal.clone().unwrap())
+                }
+
+                fn observe_tree(&mut self, fixture: &Fixture) -> Result<Vec<(u32, String)>> {
+                    let deadline = Instant::now() + Duration::from_secs(2);
+                    loop {
+                        ensure!(
+                            Instant::now() < deadline,
+                            "no receipt and descendant tree before deadline"
+                        );
+                        self.poll(fixture)?;
+                        ensure!(
+                            self.terminal.is_none(),
+                            "job ended before cancellation observation"
+                        );
+                        let identities = fixture.identities()?;
+                        if self.stdout.contains("descendants-ready\n") && identities.len() >= 5 {
+                            return Ok(identities);
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                }
+            }
+
+            fn gone(identities: &[(u32, String)]) -> Result<()> {
+                let deadline = Instant::now() + Duration::from_secs(3);
+                while identities
+                    .iter()
+                    .any(|(pid, start)| process_start(*pid).as_ref() == Some(start))
+                {
+                    ensure!(
+                        Instant::now() < deadline,
+                        "observed descendant still present after terminal"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Ok(())
+            }
+
+            /// Real JSON-RPC tool dispatch, provider and manager; no capability
+            /// wrapper or direct execute path. Requires the same finite outer
+            /// delegated unit as the confinement gate, and never changes policy.
+            #[test]
+            #[ignore = "Linux managed-job gate: explicit PLAYGROUND_BWRAP_TEST_CGROUP; bounded outer unit required"]
+            fn linux_mcp_managed_jobs_lifecycle() -> Result<()> {
+                let parent = std::env::var_os("PLAYGROUND_BWRAP_TEST_CGROUP")
+                    .context("test requires explicit delegated cgroup parent")?;
+                let path = std::env::temp_dir().join(format!(
+                    "playground-managed-{}-{}.txt",
+                    std::process::id(),
+                    rand::random::<u64>(),
+                ));
+                let marker = format!("managed-fixture-{:016x}\n", rand::random::<u64>());
+                let mut file = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&path)?;
+                // This guard also covers construction failure before Fixture owns it.
+                struct Remove(PathBuf);
+                impl Drop for Remove {
+                    fn drop(&mut self) {
+                        let _ = fs::remove_file(&self.0);
+                    }
+                }
+                let _remove = Remove(path.clone());
+                file.write_all(marker.as_bytes())?;
+                let backend = Bubblewrap::open(Options {
+                    bubblewrap_fixture: Some(path.clone()),
+                    bubblewrap_cgroup_parent: Some(parent.into()),
+                    bubblewrap_tenant: Some("managed-test".into()),
+                    bubblewrap_memory_mib: 512,
+                    bubblewrap_tasks: 64,
+                    bubblewrap_cpu_percent: 100,
+                })?;
+                ensure!(backend.supports_background_jobs());
+                let group = backend.group.path.clone();
+                let fixture = Fixture {
+                    server: McpServer::new(SandboxProvider::new(Box::new(backend))),
+                    group,
+                    path,
+                };
+                let session = text(
+                    &fixture.server,
+                    "open_session",
+                    json!({"tenant": "managed-test"}),
+                )?;
+                let mut read = Pending::submit(
+                    &fixture.server,
+                    &session,
+                    "cat /fixture/record.txt; printf 'fixture-read\n' >&2",
+                    1000,
+                )?;
+                let terminal = read.finish(&fixture)?;
+                ensure!(terminal["kind"] == "exited" && terminal["exit_code"] == 0);
+                ensure!(terminal["error"].is_null());
+                ensure!(read.stdout == marker && read.stderr == "fixture-read\n");
+
+                // The detached shell emits readiness only AFTER forking its
+                // nested child. Observation also requires live host identities.
+                let tree = "setsid /bin/sh -c 'sleep 60 & printf \"descendants-ready\\n\"; wait' & sleep 60 & wait";
+                let mut cancel = Pending::submit(&fixture.server, &session, tree, 10000)?;
+                let ids = cancel.observe_tree(&fixture)?;
+                let acknowledgement =
+                    call(&fixture.server, "job_cancel", json!({"job_id": cancel.id}))?;
+                ensure!(acknowledgement["state"] == "cancelling");
+                let started = Instant::now();
+                ensure!(cancel.finish(&fixture)?["kind"] == "cancelled");
+                ensure!(
+                    started.elapsed() < Duration::from_secs(3),
+                    "cancel did not promptly finish"
+                );
+                gone(&ids)?;
+
+                let mut timeout = Pending::submit(&fixture.server, &session, tree, 3000)?;
+                let ids = timeout.observe_tree(&fixture)?;
+                let terminal = timeout.finish(&fixture)?;
+                ensure!(terminal["kind"] == "exited");
+                ensure!(
+                    terminal["error"]
+                        .as_str()
+                        .is_some_and(|s| s.contains("wall-time"))
+                );
+                gone(&ids)?;
+
+                let mut cap =
+                    Pending::submit(&fixture.server, &session, "yes managed-output", 5000)?;
+                let terminal = cap.finish(&fixture)?;
+                ensure!(
+                    terminal["error"]
+                        .as_str()
+                        .is_some_and(|s| s.contains("output cap"))
+                );
+                ensure!(!cap.stdout.is_empty() && cap.stdout.len() <= OUTPUT_CAP);
+
+                let mut reuse = Pending::submit(
+                    &fixture.server,
+                    &session,
+                    "head -c 4096 /fixture/record.txt",
+                    1000,
+                )?;
+                let terminal = reuse.finish(&fixture)?;
+                ensure!(terminal["exit_code"] == 0 && terminal["error"].is_null());
+                ensure!(reuse.stdout == marker);
+
+                let mut teardown = Pending::submit(&fixture.server, &session, tree, 10000)?;
+                let ids = teardown.observe_tree(&fixture)?;
+                let started = Instant::now();
+                fixture.eof()?;
+                ensure!(
+                    started.elapsed() < Duration::from_secs(3),
+                    "EOF waited for timeout instead of cancelling"
+                );
+                ensure!(teardown.finish(&fixture)?["kind"] == "cancelled");
+                gone(&ids)?;
+                ensure!(
+                    Pending::submit(&fixture.server, &session, "true", 1000).is_err(),
+                    "provider admitted a command after EOF teardown"
+                );
+                fixture.empty()?;
+                Ok(())
+            }
         }
 
         fn process_start(pid: u32) -> Option<String> {

@@ -428,6 +428,10 @@ pub trait SandboxBackend: Send + Sync {
     /// retained background job. The public `job_*` surface is intentionally
     /// narrower than synchronous execution: unsupported backends keep `exec`
     /// but do not pretend that killing a local transport killed remote work.
+    /// This means bounded managed handles, not permission to detach daemons.
+    /// Bubblewrap's contract is no live subtree tasks and its directly owned
+    /// child reaped before terminal; descendant zombie disposal is separately
+    /// tested with a bounded post-terminal observation.
     fn supports_background_jobs(&self) -> bool {
         false
     }
